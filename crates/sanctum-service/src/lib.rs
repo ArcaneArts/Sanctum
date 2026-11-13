@@ -7,7 +7,7 @@ pub use db::metadata::{
     Change, Edit as MetadataEdit, Entry as MetadataEntry, Mutation as MetadataMutation,
     RevisionTarget,
 };
-pub use db::metadata_filter;
+pub use db::{metadata_filter, metadata_query};
 use sanctum_core::{Error, ExternalSource, Result, Scope, ScopeId, UsageMeasurement, UsageScope};
 use sanctum_db_sqlite::{self as db, CollectionDb};
 pub use sanctum_db_sqlite::{Chunk, ChunkRef, Revision, RevisionContent};
@@ -124,6 +124,32 @@ impl Service {
                     edits,
                 )
             }
+        }
+    }
+
+    pub fn query_metadata(
+        &self,
+        tenant: &ScopeId,
+        collection: Option<ScopeId>,
+        query: metadata_query::Query,
+    ) -> Result<metadata_query::Page> {
+        use metadata_filter::Level;
+        match (query.level, collection) {
+            (Level::Collection, None) => {
+                metadata_query::catalog(&self.files.catalog_path(tenant), query)
+            }
+            (Level::Source | Level::Chunk, Some(collection)) => {
+                let scope = Scope {
+                    tenant: tenant.clone(),
+                    collection,
+                };
+                let database = self.database(&scope)?;
+                let values = self.metadata(&scope, None, None)?;
+                database.query_metadata(scope.collection.as_str(), query, &values)
+            }
+            _ => Err(Error::Invalid(
+                "collection is required only for source or chunk metadata queries".into(),
+            )),
         }
     }
 

@@ -9,7 +9,7 @@ use super::{
     metadata::{Entry, valid_name},
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
     Collection,
     Source,
@@ -62,6 +62,16 @@ impl Filter {
         }
     }
 
+    pub(super) fn allows_level(&self, level: Level) -> bool {
+        match self {
+            Self::Test(test) => test.level <= level,
+            Self::All(children) | Self::Any(children) => {
+                children.iter().all(|child| child.allows_level(level))
+            }
+            Self::Not(child) => child.allows_level(level),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         let mut nodes = 0;
         self.validate_node(1, &mut nodes)
@@ -94,14 +104,7 @@ impl Filter {
 
 impl Predicate {
     fn validate(&self) -> Result<()> {
-        if !valid_name(&self.namespace) || !valid_name(&self.key) {
-            return Err(Error::Invalid("invalid metadata namespace or key".into()));
-        }
-        if self.path.len() > 16 || self.path.iter().any(|segment| {
-            matches!(segment, PathSegment::Property(property) if property.len() > 1024)
-        }) {
-            return Err(Error::Invalid("metadata path exceeds its size limit".into()));
-        }
+        validate_field(&self.namespace, &self.key, &self.path)?;
         match (self.operator, &self.operand) {
             (Operator::Exists | Operator::Missing, None)
             | (Operator::Equal | Operator::Contains, Some(_))
@@ -118,18 +121,8 @@ impl Predicate {
         }
     }
 
-    fn select<'a>(&self, mut value: Option<&'a Value>) -> Option<&'a Value> {
-        for segment in &self.path {
-            value = match segment {
-                PathSegment::Property(property) => value?.get(property),
-                PathSegment::Index(index) => value?.get(*index as usize),
-            };
-        }
-        value
-    }
-
     fn matches(&self, root: Option<&Value>) -> bool {
-        let selected = self.select(root);
+        let selected = select(root, &self.path);
         match self.operator {
             Operator::Exists => return selected.is_some(),
             Operator::Missing => return selected.is_none(),
@@ -152,6 +145,32 @@ impl Predicate {
             }),
         }
     }
+}
+
+pub(super) fn validate_field(namespace: &str, key: &str, path: &[PathSegment]) -> Result<()> {
+    if !valid_name(namespace) || !valid_name(key) {
+        return Err(Error::Invalid("invalid metadata namespace or key".into()));
+    }
+    if path.len() > 16
+        || path.iter().any(
+            |segment| matches!(segment, PathSegment::Property(property) if property.len() > 1024),
+        )
+    {
+        return Err(Error::Invalid(
+            "metadata path exceeds its size limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn select<'a>(mut value: Option<&'a Value>, path: &[PathSegment]) -> Option<&'a Value> {
+    for segment in path {
+        value = match segment {
+            PathSegment::Property(property) => value?.get(property),
+            PathSegment::Index(index) => value?.get(*index as usize),
+        };
+    }
+    value
 }
 
 fn equal(left: &Value, right: &Value) -> bool {
@@ -182,7 +201,7 @@ fn compare(left: &Value, right: &Value) -> Option<Ordering> {
     }
 }
 
-fn numeric_order(left: &Number, right: &Number) -> Ordering {
+pub(super) fn numeric_order(left: &Number, right: &Number) -> Ordering {
     let int = |n: &Number| {
         n.as_i64()
             .map(i128::from)
@@ -208,6 +227,12 @@ fn int_float_order(integer: i128, float: f64) -> Ordering {
     })
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum CollectionValues<'a> {
+    Entries(&'a [Entry]),
+    Catalog,
+}
+
 /// Adds a parameterized predicate to a query where the candidate chunk is aliased as c.
 pub(super) fn append_condition(
     connection: &Connection,
@@ -215,6 +240,22 @@ pub(super) fn append_condition(
     arguments: &mut Vec<SqlValue>,
     filter: &Filter,
     collection: &[Entry],
+) -> Result<()> {
+    append_for(
+        connection,
+        sql,
+        arguments,
+        filter,
+        CollectionValues::Entries(collection),
+    )
+}
+
+pub(super) fn append_for(
+    connection: &Connection,
+    sql: &mut String,
+    arguments: &mut Vec<SqlValue>,
+    filter: &Filter,
+    collection: CollectionValues<'_>,
 ) -> Result<()> {
     filter.validate()?;
     let mut predicates = Vec::new();
@@ -247,11 +288,13 @@ fn compile(
     arguments: &mut Vec<SqlValue>,
     predicates: &mut Vec<Predicate>,
     filter: &Filter,
-    collection: &[Entry],
+    collection: CollectionValues<'_>,
 ) -> Result<()> {
     match filter {
         Filter::Test(test) => {
-            if matches!(test.level, Level::Collection) {
+            if let (Level::Collection, CollectionValues::Entries(collection)) =
+                (test.level, collection)
+            {
                 let value = collection
                     .iter()
                     .find(|entry| entry.namespace == test.namespace && entry.key == test.key)
@@ -272,19 +315,19 @@ fn compile(
                 sql.push_str("NOT ");
             }
             predicates.push(predicate);
-            let ordinal = match test.level {
-                Level::Source => "-1",
-                Level::Chunk => "c.ordinal",
-                Level::Collection => unreachable!("collection metadata was evaluated above"),
-            };
-            write!(
-                sql,
-                "EXISTS (SELECT 1 FROM revision_metadata AS m
-                WHERE m.source = c.source_id AND m.revision = c.revision_id
-                  AND m.ordinal = {ordinal} AND m.namespace = ? AND m.key = ?
-                  AND sanctum_metadata_matches({index}, m.value))"
-            )
-            .expect("writing to a String");
+            match test.level {
+                Level::Collection => write!(sql,
+                    "EXISTS (SELECT 1 FROM collection_metadata AS m WHERE m.collection = c.collection
+                        AND m.namespace = ? AND m.key = ? AND sanctum_metadata_matches({index}, m.value))"),
+                level => {
+                    let ordinal = if level == Level::Chunk { "c.ordinal" } else { "-1" };
+                    write!(sql,
+                        "EXISTS (SELECT 1 FROM revision_metadata AS m
+                            WHERE m.source = c.source_id AND m.revision = c.revision_id
+                              AND m.ordinal = {ordinal} AND m.namespace = ? AND m.key = ?
+                              AND sanctum_metadata_matches({index}, m.value))")
+                }
+            }.expect("writing to a String");
             arguments.push(test.namespace.clone().into());
             arguments.push(test.key.clone().into());
         }

@@ -12,7 +12,14 @@ mod usage;
 
 pub struct LocalFiles {
     root: PathBuf,
-    _owner: File,
+    owner: File,
+}
+
+impl Drop for LocalFiles {
+    fn drop(&mut self) {
+        // Unlock explicitly even if a concurrent child process is between fork and exec.
+        let _ = self.owner.unlock();
+    }
 }
 
 impl LocalFiles {
@@ -34,10 +41,7 @@ impl LocalFiles {
             }
             std::fs::TryLockError::Error(error) => Error::Io(error),
         })?;
-        Ok(Self {
-            root,
-            _owner: owner,
-        })
+        Ok(Self { root, owner })
     }
 
     pub fn catalog_path(&self, tenant: &ScopeId) -> PathBuf {
@@ -272,4 +276,22 @@ fn sync_dirs(path: &Path, root: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn sync_dirs(_path: &Path, _root: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_owner_releases_lock_while_a_duplicate_descriptor_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = LocalFiles::open(dir.path()).unwrap();
+        let duplicate = owner.owner.try_clone().unwrap();
+        assert!(matches!(LocalFiles::open(dir.path()), Err(Error::Busy(_))));
+        drop(owner);
+        let next_owner = LocalFiles::open(dir.path()).unwrap();
+        drop(duplicate);
+        assert!(matches!(LocalFiles::open(dir.path()), Err(Error::Busy(_))));
+        drop(next_owner);
+    }
 }
