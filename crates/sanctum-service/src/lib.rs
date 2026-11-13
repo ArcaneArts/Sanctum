@@ -49,7 +49,9 @@ pub use git_import::{GitImportEvent, GitRepository};
 pub use hosted_catalog::{DEFAULT_SNAPSHOT_CACHE_BYTES, HostedCatalog};
 pub use hosted_database::HostedDatabaseSession;
 pub use hosted_dispatch::{Dispatch, ReconcilePage, Task, TaskStage};
-pub use hosted_ingestion::{HostedJob, HostedJobState, HostedUpload, UploadSweep};
+pub use hosted_ingestion::{
+    HostedActivityPage, HostedJob, HostedJobState, HostedUpload, UploadSweep,
+};
 pub use hosted_rebuild::RebuildPage;
 pub use local_import::{ImportEvent, ImportOptions, ImportState};
 pub use pending_scan::{PendingText, ScanOptions, ScanPage, ScanStop};

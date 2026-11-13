@@ -276,12 +276,17 @@ message ListIngestionJobsRequest {
   string tenant = 1;
   optional string collection = 2;
   optional uint32 limit = 3;
+  // Local activity cursor.
   optional string before_operation_id = 4;
+  // Hosted activity cursor from next_page_token. Keep the same tenant and collection.
+  optional string page_token = 5;
 }
 
 message ListIngestionJobsResponse {
   repeated IngestionJob jobs = 1;
   optional string next_before_operation_id = 2;
+  // Hosted pages may be short or empty while more objects remain to examine.
+  optional string next_page_token = 3;
 }
 
 message IngestionJob {

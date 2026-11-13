@@ -112,6 +112,7 @@ pub(crate) async fn overview(host: State<'_, Host>, collection: Option<String>) 
             collection: collection.clone(),
             limit: Some(25),
             before_operation_id: None,
+            page_token: None,
         }),
     );
     let (collections, queue, jobs) = match result {

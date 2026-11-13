@@ -13,6 +13,136 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Code, transport::Server};
 
 #[tokio::test]
+async fn hosted_activity_pages_resume_across_instances_and_keep_scope() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let service =
+        || HostedCatalog::new(storage.clone(), Some(Key::parse("managed").unwrap()), 1024).unwrap();
+    let catalog = service();
+    let mut server = start(catalog.clone()).await;
+    for (tenant, collection) in [
+        ("default", "notes"),
+        ("default", "reference"),
+        ("default", "retired"),
+        ("other", "notes"),
+    ] {
+        let scope = sanctum_core::Scope {
+            tenant: tenant.parse().unwrap(),
+            collection: collection.parse().unwrap(),
+        };
+        catalog.create_collection(&scope, None).await.unwrap();
+        let header = v1::UploadTextHeader {
+            scope: Some(v1::Scope {
+                tenant: tenant.into(),
+                collection: collection.into(),
+            }),
+            name: "notes.txt".into(),
+            request_id: Some(uuid::Uuid::from_u128(42).to_string()),
+            ..Default::default()
+        };
+        server
+            .client
+            .submit_text(upload_frames(&header, [b"accepted text".as_slice()]))
+            .await
+            .unwrap();
+    }
+    let scope = |collection: &str| sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: collection.parse().unwrap(),
+    };
+    catalog
+        .cancel_upload(&scope("reference"), uuid::Uuid::from_u128(42))
+        .await
+        .unwrap();
+    catalog
+        .delete_collection(&scope("retired"), None)
+        .await
+        .unwrap();
+    // Exercise continuation when a bounded scan only sees non-job objects.
+    for index in 0..10 {
+        let key = Key::parse(format!(
+            "managed/default/collections/notes/operations/00-fixture-{index}"
+        ))
+        .unwrap();
+        storage
+            .put_control(&key, b"{}".as_slice().into(), Condition::Create)
+            .await
+            .unwrap();
+    }
+    let mut request = v1::ListIngestionJobsRequest {
+        tenant: "default".into(),
+        limit: Some(1),
+        ..Default::default()
+    };
+    let first = server
+        .client
+        .list_ingestion_jobs(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(first.jobs.is_empty());
+    let token = first
+        .next_page_token
+        .expect("remaining activity must be pageable");
+    assert_eq!(
+        server
+            .client
+            .list_ingestion_jobs(v1::ListIngestionJobsRequest {
+                tenant: "other".into(),
+                page_token: Some(token.clone()),
+                ..request.clone()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    server.stop().await;
+    let mut server = start(service()).await;
+    request.page_token = Some(token);
+    let mut results = Vec::new();
+    for _ in 0..10 {
+        let page = server
+            .client
+            .list_ingestion_jobs(request.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(page.jobs.len() <= 1);
+        results.extend(
+            page.jobs
+                .into_iter()
+                .map(|job| (job.scope.clone().unwrap().collection, job.state())),
+        );
+        request.page_token = page.next_page_token;
+        if request.page_token.is_none() {
+            break;
+        }
+    }
+    assert!(request.page_token.is_none());
+    assert_eq!(
+        results,
+        [
+            ("notes".into(), v1::IngestionState::Accepted),
+            ("reference".into(), v1::IngestionState::Canceled)
+        ]
+    );
+    request.collection = Some("reference".into());
+    let scoped = server
+        .client
+        .list_ingestion_jobs(request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        scoped.jobs[0].scope.as_ref().unwrap().collection,
+        "reference"
+    );
+    assert_eq!(scoped.jobs[0].state(), v1::IngestionState::Canceled);
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_upload_metadata_survives_restart_and_replay() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());

@@ -369,6 +369,16 @@ and source bytes in bounded pages. It retains the small manifest fence.
 An already materialized snapshot remains readable for the life of its
 local reader.
 
+### Hosted ingestion activity
+
+`ListIngestionJobs` and `sanctum-cli jobs [COLLECTION]` list retained
+operations in a tenant or one of its collections. Hosted activity follows
+object-key order and reads current job records. Pass `next_page_token` back
+as `page_token` with the same scope. Continue when a short or empty page
+still has a token. The server bounds object listing per request, and skips
+expired operations and deleted collections. The page is a live view of
+storage, so concurrent submissions or cleanup can change later pages.
+
 ### Hosted upload cancellation
 
 Use `CancelIngestionJob` or `sanctum-cli cancel COLLECTION OPERATION` for
