@@ -79,13 +79,27 @@ package. To exercise the UI with disposable settings and storage, set
 `SANCTUM_DESKTOP_DEV_ROOT` to an absolute temporary directory before running
 `pnpm devtop`.
 
-For a native package on the current host, run the Tauri build command.
+## Native packages
 
-```sh
-pnpm --filter @sanctum/desktop tauri build
-```
+Build on the target OS with its native prerequisites. [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
+Choose the corresponding command from the repository root after installing
+PNPM dependencies.
 
-The build embeds the server and CLI for the target. Use native builds on each
-platform to validate its installer, tray, and native dialogs. Release
-signing and platform acceptance are tracked in the
+| OS | Command | Output |
+| --- | --- | --- |
+| macOS | `pnpm --filter @sanctum/desktop tauri build --bundles app` | `apps/desktop/src-tauri/target/release/bundle/macos/Sanctum.app` |
+| Debian-based Linux | `pnpm --filter @sanctum/desktop tauri build --bundles deb` | `apps/desktop/src-tauri/target/release/bundle/deb/*.deb` |
+| Windows | `pnpm --filter @sanctum/desktop tauri build --bundles nsis` | `apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe` |
+
+The package includes `sanctum-server` and `sanctum-cli` next to the desktop
+executable. On Debian-based systems install the built package with
+`sudo apt install ./path/to/the-built-package.deb` and launch **Sanctum** from a desktop
+session with a tray host such as the Xfce Status Tray plugin. The Linux menu
+provides **Open Sanctum** and **Quit Sanctum**. [Tauri Debian packaging](https://v2.tauri.app/distribute/debian/), [Tauri tray support](https://v2.tauri.app/learn/system-tray/).
+
+For a package smoke test, launch Sanctum and create a collection. Close the
+window, confirm the MCP server still serves the collection, and reopen
+**Open Sanctum** from the tray. Launching the app again should focus the same
+window. Select **Quit Sanctum**, verify the listener stops, and relaunch to
+check the stored collection. Platform results and signing status are in the
 [implementation status](IMPLEMENTATION_STATUS.md).
