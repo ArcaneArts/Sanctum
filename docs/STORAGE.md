@@ -117,6 +117,15 @@ service. The hosted server listens on gRPC and supports collection
 creation, listing, scoped storage usage, and durable upload acceptance.
 Keep this listener within the controlling application's trusted network.
 
+To process object-backed uploads in the same standalone server, set
+`"standalone_object_worker": true` at the top level. The embedded worker
+reads durable dispatch hints from the configured bucket prefix and runs
+registration, lexical indexing, embedding, profile rebuilds, and cleanup.
+It runs one stage at a time. New submissions wake it, and it also polls
+for pending work after restart. It shares the server's gRPC/MCP listener
+configuration and needs no worker HTTP listener. Use a dedicated prefix for
+this setup. Cloud Run and Cloud Tasks have their own worker configuration.
+
 The hosted create operation initializes the collection database before
 activating its catalog record. If a request is interrupted between those
 steps, repeat it to activate the existing database. Pass a UUID through

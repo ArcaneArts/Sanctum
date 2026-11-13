@@ -200,6 +200,8 @@ when applicable. `GetRuntimeInfo` reports the current defaults.
 
 `GetRuntimeInfo` reports the serving state and version of the API process,
 its storage backend and role, and effective limits and capabilities.
+For object storage, it reports whether Cloud Tasks or the standalone
+object worker is configured.
 It includes the configured embedding profile ID and dimensions when
 enabled. This call describes process configuration without contacting
 external dependencies. Use actual storage and retrieval requests to

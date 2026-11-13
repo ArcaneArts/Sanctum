@@ -488,6 +488,9 @@ async fn main() -> anyhow::Result<()> {
             if info.cloud_task_dispatch {
                 println!("Cloud Tasks dispatch enabled");
             }
+            if info.standalone_object_worker {
+                println!("Standalone object worker enabled");
+            }
             println!("Capabilities: {}", info.capabilities.join(", "));
         }
         Command::Create {

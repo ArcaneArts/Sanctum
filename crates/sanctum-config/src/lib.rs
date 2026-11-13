@@ -13,6 +13,8 @@ pub struct Config {
     pub storage_root: PathBuf,
     pub object_storage: Option<ObjectStorageConfig>,
     pub hosted_worker_listen: Option<SocketAddr>,
+    #[serde(default)]
+    pub standalone_object_worker: bool,
     pub cloud_tasks: Option<CloudTasksConfig>,
     pub cloud_run_role: Option<CloudRunRole>,
     pub hosted_snapshot_cache_bytes: Option<u64>,
@@ -110,7 +112,8 @@ impl Config {
             && (config.hosted_worker_listen.is_some()
                 || config.cloud_tasks.is_some()
                 || config.cloud_run_role.is_some()
-                || config.hosted_snapshot_cache_bytes.is_some())
+                || config.hosted_snapshot_cache_bytes.is_some()
+                || config.standalone_object_worker)
         {
             return Err(Error::Invalid(
                 "hosted runtime settings require object storage".into(),
@@ -119,6 +122,16 @@ impl Config {
         if config.cloud_run_role.is_some() && config.hosted_worker_listen.is_some() {
             return Err(Error::Invalid(
                 "Cloud Run role uses PORT instead of hosted_worker_listen".into(),
+            ));
+        }
+        if config.standalone_object_worker
+            && (config.cloud_run_role.is_some()
+                || config.cloud_tasks.is_some()
+                || config.hosted_worker_listen.is_some())
+        {
+            return Err(Error::Invalid(
+                "standalone_object_worker cannot be combined with Cloud Run, Cloud Tasks, or a worker listener"
+                    .into(),
             ));
         }
         if !(1..=32).contains(&config.local_worker_concurrency) {

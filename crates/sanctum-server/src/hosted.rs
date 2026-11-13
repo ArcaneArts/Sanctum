@@ -43,6 +43,7 @@ pub(crate) async fn serve(
             .unwrap_or(sanctum_service::DEFAULT_SNAPSHOT_CACHE_BYTES),
     );
     runtime.cloud_task_dispatch = config.cloud_tasks.is_some();
+    runtime.standalone_object_worker = config.standalone_object_worker;
     runtime.mcp = grpc_address.is_some();
     let (storage, prefix): (Arc<dyn Storage>, _) = match storage {
         ObjectStorageConfig::S3 {
@@ -76,6 +77,12 @@ pub(crate) async fn serve(
     }
     if let Some(config) = config.cloud_tasks {
         catalog = catalog.with_dispatch(Arc::new(crate::cloud_tasks::CloudTasks::new(config)?));
+    }
+    let wake = config
+        .standalone_object_worker
+        .then(|| Arc::new(tokio::sync::Notify::new()));
+    if let Some(wake) = &wake {
+        catalog = catalog.with_standalone_worker(wake.clone());
     }
     let grpc = bind(grpc_address).await?;
     let worker = bind(worker_address).await?;
@@ -144,6 +151,8 @@ pub(crate) async fn serve(
             )
             .with_graceful_shutdown(cancellation.clone().cancelled_owned())
             .await?;
+        } else if let Some(wake) = wake {
+            crate::standalone_worker::run(catalog.clone(), wake, cancellation.child_token()).await;
         } else {
             cancellation.cancelled().await;
         }
