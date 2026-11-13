@@ -478,3 +478,31 @@ Pages default to 16 rows with a maximum of 32. Pass `next_offset` with the
 same request to get the next page. Each page reads current committed data.
 An integration that needs repeatable pages across concurrent edits can
 query an exported database snapshot once that API is available.
+
+## Read-only SQL sessions and snapshots
+
+`OpenDatabaseSession` accepts a tenant and optional collection. With only
+the tenant, it snapshots `root.db`. With a collection, it snapshots that
+collection's `meta.db`. The response includes a scoped generation ID,
+expiry, exact file size, schema version, SQLite version, schema objects,
+and required SQLite features. Collection databases use FTS5 with
+contentless-delete support. Open a downloaded copy with SQLite 3.43 or later
+and FTS5 enabled. [SQLite FTS5 reference](https://sqlite.org/fts5.html#external_content_and_contentless_tables).
+
+The server copies one committed database generation using SQLite's online
+backup API. The session reads from that immutable copy, so later writes
+do not alter queries or downloads. `QueryDatabase` accepts a single SELECT
+with typed positional parameters. It supports common scalar, aggregate,
+and JSON functions. It restricts statements to the selected database and
+rejects writes, attachment, PRAGMA, and extension loading. Result pages
+contain at most 100 rows and roughly 1 MiB of values. Set a stable
+`ORDER BY` and pass `next_offset` with the same statement and parameters
+for subsequent pages. SQL execution has a five-second budget and responds
+to gRPC cancellation.
+
+`DownloadDatabase` streams the same SQLite file in frames of at most 256 KiB.
+Use the advertised byte count to detect interrupted downloads. Each session
+expires after five minutes and is tied to the server process and its original
+scope. Close it early with `CloseDatabaseSession`. Up to four snapshot copies
+may exist at a time, including copies still held by active queries or downloads.
+A stream already in progress can finish after its handle expires or closes.

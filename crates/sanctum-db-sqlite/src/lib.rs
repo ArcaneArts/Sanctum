@@ -12,6 +12,7 @@ pub mod metadata;
 pub mod metadata_filter;
 pub mod metadata_query;
 pub mod queue;
+pub mod snapshot;
 pub mod watched_folders;
 pub use lifecycle::{RevisionKey, SourceIdentity};
 

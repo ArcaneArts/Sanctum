@@ -31,9 +31,73 @@ service Sanctum {
   rpc WatchChanges(ListChangesRequest) returns (stream ListChangesResponse);
   rpc GetChangeCursor(ChangeCursorRequest) returns (ChangeCursor);
   rpc GetStorageUsage(StorageUsageRequest) returns (StorageUsage);
+  rpc OpenDatabaseSession(DatabaseTarget) returns (DatabaseSession);
+  rpc QueryDatabase(QueryDatabaseRequest) returns (QueryDatabaseResponse);
+  rpc DownloadDatabase(DatabaseSessionRef) returns (stream DatabaseFrame);
+  rpc CloseDatabaseSession(DatabaseSessionRef) returns (Empty);
 }
 
 message Empty {}
+
+message DatabaseTarget {
+  string tenant = 1;
+  // Omit to select the tenant catalog.
+  optional string collection = 2;
+}
+
+message DatabaseSessionRef {
+  DatabaseTarget target = 1;
+  string generation = 2;
+}
+
+message DatabaseSchemaObject {
+  string kind = 1;
+  string name = 2;
+  string table = 3;
+  string sql = 4;
+}
+
+message DatabaseSession {
+  DatabaseSessionRef session = 1;
+  uint64 expires_at_unix_ms = 2;
+  uint64 bytes = 3;
+  uint32 schema_version = 4;
+  string sqlite_version = 5;
+  repeated DatabaseSchemaObject schema = 6;
+  repeated string sqlite_features = 7;
+}
+
+message SqlValue {
+  oneof value {
+    Empty null = 1;
+    sint64 integer = 2;
+    double real = 3;
+    string text = 4;
+    bytes blob = 5;
+  }
+}
+
+message QueryDatabaseRequest {
+  DatabaseSessionRef session = 1;
+  string sql = 2;
+  repeated SqlValue parameters = 3;
+  uint64 offset = 4;
+  optional uint32 limit = 5;
+}
+
+message SqlRow {
+  repeated SqlValue values = 1;
+}
+
+message QueryDatabaseResponse {
+  repeated string columns = 1;
+  repeated SqlRow rows = 2;
+  optional uint64 next_offset = 3;
+}
+
+message DatabaseFrame {
+  bytes data = 1;
+}
 
 message StorageUsageRequest {
   oneof scope {
