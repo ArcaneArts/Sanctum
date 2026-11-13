@@ -152,7 +152,16 @@ ID adopt the winning operation and discard their losing input when possible.
 The `ACCEPTED` status can be queried after restart through `GetIngestionJob`.
 A replacement targeting an external reference has an empty `source_id` until
 registration resolves it. Hosted MCP uses the same acceptance path for inline
-text. Synchronous `UploadText` remains open.
+text.
+
+`UploadText` accepts the same frames and waits up to 30 seconds after acceptance
+for a worker to publish the lexical revision. The worker continues after an
+RPC disconnect or timeout. Hosted failures after acceptance include the raw
+16-byte UUID in gRPC trailing metadata under `sanctum-operation-id-bin`.
+Use that UUID with `GetIngestionJob`. Supplying a UUID as `--request-id` also
+lets the CLI safely repeat a synchronous upload after a lost response.
+Use `SubmitText` for long-running uploads or deployments that dispatch work
+outside the waiting period.
 [Hosted MCP](MCP.md#hosted-connection).
 
 ### Hosted revision registration

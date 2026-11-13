@@ -525,7 +525,17 @@ impl Sanctum for Grpc {
         &self,
         request: Request<Streaming<v1::UploadTextFrame>>,
     ) -> Reply<v1::TextRevision> {
-        let mut job = submit_local(self.local()?, request.into_inner()).await?;
+        let stream = request.into_inner();
+        let service = match &self.0 {
+            Backend::Local(service) => service,
+            Backend::Hosted(catalog) => {
+                let (scope, job) = submit_hosted(catalog, stream).await?;
+                return wait_hosted_upload(catalog, &scope, job)
+                    .await
+                    .map(Response::new);
+            }
+        };
+        let mut job = submit_local(service, stream).await?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             match job.state {
@@ -554,7 +564,7 @@ impl Sanctum for Grpc {
                 )));
             }
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            let service = self.local()?.clone();
+            let service = service.clone();
             job = work(move || service.job(&job.scope, job.id)).await?;
         }
     }
@@ -566,7 +576,10 @@ impl Sanctum for Grpc {
         let stream = request.into_inner();
         let job = match &self.0 {
             Backend::Local(service) => wire_job(submit_local(service, stream).await?),
-            Backend::Hosted(catalog) => submit_hosted(catalog, stream).await?,
+            Backend::Hosted(catalog) => {
+                let (scope, accepted) = submit_hosted(catalog, stream).await?;
+                wire_hosted_job(&scope, accepted)
+            }
         };
         Ok(Response::new(job))
     }
@@ -889,7 +902,7 @@ async fn submit_local(
 async fn submit_hosted(
     catalog: &HostedCatalog,
     mut stream: Streaming<v1::UploadTextFrame>,
-) -> std::result::Result<v1::IngestionJob, Status> {
+) -> std::result::Result<(Scope, HostedJob), Status> {
     let (scope, upload, operation) = read_upload_header(&mut stream).await?;
     let staged = catalog
         .stage_upload(scope.clone(), upload, operation)
@@ -898,7 +911,61 @@ async fn submit_hosted(
     let file = staged.reopen().map_err(status)?;
     receive_upload(&mut stream, file, catalog.max_source_bytes()).await?;
     let accepted = staged.enqueue().await.map_err(status)?;
-    Ok(wire_hosted_job(&scope, accepted))
+    Ok((scope, accepted))
+}
+
+async fn wait_hosted_upload(
+    catalog: &HostedCatalog,
+    scope: &Scope,
+    mut job: HostedJob,
+) -> std::result::Result<v1::TextRevision, Status> {
+    use std::time::Duration;
+    let operation = job.operation;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match job.state {
+            HostedJobState::TextReady => {
+                return wire_hosted_job(scope, job)
+                    .text_revision
+                    .ok_or_else(|| Status::internal("completed revision receipt is missing"));
+            }
+            HostedJobState::Failed { code, message } => {
+                let failure = match code.as_str() {
+                    "invalid_source" | "invalid_argument" => Status::invalid_argument(message),
+                    "conflict" => Status::already_exists(message),
+                    "not_found" => Status::not_found(message),
+                    "stale_revision" | "expired" => Status::failed_precondition(message),
+                    _ => Status::unavailable(message),
+                };
+                return Err(with_operation_id(failure, operation));
+            }
+            HostedJobState::Accepted | HostedJobState::Registered => {}
+        }
+        let pending = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            catalog.ingestion_job(scope, operation).await
+        };
+        job = match tokio::time::timeout_at(deadline, pending).await {
+            Ok(Ok(job)) => job,
+            Ok(Err(error)) => return Err(with_operation_id(status(error), operation)),
+            Err(_) => {
+                return Err(with_operation_id(
+                    Status::deadline_exceeded(format!(
+                        "upload is still processing; query operation {operation}"
+                    )),
+                    operation,
+                ));
+            }
+        };
+    }
+}
+
+fn with_operation_id(mut status: Status, operation: uuid::Uuid) -> Status {
+    let value = tonic::metadata::MetadataValue::from_bytes(operation.as_bytes());
+    status
+        .metadata_mut()
+        .insert_bin("sanctum-operation-id-bin", value);
+    status
 }
 
 async fn read_upload_header(
