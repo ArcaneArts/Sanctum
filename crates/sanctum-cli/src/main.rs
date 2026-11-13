@@ -33,6 +33,8 @@ enum Command {
         exclude: Vec<String>,
         #[arg(long)]
         prune_missing: bool,
+        #[arg(long)]
+        retain_original: bool,
     },
     Upload {
         collection: String,
@@ -43,6 +45,8 @@ enum Command {
         external_id: Option<String>,
         #[arg(long)]
         background: bool,
+        #[arg(long)]
+        retain_original: bool,
         #[arg(long)]
         replace_source: Option<String>,
         #[arg(long, requires = "namespace")]
@@ -103,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
             include,
             exclude,
             prune_missing,
+            retain_original,
         } => {
             let path = std::path::absolute(path)?
                 .into_os_string()
@@ -115,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
                     include,
                     exclude,
                     prune_missing,
+                    retain_original,
                 })
                 .await?
                 .into_inner();
@@ -169,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
             namespace,
             external_id,
             background,
+            retain_original,
             replace_source,
             replace_external,
             expected_revision,
@@ -198,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
                     .zip(external_id)
                     .map(|(namespace, id)| v1::ExternalSource { namespace, id }),
                 replacement,
+                retain_original,
             };
             let (sender, receiver) = tokio::sync::mpsc::channel(2);
             if background {

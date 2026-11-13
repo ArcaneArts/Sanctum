@@ -40,6 +40,7 @@ impl Sanctum for Grpc {
                     include: request.include,
                     exclude: request.exclude,
                     prune_missing: request.prune_missing,
+                    retain_original: request.retain_original,
                 };
                 service.import_local(
                     &scope,
@@ -297,6 +298,7 @@ async fn submit(
                     id: value.id,
                 }),
                 replacement,
+                retain_original: header.retain_original,
             },
         )?;
         let file = staged.reopen()?;
@@ -364,15 +366,23 @@ fn text_revision(job: &Job) -> Option<v1::TextRevision> {
         revision_id: job.revision.to_string(),
         name: job.name.clone(),
         external: job.external.clone().map(wire_external),
-        bytes: job.bytes,
+        bytes: job.canonical_bytes.unwrap_or(job.bytes),
         chunks: job.chunks?,
         content_blake3: job.hash.clone()?,
+        original_blake3: job.original_hash.clone().or_else(|| job.hash.clone())?,
+        source_encoding: job
+            .source_encoding
+            .clone()
+            .unwrap_or_else(|| "UTF-8".into()),
+        extractor: job.extractor.clone(),
+        retain_original: job.retain_original,
     })
 }
 
 fn wire_job(job: Job) -> v1::IngestionJob {
     let state = match job.state {
         JobState::Accepted => v1::IngestionState::Accepted,
+        JobState::Indexing if job.extracting => v1::IngestionState::Extracting,
         JobState::Indexing => v1::IngestionState::Indexing,
         JobState::Publishing => v1::IngestionState::Publishing,
         JobState::TextReady => v1::IngestionState::TextReady,

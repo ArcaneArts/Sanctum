@@ -5,7 +5,7 @@ which parts have working implementations and where to find the evidence.
 
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
-| 1. Local desktop and MCP | Local Rust service and gRPC CLI with a tenant catalog, streamed UTF-8 uploads and directory imports, SQLite FTS5, byte-range fetch, restartable lexical jobs, source replacement, deletion, and local cleanup | RTF extraction and original retention, metadata and reset events, embedding reuse and readiness, usage, Ollama and vector search, MCP, tray app, desktop acceptance |
+| 1. Local desktop and MCP | Local Rust service and gRPC CLI with a tenant catalog, streamed UTF-8 and RTF ingestion, original retention, directory imports, SQLite FTS5, byte-range fetch, restartable lexical jobs, source replacement, deletion, and local cleanup | Metadata and reset events, embedding reuse and readiness, usage, Ollama and vector search, MCP, tray app, desktop acceptance |
 | 2. Providers and local integrations | Pending | Hosted provider adapters, rebuilds, watchers, URL and Git imports, metadata queries and cursors, SQL access, multi-collection retrieval, platform packaging and verification |
 | 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
@@ -67,6 +67,8 @@ Merged in [PR #4](https://github.com/ArcaneArts/Sanctum/pull/4).
 
 ## Local file and directory imports
 
+Merged in [PR #5](https://github.com/ArcaneArts/Sanctum/pull/5).
+
 - `ImportLocal` and `sanctum-cli import` walk files incrementally, apply include
   and exclude globs, and stream per-file results. Selected UTF-8 files enter
   the existing durable queue.
@@ -77,4 +79,17 @@ Merged in [PR #4](https://github.com/ArcaneArts/Sanctum/pull/4).
   missing sources and supersedes their pending imports. The gRPC tests cover
   selection, repeated imports, edits, pending work, and deletion.
 
-Next, add streaming RTF extraction and original retention to uploads and imports.
+## Streaming RTF and original retention
+
+- Local uploads and imports extract RTF in bounded buffers before indexing
+  canonical UTF-8. Revision records store both digests, input encoding, the
+  extractor version, and retention choice. Byte ranges use the canonical text.
+- Accepted input remains durable until the lexical commit. Recovery can
+  complete from that commit after original cleanup. Retained originals are
+  reclaimed with their revisions.
+- Parser tests exercise Unicode, split legacy code-page sequences, skipped
+  destinations and binary payloads, and malformed input. gRPC tests cover
+  restart, retention, exact excerpts, and directory re-import.
+- Full size and memory measurements remain part of the capacity milestone.
+
+Next, add collection, source, and chunk metadata with revision-aware updates.

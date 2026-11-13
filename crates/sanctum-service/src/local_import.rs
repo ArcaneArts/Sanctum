@@ -16,6 +16,7 @@ pub struct ImportOptions {
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     pub prune_missing: bool,
+    pub retain_original: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -83,9 +84,6 @@ impl Selection {
                 .ancestors()
                 .skip(1)
                 .any(|path| self.directory_excluded(path))
-            && !relative
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("rtf"))
             && if self.include.is_empty() {
                 default_text(relative)
             } else {
@@ -172,7 +170,13 @@ impl Service {
                     continue;
                 }
             };
-            let event = match self.import_file(scope, entry.path(), &namespace, &id) {
+            let event = match self.import_file(
+                scope,
+                entry.path(),
+                &namespace,
+                &id,
+                options.retain_original,
+            ) {
                 Ok(event) => event,
                 Err(error) => {
                     had_errors = true;
@@ -202,6 +206,7 @@ impl Service {
         path: &Path,
         namespace: &str,
         id: &str,
+        retain_original: bool,
     ) -> Result<ImportEvent> {
         let external = ExternalSource {
             namespace: namespace.into(),
@@ -213,6 +218,7 @@ impl Service {
                 name: id.rsplit('/').next().unwrap_or(id).into(),
                 external: Some(external.clone()),
                 replacement: None,
+                retain_original,
             },
         )?;
         let mut input = File::open(path)?;
@@ -253,10 +259,9 @@ impl Service {
                         None => !job.replacement,
                     }
             });
-        if let Some(pending) = pending
-            .as_ref()
-            .filter(|job| job.import_hash.as_ref() == Some(&hash))
-        {
+        if let Some(pending) = pending.as_ref().filter(|job| {
+            job.import_hash.as_ref() == Some(&hash) && job.retain_original == retain_original
+        }) {
             return Ok(ImportEvent {
                 source: Some(pending.source),
                 revision: Some(pending.revision),
@@ -264,7 +269,9 @@ impl Service {
                 ..ImportEvent::new(id, ImportState::Pending)
             });
         }
-        if let Some(current) = current.as_ref().filter(|source| source.hash == hash) {
+        if let Some(current) = current.as_ref().filter(|source| {
+            source.hash == hash && (!source.extracted || source.retain_original == retain_original)
+        }) {
             if let Some(pending) = &pending {
                 self.queue.supersede_import(scope, pending)?;
             }
@@ -446,6 +453,7 @@ fn default_text(path: &Path) -> bool {
             matches!(
                 ext.to_ascii_lowercase().as_str(),
                 "txt"
+                    | "rtf"
                     | "md"
                     | "markdown"
                     | "rst"

@@ -87,3 +87,8 @@ pub struct ExternalSource {
 }
 
 pub const UPLOAD_FRAME_BYTES: usize = 256 * 1024;
+
+pub fn is_rtf(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("rtf"))
+}

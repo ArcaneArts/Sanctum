@@ -1,8 +1,11 @@
+use std::io::{BufReader, BufWriter, Read};
+
 use sanctum_chunk::index_utf8;
-use sanctum_core::{Error, ExternalSource, Result, Scope};
+use sanctum_core::{Error, ExternalSource, Result, Scope, is_rtf};
+use sanctum_extract::{RTF_EXTRACTOR, rtf_to_utf8};
 use uuid::Uuid;
 
-use crate::{ChunkRef, Job, JobState, Revision, Service, StagedUpload};
+use crate::{ChunkRef, Job, JobState, Revision, RevisionContent, Service, StagedUpload};
 
 const PROGRESS_STEP: u64 = 1024 * 1024;
 
@@ -37,7 +40,19 @@ impl Service {
             return Ok(false);
         };
         match self.index_job(&job) {
-            Ok(revision) => self.queue.ready(job.id, &revision)?,
+            Ok(revision) => {
+                if job.extract_rtf
+                    && !job.retain_original
+                    && let Err(error) =
+                        self.files
+                            .discard_original(&job.scope, job.source, job.revision)
+                {
+                    self.queue
+                        .fail(job.id, "retryable", "could not remove the staged original")?;
+                    return Err(error);
+                }
+                self.queue.ready(job.id, &revision)?;
+            }
             Err(error) => {
                 let (code, message) = match &error {
                     Error::Invalid(message) => ("invalid_source", message.as_str()),
@@ -60,13 +75,14 @@ impl Service {
 
     fn index_job(&self, job: &Job) -> Result<Revision> {
         let mut database = self.database(&job.scope)?;
-        if let Some((hash, chunks)) = database.revision_summary(job.source, job.revision)? {
+        if let Some(content) = database.revision_summary(job.source, job.revision)? {
             // The collection commit survived a stop before the queue receipt.
-            return Ok(revision_for(job, hash, chunks));
+            return Ok(revision_for(job, content));
         }
         if !self.queue.progress(job.id, 0)? {
             return Err(Error::Conflict("indexing canceled".into()));
         }
+        let extracted = job.extract_rtf.then(|| self.extract_rtf(job)).transpose()?;
         let input = self.files.open_text(&job.scope, job.source, job.revision)?;
         let writer = database.write()?;
         if job.replacement {
@@ -87,7 +103,7 @@ impl Service {
         let mut ordinal = 0;
         let mut last_progress = 0;
         let indexed = index_utf8(input, |range, text| {
-            if range.end - last_progress >= PROGRESS_STEP {
+            if !job.extract_rtf && range.end - last_progress >= PROGRESS_STEP {
                 if !self.queue.progress(job.id, range.end)? {
                     return Err(Error::Conflict("indexing canceled".into()));
                 }
@@ -107,23 +123,33 @@ impl Service {
             ordinal += 1;
             Ok(())
         })?;
-        if indexed.bytes != job.bytes {
+        if !job.extract_rtf && indexed.bytes != job.bytes {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "queued input no longer matches its accepted size",
             )));
         }
+        let original_hash = extracted.as_ref().map_or(&indexed.hash, |input| &input.0);
         if job
             .import_hash
             .as_ref()
-            .is_some_and(|hash| hash != &indexed.hash)
+            .is_some_and(|hash| hash != original_hash)
         {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "queued import does not match its accepted digest",
             )));
         }
-        let revision = revision_for(job, indexed.hash, indexed.chunks);
+        let content = RevisionContent {
+            original_hash: original_hash.clone(),
+            hash: indexed.hash,
+            bytes: indexed.bytes,
+            chunks: indexed.chunks,
+            encoding: extracted.map_or_else(|| "UTF-8".into(), |input| input.1.into()),
+            extractor: job.extract_rtf.then(|| RTF_EXTRACTOR.into()),
+            retain_original: job.retain_original,
+        };
+        let revision = revision_for(job, content);
         writer.register(&revision, job.replacement)?;
         if !self.queue.begin_publish(job.id)? {
             return Err(Error::Conflict("indexing canceled".into()));
@@ -131,17 +157,48 @@ impl Service {
         writer.commit()?;
         Ok(revision)
     }
+    fn extract_rtf(&self, job: &Job) -> Result<(String, &'static str)> {
+        let original = self
+            .files
+            .open_original(&job.scope, job.source, job.revision)?;
+        let text = self.files.stage(&job.scope)?;
+        let mut reader = HashingReader {
+            inner: original,
+            hash: blake3::Hasher::new(),
+            bytes: 0,
+            progress_at: PROGRESS_STEP,
+            job,
+            service: self,
+        };
+        let result = rtf_to_utf8(BufReader::new(&mut reader), BufWriter::new(text.as_file()));
+        let encoding = match result {
+            Err(Error::Io(ref error)) if error.kind() == std::io::ErrorKind::ConnectionAborted => {
+                return Err(Error::Conflict("extraction canceled".into()));
+            }
+            result => result?,
+        };
+        if reader.bytes != job.bytes {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "queued RTF no longer matches its accepted size",
+            )));
+        }
+        if !self.queue.extracted(job.id)? {
+            return Err(Error::Conflict("extraction canceled".into()));
+        }
+        self.files
+            .publish_extracted(&job.scope, job.source, job.revision, text)?;
+        Ok((reader.hash.finalize().to_hex().to_string(), encoding))
+    }
 }
 
-fn revision_for(job: &Job, hash: String, chunks: u64) -> Revision {
+fn revision_for(job: &Job, content: RevisionContent) -> Revision {
     Revision {
         source: job.source,
         revision: job.revision,
         name: job.name.clone(),
         external: job.external.clone(),
-        bytes: job.bytes,
-        chunks,
-        hash,
+        content,
     }
 }
 
@@ -192,9 +249,16 @@ impl StagedUpload {
     }
 
     pub(crate) fn publish_job(self, mut job: Job) -> Result<Job> {
-        self.service
-            .files
-            .publish(&job.scope, job.source, job.revision, self.file)?;
+        job.retain_original = self.upload.retain_original;
+        if job.extract_rtf {
+            self.service
+                .files
+                .publish_original(&job.scope, job.source, job.revision, self.file)?;
+        } else {
+            self.service
+                .files
+                .publish(&job.scope, job.source, job.revision, self.file)?;
+        }
         self.service.queue.insert(&mut job)?;
         Ok(job)
     }
@@ -208,6 +272,7 @@ pub(crate) fn new_job(
     bytes: u64,
     replacement: bool,
 ) -> Job {
+    let extract_rtf = is_rtf(&name);
     Job {
         id: Uuid::new_v4(),
         source,
@@ -225,5 +290,41 @@ pub(crate) fn new_job(
         replacement,
         update_sequence: 0,
         import_hash: None,
+        extract_rtf,
+        retain_original: false,
+        extracting: false,
+        canonical_bytes: None,
+        original_hash: None,
+        source_encoding: None,
+        extractor: None,
+    }
+}
+
+struct HashingReader<'a> {
+    inner: std::fs::File,
+    hash: blake3::Hasher,
+    bytes: u64,
+    progress_at: u64,
+    job: &'a Job,
+    service: &'a Service,
+}
+
+impl Read for HashingReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.hash.update(&buffer[..read]);
+        self.bytes += read as u64;
+        if self.bytes >= self.progress_at {
+            self.progress_at = self.bytes.saturating_add(PROGRESS_STEP);
+            let active = self
+                .service
+                .queue
+                .progress(self.job.id, self.bytes)
+                .map_err(std::io::Error::other)?;
+            if !active {
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted));
+            }
+        }
+        Ok(read)
     }
 }
