@@ -14,6 +14,7 @@ pub struct Config {
     pub object_storage: Option<ObjectStorageConfig>,
     pub hosted_worker_listen: Option<SocketAddr>,
     pub cloud_tasks: Option<CloudTasksConfig>,
+    pub cloud_run_role: Option<CloudRunRole>,
     #[serde(default = "default_grpc")]
     pub grpc_listen: SocketAddr,
     #[serde(default = "default_mcp")]
@@ -24,6 +25,13 @@ pub struct Config {
     pub local_worker_concurrency: usize,
     pub embedding: Option<EmbeddingConfig>,
     pub url_import_origins: Option<HashMap<String, Option<String>>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudRunRole {
+    Api,
+    Worker,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -95,10 +103,17 @@ impl Config {
             ));
         }
         if config.object_storage.is_none()
-            && (config.hosted_worker_listen.is_some() || config.cloud_tasks.is_some())
+            && (config.hosted_worker_listen.is_some()
+                || config.cloud_tasks.is_some()
+                || config.cloud_run_role.is_some())
         {
             return Err(Error::Invalid(
-                "hosted worker and Cloud Tasks settings require object storage".into(),
+                "hosted runtime settings require object storage".into(),
+            ));
+        }
+        if config.cloud_run_role.is_some() && config.hosted_worker_listen.is_some() {
+            return Err(Error::Invalid(
+                "Cloud Run role uses PORT instead of hosted_worker_listen".into(),
             ));
         }
         if !(1..=32).contains(&config.local_worker_concurrency) {

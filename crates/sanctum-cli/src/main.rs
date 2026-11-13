@@ -6,9 +6,10 @@ use sanctum_core::UPLOAD_FRAME_BYTES;
 use sanctum_proto::v1::{self, sanctum_client::SanctumClient, upload_text_frame::Frame};
 use tokio::io::AsyncReadExt;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Status, metadata::MetadataValue, transport::Endpoint};
 
 #[derive(Parser)]
-#[command(about = "Sanctum local text ingestion and search")]
+#[command(about = "Sanctum text ingestion and search")]
 struct Args {
     #[arg(long, default_value = "http://127.0.0.1:47550")]
     endpoint: String,
@@ -175,7 +176,34 @@ async fn main() -> anyhow::Result<()> {
             collection,
         })
     };
-    let mut client = SanctumClient::connect(args.endpoint).await?;
+    let endpoint = Endpoint::new(args.endpoint)?;
+    let authorization = std::env::var_os("SANCTUM_GRPC_ID_TOKEN")
+        .map(|token| {
+            anyhow::ensure!(
+                endpoint.uri().scheme_str() == Some("https"),
+                "SANCTUM_GRPC_ID_TOKEN requires an HTTPS endpoint"
+            );
+            let token = token
+                .into_string()
+                .map_err(|_| anyhow!("invalid ID token"))?;
+            let mut value = format!("Bearer {token}")
+                .parse::<MetadataValue<_>>()
+                .map_err(|_| anyhow!("invalid ID token"))?;
+            value.set_sensitive(true);
+            Ok(value)
+        })
+        .transpose()?;
+    let mut client = SanctumClient::with_interceptor(
+        endpoint.connect().await?,
+        move |mut request: Request<()>| -> Result<Request<()>, Status> {
+            if let Some(value) = &authorization {
+                request
+                    .metadata_mut()
+                    .insert("authorization", value.clone());
+            }
+            Ok(request)
+        },
+    );
     match args.command {
         Command::McpStdio { .. } => unreachable!("handled before opening a gRPC connection"),
         Command::Watch {

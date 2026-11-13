@@ -1,20 +1,25 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use sanctum_config::{CloudTasksConfig, ObjectStorageConfig};
+use sanctum_config::{CloudRunRole, Config, ObjectStorageConfig};
 use sanctum_service::HostedCatalog;
 use sanctum_storage::{Key, Storage};
 use sanctum_storage_gcs::GcsStorage;
 use sanctum_storage_s3::{S3Config, S3Storage};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) async fn serve(
-    address: SocketAddr,
-    worker_address: Option<SocketAddr>,
-    cloud_tasks: Option<CloudTasksConfig>,
-    config: ObjectStorageConfig,
-    max_source_bytes: u64,
-) -> anyhow::Result<()> {
-    let (storage, prefix): (Arc<dyn Storage>, _) = match config {
+pub(crate) async fn serve(config: Config, storage: ObjectStorageConfig) -> anyhow::Result<()> {
+    let (grpc_address, worker_address) = if let Some(role) = config.cloud_run_role {
+        let port = std::env::var("PORT")?.parse::<u16>()?;
+        anyhow::ensure!(port != 0, "Cloud Run PORT must be positive");
+        let address = ([0, 0, 0, 0], port).into();
+        match role {
+            CloudRunRole::Api => (Some(address), None),
+            CloudRunRole::Worker => (None, Some(address)),
+        }
+    } else {
+        (Some(config.grpc_listen), config.hosted_worker_listen)
+    };
+    let (storage, prefix): (Arc<dyn Storage>, _) = match storage {
         ObjectStorageConfig::S3 {
             bucket,
             region,
@@ -37,46 +42,55 @@ pub(crate) async fn serve(
     let mut catalog = HostedCatalog::new(
         storage,
         prefix.map(Key::parse).transpose()?,
-        max_source_bytes,
+        config.max_source_bytes,
     )?;
-    if let Some(config) = cloud_tasks {
+    if let Some(config) = config.cloud_tasks {
         catalog = catalog.with_dispatch(Arc::new(crate::cloud_tasks::CloudTasks::new(config)?));
     }
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    let address = listener.local_addr()?;
-    let worker = if let Some(worker_address) = worker_address {
-        Some(tokio::net::TcpListener::bind(worker_address).await?)
-    } else {
-        None
+    let grpc = bind(grpc_address).await?;
+    let worker = bind(worker_address).await?;
+    let address = |listener: &Option<tokio::net::TcpListener>| {
+        listener
+            .as_ref()
+            .map(tokio::net::TcpListener::local_addr)
+            .transpose()
     };
-    let worker_address = worker
-        .as_ref()
-        .map(tokio::net::TcpListener::local_addr)
-        .transpose()?;
+    let grpc_address = address(&grpc)?;
+    let worker_address = address(&worker)?;
     if crate::managed() {
         println!(
             "{}",
-            serde_json::json!({"grpc": address, "mcp": null, "worker": worker_address})
+            serde_json::json!({"grpc": grpc_address, "mcp": null, "worker": worker_address})
         );
     }
-    tracing::info!(%address, "Sanctum object-backed gRPC listening");
-    if let Some(worker_address) = worker_address {
-        tracing::info!(%worker_address, "Sanctum hosted worker listening");
+    if let Some(address) = grpc_address {
+        tracing::info!(%address, "Sanctum object-backed gRPC listening");
+    }
+    if let Some(address) = worker_address {
+        tracing::info!(%address, "Sanctum hosted worker listening");
     }
 
     let cancellation = CancellationToken::new();
-    let grpc = tonic::transport::Server::builder()
-        .add_service(sanctum_api::hosted_grpc(
-            catalog.clone(),
-            cancellation.child_token(),
-        ))
-        .serve_with_incoming_shutdown(
-            tokio_stream::wrappers::TcpListenerStream::new(listener),
-            cancellation.clone().cancelled_owned(),
-        );
+    let grpc = async {
+        if let Some(grpc) = grpc {
+            tonic::transport::Server::builder()
+                .add_service(sanctum_api::hosted_grpc(
+                    catalog.clone(),
+                    cancellation.child_token(),
+                ))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(grpc),
+                    cancellation.clone().cancelled_owned(),
+                )
+                .await?;
+        } else {
+            cancellation.cancelled().await;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
     let worker = async {
         if let Some(worker) = worker {
-            axum::serve(worker, crate::hosted_worker::router(catalog))
+            axum::serve(worker, crate::hosted_worker::router(catalog.clone()))
                 .with_graceful_shutdown(cancellation.clone().cancelled_owned())
                 .await?;
         } else {
@@ -84,26 +98,27 @@ pub(crate) async fn serve(
         }
         Ok::<(), anyhow::Error>(())
     };
-    let shutdown = async {
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = crate::host_shutdown() => Ok(()),
-        }
-    };
     tokio::pin!(grpc, worker);
     tokio::select! {
         result = &mut grpc => {
             cancellation.cancel();
-            result.map_err(anyhow::Error::from).and(worker.await)
+            result.and(worker.await)
         }
         result = &mut worker => {
             cancellation.cancel();
-            result.and(grpc.await.map_err(anyhow::Error::from))
+            result.and(grpc.await)
         }
-        signal = shutdown => {
+        signal = crate::shutdown_signal() => {
             cancellation.cancel();
             let (grpc, worker) = tokio::join!(grpc, worker);
-            signal.map_err(anyhow::Error::from).and(grpc.map_err(anyhow::Error::from)).and(worker)
+            signal.map_err(anyhow::Error::from).and(grpc).and(worker)
         }
+    }
+}
+
+async fn bind(address: Option<SocketAddr>) -> std::io::Result<Option<tokio::net::TcpListener>> {
+    match address {
+        Some(address) => tokio::net::TcpListener::bind(address).await.map(Some),
+        None => Ok(None),
     }
 }

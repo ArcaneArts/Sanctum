@@ -12,3 +12,4 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tonic = { workspace = true, features = ["tls-ring", "tls-webpki-roots"] }

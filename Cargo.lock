@@ -2406,6 +2406,7 @@ dependencies = [
  "sanctum-proto",
  "tokio",
  "tokio-stream",
+ "tonic",
 ]
 
 [[package]]
@@ -3189,12 +3190,14 @@ dependencies = [
  "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]

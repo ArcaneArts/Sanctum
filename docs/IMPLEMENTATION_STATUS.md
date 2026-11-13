@@ -499,3 +499,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - Actual Cloud Run ingress, Cloud Tasks delivery, Cloud Scheduler invocations,
   and live GCS still require an authorized Sanctum Google Cloud project.
   Hosted embedding work, cleanup, and additional retrieval APIs remain open.
+
+- Delivered in [PR #31](https://github.com/ArcaneArts/Sanctum/pull/31).
+
+## Cloud Run runtime and packaging
+
+- The Linux image supports separate Cloud Run API and worker roles. Each
+  binds the injected PORT and handles SIGTERM. The API uses gRPC over
+  HTTP/2, and the worker serves private task and repair routes.
+- The CLI supports TLS and attaches SANCTUM_GRPC_ID_TOKEN on HTTPS.
+  The [deployment guide](CLOUD_RUN.md) records IAM, queue and Scheduler
+  setup, and an authenticated deployment smoke test.
+- Local process tests verified port binding and graceful SIGTERM shutdown.
+  A cross-compiled Linux amd64 release executable ran as both roles in
+  non-root Debian containers and completed upload, HTTP registration,
+  indexing, and gRPC search against MinIO. The Dockerfile static check
+  passed.
+- Live Cloud Run and GCS verification are still open.
