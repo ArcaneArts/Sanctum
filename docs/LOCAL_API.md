@@ -110,6 +110,13 @@ single chunk using SQLite FTS5 tokenization. Results include byte offsets as
 the canonical UTF-8 representation. Pass the result's `ChunkRef` unchanged
 to `FetchChunk` to retrieve that range.
 
+Use `FetchContext` with the same reference and up to 16 KiB before
+and after the cited chunk. Omitted gRPC budgets default to zero. The
+server clips the window to the source and trims incomplete UTF-8 code
+points at either outer boundary. The returned half-open range identifies
+the context. The nested hit still describes the exact cited chunk and
+its verified content hash.
+
 ## Source inspection
 
 `ListSources` returns the current published revision of each source in

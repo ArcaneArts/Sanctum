@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+pub use context::ChunkContext;
 pub use database_sessions::{DatabaseSession, DatabaseTarget};
 pub use db::metadata::{
     Change, Edit as MetadataEdit, Entry as MetadataEntry, Mutation as MetadataMutation,
@@ -16,6 +17,7 @@ use sanctum_storage_fs::LocalFiles;
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+mod context;
 mod database_sessions;
 mod embedding;
 mod git_import;

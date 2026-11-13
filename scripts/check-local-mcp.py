@@ -181,6 +181,8 @@ def check(bin_dir):
                 exact = stdio.tool("fetch_chunk", **reference)
                 assert exact["excerpt"] == content
                 assert exact["end_byte"] == len(content.encode("utf-8"))
+                context = stdio.tool("fetch_context", **reference, before_bytes=8, after_bytes=8)
+                assert context["text"] == content and context["hit"] == exact
                 missing = stdio.request("tools/call", {"name": "fetch_chunk", "arguments": reference | {"tenant": "other"}})
                 assert missing.get("isError"), missing
                 bridge.stdin.close()
@@ -245,7 +247,7 @@ def check_hosted(bin_dir):
             raise AssertionError("hosted MCP accepted a browser Origin")
         tools = {tool["name"] for tool in rpc.request("tools/list")["tools"]}
         assert tools == {"create_collection", "list_collections", "ingest_text", "ingestion_status",
-                         "search", "search_collections", "fetch_chunk", "get_metadata", "mutate_metadata"}, tools
+                         "search", "search_collections", "fetch_chunk", "fetch_context", "get_metadata", "mutate_metadata"}, tools
         rpc.tool("create_collection", **scope)
         rpc.tool("create_collection", tenant=scope["tenant"], collection="reference")
         first_page = rpc.tool("list_collections", tenant=scope["tenant"], limit=1)
@@ -284,6 +286,8 @@ def check_hosted(bin_dir):
         assert hit["database_generation"]
         reference = {key: hit[key] for key in ("tenant", "collection", "source_id", "revision_id", "ordinal")}
         exact = rpc.tool("fetch_chunk", **reference)
+        context = rpc.tool("fetch_context", **reference)
+        assert context["text"] == text and context["hit"] == exact
         rpc.tool("mutate_metadata", **reference, edits=[edit])
         rpc.exchange = second_http
         assert rpc.tool("get_metadata", **reference)["entries"][0]["value"] == edit["value"]

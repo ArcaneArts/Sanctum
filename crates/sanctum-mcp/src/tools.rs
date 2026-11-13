@@ -169,6 +169,26 @@ struct Fetch {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct FetchContext {
+    #[serde(flatten)]
+    chunk: Fetch,
+    /// Maximum UTF-8 bytes before the chunk, default 1024 and maximum 16384.
+    before_bytes: Option<u32>,
+    /// Maximum UTF-8 bytes after the chunk, default 1024 and maximum 16384.
+    after_bytes: Option<u32>,
+}
+
+impl Fetch {
+    fn reference(&self) -> SanctumResult<ChunkRef> {
+        Ok(ChunkRef {
+            source: id(&self.source_id)?,
+            revision: id(&self.revision_id)?,
+            ordinal: self.ordinal,
+        })
+    }
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct Operation {
     #[serde(flatten)]
     scope: Collection,
@@ -393,11 +413,7 @@ impl Tools {
     async fn fetch_chunk(&self, Parameters(args): Parameters<Fetch>) -> CallToolResult {
         let result = async {
             let scope = args.scope.scope()?;
-            let reference = ChunkRef {
-                source: id(&args.source_id)?,
-                revision: id(&args.revision_id)?,
-                ordinal: args.ordinal,
-            };
+            let reference = args.reference()?;
             let hit = match &self.backend {
                 Backend::Local(service) => {
                     local(service, {
@@ -409,6 +425,38 @@ impl Tools {
                 Backend::Hosted(catalog) => catalog.fetch(&scope, reference).await?,
             };
             Ok(hit_value(&scope, hit))
+        }
+        .await;
+        response(result)
+    }
+
+    #[tool(description = "Read bounded canonical UTF-8 context around a cited chunk.")]
+    async fn fetch_context(&self, Parameters(args): Parameters<FetchContext>) -> CallToolResult {
+        let result = async {
+            let scope = args.chunk.scope.scope()?;
+            let reference = args.chunk.reference()?;
+            let before = args.before_bytes.unwrap_or(1024);
+            let after = args.after_bytes.unwrap_or(1024);
+            let context = match &self.backend {
+                Backend::Local(service) => {
+                    local(service, {
+                        let scope = scope.clone();
+                        move |service| service.fetch_context(&scope, &reference, before, after)
+                    })
+                    .await?
+                }
+                Backend::Hosted(catalog) => {
+                    catalog
+                        .fetch_context(&scope, reference, before, after)
+                        .await?
+                }
+            };
+            Ok(json!({
+                "hit": hit_value(&scope, context.hit),
+                "start_byte": context.start_byte,
+                "end_byte": context.end_byte,
+                "text": context.text,
+            }))
         }
         .await;
         response(result)

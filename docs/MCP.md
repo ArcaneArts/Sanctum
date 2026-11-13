@@ -60,6 +60,7 @@ bridge.
 | `search` | Supply `collection`, `query`, optional `mode` (default hybrid), optional `metadata_filter`, and optional `limit` (1–10, default 5). Returns excerpts and exact source references, with the strategy used and embedding coverage. |
 | `search_collections` | Supply `collections` with one to eight distinct IDs in the same tenant, `query`, and the same optional arguments as `search`. Returns combined coverage and hits with their original collection IDs. |
 | `fetch_chunk` | Supply `collection`, `source_id`, `revision_id`, and `ordinal` from a hit. Returns the exact UTF-8 excerpt and its half-open byte range. |
+| `fetch_context` | Supply the same reference as `fetch_chunk` and optional `before_bytes` and `after_bytes` (each defaults to 1024, maximum 16384). Returns canonical UTF-8 context, its half-open byte range, and the original hit. |
 | `get_metadata` | Supply `collection` for collection metadata, both `source_id` and `revision_id` for the current source, or those IDs and `ordinal` for a chunk. Returns up to 64 namespaced entries, subject to the shared 512 KiB value limit. |
 | `mutate_metadata` | Supply the same target as `get_metadata` plus up to 32 `edits`. Each edit uses `namespace`, `key`, and `operation` (`set`, `patch`, or `remove`). Set and patch also take `value`. |
 

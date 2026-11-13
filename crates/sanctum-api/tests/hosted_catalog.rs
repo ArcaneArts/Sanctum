@@ -367,6 +367,89 @@ async fn hosted_collection_reclamation_keeps_open_snapshots_and_resumes() {
 }
 
 #[tokio::test]
+async fn hosted_context_trims_utf8_boundaries_and_bounds_the_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(sanctum_storage_fs::FileStorage::open(dir.path()).unwrap());
+    let catalog = HostedCatalog::new(store, None, 32_768).unwrap();
+    let mut api = start(catalog.clone()).await;
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let wire_scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    catalog.create_collection(&scope, None).await.unwrap();
+    let text = "🦀".repeat(3000);
+    let header = v1::UploadTextHeader {
+        scope: Some(wire_scope.clone()),
+        name: "notes.txt".into(),
+        ..Default::default()
+    };
+    let job = api
+        .client
+        .submit_text(upload_frames(&header, [text.as_bytes()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let operation = job.operation_id.parse().unwrap();
+    catalog.register_upload(&scope, operation).await.unwrap();
+    catalog.index_upload(&scope, operation).await.unwrap();
+    let request = v1::FetchContextRequest {
+        chunk: Some(v1::ChunkRef {
+            scope: Some(wire_scope),
+            source_id: job.source_id,
+            revision_id: job.revision_id,
+            ordinal: 1,
+        }),
+        before_bytes: 5,
+        after_bytes: 5,
+    };
+    let context = api
+        .client
+        .fetch_context(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let hit = context.hit.unwrap();
+    assert_eq!(context.start_byte + 4, hit.start_byte);
+    assert_eq!(context.end_byte, hit.end_byte + 4);
+    assert!(hit.database_generation.is_some());
+    assert_eq!(
+        context.text,
+        text[context.start_byte as usize..context.end_byte as usize]
+    );
+    let clipped = api
+        .client
+        .fetch_context(v1::FetchContextRequest {
+            before_bytes: 16_384,
+            after_bytes: 16_384,
+            ..request.clone()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (clipped.start_byte, clipped.end_byte),
+        (0, text.len() as u64)
+    );
+    let too_large = v1::FetchContextRequest {
+        before_bytes: 16_385,
+        ..request
+    };
+    assert_eq!(
+        api.client
+            .fetch_context(too_large)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_sources_page_current_revisions_and_keep_tenant_scope() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(sanctum_storage_fs::FileStorage::open(dir.path()).unwrap());

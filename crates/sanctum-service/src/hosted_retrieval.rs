@@ -268,6 +268,14 @@ impl HostedCatalog {
         key: String,
         generation: Uuid,
     ) -> Result<Hit> {
+        let key = self.checked_text_key(scope, key)?;
+        let bytes = self.storage.read_range(&key, chunk.range).await?;
+        let mut hit = Hit::from_bytes(chunk, &bytes)?;
+        hit.database_generation = Some(generation);
+        Ok(hit)
+    }
+
+    pub(crate) fn checked_text_key(&self, scope: &Scope, key: String) -> Result<Key> {
         let collection = collection_prefix(self.prefix.as_ref(), scope)?;
         let key = Key::parse(key)?;
         if !key
@@ -279,10 +287,7 @@ impl HostedCatalog {
                 "canonical text key escapes its collection".into(),
             ));
         }
-        let bytes = self.storage.read_range(&key, chunk.range).await?;
-        let mut hit = Hit::from_bytes(chunk, &bytes)?;
-        hit.database_generation = Some(generation);
-        Ok(hit)
+        Ok(key)
     }
 }
 

@@ -828,27 +828,7 @@ impl Sanctum for Grpc {
     }
 
     async fn fetch_chunk(&self, request: Request<v1::FetchChunkRequest>) -> Reply<v1::TextHit> {
-        let reference = request
-            .into_inner()
-            .chunk
-            .ok_or_else(|| Status::invalid_argument("chunk is required"))?;
-        let scope = parse_scope(reference.scope)?;
-        if reference.ordinal > i64::MAX as u64 {
-            return Err(Status::invalid_argument(
-                "chunk ordinal exceeds the supported range",
-            ));
-        }
-        let reference = ChunkRef {
-            source: reference
-                .source_id
-                .parse()
-                .map_err(|_| Status::invalid_argument("invalid source ID"))?,
-            revision: reference
-                .revision_id
-                .parse()
-                .map_err(|_| Status::invalid_argument("invalid revision ID"))?,
-            ordinal: reference.ordinal,
-        };
+        let (scope, reference) = parse_chunk(request.into_inner().chunk)?;
         let hit = match &self.0 {
             Backend::Local(service) => {
                 let service = service.clone();
@@ -858,6 +838,33 @@ impl Sanctum for Grpc {
             Backend::Hosted(service) => service.fetch(&scope, reference).await.map_err(status)?,
         };
         Ok(Response::new(wire_hit(&scope, hit)))
+    }
+
+    async fn fetch_context(
+        &self,
+        request: Request<v1::FetchContextRequest>,
+    ) -> Reply<v1::TextContext> {
+        let request = request.into_inner();
+        let (scope, reference) = parse_chunk(request.chunk)?;
+        let before = request.before_bytes;
+        let after = request.after_bytes;
+        let context = match &self.0 {
+            Backend::Local(service) => {
+                let service = service.clone();
+                let scope = scope.clone();
+                work(move || service.fetch_context(&scope, &reference, before, after)).await?
+            }
+            Backend::Hosted(service) => service
+                .fetch_context(&scope, reference, before, after)
+                .await
+                .map_err(status)?,
+        };
+        Ok(Response::new(v1::TextContext {
+            hit: Some(wire_hit(&scope, context.hit)),
+            start_byte: context.start_byte,
+            end_byte: context.end_byte,
+            text: context.text,
+        }))
     }
 
     async fn list_sources(
@@ -1471,6 +1478,29 @@ async fn work<T: Send + 'static>(
             Status::internal("server operation failed")
         })?
         .map_err(status)
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_chunk(reference: Option<v1::ChunkRef>) -> std::result::Result<(Scope, ChunkRef), Status> {
+    let reference = reference.ok_or_else(|| Status::invalid_argument("chunk is required"))?;
+    let scope = parse_scope(reference.scope)?;
+    if reference.ordinal > i64::MAX as u64 {
+        return Err(Status::invalid_argument(
+            "chunk ordinal exceeds the supported range",
+        ));
+    }
+    let reference = ChunkRef {
+        source: reference
+            .source_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("invalid source ID"))?,
+        revision: reference
+            .revision_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("invalid revision ID"))?,
+        ordinal: reference.ordinal,
+    };
+    Ok((scope, reference))
 }
 
 #[allow(clippy::result_large_err)]
