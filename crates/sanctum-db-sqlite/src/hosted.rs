@@ -263,6 +263,28 @@ impl crate::CollectionDb {
         ).map_err(database_error)
     }
 
+    pub fn has_hosted_text_object(&self, source: Uuid, revision: Uuid, key: &str) -> Result<bool> {
+        let referenced = self
+            .0
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM hosted_revision_objects
+              WHERE source_id = ?1 AND revision_id = ?2 AND text_key = ?3)",
+                params![source.to_string(), revision.to_string(), key],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        if referenced || crate::schema_version(&self.0)? < 10 {
+            return Ok(referenced);
+        }
+        self.0
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM hosted_object_garbage WHERE object_key = ?1)",
+                [key],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
+    }
+
     pub fn due_hosted_objects(&self) -> Result<Vec<String>> {
         if crate::schema_version(&self.0)? < 10 {
             return Ok(Vec::new());

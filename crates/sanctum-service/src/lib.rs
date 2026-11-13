@@ -40,7 +40,7 @@ pub use git_import::{GitImportEvent, GitRepository};
 pub use hosted_catalog::HostedCatalog;
 pub use hosted_database::HostedDatabaseSession;
 pub use hosted_dispatch::{Dispatch, ReconcilePage, Task, TaskStage};
-pub use hosted_ingestion::{HostedJob, HostedJobState, HostedUpload};
+pub use hosted_ingestion::{HostedJob, HostedJobState, HostedUpload, UploadSweep};
 pub use hosted_rebuild::RebuildPage;
 pub use local_import::{ImportEvent, ImportOptions, ImportState};
 pub use sanctum_db_sqlite::embedding::EmbeddingStatus;

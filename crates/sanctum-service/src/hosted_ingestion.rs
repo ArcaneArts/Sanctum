@@ -16,6 +16,9 @@ use crate::{HostedCatalog, RevisionContent, TaskStage, TextUpload};
 
 mod embedding_tasks;
 mod indexing;
+mod orphan_cleanup;
+
+pub use orphan_cleanup::UploadSweep;
 
 const FORMAT: u8 = 1;
 // Expire unregistered work before the publication executor can reclaim its receipt.

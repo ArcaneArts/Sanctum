@@ -152,7 +152,7 @@ ID adopt the winning operation and discard their losing input when possible.
 The `ACCEPTED` status can be queried after restart through `GetIngestionJob`.
 A replacement targeting an external reference has an empty `source_id` until
 registration resolves it. Hosted MCP uses the same acceptance path for inline
-text. Synchronous `UploadText` and abandoned-input reclamation remain open.
+text. Synchronous `UploadText` remains open.
 [Hosted MCP](MCP.md#hosted-connection).
 
 ### Hosted revision registration
@@ -328,3 +328,15 @@ BLAKE3 digest and reuse it within the configured snapshot cache budget.
 The regular snapshot sweep removes expired session records after the
 reader grace period. Close a session early to release its handle.
 [Operator SQL and export](LOCAL_API.md#read-only-sql-sessions-and-snapshots).
+
+### Abandoned upload candidates
+
+The private upload sweep advances a durable scan cursor. It checks up to
+eight candidates per invocation. An input older than 15 minutes is
+eligible when a different attempt won the operation envelope. An RTF
+extraction candidate is eligible after the 30-day indexing window and
+15-minute reader grace if it has neither a published locator nor a
+pending source-reclamation entry. An input without an operation envelope
+is retained because acceptance may still publish it. It needs a durable
+acceptance fence before it can be reclaimed safely.
+[Cloud Scheduler configuration](CLOUD_RUN.md#schedule-dispatch-repair).

@@ -2264,6 +2264,148 @@ async fn snapshot_sweep_resumes_units_and_protects_published_generations() {
 }
 
 #[tokio::test]
+async fn upload_sweep_reclaims_only_unreferenced_candidates_and_resumes() {
+    use std::time::{Duration, SystemTime};
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(dir.path()).unwrap());
+    let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let service = catalog();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    service.create_collection(&scope, None).await.unwrap();
+    let operation = uuid::Uuid::new_v4();
+    let upload = service
+        .stage_upload(
+            scope.clone(),
+            sanctum_service::TextUpload {
+                name: "notes.rtf".into(),
+                external: None,
+                replacement: None,
+                retain_original: true,
+            },
+            Some(operation),
+        )
+        .await
+        .unwrap();
+    std::io::Write::write_all(&mut upload.reopen().unwrap(), br"{\rtf1\ansi quartz note}").unwrap();
+    let job = upload.enqueue().await.unwrap();
+    service.register_upload(&scope, operation).await.unwrap();
+    service.index_upload(&scope, operation).await.unwrap();
+    let base = "default/collections/notes";
+    let inputs = Key::parse(format!("{base}/operations/{operation}/inputs")).unwrap();
+    let winner = storage
+        .list(Some(&inputs), None, 10)
+        .await
+        .unwrap()
+        .objects
+        .remove(0)
+        .key;
+    let extracts = Key::parse(format!(
+        "{base}/sources/{}/{}/objects",
+        job.source.unwrap(),
+        job.revision
+    ))
+    .unwrap();
+    let canonical = storage
+        .list(Some(&extracts), None, 10)
+        .await
+        .unwrap()
+        .objects
+        .remove(0)
+        .key;
+    let age = |key: &Key| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join(key.as_str()))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(31 * 86_400))
+            .unwrap();
+    };
+    let make = |key: Key, old: bool| {
+        let storage = storage.clone();
+        async move {
+            storage
+                .put_stream(&key, Box::pin(std::io::Cursor::new(b"candidate")), 9)
+                .await
+                .unwrap();
+            if old {
+                age(&key);
+            }
+            key
+        }
+    };
+    age(&winner);
+    age(&canonical);
+    let young = make(
+        Key::parse(format!("{inputs}/{}", uuid::Uuid::new_v4())).unwrap(),
+        false,
+    )
+    .await;
+    let uncertain = make(
+        Key::parse(format!(
+            "{base}/operations/{}/inputs/{}",
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap(),
+        true,
+    )
+    .await;
+    let extract = make(
+        Key::parse(format!("{extracts}/{}/text.utf8", uuid::Uuid::new_v4())).unwrap(),
+        true,
+    )
+    .await;
+    let mut losers = Vec::new();
+    for _ in 0..10 {
+        losers.push(
+            make(
+                Key::parse(format!("{inputs}/{}", uuid::Uuid::new_v4())).unwrap(),
+                true,
+            )
+            .await,
+        );
+    }
+
+    let first = service.sweep_abandoned_uploads().await.unwrap();
+    assert!(first.more);
+    assert!(first.deleted <= 8);
+    let restarted = catalog();
+    let mut deleted = first.deleted;
+    for _ in 0..8 {
+        let report = restarted.sweep_abandoned_uploads().await.unwrap();
+        assert_eq!(report.failed, 0);
+        deleted += report.deleted;
+        if !report.more {
+            break;
+        }
+    }
+    assert_eq!(deleted, 11);
+    for key in losers.into_iter().chain([extract]) {
+        assert!(matches!(storage.head(&key).await, Err(Error::NotFound(_))));
+    }
+    for key in [winner, canonical, uncertain, young] {
+        storage.head(&key).await.unwrap();
+    }
+    let hit = restarted
+        .retrieve(
+            scope,
+            "quartz".into(),
+            5,
+            None,
+            sanctum_service::SearchMode::Lexical,
+        )
+        .await
+        .unwrap()
+        .hits
+        .remove(0);
+    assert_eq!(hit.excerpt, "quartz note");
+}
+
+#[tokio::test]
 async fn hosted_submissions_recover_from_interrupted_acceptance() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance {
