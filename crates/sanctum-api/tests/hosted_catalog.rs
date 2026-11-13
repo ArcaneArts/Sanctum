@@ -1308,6 +1308,145 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
     assert!(matches!(storage.head(&key).await, Err(Error::NotFound(_))));
 }
 
+#[tokio::test]
+async fn idle_collections_rebuild_after_a_profile_change() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let dispatch = Arc::new(TestDispatch {
+        fail: AtomicU8::new(0),
+        delivered: std::sync::Mutex::new(Vec::new()),
+    });
+    let catalog = |profile| {
+        HostedCatalog::new(storage.clone(), None, 1024)
+            .unwrap()
+            .with_dispatch(dispatch.clone())
+            .with_embedding(Some(Arc::new(HostedEmbeddingFixture {
+                profile,
+                fail: AtomicU8::new(0),
+                queries: AtomicUsize::new(0),
+            })))
+    };
+    let first = catalog("fixture-v1");
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    first.create_collection(&scope, None).await.unwrap();
+    let mut server = start(first.clone()).await;
+    let header = v1::UploadTextHeader {
+        scope: Some(v1::Scope {
+            tenant: "default".into(),
+            collection: "notes".into(),
+        }),
+        name: "idle.txt".into(),
+        ..Default::default()
+    };
+    let accepted = server
+        .client
+        .submit_text(upload_frames(&header, [b"idle unicorn".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let upload = accepted.operation_id.parse().unwrap();
+    first.register_upload(&scope, upload).await.unwrap();
+    first.index_upload(&scope, upload).await.unwrap();
+    first.embed_upload(&scope, upload, 0).await.unwrap();
+    first.embed_upload(&scope, upload, 1).await.unwrap();
+    first.try_dispatch(&scope, upload).await;
+    assert_eq!(
+        first
+            .embedding_status(&scope, None)
+            .await
+            .unwrap()
+            .coverage
+            .embedded,
+        1
+    );
+    assert!(first.discover_profile_rebuild().await.unwrap().complete);
+    server.stop().await;
+
+    let second = catalog("fixture-v2");
+    assert_eq!(
+        second
+            .embedding_status(&scope, None)
+            .await
+            .unwrap()
+            .coverage
+            .embedded,
+        0
+    );
+    // Force a second discovery page and verify that a new instance resumes it.
+    for i in 0..256 {
+        let key = Key::parse(format!("_fixture/{i:03}")).unwrap();
+        storage
+            .put_control(&key, b"{}".as_slice().into(), Condition::Create)
+            .await
+            .unwrap();
+    }
+    assert!(!second.discover_profile_rebuild().await.unwrap().complete);
+    drop(second);
+    let second = catalog("fixture-v2");
+    assert!(second.discover_profile_rebuild().await.unwrap().complete);
+    for shard in 0..16 {
+        second.reconcile_shard(shard).await.unwrap();
+    }
+    let operation = dispatch
+        .delivered
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|&(operation, stage)| {
+            matches!(stage, TaskStage::Rebuild { step: 0 }).then_some(operation)
+        })
+        .unwrap();
+    assert!(matches!(
+        first.run_profile_rebuild(&scope, operation, 0).await,
+        Err(Error::Busy(_))
+    ));
+    assert!(matches!(
+        second.run_profile_rebuild(&scope, operation, 1).await,
+        Err(Error::Busy(_))
+    ));
+    second
+        .run_profile_rebuild(&scope, operation, 0)
+        .await
+        .unwrap();
+    let coverage = second.embedding_status(&scope, None).await.unwrap();
+    assert_eq!(coverage.profile.as_deref(), Some("fixture-v2"));
+    assert_eq!(coverage.coverage.embedded, 1);
+    second.try_dispatch_rebuild(&scope, operation).await;
+    assert!(
+        dispatch
+            .delivered
+            .lock()
+            .unwrap()
+            .contains(&(operation, TaskStage::Rebuild { step: 1 }))
+    );
+    second
+        .run_profile_rebuild(&scope, operation, 0)
+        .await
+        .unwrap();
+    second
+        .run_profile_rebuild(&scope, operation, 1)
+        .await
+        .unwrap();
+    second.try_dispatch_rebuild(&scope, operation).await;
+    assert_eq!(
+        second.discover_profile_rebuild().await.unwrap().discovered,
+        0
+    );
+    let pending = Key::parse("_dispatch").unwrap();
+    assert!(
+        !storage
+            .list(Some(&pending), None, 128)
+            .await
+            .unwrap()
+            .objects
+            .iter()
+            .any(|item| item.key.as_str().ends_with(&operation.to_string()))
+    );
+}
+
 struct TestDispatch {
     fail: AtomicU8,
     delivered: std::sync::Mutex<Vec<(uuid::Uuid, TaskStage)>>,

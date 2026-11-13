@@ -16,6 +16,14 @@ pub(crate) fn router(service: HostedCatalog) -> Router {
         .route("/internal/tasks/index-upload", post(index))
         .route("/internal/tasks/embed-collection", post(embed))
         .route("/internal/tasks/embed-upload", post(embed_upload))
+        .route(
+            "/internal/tasks/rebuild-collection",
+            post(rebuild_collection),
+        )
+        .route(
+            "/internal/maintenance/embedding-profile",
+            post(discover_profile),
+        )
         .route("/internal/maintenance/dispatch/{shard}", post(reconcile))
         .layer(DefaultBodyLimit::max(4096))
         .with_state(service)
@@ -146,6 +154,49 @@ async fn embed_upload(
         Err(error) => {
             tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
                 operation = %task.operation_id, step = task.step, "hosted embedding task will need a retry");
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    }
+}
+
+async fn discover_profile(State(service): State<HostedCatalog>) -> Response {
+    match service.discover_profile_rebuild().await {
+        Ok(page) => Json(serde_json::json!({
+            "discovered": page.discovered,
+            "complete": page.complete,
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "profile rebuild discovery will need a retry");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
+}
+
+async fn rebuild_collection(
+    State(service): State<HostedCatalog>,
+    Json(task): Json<EmbedUpload>,
+) -> StatusCode {
+    let (Ok(tenant), Ok(collection)) = (task.tenant.parse(), task.collection.parse()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if task.operation_id.is_nil() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let scope = Scope { tenant, collection };
+    match service
+        .run_profile_rebuild(&scope, task.operation_id, task.step)
+        .await
+    {
+        Ok(()) => {
+            service
+                .try_dispatch_rebuild(&scope, task.operation_id)
+                .await;
+            StatusCode::NO_CONTENT
+        }
+        Err(error) => {
+            tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
+                operation = %task.operation_id, step = task.step, "profile rebuild will need a retry");
             StatusCode::SERVICE_UNAVAILABLE
         }
     }

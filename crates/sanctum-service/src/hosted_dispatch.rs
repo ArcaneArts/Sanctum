@@ -21,6 +21,7 @@ pub enum TaskStage {
     Register,
     Index,
     Embed { step: u32 },
+    Rebuild { step: u32 },
 }
 
 pub struct Task<'a> {
@@ -108,10 +109,15 @@ impl HostedCatalog {
         let mut dispatched = 0;
         let mut failed = 0;
         for entry in page.objects {
-            let Some((scope, operation)) = parse_hint(&pending, &entry.key) else {
+            let Some((scope, operation, rebuild)) = parse_hint(&pending, &entry.key) else {
                 continue;
             };
-            match self.dispatch_pending(&scope, operation).await {
+            let result = if rebuild {
+                self.dispatch_rebuild(&scope, operation).await
+            } else {
+                self.dispatch_pending(&scope, operation).await
+            };
+            match result {
                 Ok(true) => dispatched += 1,
                 Ok(false) => {}
                 Err(error) => {
@@ -129,7 +135,16 @@ impl HostedCatalog {
     }
 
     pub(crate) async fn record_dispatch_hint(&self, scope: &Scope, operation: Uuid) -> Result<()> {
-        let key = self.dispatch_hint(scope, operation)?;
+        self.record_hint(scope, operation, false).await
+    }
+
+    pub(crate) async fn record_hint(
+        &self,
+        scope: &Scope,
+        operation: Uuid,
+        rebuild: bool,
+    ) -> Result<()> {
+        let key = self.dispatch_hint(scope, operation, rebuild)?;
         match self
             .storage
             .put_control(&key, b"{}".as_slice().into(), Condition::Create)
@@ -141,18 +156,32 @@ impl HostedCatalog {
     }
 
     pub(crate) async fn clear_dispatch_hint(&self, scope: &Scope, operation: Uuid) -> Result<()> {
-        let key = self.dispatch_hint(scope, operation)?;
+        self.clear_hint(scope, operation, false).await
+    }
+
+    pub(crate) async fn clear_hint(
+        &self,
+        scope: &Scope,
+        operation: Uuid,
+        rebuild: bool,
+    ) -> Result<()> {
+        let key = self.dispatch_hint(scope, operation, rebuild)?;
         match self.storage.delete(&key).await {
             Ok(()) | Err(Error::NotFound(_)) => Ok(()),
             Err(error) => Err(error),
         }
     }
 
-    fn dispatch_hint(&self, scope: &Scope, operation: Uuid) -> Result<Key> {
+    fn dispatch_hint(&self, scope: &Scope, operation: Uuid, rebuild: bool) -> Result<Key> {
         let shard = operation.as_bytes()[0] % SHARDS;
         let partition = self.dispatch_partition(shard)?;
+        let name = if rebuild {
+            format!("rebuild-{operation}")
+        } else {
+            operation.to_string()
+        };
         Key::parse(format!(
-            "{partition}/pending/{}/{}/{operation}",
+            "{partition}/pending/{}/{}/{name}",
             scope.tenant, scope.collection
         ))
     }
@@ -173,7 +202,7 @@ impl HostedCatalog {
     }
 }
 
-fn parse_hint(prefix: &Key, key: &Key) -> Option<(Scope, Uuid)> {
+fn parse_hint(prefix: &Key, key: &Key) -> Option<(Scope, Uuid, bool)> {
     let path = key
         .as_str()
         .strip_prefix(prefix.as_str())?
@@ -184,5 +213,9 @@ fn parse_hint(prefix: &Key, key: &Key) -> Option<(Scope, Uuid)> {
         tenant: tenant.parse().ok()?,
         collection: collection.parse().ok()?,
     };
-    Some((scope, operation.parse().ok()?))
+    let (id, rebuild) = match operation.strip_prefix("rebuild-") {
+        Some(id) => (id, true),
+        None => (operation, false),
+    };
+    Some((scope, id.parse().ok()?, rebuild))
 }
