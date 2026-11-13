@@ -1,5 +1,41 @@
 # Capacity measurements
 
+## 200 MiB text ingestion
+
+The benchmark generates exactly 209,715,200 bytes of deterministic UTF-8
+text from numbered synthetic observations. It streams the source through
+the release CLI and gRPC, polls for lexical publication, searches for a
+unique marker near the end, and compares the MCP fetch byte for byte with
+the original file. It samples server process RSS every 200 ms from upload
+through publication. Collection usage comes from the storage API and
+includes source and index files or objects. The benchmark runs without
+embeddings to isolate upload, chunking, and lexical indexing.
+
+```sh
+cargo build --release --locked -p sanctum-server -p sanctum-cli
+python3 scripts/benchmark-ingestion.py
+```
+
+On macOS or Linux, pass `--mib` to change the input size. To run against
+MinIO, supply a [standalone S3 configuration](STORAGE.md#hosted-server-configuration)
+with a dedicated empty prefix in `SANCTUM_CONFIG_JSON` and run
+`python3 scripts/benchmark-ingestion.py --hosted`. The script leaves hosted
+objects in that prefix for inspection.
+
+| Backend | Upload to acceptance | Acceptance to text ready | Total | Sampled peak server RSS | Warm MCP fetch | Stored collection bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Local filesystem | 0.279 s | 5.739 s | 6.018 s | 29,392,896 | 1.798 ms | 269,590,528 |
+| MinIO | 2.950 s | 6.180 s | 9.130 s | 46,415,872 | 12.108 ms | 269,886,586 |
+
+Each backend was measured once on the Apple M4 Max setup below. Both
+returned chunk 58,199 with the same 2,631-byte range from offset
+209,712,569 through EOF. The filesystem had 29 RSS samples and MinIO
+had 45. RSS excludes the client, object store, and on-disk files.
+The warm fetch followed a search in the same process. The synthetic
+vocabulary is small, so index sizes and timings depend on the workload.
+Vector work, GB-scale collections, and Cloud Run memory remain separate
+measurements.
+
 ## SQLite snapshot transfer and publication
 
 The MinIO benchmark publishes synthetic SQLite databases with about 1 GiB
