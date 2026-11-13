@@ -92,3 +92,48 @@ memory. [Cloud Run container filesystem](https://docs.cloud.google.com/run/docs/
 The one-row result establishes the cost of full snapshot publication at
 the target size. The next workload should measure realistic source and
 embedding batches before choosing a mutation journal or database split.
+
+## Exact vector ranking in SQLite
+
+The release comparison uses one SQLite database for chunk identity, metadata,
+and normalized float32 vectors. A fixture creates 262,144 synthetic vectors
+at each dimension, with 64 chunks per source. It includes deleted sources and
+chunks associated with another profile. A nested JSON array-membership filter
+selects about 10% of sources. Both implementations apply current revision,
+profile, and metadata conditions before choosing the top ten.
+
+The production `VectorIndex` uses Rust to score existing SQLite vector BLOBs.
+The test compares that implementation with the cosine function from
+[sqlite-vec v0.1.9](https://github.com/asg017/sqlite-vec/releases/tag/v0.1.9)
+using the same BLOBs and candidate SQL. A fixed-schema `vec0` table would need
+its own design for arbitrary source and chunk filters, revision eligibility,
+and content-hash reuse. [sqlite-vec KNN query modes](https://alexgarcia.xyz/sqlite-vec/features/knn.html).
+
+```sh
+cargo test --release --locked -p sanctum-db-sqlite compare_sqlite_vec \
+  -- --ignored --nocapture
+```
+
+`SANCTUM_VECTOR_BENCH_ROWS` overrides the fixture size. Each case uses a warm-up
+and five measured queries per implementation on separate read-only connections.
+Rust ran first for each query. The working SQLite files were on the Apple M4 Max
+host, and the operating system page cache was left as observed.
+
+| Dimensions | SQLite file bytes | Filter | Rust median | sqlite-vec median | Matched top-ten IDs |
+| --- | ---: | --- | ---: | ---: | ---: |
+| 768 | 1,275,162,624 | None | 2,269 ms | 2,531 ms | 60/60 |
+| 768 | 1,275,162,624 | Source JSON | 370 ms | 379 ms | 60/60 |
+| 1,536 | 2,348,904,448 | None | 4,200 ms | 4,328 ms | 60/60 |
+| 1,536 | 2,348,904,448 | Source JSON | 496 ms | 511 ms | 60/60 |
+
+All 240 returned neighbors matched as sets and scores agreed within 0.000002.
+Unfiltered 768-dimension Rust samples ranged from 2.22 to 4.62 seconds. The
+fixture isolates ranking and SQLite I/O. It excludes real model recall,
+lexical indexing, provider requests, source-range reads, object transfer, and
+concurrent tenants.
+
+The scalar extension did not improve median latency in these cases. Sanctum
+keeps the Rust scorer and its existing storage format. The measured cost of
+unfiltered exact scans at this size motivates testing candidate indexes or
+vector layouts against a representative corpus with the same filter and recall
+requirements.

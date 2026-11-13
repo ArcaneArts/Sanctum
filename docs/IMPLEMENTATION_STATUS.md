@@ -1045,3 +1045,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - Local publication took 6.018 s at a sampled peak server RSS of 29,392,896
   bytes. MinIO took 9.130 s at 46,415,872 bytes. The workload used lexical
   indexing with embeddings disabled. [Reproduction and results](CAPACITY.md).
+
+## Exact vector ranking measurements
+
+- Local, hosted, and cross-collection retrieval use the `VectorIndex` boundary.
+  The production implementation retains the SQLite BLOB format and exact
+  Rust scorer, with current-revision and metadata conditions applied before
+  top-k.
+- A release comparison with pinned sqlite-vec v0.1.9 at 262,144 vectors and
+  both 768 and 1,536 dimensions matched all 240 returned top-ten neighbors.
+  The scalar extension did not improve median latency. Representative model
+  recall and concurrent collections remain open. [Method and results](CAPACITY.md#exact-vector-ranking-in-sqlite).

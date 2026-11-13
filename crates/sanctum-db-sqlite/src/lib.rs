@@ -15,6 +15,7 @@ pub mod metadata_query;
 pub mod queue;
 pub mod snapshot;
 mod sources;
+pub mod vector_index;
 pub mod watched_folders;
 pub use lifecycle::{RevisionKey, SourceIdentity};
 
