@@ -173,6 +173,38 @@ impl HostedCatalog {
         Ok(record.job())
     }
 
+    pub async fn pending_text(&self, scope: &Scope, operation: Uuid) -> Result<crate::PendingText> {
+        use crate::pending_scan::ScanSource;
+        self.require_collection(scope).await?;
+        let prefix = self.operation_prefix(scope, operation)?;
+        let (record, _) = self.require_operation(&prefix, operation).await?;
+        if !matches!(
+            record.stage,
+            Stage::PendingRegistration | Stage::PendingIndexing { .. }
+        ) {
+            return Err(Error::Conflict(
+                "literal scan requires pending text ingestion".into(),
+            ));
+        }
+        let input = if sanctum_core::is_rtf(&record.upload.name) {
+            ScanSource::RtfOriginal
+        } else {
+            ScanSource::Hosted {
+                storage: self.storage.clone(),
+                key: record.input_key(&prefix)?,
+            }
+        };
+        let job = record.job();
+        Ok(crate::PendingText {
+            source: job.source,
+            revision: job.revision,
+            name: job.name,
+            external: job.external,
+            total_bytes: job.bytes,
+            input,
+        })
+    }
+
     /// Registers revision intent and checkpoints the next stage for a durable submission.
     pub async fn register_upload(&self, scope: &Scope, operation: Uuid) -> Result<HostedJob> {
         let prefix = self.operation_prefix(scope, operation)?;

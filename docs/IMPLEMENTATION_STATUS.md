@@ -916,3 +916,15 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   window. Pending and retryable jobs retain their input and status.
 - The local gRPC test runs maintenance, restarts the service, and verifies
   expiration, searchable published bytes, and retained pending inputs.
+- Delivered in [PR #61](https://github.com/ArcaneArts/Sanctum/pull/61).
+
+## Pending literal scan
+
+- Local and hosted gRPC and MCP scan accepted UTF-8 input by operation ID
+  while it awaits lexical publication. The response reports exact match
+  ranges, bytes read and searched, and completion or a partial reason.
+- The gRPC tests exercise exact matches across a 64 KiB boundary, limits,
+  invalid text, empty uploads, tenant scope, and unextracted RTF. Dropping
+  the gRPC stream cancels an in-flight range read in the storage fixture.
+- The hosted MCP smoke on live MinIO returns the exact UTF-8 byte range
+  of a literal before any indexing task has run.

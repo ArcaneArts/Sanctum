@@ -99,6 +99,52 @@ impl Running {
 }
 
 #[tokio::test]
+async fn local_pending_literal_scan_does_not_require_lexical_publication() {
+    use v1::pending_text_scan_event::Event;
+    let dir = TempDir::new().unwrap();
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    create(&mut api.client, "default").await;
+    let input = "config: key=🦀café";
+    let queued = api
+        .client
+        .submit_text(tokio_stream::iter([
+            header("default"),
+            data(input.as_bytes()),
+            end(),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(search(&mut api.client, "default", "café").await.is_empty());
+    let mut scan = api
+        .client
+        .scan_pending_text(v1::ScanPendingTextRequest {
+            job: Some(job_request(queued.operation_id)),
+            literal: "=🦀café".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        matches!(scan.message().await.unwrap().unwrap().event, Some(Event::Source(source)) if source.source_id.as_deref() == Some(&queued.source_id))
+    );
+    let Some(Event::Progress(progress)) = scan.message().await.unwrap().unwrap().event else {
+        panic!("missing scan progress")
+    };
+    assert_eq!(progress.stop(), v1::PendingTextScanStop::Complete);
+    let [hit] = progress.matches.as_slice() else {
+        panic!("expected one match")
+    };
+    assert_eq!(
+        &input[hit.start_byte as usize..hit.end_byte as usize],
+        "=🦀café"
+    );
+    assert!(scan.message().await.unwrap().is_none());
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn local_upload_keeps_accepted_chunk_settings_across_restart() {
     let dir = TempDir::new().unwrap();
     let configured = Service::open(dir.path(), 32_768)

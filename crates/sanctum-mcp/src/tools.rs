@@ -11,7 +11,8 @@ use rmcp::{
 use sanctum_core::{Error, ExternalSource, Result as SanctumResult, Scope, ScopeId};
 use sanctum_service::{
     ChunkRef, Hit, HostedCatalog, HostedJob, HostedJobState, Job, JobState, MetadataEdit,
-    MetadataEntry, MetadataMutation, Replacement, RevisionTarget, SearchMode, Service, TextUpload,
+    MetadataEntry, MetadataMutation, Replacement, RevisionTarget, ScanOptions, SearchMode, Service,
+    TextUpload,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -196,6 +197,18 @@ struct Operation {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct ScanPendingText {
+    #[serde(flatten)]
+    job: Operation,
+    /// Case-sensitive UTF-8 literal, up to 1024 bytes.
+    literal: String,
+    /// Bytes to read from the start, default 1048576 and maximum 4194304.
+    byte_limit: Option<u64>,
+    /// Maximum number of matches, default 10 and maximum 100.
+    hit_limit: Option<u32>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct Target {
     #[serde(flatten)]
     scope: Collection,
@@ -372,6 +385,53 @@ impl Tools {
             }
         }
         .await;
+        response(result)
+    }
+
+    #[tool(
+        description = "Find a case-sensitive literal in one pending UTF-8 upload. Reports actual scan coverage and exact match ranges."
+    )]
+    async fn scan_pending_text(
+        &self,
+        Parameters(args): Parameters<ScanPendingText>,
+    ) -> CallToolResult {
+        let result = async {
+            let scope = args.job.scope.scope()?;
+            let operation = id(&args.job.operation_id)?;
+            let bytes = args.byte_limit.unwrap_or(1024 * 1024);
+            if bytes > 4 * 1024 * 1024 {
+                return Err(Error::Invalid("MCP literal scan reads at most 4194304 bytes".into()));
+            }
+            let options = ScanOptions::new(args.literal, bytes, args.hit_limit.unwrap_or(10))?;
+            let pending = match &self.backend {
+                Backend::Local(service) => local(service, {
+                    let scope = scope.clone();
+                    move |service| service.pending_text(&scope, operation)
+                }).await?,
+                Backend::Hosted(catalog) => catalog.pending_text(&scope, operation).await?,
+            };
+            let source = json!({
+                "scope": scope_value(&scope),
+                "operation_id": operation,
+                "source_id": pending.source,
+                "revision_id": pending.revision,
+                "name": pending.name,
+                "external": pending.external.as_ref().map(|source| json!({"namespace": source.namespace, "id": source.id})),
+                "total_bytes": pending.total_bytes,
+            });
+            let mut matches = Vec::new();
+            let mut read_bytes = 0;
+            let mut scanned_bytes = 0;
+            let mut stop = None;
+            pending.scan(&options, |page| {
+                read_bytes = page.read_bytes;
+                scanned_bytes = page.scanned_bytes;
+                matches.extend(page.hits.into_iter().map(|range| json!({"start_byte": range.start, "end_byte": range.end})));
+                stop = page.stop.map(|stop| stop.as_str());
+                std::future::ready(true)
+            }).await?;
+            Ok(json!({"source": source, "matches": matches, "read_bytes": read_bytes, "scanned_bytes": scanned_bytes, "stop": stop}))
+        }.await;
         response(result)
     }
 

@@ -128,6 +128,26 @@ points at either outer boundary. The returned half-open range identifies
 the context. The nested hit still describes the exact cited chunk and
 its verified content hash.
 
+## Literal scan of pending text
+
+`ScanPendingText` searches a single pending operation from the same tenant
+and collection. Pass the operation ID returned by `SubmitText`. The first
+stream event identifies the staged source and revision. Later events report
+nonoverlapping case-sensitive UTF-8 matches as half-open byte ranges. They
+also report bytes searched and bytes read, which can differ at a UTF-8
+boundary or when the hit limit stops the search inside the current buffer.
+
+The default byte budget is 1 MiB and the maximum is 32 MiB. The literal can
+be 1 to 1024 UTF-8 bytes. The default hit limit is 10 and the maximum is 100.
+The final event reports `COMPLETE`, `BYTE_LIMIT`, `HIT_LIMIT`,
+`INVALID_TEXT`, or `EXTRACTION_PENDING` for an RTF upload awaiting canonical
+text. A match is provisional until its source is published. Closing the
+gRPC stream stops the scan. Published text uses the ordinary search path.
+
+```sh
+cargo run --locked -p sanctum-cli -- scan-pending notes OPERATION_ID '=value' --byte-limit 65536
+```
+
 ## Chunk configuration
 
 Set `chunking.window_bytes` and `chunking.overlap_bytes` in

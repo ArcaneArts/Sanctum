@@ -13,6 +13,233 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Code, transport::Server};
 
 #[tokio::test]
+async fn hosted_pending_literal_scan_reports_exact_ranges_and_partial_coverage() {
+    use v1::{PendingTextScanStop as Stop, pending_text_scan_event::Event};
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        interrupt: AtomicU8::new(0),
+    });
+    let catalog = HostedCatalog::new(storage.clone(), None, 512 * 1024).unwrap();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    catalog.create_collection(&scope, None).await.unwrap();
+    let mut server = start(catalog.clone()).await;
+    let literal = "🦀Café";
+    let text = format!("{}{literal}lower café {literal}tail", "x".repeat(65_535));
+    let wire_scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    let mut header = v1::UploadTextHeader {
+        scope: Some(wire_scope.clone()),
+        name: "text.md".into(),
+        ..Default::default()
+    };
+    let accepted = server
+        .client
+        .submit_text(upload_frames(&header, [text.as_bytes()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let job = v1::IngestionJobRequest {
+        scope: Some(wire_scope),
+        operation_id: accepted.operation_id.clone(),
+    };
+    let request = v1::ScanPendingTextRequest {
+        job: Some(job.clone()),
+        literal: literal.into(),
+        ..Default::default()
+    };
+    let mut stream = server
+        .client
+        .scan_pending_text(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(stream.message().await.unwrap().unwrap().event,
+        Some(Event::Source(source)) if source.revision_id == accepted.revision_id && source.total_bytes == text.len() as u64));
+    let Some(Event::Progress(first)) = stream.message().await.unwrap().unwrap().event else {
+        panic!("missing first progress")
+    };
+    assert_eq!(first.stop(), Stop::Unspecified);
+    assert_eq!((first.scanned_bytes, first.read_bytes), (65_535, 65_536));
+    assert!(first.matches.is_empty());
+    let Some(Event::Progress(last)) = stream.message().await.unwrap().unwrap().event else {
+        panic!("missing final progress")
+    };
+    assert_eq!(last.stop(), Stop::Complete);
+    assert_eq!(last.scanned_bytes, text.len() as u64);
+    assert_eq!(last.matches.len(), 2);
+    for (hit, (start, value)) in last.matches.iter().zip(text.match_indices(literal)) {
+        assert_eq!(
+            (hit.start_byte as usize, hit.end_byte as usize),
+            (start, start + value.len())
+        );
+        assert_eq!(
+            &text[hit.start_byte as usize..hit.end_byte as usize],
+            literal
+        );
+    }
+    assert!(stream.message().await.unwrap().is_none());
+    for (bytes, hits, expected, scanned) in [
+        (65_536, 10, Stop::ByteLimit, 65_535),
+        (
+            1024 * 1024,
+            1,
+            Stop::HitLimit,
+            65_535 + literal.len() as u64,
+        ),
+    ] {
+        let mut stream = server
+            .client
+            .scan_pending_text(v1::ScanPendingTextRequest {
+                byte_limit: Some(bytes),
+                hit_limit: Some(hits),
+                ..request.clone()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut terminal = false;
+        while let Some(event) = stream.message().await.unwrap() {
+            if let Some(Event::Progress(progress)) = event.event
+                && progress.stop() != Stop::Unspecified
+            {
+                terminal = true;
+                assert_eq!(progress.stop(), expected);
+                assert_eq!(progress.scanned_bytes, scanned);
+                assert_eq!(
+                    progress.matches.len(),
+                    usize::from(expected == Stop::HitLimit)
+                );
+                break;
+            }
+        }
+        assert!(terminal);
+    }
+    storage.interrupt.store(BLOCK_SCAN_RANGE, Ordering::Relaxed);
+    let mut canceled = server
+        .client
+        .scan_pending_text(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(
+        canceled.message().await.unwrap().unwrap().event,
+        Some(Event::Source(_))
+    ));
+    assert!(matches!(
+        canceled.message().await.unwrap().unwrap().event,
+        Some(Event::Progress(_))
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while storage.interrupt.load(Ordering::Relaxed) != SCAN_RANGE_BLOCKED {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(canceled);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while storage.interrupt.load(Ordering::Relaxed) != SCAN_RANGE_DROPPED {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    storage.interrupt.store(0, Ordering::Relaxed);
+
+    let wrong_tenant = v1::IngestionJobRequest {
+        scope: Some(v1::Scope {
+            tenant: "other".into(),
+            collection: "notes".into(),
+        }),
+        ..job
+    };
+    assert_eq!(
+        server
+            .client
+            .scan_pending_text(v1::ScanPendingTextRequest {
+                job: Some(wrong_tenant),
+                ..request.clone()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    let operation = accepted.operation_id.parse().unwrap();
+    catalog.register_upload(&scope, operation).await.unwrap();
+    catalog.index_upload(&scope, operation).await.unwrap();
+    assert_eq!(
+        server
+            .client
+            .scan_pending_text(request)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+
+    for (name, bytes, stop, scanned, read) in [
+        (
+            "invalid.txt",
+            b"ok\xffmore".as_slice(),
+            Stop::InvalidText,
+            2,
+            7,
+        ),
+        ("empty.txt", b"".as_slice(), Stop::Complete, 0, 0),
+        (
+            "rich.rtf",
+            br"{\rtf1 hello}".as_slice(),
+            Stop::ExtractionPending,
+            0,
+            0,
+        ),
+    ] {
+        header.name = name.into();
+        let accepted = server
+            .client
+            .submit_text(upload_frames(&header, [bytes]))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut scan = server
+            .client
+            .scan_pending_text(v1::ScanPendingTextRequest {
+                job: Some(v1::IngestionJobRequest {
+                    scope: header.scope.clone(),
+                    operation_id: accepted.operation_id,
+                }),
+                literal: "ok".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            scan.message().await.unwrap().unwrap().event,
+            Some(Event::Source(_))
+        ));
+        let Some(Event::Progress(progress)) = scan.message().await.unwrap().unwrap().event else {
+            panic!("missing scan outcome")
+        };
+        assert_eq!(progress.stop(), stop);
+        assert_eq!(
+            (progress.scanned_bytes, progress.read_bytes),
+            (scanned, read)
+        );
+        assert!(scan.message().await.unwrap().is_none());
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_catalog_recovers_across_server_restart_and_stays_in_scope() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
@@ -3671,6 +3898,18 @@ async fn hosted_submissions_recover_from_interrupted_acceptance() {
     server.stop().await;
 }
 
+const BLOCK_SCAN_RANGE: u8 = 5;
+const SCAN_RANGE_BLOCKED: u8 = 6;
+const SCAN_RANGE_DROPPED: u8 = 7;
+
+struct InterruptedRead<'a>(&'a AtomicU8);
+
+impl Drop for InterruptedRead<'_> {
+    fn drop(&mut self) {
+        self.0.store(SCAN_RANGE_DROPPED, Ordering::Relaxed);
+    }
+}
+
 struct InterruptAcceptance {
     inner: sanctum_storage_fs::FileStorage,
     interrupt: AtomicU8,
@@ -3687,6 +3926,11 @@ impl Storage for InterruptAcceptance {
     }
 
     async fn read_range(&self, key: &Key, range: ByteRange) -> StorageResult<axum::body::Bytes> {
+        if range.start != 0 && self.interrupt.load(Ordering::Relaxed) == BLOCK_SCAN_RANGE {
+            let _dropped = InterruptedRead(&self.interrupt);
+            self.interrupt.store(SCAN_RANGE_BLOCKED, Ordering::Relaxed);
+            std::future::pending::<()>().await;
+        }
         self.inner.read_range(key, range).await
     }
 
