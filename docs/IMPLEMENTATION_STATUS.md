@@ -688,3 +688,18 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - The live check found that SQLite's columnless read for `count(*)`
   omits the schema. The SQL authorizer now handles that case while
   retaining the same write and attachment restrictions.
+- Delivered in [PR #43](https://github.com/ArcaneArts/Sanctum/pull/43).
+
+## Abandoned upload candidates
+
+- The worker upload sweep persists a bounded cursor. It reclaims
+  losing input attempts after an envelope identifies the winner
+  and old extracted text without a published locator or retirement
+  entry. It keeps winning input, current extracted text, and
+  recent attempts.
+- The integration test ages objects, restarts between bounded batches,
+  checks which objects survived, and verifies exact retrieval.
+- The live MinIO worker route preserved a recent attempt and published
+  RTF text across restart. The local object-store test verifies deletion
+  using controlled object ages.
+- Inputs with no acceptance envelope still require a durable fence.

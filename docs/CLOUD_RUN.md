@@ -145,9 +145,18 @@ gcloud scheduler jobs create http sanctum-snapshot-sweep \
   --uri "$WORKER_URL/internal/maintenance/snapshot-sweep" \
   --oidc-service-account-email "$SCHEDULER_SA" \
   --oidc-token-audience "$WORKER_URL" --attempt-deadline 300s
+
+gcloud scheduler jobs create http sanctum-upload-sweep \
+  --project "$PROJECT" --location "$REGION" \
+  --schedule '*/5 * * * *' --time-zone Etc/UTC --http-method POST \
+  --uri "$WORKER_URL/internal/maintenance/upload-sweep" \
+  --oidc-service-account-email "$SCHEDULER_SA" \
+  --oidc-token-audience "$WORKER_URL" --attempt-deadline 300s
 ```
 
-The snapshot sweep advances stored cursors for catalog and collection
+The upload sweep reclaims losing input attempts and old unpublished
+extractions. It saves a scan cursor so subsequent calls continue the
+same pass. The snapshot sweep advances stored cursors for catalog and collection
 snapshots and deletes noncurrent generations after reader grace.
 The source sweep advances a durable cursor and reclaims retired source
 bytes in bounded pages. The embedding profile job checks the worker's configured profile and

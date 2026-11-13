@@ -30,6 +30,7 @@ pub(crate) fn router(service: HostedCatalog) -> Router {
             "/internal/maintenance/snapshot-sweep",
             post(sweep_snapshots),
         )
+        .route("/internal/maintenance/upload-sweep", post(sweep_uploads))
         .layer(DefaultBodyLimit::max(4096))
         .with_state(service)
 }
@@ -234,6 +235,21 @@ async fn sweep_snapshots(State(service): State<HostedCatalog>) -> Response {
         .into_response(),
         Err(error) => {
             tracing::warn!(%error, "hosted snapshot sweep will need a retry");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
+}
+
+async fn sweep_uploads(State(service): State<HostedCatalog>) -> Response {
+    match service.sweep_abandoned_uploads().await {
+        Ok(report) => Json(serde_json::json!({
+            "deleted": report.deleted,
+            "failed": report.failed,
+            "more": report.more,
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "abandoned upload sweep will need a retry");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
