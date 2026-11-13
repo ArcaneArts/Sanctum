@@ -64,3 +64,26 @@ operation envelopes when it invokes this executor.
 The executor runs against the filesystem and MinIO in its contract
 tests. It is available as a Rust library while the hosted service
 wires its application commands to the executor.
+
+## Google Cloud Storage adapter
+
+The native adapter uses the GCS JSON API and Application Default
+Credentials. It creates control objects with `ifGenerationMatch=0`
+and replaces them using the returned generation. Full downloads fence
+the media request to the generation from the metadata response. Range
+reads require a 206 response and verify the exact interval and length.
+Bulk transfers use bounded 8 MiB parts in a GCS resumable upload
+session. If a transfer fails, the caller receives the error and can
+start another attempt with a fresh object key. [GCS generation preconditions](https://docs.cloud.google.com/storage/docs/request-preconditions), [resumable uploads](https://docs.cloud.google.com/storage/docs/performing-resumable-uploads).
+
+Run the live contract against an authorized test bucket with ADC that
+can create, read, list, replace, and delete objects. Use a bucket without
+a retention rule that prevents test cleanup.
+
+```sh
+export SANCTUM_GCS_BUCKET=YOUR_TEST_BUCKET
+cargo test --locked -p sanctum-storage-gcs --test live -- --ignored
+```
+
+The regular test suite checks the JSON API contract with a loopback HTTP
+fixture. Live bucket verification remains open.

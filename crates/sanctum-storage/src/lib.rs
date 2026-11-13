@@ -98,7 +98,8 @@ pub trait Storage: Send + Sync {
     /// Read exactly this half-open range without fetching the full object.
     async fn read_range(&self, key: &Key, range: ByteRange) -> Result<Bytes>;
 
-    /// Stream to a fresh unique key owned by the caller. A retry can write the same bytes.
+    /// Stream to a fresh unique key owned by the caller.
+    /// On ambiguous failure, retry with a new key or verify the previous object.
     /// Coordination keys use put_control with a storage-side precondition.
     async fn put_stream(&self, key: &Key, reader: Reader, length: u64) -> Result<Version>;
     async fn put_control(&self, key: &Key, bytes: Bytes, condition: Condition) -> Result<Version>;
