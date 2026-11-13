@@ -747,5 +747,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   the repair, request replay, and retired ID behavior.
 - A generated Python client exercised deletion and replay across a
   MinIO-backed API restart and verified the stored manifest fence.
-- Physical cleanup of deleted collection contents and local collection
-  deletion remain open.
+- Delivered in [PR #47](https://github.com/ArcaneArts/Sanctum/pull/47).
+
+## Hosted collection reclamation
+
+- The hosted manifest records the time it was fenced. After a
+  15-minute grace, the snapshot sweep removes the collection's
+  source, operation, and database objects in bounded pages and
+  leaves its permanent fence. Uploads recheck the catalog after
+  staging and remove their input if deletion won.
+- The integration test verifies a scoped reader within the grace
+  period, resumes across multiple cleanup pages after restart, and
+  queries an already materialized snapshot after object removal.
+- The live MinIO worker route preserved a recently retired snapshot.
+  After advancing the stored deletion timestamp in the test fixture,
+  the worker removed the collection objects and preserved the fence.
+- Local collection deletion remains open.

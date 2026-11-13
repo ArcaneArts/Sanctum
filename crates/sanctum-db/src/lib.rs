@@ -97,6 +97,8 @@ struct Head {
     owner: Option<Owner>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     deleted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deleted_at_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -167,13 +169,17 @@ impl Publication {
         if self
             .read_head(unit)
             .await?
-            .is_some_and(|(head, _)| head.deleted)
+            .is_some_and(|(head, _)| head.deleted_at_ms.is_some())
         {
             return Ok(());
         }
-        let mut lease = self.acquire_existing(unit).await?;
+        let mut lease = self.acquire_unit(unit, false, true).await?;
+        if lease.head.deleted_at_ms.is_some() {
+            return lease.release().await;
+        }
         let mut head = lease.head.clone();
         head.deleted = true;
+        head.deleted_at_ms = Some(unix_ms()?);
         head.owner = None;
         lease.write(head).await
     }
@@ -193,6 +199,7 @@ impl Publication {
                     generation: None,
                     owner: None,
                     deleted: false,
+                    deleted_at_ms: None,
                 },
                 Condition::Create,
             ),
@@ -256,6 +263,23 @@ impl Publication {
         }
         let mut lease = self.acquire_unit(unit, false, true).await?;
         let result = lease.reclaim(grace, cursor).await;
+        let release = lease.release().await;
+        result.and_then(|page| release.map(|()| page))
+    }
+
+    pub async fn reclaim_retired(
+        &self,
+        unit: &Unit,
+        grace: Duration,
+        cursor: Option<&str>,
+    ) -> Result<CleanupPage> {
+        if grace < Duration::from_secs(300) {
+            return Err(Error::Invalid(
+                "collection cleanup requires at least five minutes of grace".into(),
+            ));
+        }
+        let mut lease = self.acquire_unit(unit, false, true).await?;
+        let result = lease.reclaim_retired(grace, cursor).await;
         let release = lease.release().await;
         result.and_then(|page| release.map(|()| page))
     }
@@ -575,6 +599,47 @@ impl Lease {
                 Ok(_) => {}
                 Err(error) => return Err(error),
             }
+        }
+        Ok(CleanupPage {
+            deleted,
+            next_cursor: page.next_cursor,
+        })
+    }
+
+    async fn reclaim_retired(
+        &mut self,
+        grace: Duration,
+        cursor: Option<&str>,
+    ) -> Result<CleanupPage> {
+        let deleted_at = self
+            .head
+            .deleted_at_ms
+            .ok_or_else(|| Error::Conflict("database is not retired".into()))?;
+        if unix_ms()?.saturating_sub(deleted_at) < grace.as_millis() as u64 {
+            return Ok(CleanupPage {
+                deleted: 0,
+                next_cursor: None,
+            });
+        }
+        let page = self
+            .publication
+            .storage
+            .list(Some(&self.unit.prefix), cursor, 128)
+            .await?;
+        let manifest = self.unit.head()?;
+        let mut deleted = 0;
+        for object in page.objects {
+            if object.key == manifest {
+                continue;
+            }
+            self.ensure_live()?;
+            self.publication.storage.delete(&object.key).await?;
+            deleted += 1;
+        }
+        if page.next_cursor.is_none() && self.head.generation.is_some() {
+            let mut head = self.head.clone();
+            head.generation = None;
+            self.write(head).await?;
         }
         Ok(CleanupPage {
             deleted,

@@ -257,6 +257,116 @@ async fn hosted_collection_deletion_recovers_between_catalog_and_collection_comm
 }
 
 #[tokio::test]
+async fn hosted_collection_reclamation_keeps_open_snapshots_and_resumes() {
+    use std::time::{Duration, SystemTime};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(sanctum_storage_fs::FileStorage::open(dir.path()).unwrap());
+    let catalog = || HostedCatalog::new(store.clone(), None, 1024).unwrap();
+    let service = catalog();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    service.create_collection(&scope, None).await.unwrap();
+    let upload = service
+        .stage_upload(
+            scope.clone(),
+            sanctum_service::TextUpload {
+                name: "notes.txt".into(),
+                external: None,
+                replacement: None,
+                retain_original: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    std::io::Write::write_all(&mut upload.reopen().unwrap(), b"published text").unwrap();
+    let accepted = upload.enqueue().await.unwrap();
+    service
+        .register_upload(&scope, accepted.operation)
+        .await
+        .unwrap();
+    service
+        .index_upload(&scope, accepted.operation)
+        .await
+        .unwrap();
+    let target = sanctum_service::DatabaseTarget {
+        tenant: scope.tenant.clone(),
+        collection: Some(scope.collection.clone()),
+    };
+    let session = service.open_database_session(&target).await.unwrap();
+    service.delete_collection(&scope, None).await.unwrap();
+    assert!(matches!(
+        service.ingestion_job(&scope, accepted.operation).await,
+        Err(Error::NotFound(_))
+    ));
+    let downloaded = catalog()
+        .database_session(&target, session.id)
+        .await
+        .unwrap();
+    assert_eq!(downloaded.generation.id, session.snapshot_generation);
+    assert_eq!(service.sweep_hosted_snapshots().await.unwrap().deleted, 0);
+
+    let prefix = Key::parse("default/collections/notes").unwrap();
+    let head = Key::parse(format!("{prefix}/HEAD.json")).unwrap();
+    for index in 0..130 {
+        let key = Key::parse(format!("{prefix}/sources/late-{index:03}")).unwrap();
+        store
+            .put_stream(&key, Box::pin(std::io::Cursor::new(b"x")), 1)
+            .await
+            .unwrap();
+    }
+    let mut record = store.get(&head).await.unwrap();
+    let mut bytes = Vec::new();
+    record.reader.read_to_end(&mut bytes).await.unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value["deleted_at_ms"] = serde_json::json!(
+        (SystemTime::now() - Duration::from_secs(901))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    );
+    store
+        .put_control(
+            &head,
+            serde_json::to_vec(&value).unwrap().into(),
+            Condition::Match(record.object.version),
+        )
+        .await
+        .unwrap();
+    let first = service.sweep_hosted_snapshots().await.unwrap();
+    assert!(first.more && first.deleted > 0);
+    let restarted = catalog();
+    for _ in 0..8 {
+        let report = restarted.sweep_hosted_snapshots().await.unwrap();
+        assert_eq!(report.failed, 0);
+        if !report.more {
+            break;
+        }
+    }
+    let remaining = store.list(Some(&prefix), None, 8).await.unwrap().objects;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].key, head);
+    let result = sanctum_service::database_snapshot::query(
+        downloaded.path(),
+        "SELECT count(*) FROM chunks",
+        Vec::new(),
+        0,
+        1,
+        || false,
+    )
+    .unwrap();
+    assert_eq!(
+        result.rows,
+        vec![vec![sanctum_service::database_snapshot::SqlValue::Integer(
+            1
+        )]]
+    );
+}
+
+#[tokio::test]
 async fn hosted_synchronous_upload_waits_for_worker_and_replays() {
     use std::time::Duration;
 

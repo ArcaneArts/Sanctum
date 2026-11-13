@@ -361,4 +361,8 @@ same deletion after an ambiguous response. If a current writer delays
 the fence, retry the request or let the snapshot sweep finish it from
 the catalog tombstone. Deleted collection IDs remain reserved.
 Existing database inspection handles can read their pinned generation
-until expiry. Physical cleanup of the deleted collection is tracked separately.
+until expiry. The worker waits 15 minutes after the manifest is fenced,
+then removes the retired collection's snapshots, operation objects,
+and source bytes in bounded pages. It retains the small manifest fence.
+An already materialized snapshot remains readable for the life of its
+local reader.
