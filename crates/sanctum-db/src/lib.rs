@@ -12,6 +12,9 @@ use tempfile::{NamedTempFile, TempDir};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
+mod cache;
+pub use cache::SnapshotCache;
+
 const FORMAT: u32 = 1;
 const MAX_BATCH: usize = 64;
 const RECEIPT_RETENTION: Duration = Duration::from_secs(45 * 24 * 3600);

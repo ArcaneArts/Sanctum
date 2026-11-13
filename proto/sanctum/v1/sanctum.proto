@@ -609,4 +609,6 @@ message TextHit {
   string excerpt = 6;
   string content_blake3 = 7;
   optional double score = 8;
+  // The immutable hosted collection snapshot used to resolve this hit.
+  optional string database_generation = 9;
 }

@@ -123,7 +123,7 @@ pub fn list_collections_page(path: &Path, after: Option<&str>, limit: u32) -> Re
         return Ok(Vec::new());
     }
     query_all(
-        &open(path, false)?,
+        &open_read_only(path)?,
         "SELECT id FROM collections WHERE id > ?1 ORDER BY id LIMIT ?2",
         params![after.unwrap_or_default(), limit],
         |row| row.get(0),
@@ -132,7 +132,7 @@ pub fn list_collections_page(path: &Path, after: Option<&str>, limit: u32) -> Re
 
 pub fn require_collection(path: &Path, collection: &str) -> Result<()> {
     if path.try_exists()? {
-        let found = open(path, false)?
+        let found = open_read_only(path)?
             .query_row(
                 "SELECT 1 FROM collections WHERE id = ?1",
                 [collection],
@@ -156,6 +156,10 @@ impl CollectionDb {
         let mut connection = open(path, false)?;
         migrate(&mut connection, COLLECTION_MIGRATIONS)?;
         Ok(Self(connection))
+    }
+
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        open_read_only(path).map(Self)
     }
 
     pub fn imported_sources(&self, namespace: &str, after: &str) -> Result<Vec<String>> {
@@ -393,6 +397,18 @@ impl<T: Deref<Target = Connection>> RevisionWrite<T> {
 
         Ok(())
     }
+}
+
+fn open_read_only(path: &Path) -> Result<Connection> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(database_error)?;
+    connection
+        .busy_timeout(Duration::from_secs(10))
+        .map_err(database_error)?;
+    Ok(connection)
 }
 
 fn open(path: &Path, create: bool) -> Result<Connection> {
