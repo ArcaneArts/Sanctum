@@ -30,7 +30,7 @@ mod worker;
 pub use embedding::{CollectionSearchResult, SearchMode, run_embedding_worker};
 pub use git_import::{GitImportEvent, GitRepository};
 pub use hosted_catalog::HostedCatalog;
-pub use hosted_ingestion::{AcceptedUpload, HostedUpload};
+pub use hosted_ingestion::{HostedJob, HostedJobState, HostedUpload};
 pub use local_import::{ImportEvent, ImportOptions, ImportState};
 pub use sanctum_db_sqlite::embedding::EmbeddingStatus;
 pub use watched_folders::{WatchedFolder, run_watched_folders};

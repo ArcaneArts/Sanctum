@@ -1,8 +1,12 @@
-use std::{io, time::SystemTime};
+use std::{
+    io,
+    time::{Duration, SystemTime},
+};
 
 use sanctum_core::{Error, ExternalSource, Result, Scope};
-use sanctum_db::collection_prefix;
-use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES};
+use sanctum_db::{Command, Unit, collection_prefix};
+use sanctum_db_sqlite::hosted::{Registration, RevisionIntent, Target, register_revision};
+use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES, Version};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
@@ -11,6 +15,8 @@ use uuid::Uuid;
 use crate::{HostedCatalog, TextUpload};
 
 const FORMAT: u8 = 1;
+// Expire unregistered work before the publication executor can reclaim its receipt.
+const REGISTRATION_WINDOW: Duration = Duration::from_secs(30 * 24 * 3600);
 
 pub struct HostedUpload {
     service: HostedCatalog,
@@ -20,7 +26,7 @@ pub struct HostedUpload {
     file: NamedTempFile,
 }
 
-pub struct AcceptedUpload {
+pub struct HostedJob {
     pub operation: Uuid,
     pub source: Option<Uuid>,
     pub revision: Uuid,
@@ -28,12 +34,29 @@ pub struct AcceptedUpload {
     pub external: Option<ExternalSource>,
     pub bytes: u64,
     pub created_at: u64,
+    pub update_sequence: u64,
+    pub state: HostedJobState,
+}
+
+pub enum HostedJobState {
+    Accepted,
+    Registered,
+    Failed { code: String, message: String },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+enum Stage {
+    PendingRegistration,
+    PendingIndexing { registration: Registration },
+    Failed { code: String, message: String },
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Stage {
-    PendingRegistration,
+enum RegistrationOutcome {
+    Registered(Registration),
+    Failed { code: String, message: String },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,6 +70,7 @@ struct Operation {
     blake3: String,
     attempt: Uuid,
     created_at: u64,
+    #[serde(flatten)]
     stage: Stage,
 }
 
@@ -75,12 +99,75 @@ impl HostedCatalog {
         })
     }
 
-    pub async fn ingestion_job(&self, scope: &Scope, operation: Uuid) -> Result<AcceptedUpload> {
+    pub async fn ingestion_job(&self, scope: &Scope, operation: Uuid) -> Result<HostedJob> {
         let prefix = self.operation_prefix(scope, operation)?;
-        self.read_operation(&prefix, operation)
-            .await?
-            .map(Operation::accepted)
-            .ok_or_else(|| Error::NotFound("ingestion operation was not found".into()))
+        let (record, _) = self.require_operation(&prefix, operation).await?;
+        Ok(record.job())
+    }
+
+    /// Registers revision intent and checkpoints the next stage for a durable submission.
+    pub async fn register_upload(&self, scope: &Scope, operation: Uuid) -> Result<HostedJob> {
+        let prefix = self.operation_prefix(scope, operation)?;
+        let (mut record, version) = self.require_operation(&prefix, operation).await?;
+        if !matches!(record.stage, Stage::PendingRegistration) {
+            return Ok(record.job());
+        }
+        let unit = Unit::collection(self.prefix.as_ref(), scope)?;
+        let intent = record.revision_intent()?;
+        let expires_at = record
+            .created_at
+            .saturating_add(REGISTRATION_WINDOW.as_secs());
+        let mut writer = self.publication.acquire(&unit).await?;
+        let result = writer
+            .apply(
+                vec![Command {
+                    operation,
+                    payload: intent,
+                }],
+                move |tx, intent| {
+                    let outcome = if unix_seconds()? >= expires_at {
+                        RegistrationOutcome::Failed {
+                            code: "expired".into(),
+                            message: "registration window expired".into(),
+                        }
+                    } else {
+                        RegistrationOutcome::from_registration(register_revision(tx, intent))?
+                    };
+                    serde_json::to_string(&outcome)
+                        .map_err(|error| Error::Internal(Box::new(error)))
+                },
+            )
+            .await;
+        let released = writer.release().await;
+        let (_, receipts) = result?;
+        released?;
+        let outcome: RegistrationOutcome = serde_json::from_str(&receipts[0].outcome)
+            .map_err(|error| Error::Internal(Box::new(error)))?;
+        record.stage = match outcome {
+            RegistrationOutcome::Registered(registration) => {
+                Stage::PendingIndexing { registration }
+            }
+            RegistrationOutcome::Failed { code, message } => Stage::Failed { code, message },
+        };
+        let envelope = envelope_key(&prefix)?;
+        let body = serde_json::to_vec(&record).map_err(|error| Error::Internal(Box::new(error)))?;
+        match self
+            .storage
+            .put_control(&envelope, body.into(), Condition::Match(version))
+            .await
+        {
+            Ok(_) => Ok(record.job()),
+            Err(Error::Conflict(_)) => {
+                let (current, _) = self.require_operation(&prefix, operation).await?;
+                if matches!(current.stage, Stage::PendingRegistration) {
+                    return Err(Error::Busy(
+                        "ingestion envelope changed during registration".into(),
+                    ));
+                }
+                Ok(current.job())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn operation_prefix(&self, scope: &Scope, operation: Uuid) -> Result<Key> {
@@ -88,7 +175,21 @@ impl HostedCatalog {
         Key::parse(format!("{collection}/operations/{operation}"))
     }
 
-    async fn read_operation(&self, prefix: &Key, operation: Uuid) -> Result<Option<Operation>> {
+    async fn require_operation(
+        &self,
+        prefix: &Key,
+        operation: Uuid,
+    ) -> Result<(Operation, Version)> {
+        self.read_operation(prefix, operation)
+            .await?
+            .ok_or_else(|| Error::NotFound("ingestion operation was not found".into()))
+    }
+
+    async fn read_operation(
+        &self,
+        prefix: &Key,
+        operation: Uuid,
+    ) -> Result<Option<(Operation, Version)>> {
         let key = envelope_key(prefix)?;
         let download = match self.storage.get(&key).await {
             Ok(download) => download,
@@ -114,7 +215,7 @@ impl HostedCatalog {
                 "ingestion envelope identity mismatch".into(),
             ));
         }
-        Ok(Some(record))
+        Ok(Some((record, download.object.version)))
     }
 }
 
@@ -123,7 +224,7 @@ impl HostedUpload {
         Ok(self.file.reopen()?)
     }
 
-    pub async fn enqueue(self) -> Result<AcceptedUpload> {
+    pub async fn enqueue(self) -> Result<HostedJob> {
         let mut input = self.file.reopen()?;
         let (bytes, blake3) = tokio::task::spawn_blocking(move || {
             let mut hash = blake3::Hasher::new();
@@ -152,13 +253,10 @@ impl HostedUpload {
             bytes,
             blake3,
             attempt: Uuid::new_v4(),
-            created_at: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map_err(|error| Error::Internal(Box::new(error)))?
-                .as_secs(),
+            created_at: unix_seconds()?,
             stage: Stage::PendingRegistration,
         };
-        if let Some(saved) = self.service.read_operation(&prefix, self.operation).await? {
+        if let Some((saved, _)) = self.service.read_operation(&prefix, self.operation).await? {
             return saved.replay(&candidate);
         }
         let key = envelope_key(&prefix)?;
@@ -172,9 +270,9 @@ impl HostedUpload {
             .put_control(&key, body.into(), Condition::Create)
             .await
         {
-            Ok(_) => Ok(candidate.accepted()),
+            Ok(_) => Ok(candidate.job()),
             Err(Error::Conflict(_)) => {
-                let saved = self
+                let (saved, _) = self
                     .service
                     .read_operation(&prefix, self.operation)
                     .await?
@@ -203,19 +301,60 @@ impl Operation {
         Key::parse(format!("{prefix}/inputs/{}", self.attempt))
     }
 
-    fn accepted(self) -> AcceptedUpload {
-        AcceptedUpload {
+    fn revision_intent(&self) -> Result<RevisionIntent> {
+        let target = match &self.upload.replacement {
+            Some(replacement) => Target::Replace {
+                source: replacement.source,
+                expected_revision: replacement.expected_revision,
+            },
+            None => Target::Create(
+                self.source
+                    .ok_or_else(|| Error::Internal("creation has no source ID".into()))?,
+            ),
+        };
+        Ok(RevisionIntent {
             operation: self.operation,
-            source: self.source,
+            revision: self.revision,
+            target,
+            external: self.upload.external.clone(),
+        })
+    }
+
+    fn job(self) -> HostedJob {
+        let (state, source, external, update_sequence) = match self.stage {
+            Stage::PendingRegistration => (
+                HostedJobState::Accepted,
+                self.source,
+                self.upload.external,
+                0,
+            ),
+            Stage::PendingIndexing { registration } => (
+                HostedJobState::Registered,
+                Some(registration.source),
+                registration.external,
+                registration.update_sequence,
+            ),
+            Stage::Failed { code, message } => (
+                HostedJobState::Failed { code, message },
+                self.source,
+                self.upload.external,
+                0,
+            ),
+        };
+        HostedJob {
+            operation: self.operation,
+            source,
             revision: self.revision,
             name: self.upload.name,
-            external: self.upload.external,
+            external,
             bytes: self.bytes,
             created_at: self.created_at,
+            update_sequence,
+            state,
         }
     }
 
-    fn replay(self, candidate: &Self) -> Result<AcceptedUpload> {
+    fn replay(self, candidate: &Self) -> Result<HostedJob> {
         if self.upload != candidate.upload
             || self.bytes != candidate.bytes
             || self.blake3 != candidate.blake3
@@ -224,6 +363,29 @@ impl Operation {
                 "request ID already applies to a different upload".into(),
             ));
         }
-        Ok(self.accepted())
+        Ok(self.job())
+    }
+}
+
+fn unix_seconds() -> Result<u64> {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .map_err(|error| Error::Internal(Box::new(error)))
+}
+
+impl RegistrationOutcome {
+    fn from_registration(result: Result<Registration>) -> Result<Self> {
+        let (code, message) = match result {
+            Ok(registration) => return Ok(Self::Registered(registration)),
+            Err(Error::NotFound(message)) => ("not_found", message),
+            Err(Error::StaleRevision(message)) => ("stale_revision", message),
+            Err(Error::Conflict(message)) => ("conflict", message),
+            Err(error) => return Err(error),
+        };
+        Ok(Self::Failed {
+            code: code.into(),
+            message,
+        })
     }
 }

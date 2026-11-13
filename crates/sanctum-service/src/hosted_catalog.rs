@@ -12,7 +12,7 @@ pub struct HostedCatalog {
     pub(crate) storage: Arc<dyn Storage>,
     pub(crate) prefix: Option<Key>,
     pub(crate) max_source_bytes: u64,
-    publication: Publication,
+    pub(crate) publication: Publication,
 }
 
 impl HostedCatalog {

@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 sanctum-api = { path = "../sanctum-api" }
 sanctum-config = { path = "../sanctum-config" }
+sanctum-core = { path = "../sanctum-core" }
 sanctum-embedding-ollama = { path = "../sanctum-embedding-ollama" }
 sanctum-embedding-openai = { path = "../sanctum-embedding-openai" }
 sanctum-embedding-google = { path = "../sanctum-embedding-google" }
@@ -19,6 +20,7 @@ sanctum-storage-gcs = { path = "../sanctum-storage-gcs" }
 sanctum-storage-s3 = { path = "../sanctum-storage-s3" }
 anyhow = { workspace = true }
 axum.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -26,3 +28,4 @@ tokio-util.workspace = true
 tonic = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing = { workspace = true }
+uuid.workspace = true

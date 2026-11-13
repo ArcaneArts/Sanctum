@@ -153,3 +153,30 @@ The `ACCEPTED` status can be queried after restart through `GetIngestionJob`.
 A replacement targeting an external reference has an empty `source_id` until
 registration resolves it. Hosted indexing, repair of abandoned input attempts,
 synchronous `UploadText`, retrieval, and MCP remain open.
+
+### Hosted revision registration
+
+Set `hosted_worker_listen` in `SANCTUM_CONFIG_JSON` to enable the private
+HTTP worker listener. For local testing use `127.0.0.1:47552`. Restrict this
+listener to trusted callers. Deployment identity and automatic task
+delivery are pending.
+
+```sh
+curl --fail-with-body http://127.0.0.1:47552/internal/tasks/register-upload \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant":"default","collection":"notes","operation_id":"OPERATION_UUID"}'
+```
+
+The task applies a revision intent under the collection writer lease. The
+published database contains the resulting update sequence and operation
+receipt. The worker then conditionally advances the envelope. If it stops
+between these steps, redelivery reuses the database receipt and checkpoints
+the same result. Duplicate or conflicting deliveries cannot advance the
+sequence twice for one operation.
+
+After registration, `GetIngestionJob` reports `REGISTERED` and the assigned
+update sequence. Existing revisions stay current until indexing publishes a
+replacement. A stale expected revision or a duplicate external source
+returns a durable failed status. HTTP 204 confirms the outcome was recorded.
+An operation without a recorded registration outcome expires after 30 days.
+A recorded outcome can be replayed while its database receipt is retained.

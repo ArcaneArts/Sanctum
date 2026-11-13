@@ -398,6 +398,204 @@ async fn hosted_submissions_store_exact_bytes_and_replay_after_restart() {
 }
 
 #[tokio::test]
+async fn hosted_registration_replays_after_checkpoint_failure_and_orders_replacements() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        interrupt: AtomicU8::new(0),
+    });
+    let catalog = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let mut server = start(catalog.clone()).await;
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let wire_scope = v1::Scope {
+        tenant: scope.tenant.to_string(),
+        collection: scope.collection.to_string(),
+    };
+    server
+        .client
+        .create_collection(v1::CreateCollectionRequest {
+            scope: Some(wire_scope.clone()),
+            request_id: None,
+        })
+        .await
+        .unwrap();
+    let source = uuid::Uuid::new_v4();
+    let revision = uuid::Uuid::new_v4();
+    let external = v1::ExternalSource {
+        namespace: "editor".into(),
+        id: "known".into(),
+    };
+
+    // A published baseline revision lets both competing intents target the same current revision.
+    let executor =
+        sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(15)).unwrap();
+    let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
+    let mut writer = executor.acquire(&unit).await.unwrap();
+    writer
+        .apply(
+            vec![sanctum_db::Command {
+                operation: uuid::Uuid::new_v4(),
+                payload: (source, revision),
+            }],
+            |tx, (source, revision)| {
+                tx.execute(
+            "INSERT INTO sources (id, name, external_namespace, external_id, current_revision)
+             VALUES (?1, 'baseline.txt', 'editor', 'known', ?2)",
+            [source.to_string(), revision.to_string()],
+        ).map_err(|error| Error::Internal(Box::new(error)))?;
+                tx.execute(
+            "INSERT INTO revisions (source_id, id, content_hash, bytes, chunk_count, chunker)
+             VALUES (?1, ?2, 'baseline', 0, 0, 'utf8-overlap-v1')",
+            [source.to_string(), revision.to_string()],
+        ).map_err(|error| Error::Internal(Box::new(error)))?;
+                Ok("baseline".into())
+            },
+        )
+        .await
+        .unwrap();
+    writer.release().await.unwrap();
+
+    let header = v1::UploadTextHeader {
+        scope: Some(wire_scope.clone()),
+        name: "replacement.txt".into(),
+        external: Some(external.clone()),
+        replacement: Some(v1::Replacement {
+            source_id: None,
+            expected_revision_id: Some(revision.to_string()),
+        }),
+        ..Default::default()
+    };
+    let data = [b"replacement".as_slice()];
+    let first = server
+        .client
+        .submit_text(upload_frames(&header, data))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(first.source_id.is_empty());
+    let first_id = first.operation_id.parse().unwrap();
+    storage.interrupt.store(1, Ordering::Relaxed);
+    assert!(matches!(
+        catalog.register_upload(&scope, first_id).await,
+        Err(Error::Busy(_))
+    ));
+    assert!(executor.receipt(&unit, first_id).await.unwrap().is_some());
+    let first_snapshot = executor.generation(&unit).await.unwrap();
+    server.stop().await;
+
+    let mut server = start(catalog.clone()).await;
+    let request = v1::IngestionJobRequest {
+        scope: Some(wire_scope.clone()),
+        operation_id: first.operation_id,
+    };
+    assert_eq!(
+        server
+            .client
+            .get_ingestion_job(request.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .state(),
+        v1::IngestionState::Accepted
+    );
+    assert_eq!(
+        catalog
+            .register_upload(&scope, first_id)
+            .await
+            .unwrap()
+            .update_sequence,
+        1
+    );
+    assert_eq!(executor.generation(&unit).await.unwrap(), first_snapshot);
+    let registered = server
+        .client
+        .get_ingestion_job(request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(registered.state(), v1::IngestionState::Registered);
+    assert_eq!(registered.source_id, source.to_string());
+    assert_eq!(registered.external, Some(external));
+    assert_eq!(registered.update_sequence, 1);
+    assert!(registered.text_revision.is_none());
+
+    let second = server
+        .client
+        .submit_text(upload_frames(&header, data))
+        .await
+        .unwrap()
+        .into_inner();
+    let second_id = second.operation_id.parse().unwrap();
+    assert_eq!(
+        catalog
+            .register_upload(&scope, second_id)
+            .await
+            .unwrap()
+            .update_sequence,
+        2
+    );
+    assert_eq!(
+        catalog
+            .register_upload(&scope, first_id)
+            .await
+            .unwrap()
+            .update_sequence,
+        1
+    );
+    let stale = v1::UploadTextHeader {
+        replacement: Some(v1::Replacement {
+            source_id: Some(source.to_string()),
+            expected_revision_id: Some(uuid::Uuid::new_v4().to_string()),
+        }),
+        ..header.clone()
+    };
+    let stale = server
+        .client
+        .submit_text(upload_frames(&stale, data))
+        .await
+        .unwrap()
+        .into_inner();
+    catalog
+        .register_upload(&scope, stale.operation_id.parse().unwrap())
+        .await
+        .unwrap();
+    let stale = server
+        .client
+        .get_ingestion_job(v1::IngestionJobRequest {
+            scope: Some(wire_scope),
+            operation_id: stale.operation_id,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(stale.state(), v1::IngestionState::Failed);
+    assert_eq!(stale.error_code.as_deref(), Some("stale_revision"));
+    assert_eq!(stale.update_sequence, 0);
+
+    let scratch = tempfile::tempdir().unwrap();
+    let generation = executor.read(&unit, scratch.path()).await.unwrap().unwrap();
+    let database = rusqlite::Connection::open(generation.path()).unwrap();
+    let latest: (String, String, i64) = database.query_row(
+        "SELECT operation_id, revision_id, update_sequence FROM hosted_revision_intents WHERE source_id = ?1",
+        [source.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(latest, (second.operation_id, second.revision_id, 2));
+    let current: String = database
+        .query_row(
+            "SELECT current_revision FROM sources WHERE id = ?1",
+            [source.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(current, revision.to_string());
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_submissions_recover_from_interrupted_acceptance() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance {
