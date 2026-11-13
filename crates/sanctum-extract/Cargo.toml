@@ -1,0 +1,9 @@
+[package]
+name = "sanctum-extract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+encoding_rs.workspace = true
+sanctum-core = { path = "../sanctum-core" }

@@ -68,6 +68,7 @@ fn header(tenant: &str) -> v1::UploadTextFrame {
                 id: "entry:42".into(),
             }),
             replacement: None,
+            retain_original: false,
         })),
     }
 }
@@ -835,6 +836,7 @@ async fn directory_import_tracks_edits_duplicates_and_removed_paths() {
         include: vec!["**/*.md".into()],
         exclude: vec!["private.md".into()],
         prune_missing: false,
+        retain_original: false,
     };
     running
         .client
@@ -976,4 +978,167 @@ async fn import(
         events.push(event);
     }
     events
+}
+
+#[tokio::test]
+async fn rtf_upload_indexes_canonical_bytes_and_honors_original_retention() {
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    let rtf = br"{\rtf1\ansi\ansicpg1252{\fonttbl HiddenGarnet;}Caf\'e9\par Beryl \u28450?}";
+    let canonical = "Café\nBeryl 漢";
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: true })
+        .await
+        .unwrap();
+    let job = running
+        .client
+        .submit_text(tokio_stream::iter([
+            rtf_header(false, "rtf-discard"),
+            data(rtf),
+            end(),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    let text = text_path(&dir, &job.source_id, &job.revision_id);
+    let original = text.with_file_name("original");
+    assert_eq!(std::fs::read(&original).unwrap(), rtf);
+    assert!(!text.exists());
+    running.stop().await;
+
+    let mut running = Running::start(&dir).await;
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: false })
+        .await
+        .unwrap();
+    let request = job_request(job.operation_id.clone());
+    let ready = await_ready(&mut running.client, request.clone()).await;
+    let info = ready.text_revision.unwrap();
+    assert_eq!(info.bytes, canonical.len() as u64);
+    assert_ne!(info.content_blake3, info.original_blake3);
+    assert_eq!(info.source_encoding, "windows-1252");
+    assert_eq!(info.extractor.as_deref(), Some("rtf-text-v1"));
+    assert_eq!(std::fs::read_to_string(&text).unwrap(), canonical);
+    assert!(!original.exists());
+    assert!(
+        search(&mut running.client, "default", "HiddenGarnet")
+            .await
+            .is_empty()
+    );
+    let hit = search(&mut running.client, "default", "beryl")
+        .await
+        .remove(0);
+    assert_eq!(
+        hit.excerpt,
+        canonical[hit.start_byte as usize..hit.end_byte as usize]
+    );
+
+    let retained = upload(&mut running.client, rtf_header(true, "rtf-retain"), rtf).await;
+    assert!(retained.retain_original);
+    assert_eq!(
+        std::fs::read(
+            text_path(&dir, &retained.source_id, &retained.revision_id).with_file_name("original")
+        )
+        .unwrap(),
+        rtf
+    );
+    running.stop().await;
+
+    // Recover a collection commit after original cleanup and before its queue receipt.
+    let runtime = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
+    runtime
+        .execute(
+            "UPDATE ingestion_jobs SET status = 'publishing', chunks = NULL, content_hash = NULL,
+            canonical_bytes = NULL, original_hash = NULL, source_encoding = NULL
+         WHERE operation_id = ?1",
+            [&job.operation_id],
+        )
+        .unwrap();
+    drop(runtime);
+    let mut running = Running::start(&dir).await;
+    assert_eq!(
+        await_ready(&mut running.client, request)
+            .await
+            .text_revision
+            .unwrap(),
+        info
+    );
+    let malformed = running
+        .client
+        .upload_text(tokio_stream::iter([
+            rtf_header(false, "rtf-malformed"),
+            data(br"{\rtf1 partial spinel"),
+            end(),
+        ]))
+        .await
+        .unwrap_err();
+    assert_eq!(malformed.code(), Code::InvalidArgument);
+    assert!(
+        search(&mut running.client, "default", "spinel")
+            .await
+            .is_empty()
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn rtf_directory_import_compares_original_digest_and_retention_policy() {
+    let dir = TempDir::new().unwrap();
+    let input = TempDir::new().unwrap();
+    std::fs::write(
+        input.path().join("specimen.RTF"),
+        br"{\rtf1 zircon specimen}",
+    )
+    .unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    let mut request = v1::ImportLocalRequest {
+        scope: scope("default"),
+        path: input.path().to_str().unwrap().into(),
+        ..Default::default()
+    };
+    let imported = import(&mut running.client, request.clone()).await.remove(0);
+    await_ready(
+        &mut running.client,
+        job_request(imported.operation_id.unwrap()),
+    )
+    .await;
+    let repeated = import(&mut running.client, request.clone()).await.remove(0);
+    assert_eq!(repeated.state(), v1::ImportState::Unchanged);
+
+    request.retain_original = true;
+    let changed = import(&mut running.client, request).await.remove(0);
+    assert_eq!(changed.state(), v1::ImportState::Queued);
+    assert_eq!(changed.source_id, imported.source_id);
+    let revision = await_ready(
+        &mut running.client,
+        job_request(changed.operation_id.unwrap()),
+    )
+    .await
+    .text_revision
+    .unwrap();
+    assert!(revision.retain_original);
+    assert!(
+        text_path(&dir, &revision.source_id, &revision.revision_id)
+            .with_file_name("original")
+            .is_file()
+    );
+    assert_eq!(
+        search(&mut running.client, "default", "zircon").await.len(),
+        1
+    );
+    running.stop().await;
+}
+
+fn rtf_header(retain_original: bool, external_id: &str) -> v1::UploadTextFrame {
+    let mut request = header("default");
+    if let Some(Frame::Header(header)) = &mut request.frame {
+        header.name = "sample.rtf".into();
+        header.external.as_mut().unwrap().id = external_id.into();
+        header.retain_original = retain_original;
+    }
+    request
 }

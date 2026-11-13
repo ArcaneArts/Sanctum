@@ -15,7 +15,7 @@ SANCTUM_CONFIG_JSON='{"version":1,"storage_root":"./local-data"}' \
 1 GiB. This local service trusts callers. Keep it on loopback for local use.
 `local_worker_concurrency` defaults to one and accepts 1 to 32 workers.
 
-In another terminal, create a collection, upload a UTF-8 file, and search:
+In another terminal, create a collection, upload a UTF-8 or RTF file, and search:
 
 ```sh
 cargo run --locked -p sanctum-cli -- create notes
@@ -37,6 +37,25 @@ initial version, retrying an upload with the same external namespace and ID
 returns `ALREADY_EXISTS`. `UploadText` waits up to 30 seconds for lexical publication.
 If its wait expires, the response message contains the operation ID. The
 accepted work can continue after the client disconnects.
+
+A source name ending in `.rtf` selects streaming RTF text extraction. Uploads
+and directory imports use text-only retention by default. Set
+`retain_original` in the request or pass `--retain-original` to keep the
+uploaded RTF alongside the searchable text.
+
+```sh
+cargo run --locked -p sanctum-cli -- upload notes report.rtf --retain-original
+```
+
+An RTF revision reports the original and canonical BLAKE3 digests, the
+document's declared code page, and the extractor version. `TextRevision.bytes`
+and search offsets refer to canonical UTF-8. Job progress counts input bytes.
+For UTF-8 sources, the original and canonical bytes share a single file.
+
+The extractor indexes text and common paragraph, line, and table separators.
+It skips formatting destinations, image and object data, and field
+instructions. It supports Unicode escapes and common ANSI code pages.
+Malformed input and unsupported declared code pages fail the ingestion job.
 
 To replace a source, submit an upload with a `Replacement` target. Provide
 either its Sanctum source ID or its external namespace and ID. An optional
@@ -93,9 +112,9 @@ cargo run --locked -p sanctum-cli -- import notes ./library \
 ```
 
 Include and exclude globs match paths relative to the import root. Without
-include patterns, the importer selects common UTF-8 text, code, and
+include patterns, the importer selects RTF and common UTF-8 text, code, and
 configuration files. Directory traversal skips symbolic links, `.git`,
-`node_modules`, and the managed storage directory. RTF support is pending.
+`node_modules`, and the managed storage directory.
 
 A file's import identity combines the canonical import root with its
 relative path. Repeating an import reuses a pending operation or skips an

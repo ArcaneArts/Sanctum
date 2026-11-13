@@ -28,6 +28,7 @@ enum IngestionState {
   INGESTION_STATE_TEXT_READY = 4;
   INGESTION_STATE_FAILED = 5;
   INGESTION_STATE_CANCELED = 6;
+  INGESTION_STATE_EXTRACTING = 7;
 }
 
 message IngestionJobRequest {
@@ -91,6 +92,8 @@ message UploadTextHeader {
   string name = 2;
   ExternalSource external = 3;
   Replacement replacement = 4;
+  // Retain the original after extraction. UTF-8 input shares its canonical file.
+  bool retain_original = 5;
 }
 
 message Replacement {
@@ -117,6 +120,7 @@ message ImportLocalRequest {
   repeated string include = 3;
   repeated string exclude = 4;
   bool prune_missing = 5;
+  bool retain_original = 6;
 }
 
 enum ImportState {
@@ -159,6 +163,10 @@ message TextRevision {
   uint64 bytes = 6;
   uint64 chunks = 7;
   string content_blake3 = 8;
+  string original_blake3 = 9;
+  string source_encoding = 10;
+  optional string extractor = 11;
+  bool retain_original = 12;
 }
 
 message SearchTextRequest {

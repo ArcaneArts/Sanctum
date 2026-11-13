@@ -57,6 +57,13 @@ pub struct Job {
     pub replacement: bool,
     pub update_sequence: u64,
     pub import_hash: Option<String>,
+    pub extract_rtf: bool,
+    pub retain_original: bool,
+    pub extracting: bool,
+    pub canonical_bytes: Option<u64>,
+    pub original_hash: Option<String>,
+    pub source_encoding: Option<String>,
+    pub extractor: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -65,7 +72,8 @@ pub struct LocalQueue(PathBuf);
 const COLUMNS: &str = "operation_id, tenant, collection, source_id, revision_id,
     name, external_namespace, external_id, total_bytes, processed_bytes,
     attempts, status, error_code, error_message, content_hash, chunks,
-    replacement, update_sequence, import_hash";
+    replacement, update_sequence, import_hash, extract_rtf, retain_original, extracting,
+    canonical_bytes, original_hash, source_encoding, extractor";
 
 impl LocalQueue {
     /// The caller holds the storage owner's exclusive lock for this queue.
@@ -77,6 +85,7 @@ impl LocalQueue {
                 include_str!("runtime.sql"),
                 include_str!("runtime_v2.sql"),
                 include_str!("runtime_v3.sql"),
+                include_str!("runtime_v4.sql"),
             ],
         )?;
         connection
@@ -117,8 +126,8 @@ impl LocalQueue {
             .execute(
                 "INSERT INTO ingestion_jobs (operation_id, tenant, collection, source_id,
                 revision_id, name, external_namespace, external_id, total_bytes,
-                replacement, update_sequence, import_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                replacement, update_sequence, import_hash, extract_rtf, retain_original)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     job.id.to_string(),
                     job.scope.tenant.as_str(),
@@ -132,6 +141,8 @@ impl LocalQueue {
                     job.replacement,
                     sql_integer(job.update_sequence)?,
                     job.import_hash,
+                    job.extract_rtf,
+                    job.retain_original,
                 ],
             )
             .map_err(database_error)?;
@@ -260,7 +271,7 @@ impl LocalQueue {
     pub fn claim(&self) -> Result<Option<Job>> {
         self.connect()?.query_row(
             &format!("UPDATE ingestion_jobs
-                SET status = 'indexing', attempts = attempts + 1, processed_bytes = 0
+                SET status = 'indexing', attempts = attempts + 1, processed_bytes = 0, extracting = extract_rtf
                 WHERE operation_id = (
                     SELECT operation_id FROM ingestion_jobs
                     WHERE status = 'accepted' AND (SELECT paused = 0 FROM executor_settings WHERE id = 1)
@@ -283,6 +294,18 @@ impl LocalQueue {
         Ok(changed == 1)
     }
 
+    pub fn extracted(&self, id: Uuid) -> Result<bool> {
+        let updated = self
+            .connect()?
+            .execute(
+                "UPDATE ingestion_jobs SET extracting = 0, processed_bytes = total_bytes
+             WHERE operation_id = ?1 AND status = 'indexing' AND cancel_requested = 0",
+                [id.to_string()],
+            )
+            .map_err(database_error)?;
+        Ok(updated == 1)
+    }
+
     /// This transition is the point after which cancellation cannot win.
     pub fn begin_publish(&self, id: Uuid) -> Result<bool> {
         let changed = self
@@ -301,10 +324,19 @@ impl LocalQueue {
         self.connect()?
             .execute(
                 "UPDATE ingestion_jobs
-             SET status = 'text_ready', content_hash = ?2, chunks = ?3,
+             SET status = 'text_ready', content_hash = ?2, chunks = ?3, extracting = 0,
+                 canonical_bytes = ?4, original_hash = ?5, source_encoding = ?6, extractor = ?7,
                  processed_bytes = total_bytes, error_code = NULL, error_message = NULL
              WHERE operation_id = ?1 AND status IN ('indexing', 'publishing')",
-                params![id.to_string(), revision.hash, sql_integer(revision.chunks)?],
+                params![
+                    id.to_string(),
+                    revision.content.hash,
+                    sql_integer(revision.content.chunks)?,
+                    sql_integer(revision.content.bytes)?,
+                    revision.content.original_hash,
+                    revision.content.encoding,
+                    revision.content.extractor
+                ],
             )
             .map_err(database_error)?;
         Ok(())
@@ -445,6 +477,13 @@ fn map_job(row: &Row<'_>) -> rusqlite::Result<Job> {
         replacement: row.get(16)?,
         update_sequence: unsigned_column(row, 17)?,
         import_hash: row.get(18)?,
+        extract_rtf: row.get(19)?,
+        retain_original: row.get(20)?,
+        extracting: row.get(21)?,
+        canonical_bytes: row.get::<_, Option<i64>>(22)?.map(|n| n as u64),
+        original_hash: row.get(23)?,
+        source_encoding: row.get(24)?,
+        extractor: row.get(25)?,
     })
 }
 

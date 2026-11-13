@@ -12,7 +12,11 @@ pub use lifecycle::{RevisionKey, SourceIdentity};
 
 const CATALOG_SCHEMA: &str = include_str!("catalog.sql");
 const COLLECTION_SCHEMA: &str = include_str!("collection.sql");
-const COLLECTION_MIGRATIONS: &[&str] = &[COLLECTION_SCHEMA, include_str!("collection_v2.sql")];
+const COLLECTION_MIGRATIONS: &[&str] = &[
+    COLLECTION_SCHEMA,
+    include_str!("collection_v2.sql"),
+    include_str!("collection_v3.sql"),
+];
 
 #[derive(Debug)]
 pub struct Revision {
@@ -20,9 +24,18 @@ pub struct Revision {
     pub revision: Uuid,
     pub name: String,
     pub external: Option<ExternalSource>,
+    pub content: RevisionContent,
+}
+
+#[derive(Debug)]
+pub struct RevisionContent {
     pub bytes: u64,
     pub chunks: u64,
     pub hash: String,
+    pub original_hash: String,
+    pub encoding: String,
+    pub extractor: Option<String>,
+    pub retain_original: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -116,12 +129,28 @@ impl CollectionDb {
         )
     }
 
-    pub fn revision_summary(&self, source: Uuid, revision: Uuid) -> Result<Option<(String, u64)>> {
+    pub fn revision_summary(
+        &self,
+        source: Uuid,
+        revision: Uuid,
+    ) -> Result<Option<RevisionContent>> {
         self.0
             .query_row(
-                "SELECT content_hash, chunk_count FROM revisions WHERE source_id = ?1 AND id = ?2",
+                "SELECT content_hash, chunk_count, bytes, COALESCE(original_hash, content_hash),
+                    source_encoding, extractor, retain_original
+                 FROM revisions WHERE source_id = ?1 AND id = ?2",
                 params![source.to_string(), revision.to_string()],
-                |row| Ok((row.get(0)?, unsigned_column(row, 1)?)),
+                |row| {
+                    Ok(RevisionContent {
+                        hash: row.get(0)?,
+                        chunks: unsigned_column(row, 1)?,
+                        bytes: unsigned_column(row, 2)?,
+                        original_hash: row.get(3)?,
+                        encoding: row.get(4)?,
+                        extractor: row.get(5)?,
+                        retain_original: row.get(6)?,
+                    })
+                },
             )
             .optional()
             .map_err(database_error)
@@ -223,14 +252,19 @@ impl RevisionWriter<'_> {
         }
         self.0
             .execute(
-                "INSERT INTO revisions (source_id, id, content_hash, bytes, chunk_count, chunker)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'utf8-overlap-v1')",
+                "INSERT INTO revisions (source_id, id, content_hash, bytes, chunk_count, chunker,
+                    original_hash, source_encoding, extractor, retain_original)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'utf8-overlap-v1', ?6, ?7, ?8, ?9)",
                 params![
                     data.source.to_string(),
                     data.revision.to_string(),
-                    data.hash,
-                    sql_integer(data.bytes)?,
-                    sql_integer(data.chunks)?
+                    data.content.hash,
+                    sql_integer(data.content.bytes)?,
+                    sql_integer(data.content.chunks)?,
+                    data.content.original_hash,
+                    data.content.encoding,
+                    data.content.extractor,
+                    data.content.retain_original
                 ],
             )
             .map_err(database_error)?;

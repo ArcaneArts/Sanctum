@@ -5,7 +5,7 @@ use std::{
 
 use sanctum_core::{Error, ExternalSource, Result, Scope, ScopeId};
 use sanctum_db_sqlite::{self as db, CollectionDb};
-pub use sanctum_db_sqlite::{Chunk, ChunkRef, Revision};
+pub use sanctum_db_sqlite::{Chunk, ChunkRef, Revision, RevisionContent};
 use sanctum_storage_fs::LocalFiles;
 use tempfile::NamedTempFile;
 use uuid::Uuid;
@@ -32,6 +32,7 @@ pub struct TextUpload {
     pub name: String,
     pub external: Option<ExternalSource>,
     pub replacement: Option<Replacement>,
+    pub retain_original: bool,
 }
 
 pub struct Replacement {

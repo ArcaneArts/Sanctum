@@ -103,11 +103,8 @@ impl LocalFiles {
     pub fn discard_text(&self, scope: &Scope, source: Uuid, revision: Uuid) -> Result<()> {
         let text = self.text_path(scope, source, revision);
         let parent = text.parent().expect("text path has a revision directory");
-        match fs::remove_file(&text) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        remove_file_if_present(&text)?;
+        remove_file_if_present(&parent.join("original"))?;
         match fs::remove_dir(parent) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -139,13 +136,60 @@ impl LocalFiles {
         revision: Uuid,
         staged: NamedTempFile,
     ) -> Result<()> {
-        let path = self.text_path(scope, source, revision);
+        self.publish_file(self.text_path(scope, source, revision), staged, false)
+    }
+
+    pub fn publish_original(
+        &self,
+        scope: &Scope,
+        source: Uuid,
+        revision: Uuid,
+        staged: NamedTempFile,
+    ) -> Result<()> {
+        self.publish_file(
+            self.text_path(scope, source, revision)
+                .with_file_name("original"),
+            staged,
+            false,
+        )
+    }
+
+    pub fn publish_extracted(
+        &self,
+        scope: &Scope,
+        source: Uuid,
+        revision: Uuid,
+        staged: NamedTempFile,
+    ) -> Result<()> {
+        self.publish_file(self.text_path(scope, source, revision), staged, true)
+    }
+
+    pub fn open_original(&self, scope: &Scope, source: Uuid, revision: Uuid) -> Result<File> {
+        Ok(File::open(
+            self.text_path(scope, source, revision)
+                .with_file_name("original"),
+        )?)
+    }
+
+    pub fn discard_original(&self, scope: &Scope, source: Uuid, revision: Uuid) -> Result<()> {
+        remove_file_if_present(
+            &self
+                .text_path(scope, source, revision)
+                .with_file_name("original"),
+        )
+    }
+
+    fn publish_file(&self, path: PathBuf, staged: NamedTempFile, replace: bool) -> Result<()> {
         let parent = path.parent().expect("text path has a revision directory");
         fs::create_dir_all(parent)?;
         staged.as_file().sync_all()?;
-        staged
-            .persist_noclobber(&path)
-            .map_err(|error| error.error)?;
+        if replace {
+            staged.persist(&path).map_err(|error| error.error)?;
+        } else {
+            staged
+                .persist_noclobber(&path)
+                .map_err(|error| error.error)?;
+        }
         sync_dirs(parent, &self.root)?;
         Ok(())
     }
@@ -180,6 +224,14 @@ impl LocalFiles {
             .join(source.to_string())
             .join(revision.to_string())
             .join("text.utf8")
+    }
+}
+
+fn remove_file_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
