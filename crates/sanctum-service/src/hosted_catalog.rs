@@ -64,6 +64,9 @@ impl HostedCatalog {
             return collection_outcome(scope, &outcome);
         }
 
+        if self.collection_retired(scope).await? {
+            return Err(Error::Conflict("collection ID was retired".into()));
+        }
         let initialize = Unit::collection(self.prefix.as_ref(), scope)?;
         // A previous attempt can have published the collection before catalog activation.
         if self.publication.generation(&initialize).await?.is_none() {
@@ -105,6 +108,56 @@ impl HostedCatalog {
         let (_, receipts) = result?;
         release?;
         collection_outcome(scope, &receipts[0].outcome)
+    }
+
+    pub async fn delete_collection(&self, scope: &Scope, request_id: Option<Uuid>) -> Result<()> {
+        if request_id.is_some_and(|id| id.is_nil()) {
+            return Err(Error::Invalid("request ID must be a nonzero UUID".into()));
+        }
+        let catalog = Unit::catalog(self.prefix.as_ref(), &scope.tenant)?;
+        let collection = scope.collection.to_string();
+        let unit = Unit::collection(self.prefix.as_ref(), scope)?;
+        if let Some(operation) = request_id
+            && let Some(saved) = self
+                .publication
+                .stage_receipt(&catalog, operation, "delete-collection")
+                .await?
+        {
+            deletion_outcome(&collection, &saved)?;
+            return self.publication.fence_deletion(&unit).await;
+        }
+        let mut writer = self.publication.acquire_existing(&catalog).await?;
+        let result = writer
+            .apply_stage(
+                "delete-collection",
+                vec![Command {
+                    operation: request_id.unwrap_or_else(Uuid::new_v4),
+                    payload: collection.clone(),
+                }],
+                |tx, collection| {
+                    db::initialize_catalog(tx)?;
+                    db::delete_catalog_collection(tx, &collection)?;
+                    Ok(collection)
+                },
+            )
+            .await;
+        let release = writer.release().await;
+        let (_, receipts) = result?;
+        release?;
+        deletion_outcome(&collection, &receipts[0].outcome)?;
+        self.publication.fence_deletion(&unit).await
+    }
+
+    pub(crate) async fn collection_retired(&self, scope: &Scope) -> Result<bool> {
+        match self
+            .with_catalog(scope, |path, collection| {
+                db::catalog_collection_deleted(path, &collection)
+            })
+            .await
+        {
+            Err(Error::NotFound(_)) => Ok(false),
+            result => result,
+        }
     }
 
     pub async fn list_collections(
@@ -178,6 +231,16 @@ fn collection_outcome(scope: &Scope, outcome: &str) -> Result<()> {
     } else {
         Err(Error::Conflict(
             "request ID already applies to a different collection".into(),
+        ))
+    }
+}
+
+fn deletion_outcome(collection: &str, saved: &str) -> Result<()> {
+    if collection == saved {
+        Ok(())
+    } else {
+        Err(Error::Conflict(
+            "request ID already applies to a different collection deletion".into(),
         ))
     }
 }

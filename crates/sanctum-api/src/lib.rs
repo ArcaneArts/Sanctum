@@ -462,6 +462,27 @@ impl Sanctum for Grpc {
         }))
     }
 
+    async fn delete_collection(
+        &self,
+        request: Request<v1::DeleteCollectionRequest>,
+    ) -> Reply<v1::Empty> {
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        let operation = parse_optional_id(request.request_id, "request ID must be a UUID")?;
+        match &self.0 {
+            Backend::Hosted(catalog) => catalog
+                .delete_collection(&scope, operation)
+                .await
+                .map_err(status)?,
+            Backend::Local(_) => {
+                return Err(Status::unimplemented(
+                    "collection deletion currently requires hosted storage",
+                ));
+            }
+        }
+        Ok(Response::new(v1::Empty {}))
+    }
+
     async fn list_collections(
         &self,
         request: Request<v1::ListCollectionsRequest>,

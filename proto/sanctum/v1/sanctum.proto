@@ -4,6 +4,7 @@ package sanctum.v1;
 
 service Sanctum {
   rpc CreateCollection(CreateCollectionRequest) returns (Collection);
+  rpc DeleteCollection(DeleteCollectionRequest) returns (Empty);
   rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
   rpc UploadText(stream UploadTextFrame) returns (TextRevision);
   rpc SubmitText(stream UploadTextFrame) returns (IngestionJob);
@@ -294,6 +295,11 @@ message Scope {
 message CreateCollectionRequest {
   Scope scope = 1;
   // Hosted storage replays a matching request ID after an ambiguous failure.
+  optional string request_id = 2;
+}
+
+message DeleteCollectionRequest {
+  Scope scope = 1;
   optional string request_id = 2;
 }
 

@@ -733,3 +733,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - The live MinIO smoke seeded a fence, replaced it using the server's
   ETag precondition, replayed the accepted request, and indexed it
   through the worker.
+- Delivered in [PR #46](https://github.com/ArcaneArts/Sanctum/pull/46).
+
+## Hosted collection tombstones
+
+- `DeleteCollection` removes the collection from the tenant catalog
+  and fences its manifest. The scheduled snapshot sweep reconciles
+  a tombstone left before the collection fence. The tenant catalog
+  reserves deleted IDs to prevent old tasks from reaching a new collection
+  with the same scope.
+- The gRPC integration test holds the collection lease to interrupt
+  deletion between the two commits, restarts the service, and checks
+  the repair, request replay, and retired ID behavior.
+- A generated Python client exercised deletion and replay across a
+  MinIO-backed API restart and verified the stored manifest fence.
+- Physical cleanup of deleted collection contents and local collection
+  deletion remain open.

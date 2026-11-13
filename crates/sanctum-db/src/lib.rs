@@ -95,6 +95,8 @@ struct Head {
     update: Uuid,
     generation: Option<Generation>,
     owner: Option<Owner>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    deleted: bool,
 }
 
 #[derive(Clone)]
@@ -154,14 +156,29 @@ impl Publication {
     }
 
     pub async fn acquire(&self, unit: &Unit) -> Result<Lease> {
-        self.acquire_unit(unit, true).await
+        self.acquire_unit(unit, true, false).await
     }
 
     pub async fn acquire_existing(&self, unit: &Unit) -> Result<Lease> {
-        self.acquire_unit(unit, false).await
+        self.acquire_unit(unit, false, false).await
     }
 
-    async fn acquire_unit(&self, unit: &Unit, create: bool) -> Result<Lease> {
+    pub async fn fence_deletion(&self, unit: &Unit) -> Result<()> {
+        if self
+            .read_head(unit)
+            .await?
+            .is_some_and(|(head, _)| head.deleted)
+        {
+            return Ok(());
+        }
+        let mut lease = self.acquire_existing(unit).await?;
+        let mut head = lease.head.clone();
+        head.deleted = true;
+        head.owner = None;
+        lease.write(head).await
+    }
+
+    async fn acquire_unit(&self, unit: &Unit, create: bool, allow_deleted: bool) -> Result<Lease> {
         let key = unit.head()?;
         let (mut head, condition) = match self.read_head(unit).await? {
             Some((head, version)) => (head, Condition::Match(version)),
@@ -175,10 +192,14 @@ impl Publication {
                     update: Uuid::nil(),
                     generation: None,
                     owner: None,
+                    deleted: false,
                 },
                 Condition::Create,
             ),
         };
+        if head.deleted && !allow_deleted {
+            return Err(Error::NotFound("database unit was deleted".into()));
+        }
         let now = unix_ms()?;
         if head
             .owner
@@ -233,7 +254,7 @@ impl Publication {
                 "snapshot cleanup requires at least five minutes of grace".into(),
             ));
         }
-        let mut lease = self.acquire_existing(unit).await?;
+        let mut lease = self.acquire_unit(unit, false, true).await?;
         let result = lease.reclaim(grace, cursor).await;
         let release = lease.release().await;
         result.and_then(|page| release.map(|()| page))
@@ -279,19 +300,19 @@ impl Publication {
         Ok(self
             .read_head(unit)
             .await?
-            .and_then(|(head, _)| head.generation))
+            .and_then(|(head, _)| if head.deleted { None } else { head.generation }))
     }
 
     pub async fn read(&self, unit: &Unit, directory: &Path) -> Result<Option<Materialized>> {
         let Some((head, _)) = self.read_head(unit).await? else {
             return Ok(None);
         };
-        match head.generation {
-            Some(generation) => self
+        match (head.deleted, head.generation) {
+            (false, Some(generation)) => self
                 .materialize(unit, generation, directory)
                 .await
                 .map(Some),
-            None => Ok(None),
+            _ => Ok(None),
         }
     }
 

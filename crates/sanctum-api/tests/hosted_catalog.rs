@@ -168,6 +168,95 @@ async fn hosted_catalog_recovers_across_server_restart_and_stays_in_scope() {
 }
 
 #[tokio::test]
+async fn hosted_collection_deletion_recovers_between_catalog_and_collection_commits() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(sanctum_storage_fs::FileStorage::open(dir.path()).unwrap());
+    let catalog = || HostedCatalog::new(store.clone(), None, 1024).unwrap();
+    let mut api = start(catalog()).await;
+    let scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    api.client
+        .create_collection(v1::CreateCollectionRequest {
+            scope: Some(scope.clone()),
+            request_id: None,
+        })
+        .await
+        .unwrap();
+    let core_scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let unit = sanctum_db::Unit::collection(None, &core_scope).unwrap();
+    let executor = sanctum_db::Publication::new(store.clone(), Duration::from_secs(30)).unwrap();
+    let lease = executor.acquire(&unit).await.unwrap();
+
+    let request = v1::DeleteCollectionRequest {
+        scope: Some(scope.clone()),
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+    };
+    assert_eq!(
+        api.client
+            .delete_collection(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable
+    );
+    let listed = api
+        .client
+        .list_collections(v1::ListCollectionsRequest {
+            tenant: "default".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(listed.collections.is_empty());
+    lease.release().await.unwrap();
+    api.stop().await;
+
+    let service = catalog();
+    assert_eq!(service.sweep_hosted_snapshots().await.unwrap().failed, 0);
+    assert!(matches!(
+        executor.acquire(&unit).await,
+        Err(Error::NotFound(_))
+    ));
+    let mut api = start(service).await;
+    api.client.delete_collection(request.clone()).await.unwrap();
+    let other = v1::DeleteCollectionRequest {
+        scope: Some(v1::Scope {
+            collection: "other".into(),
+            ..scope.clone()
+        }),
+        ..request
+    };
+    assert_eq!(
+        api.client
+            .delete_collection(other)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    assert_eq!(
+        api.client
+            .create_collection(v1::CreateCollectionRequest {
+                scope: Some(scope),
+                request_id: None
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_synchronous_upload_waits_for_worker_and_replays() {
     use std::time::Duration;
 
