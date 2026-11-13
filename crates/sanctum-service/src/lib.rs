@@ -23,6 +23,7 @@ mod hosted_catalog;
 mod hosted_dispatch;
 mod hosted_embedding;
 mod hosted_ingestion;
+mod hosted_lifecycle;
 mod hosted_rebuild;
 mod hosted_retrieval;
 mod local_import;

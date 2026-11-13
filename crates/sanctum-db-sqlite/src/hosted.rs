@@ -185,3 +185,94 @@ pub fn publish_revision(
     release_intent(tx, revision.source)?;
     Ok(())
 }
+
+pub fn delete_source(tx: &Transaction<'_>, source: Uuid, expected: Option<Uuid>) -> Result<Uuid> {
+    initialize_collection(tx)?;
+    let writer = crate::RevisionWrite(&**tx);
+    let deleted = writer.delete_source(source, expected)?;
+    tx.execute(
+        "DELETE FROM hosted_revision_intents WHERE source_id = ?1",
+        [source.to_string()],
+    )
+    .map_err(database_error)?;
+    Ok(deleted.revision)
+}
+
+const HOSTED_READER_GRACE_SECONDS: i64 = 900;
+
+pub fn retire_revisions(tx: &Transaction<'_>, profile: Option<&str>) -> Result<()> {
+    initialize_collection(tx)?;
+    let writer = crate::RevisionWrite(&**tx);
+    writer.release_retirements(profile)?;
+    for revision in writer.retirement_candidates(profile)? {
+        if writer.revision_held(revision)? {
+            continue;
+        }
+        let source = revision.source.to_string();
+        let id = revision.revision.to_string();
+        tx.execute(
+            "INSERT OR IGNORE INTO hosted_object_garbage (object_key, delete_after)
+             SELECT text_key, unixepoch() + ?3 FROM hosted_revision_objects
+               WHERE source_id = ?1 AND revision_id = ?2
+             UNION
+             SELECT original_key, unixepoch() + ?3 FROM hosted_revision_objects
+               WHERE source_id = ?1 AND revision_id = ?2 AND original_key IS NOT NULL",
+            params![source, id, HOSTED_READER_GRACE_SECONDS],
+        )
+        .map_err(database_error)?;
+        writer.retire(revision)?;
+        tx.execute(
+            "DELETE FROM revision_garbage WHERE source_id = ?1 AND revision_id = ?2",
+            params![source, id],
+        )
+        .map_err(database_error)?;
+    }
+    writer.expire_deletion_receipts()?;
+    writer.prune_unreferenced_embeddings()
+}
+
+pub fn acknowledge_objects(tx: &Transaction<'_>, objects: &[String]) -> Result<()> {
+    let mut delete = tx
+        .prepare("DELETE FROM hosted_object_garbage WHERE object_key = ?1")
+        .map_err(database_error)?;
+    for key in objects {
+        delete.execute([key]).map_err(database_error)?;
+    }
+    Ok(())
+}
+
+impl crate::CollectionDb {
+    pub fn has_hosted_retirement_work(&self, profile: Option<&str>) -> Result<bool> {
+        self.0.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM revisions r JOIN sources s ON s.id = r.source_id
+                WHERE (s.deleted = 1 AND r.retire_at <= unixepoch())
+                  OR (s.deleted = 0 AND r.id <> s.current_revision
+                    AND (r.retire_at IS NULL OR r.retire_at <= unixepoch())
+                    AND (?1 IS NULL OR NOT EXISTS (
+                        SELECT 1 FROM chunks c LEFT JOIN embedding_cache e
+                          ON e.profile = ?1 AND e.input_hash = c.content_hash AND e.vector IS NOT NULL
+                        WHERE c.source_id = s.id AND c.revision_id = s.current_revision AND e.input_hash IS NULL
+                    )))
+            ) OR EXISTS (
+                SELECT 1 FROM deleted_sources d WHERE d.expires_at <= unixepoch()
+                 AND NOT EXISTS (SELECT 1 FROM sources WHERE id = d.id)
+            )",
+            [profile],
+            |row| row.get(0),
+        ).map_err(database_error)
+    }
+
+    pub fn due_hosted_objects(&self) -> Result<Vec<String>> {
+        if crate::schema_version(&self.0)? < 10 {
+            return Ok(Vec::new());
+        }
+        crate::query_all(
+            &self.0,
+            "SELECT object_key FROM hosted_object_garbage WHERE delete_after <= unixepoch()
+             ORDER BY delete_after, object_key LIMIT 64",
+            [],
+            |row| row.get(0),
+        )
+    }
+}

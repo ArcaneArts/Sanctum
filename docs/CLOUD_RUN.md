@@ -131,9 +131,17 @@ gcloud scheduler jobs create http sanctum-embedding-profile \
   --uri "$WORKER_URL/internal/maintenance/embedding-profile" \
   --oidc-service-account-email "$SCHEDULER_SA" \
   --oidc-token-audience "$WORKER_URL" --attempt-deadline 300s
+
+gcloud scheduler jobs create http sanctum-source-sweep \
+  --project "$PROJECT" --location "$REGION" \
+  --schedule '*/5 * * * *' --time-zone Etc/UTC --http-method POST \
+  --uri "$WORKER_URL/internal/maintenance/source-sweep" \
+  --oidc-service-account-email "$SCHEDULER_SA" \
+  --oidc-token-audience "$WORKER_URL" --attempt-deadline 300s
 ```
 
-The embedding profile job checks the worker's configured profile and
+The source sweep advances a durable cursor and reclaims retired source
+bytes in bounded pages. The embedding profile job checks the worker's configured profile and
 resumes discovery after a change. It shares the existing dispatch
 shards. Point scheduled requests and task deliveries at the active
 worker revision when updating the embedding configuration.

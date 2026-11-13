@@ -51,10 +51,22 @@ impl HostedCatalog {
             .await?;
         let outcome = match receipt {
             Some(receipt) => decode(&receipt)?,
-            None => {
-                self.index_registered(scope, &unit, &prefix, &record, registration)
-                    .await?
-            }
+            None => match self
+                .index_registered(scope, &unit, &prefix, &record, registration)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(Error::NotFound(_)) => {
+                    // A competing index delivery may have committed and removed its RTF input.
+                    let receipt = self
+                        .publication
+                        .stage_receipt(&unit, operation, INDEX_STAGE)
+                        .await?
+                        .ok_or_else(|| Error::Busy("registered input is unavailable".into()))?;
+                    decode(&receipt)?
+                }
+                Err(error) => return Err(error),
+            },
         };
         let Stage::PendingIndexing { registration } = record.stage else {
             unreachable!("stage was checked above");
@@ -80,6 +92,15 @@ impl HostedCatalog {
                 registration: Some(registration),
             },
         };
+        let input_key = record.input_key(&prefix)?;
+        let discard_input = matches!(&record.stage, Stage::Failed { .. })
+            || (is_rtf(&record.upload.name) && !record.upload.retain_original);
+        if discard_input {
+            match self.storage.delete(&input_key).await {
+                Ok(()) | Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
         self.checkpoint(&prefix, record, version, |stage| {
             matches!(stage, Stage::PendingIndexing { .. })
         })

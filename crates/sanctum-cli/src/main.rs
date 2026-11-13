@@ -128,6 +128,8 @@ enum Command {
         source_id: String,
         #[arg(long)]
         expected_revision: Option<String>,
+        #[arg(long)]
+        request_id: Option<String>,
     },
     Job {
         collection: String,
@@ -528,12 +530,14 @@ async fn main() -> anyhow::Result<()> {
             collection,
             source_id,
             expected_revision,
+            request_id,
         } => {
             let deleted = client
                 .delete_source(v1::DeleteSourceRequest {
                     scope: scope(collection),
                     source_id,
                     expected_revision_id: expected_revision,
+                    request_id,
                 })
                 .await?
                 .into_inner();

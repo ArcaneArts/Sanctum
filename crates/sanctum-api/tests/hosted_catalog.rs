@@ -1467,6 +1467,174 @@ impl sanctum_service::Dispatch for TestDispatch {
 }
 
 #[tokio::test]
+async fn hosted_deletion_replays_and_defers_object_reclamation() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let service = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let mut server = start(service.clone()).await;
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    service.create_collection(&scope, None).await.unwrap();
+    let wire_scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    let header = v1::UploadTextHeader {
+        scope: Some(wire_scope.clone()),
+        name: "notes.txt".into(),
+        ..Default::default()
+    };
+    let accepted = server
+        .client
+        .submit_text(upload_frames(&header, [b"obsolete note".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let operation = accepted.operation_id.parse().unwrap();
+    service.register_upload(&scope, operation).await.unwrap();
+    service.index_upload(&scope, operation).await.unwrap();
+    let query = v1::SearchTextRequest {
+        scope: Some(wire_scope.clone()),
+        query: "obsolete".into(),
+        ..Default::default()
+    };
+    let found = server
+        .client
+        .search_text(query.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let hit = found.hits[0].chunk.clone().unwrap();
+
+    let replacement = v1::UploadTextHeader {
+        replacement: Some(v1::Replacement {
+            source_id: Some(accepted.source_id.clone()),
+            expected_revision_id: Some(accepted.revision_id.clone()),
+        }),
+        ..header
+    };
+    let pending = server
+        .client
+        .submit_text(upload_frames(&replacement, [b"late note".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let pending = pending.operation_id.parse().unwrap();
+    service.register_upload(&scope, pending).await.unwrap();
+
+    let delete = v1::DeleteSourceRequest {
+        scope: Some(wire_scope),
+        source_id: accepted.source_id.clone(),
+        expected_revision_id: Some(accepted.revision_id.clone()),
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+    };
+    let stale = v1::DeleteSourceRequest {
+        expected_revision_id: Some(uuid::Uuid::new_v4().to_string()),
+        ..delete.clone()
+    };
+    assert_eq!(
+        server.client.delete_source(stale).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+    let removed = server
+        .client
+        .delete_source(delete.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(removed.revision_id, accepted.revision_id);
+    assert_eq!(
+        server
+            .client
+            .delete_source(delete.clone())
+            .await
+            .unwrap()
+            .into_inner(),
+        removed
+    );
+    let reused = v1::DeleteSourceRequest {
+        expected_revision_id: None,
+        ..delete
+    };
+    assert_eq!(
+        server
+            .client
+            .delete_source(reused)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    assert!(
+        server
+            .client
+            .search_text(query)
+            .await
+            .unwrap()
+            .into_inner()
+            .hits
+            .is_empty()
+    );
+    assert_eq!(
+        server
+            .client
+            .fetch_chunk(v1::FetchChunkRequest { chunk: Some(hit) })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert!(
+        matches!(service.index_upload(&scope, pending).await.unwrap().state,
+        sanctum_service::HostedJobState::Failed { code, .. } if code == "stale_revision")
+    );
+
+    let executor =
+        sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(15)).unwrap();
+    let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let snapshot = executor.read(&unit, scratch.path()).await.unwrap().unwrap();
+    let db = rusqlite::Connection::open(snapshot.path()).unwrap();
+    let key: String = db
+        .query_row("SELECT text_key FROM hosted_revision_objects", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let key = Key::parse(key).unwrap();
+    assert!(storage.head(&key).await.is_ok());
+    assert_eq!(service.reclaim_hosted_sources(&scope).await.unwrap(), 0);
+
+    let age = async |sql: &'static str| {
+        let mut writer = executor.acquire(&unit).await.unwrap();
+        writer
+            .apply(
+                vec![sanctum_db::Command {
+                    operation: uuid::Uuid::new_v4(),
+                    payload: sql,
+                }],
+                |tx, sql| {
+                    tx.execute(sql, [])
+                        .map_err(|error| Error::Internal(Box::new(error)))?;
+                    Ok("aged".into())
+                },
+            )
+            .await
+            .unwrap();
+        writer.release().await.unwrap();
+    };
+    age("UPDATE revisions SET retire_at = unixepoch() - 1").await;
+    assert_eq!(service.reclaim_hosted_sources(&scope).await.unwrap(), 0);
+    assert!(storage.head(&key).await.is_ok());
+    age("UPDATE hosted_object_garbage SET delete_after = unixepoch() - 1").await;
+    assert_eq!(service.sweep_hosted_sources().await.unwrap().deleted, 1);
+    assert!(matches!(storage.head(&key).await, Err(Error::NotFound(_))));
+    assert_eq!(service.reclaim_hosted_sources(&scope).await.unwrap(), 0);
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_submissions_recover_from_interrupted_acceptance() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance {

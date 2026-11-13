@@ -594,3 +594,23 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   worker steps restored semantic search for the idle collection.
 - Discovery lists object metadata across the deployment prefix. Its
   scan cost and live Cloud Scheduler delivery remain to be measured.
+
+- Delivered in [PR #37](https://github.com/ArcaneArts/Sanctum/pull/37).
+
+## Hosted source deletion and reclamation
+
+- Hosted deletion uses a fenced SQLite publication with an expected
+  revision, a durable request receipt, and a tombstone. It immediately
+  removes hits and fences registered replacements.
+- The source sweep persists a scan cursor. It retires locators under
+  the writer, keeps immutable bytes for a 15-minute reader grace, and
+  retries physical deletions from a durable cleanup table. Successful
+  text-only RTF indexing also drops the accepted original.
+- The integration test verifies a stale deletion, receipt replay,
+  replacement fencing, stale references, both reclamation phases,
+  and an empty repeat sweep. It advances timestamps inside test snapshots.
+- A standalone MinIO smoke verified text-only RTF retention, deletion
+  replay after restart, search exclusion, and the worker sweep preserving
+  bytes during the grace period.
+- Automatic snapshot reclamation and abandoned candidate-object cleanup
+  remain open.

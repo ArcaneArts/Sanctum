@@ -238,6 +238,12 @@ impl HostedCatalog {
                 embedding: None, ..
             }
             | Stage::Failed { .. } => {
+                if matches!(record.stage, Stage::Failed { .. }) {
+                    match self.storage.delete(&record.input_key(&prefix)?).await {
+                        Ok(()) | Err(Error::NotFound(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
                 self.clear_dispatch_hint(scope, operation).await?;
                 return Ok(false);
             }

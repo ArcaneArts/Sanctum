@@ -82,6 +82,7 @@ pub(crate) async fn serve(
     let grpc = async {
         if let Some(grpc) = grpc {
             tonic::transport::Server::builder()
+                .timeout(std::time::Duration::from_secs(600))
                 .add_service(sanctum_api::hosted_grpc(
                     catalog.clone(),
                     cancellation.child_token(),
