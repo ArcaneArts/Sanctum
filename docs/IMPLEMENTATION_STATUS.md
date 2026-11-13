@@ -6,7 +6,7 @@ which parts have working implementations and where to find the evidence.
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | Personal workflow verified on macOS. Cross-platform packaging and tray verification are tracked in milestone 2. |
-| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, Windows package and tray verification, distribution signing |
+| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, URL and Git imports, and a Windows x64 installer build | Live hosted provider checks, Windows installation and tray verification, distribution signing |
 | 3. Object storage and publication | Shared storage contract, filesystem and MinIO-tested S3, native GCS adapter, and fenced SQLite snapshot publication for hosted catalog, source, and metadata operations | Live GCS verification and cloud recovery scenarios |
 | 4. Cloud Run and Cloud Tasks | Linux API and worker containers, durable staged uploads, dispatch and repair, scheduled maintenance, and hosted gRPC and MCP | Live IAM, Cloud Run ingress, and Tasks and Scheduler delivery |
 | 5. Capacity | [200 MiB lexical ingestion and 1–2 GiB snapshot measurements](CAPACITY.md) | Hosted write amplification, cold/warm cloud performance, and broader retrieval workloads |
@@ -1120,3 +1120,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - An eight-byte edit changed one of 11 chunks. The live Ollama request
   contained one input, with the other ten chunks immediately able to
   reuse vectors from the same profile. [Method and results](CAPACITY.md#retrieval-relevance-and-embedding-reuse).
+
+## Windows x64 installer build
+
+- The desktop build hook can use `cargo xwin` for the Rust sidecars when
+  Tauri uses the same Windows cross-compilation toolchain. The default build
+  path still uses Cargo for native development and packaging.
+- A release build on Apple Silicon produced a 14.24 MiB unsigned x64 NSIS
+  installer. Extracting its payload confirmed three x64 PE executables.
+  Both packaged sidecars matched the compiler output byte for byte.
+- A disposable x64 Windows 11 Enterprise evaluation guest booted from
+  checksum-verified Microsoft media into Windows Setup. Installing the
+  app and exercising the tray, sidecar lifecycle, and WebView2 still
+  require a licensed Windows environment. [Build commands](DESKTOP.md#native-packages).

@@ -12,6 +12,7 @@ const output = join(root, "apps/desktop/src-tauri/binaries")
 const programs = ["sanctum-server", "sanctum-cli"]
 const devBuild = process.argv.includes("--dev-build")
 const build = ["build", "--locked", "--target", target, "--target-dir", targetDir]
+if (process.env.SANCTUM_DESKTOP_CARGO_XWIN === "1") build.unshift("xwin")
 if (release) build.push("--release")
 for (const program of programs) build.push("-p", program)
 // The Tauri build script is itself running under Cargo. The sidecars use the
