@@ -338,6 +338,12 @@ the integration's view, then replay changes after it. Clients should
 handle changes idempotently because the rescan can already include some
 of those updates. A cursor ahead of the log returns `INVALID_ARGUMENT`.
 
+Hosted deployments expose the same change methods. Registration by
+itself emits no source change. Events become visible when the worker
+publishes a searchable revision. The hosted stream checks for a newer
+snapshot about every two seconds when caught up. Reconnect with the
+saved cursor when the API connection or its deployment deadline ends.
+
 `SearchText.metadata_filter` accepts a tree of `test`, `all`, `any`, and
 `not` expressions. A test selects a namespace and key at the collection,
 source, or chunk level. An optional path selects object properties and

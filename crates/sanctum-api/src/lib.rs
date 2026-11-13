@@ -30,6 +30,7 @@ pub fn hosted_grpc(catalog: HostedCatalog, shutdown: CancellationToken) -> Sanct
         .max_decoding_message_size(3 * 1024 * 1024)
 }
 
+#[derive(Clone)]
 enum Backend {
     Local(Service),
     Hosted(HostedCatalog),
@@ -215,7 +216,7 @@ impl Sanctum for Grpc {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
         changes_page(
-            self.local()?.clone(),
+            self.0.clone(),
             scope,
             request.after_cursor,
             request.limit.unwrap_or(100),
@@ -233,15 +234,15 @@ impl Sanctum for Grpc {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
         let limit = request.limit.unwrap_or(100);
-        let service = self.local()?.clone();
+        let backend = self.0.clone();
         let first =
-            changes_page(service.clone(), scope.clone(), request.after_cursor, limit).await?;
+            changes_page(backend.clone(), scope.clone(), request.after_cursor, limit).await?;
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         let shutdown = self.1.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = shutdown.cancelled() => {}
-                _ = stream_changes(service, scope, limit, first, sender) => {}
+                _ = stream_changes(backend, scope, limit, first, sender) => {}
             }
         });
         Ok(Response::new(ReceiverStream::new(receiver)))
@@ -252,14 +253,14 @@ impl Sanctum for Grpc {
         request: Request<v1::ChangeCursorRequest>,
     ) -> Reply<v1::ChangeCursor> {
         let scope = parse_scope(request.into_inner().scope)?;
-        let service = self.local()?.clone();
-        work(move || {
-            Ok(v1::ChangeCursor {
-                cursor: service.change_cursor(&scope)?,
-            })
-        })
-        .await
-        .map(Response::new)
+        let cursor = match &self.0 {
+            Backend::Local(service) => {
+                let service = service.clone();
+                work(move || service.change_cursor(&scope)).await?
+            }
+            Backend::Hosted(catalog) => catalog.change_cursor(&scope).await.map_err(status)?,
+        };
+        Ok(Response::new(v1::ChangeCursor { cursor }))
     }
 
     async fn import_url(
@@ -1192,12 +1193,16 @@ fn wire_import(event: ImportEvent) -> v1::ImportLocalEvent {
 }
 
 async fn stream_changes(
-    service: Service,
+    backend: Backend,
     scope: Scope,
     limit: u32,
     first: v1::ListChangesResponse,
     sender: tokio::sync::mpsc::Sender<std::result::Result<v1::ListChangesResponse, Status>>,
 ) {
+    let interval = match backend {
+        Backend::Local(_) => std::time::Duration::from_millis(500),
+        Backend::Hosted(_) => std::time::Duration::from_secs(2),
+    };
     let mut at_head = first.changes.len() < limit as usize;
     let mut cursor = first.next_cursor;
     if sender.send(Ok(first)).await.is_err() {
@@ -1208,13 +1213,13 @@ async fn stream_changes(
         if at_head {
             tokio::select! {
                 _ = sender.closed() => return,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                _ = tokio::time::sleep(interval) => {}
             }
         }
         let Ok(permit) = sender.reserve().await else {
             return;
         };
-        match changes_page(service.clone(), scope.clone(), cursor, limit).await {
+        match changes_page(backend.clone(), scope.clone(), cursor, limit).await {
             Ok(page) => {
                 at_head = page.changes.len() < limit as usize;
                 if !page.changes.is_empty() || tokio::time::Instant::now() >= heartbeat {
@@ -1232,30 +1237,35 @@ async fn stream_changes(
 }
 
 async fn changes_page(
-    service: Service,
+    backend: Backend,
     scope: Scope,
     after_cursor: u64,
     limit: u32,
 ) -> std::result::Result<v1::ListChangesResponse, Status> {
-    work(move || {
-        let changes = service.changes(&scope, after_cursor, limit)?;
-        let next_cursor = changes.last().map_or(after_cursor, |change| change.cursor);
-        Ok(v1::ListChangesResponse {
-            next_cursor,
-            changes: changes
-                .into_iter()
-                .map(|change| v1::SourceChange {
-                    cursor: change.cursor,
-                    kind: change.kind,
-                    source_id: change.source,
-                    revision_id: change.revision,
-                    previous_revision_id: change.previous_revision,
-                    chunk_ordinal: change.ordinal,
-                })
-                .collect(),
-        })
+    let changes = match backend {
+        Backend::Local(service) => {
+            work(move || service.changes(&scope, after_cursor, limit)).await?
+        }
+        Backend::Hosted(catalog) => catalog
+            .changes(&scope, after_cursor, limit)
+            .await
+            .map_err(status)?,
+    };
+    let next_cursor = changes.last().map_or(after_cursor, |change| change.cursor);
+    Ok(v1::ListChangesResponse {
+        next_cursor,
+        changes: changes
+            .into_iter()
+            .map(|change| v1::SourceChange {
+                cursor: change.cursor,
+                kind: change.kind,
+                source_id: change.source,
+                revision_id: change.revision,
+                previous_revision_id: change.previous_revision,
+                chunk_ordinal: change.ordinal,
+            })
+            .collect(),
     })
-    .await
 }
 
 async fn work<T: Send + 'static>(
