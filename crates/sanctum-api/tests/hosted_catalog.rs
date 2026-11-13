@@ -189,9 +189,7 @@ async fn hosted_submissions_store_exact_bytes_and_replay_after_restart() {
         request_id: Some(operation.clone()),
         ..Default::default()
     };
-    let bytes = "café 🦀
-"
-    .as_bytes();
+    let bytes = "café 🦀\n".as_bytes();
     assert_eq!(
         state
             .client
@@ -592,6 +590,246 @@ async fn hosted_registration_replays_after_checkpoint_failure_and_orders_replace
         )
         .unwrap();
     assert_eq!(current, revision.to_string());
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn hosted_indexing_publishes_searchable_text_and_fences_old_replacements() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        interrupt: AtomicU8::new(0),
+    });
+    let catalog = HostedCatalog::new(storage.clone(), None, 1024 * 1024).unwrap();
+    let mut server = start(catalog.clone()).await;
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let wire_scope = v1::Scope {
+        tenant: scope.tenant.to_string(),
+        collection: scope.collection.to_string(),
+    };
+    server
+        .client
+        .create_collection(v1::CreateCollectionRequest {
+            scope: Some(wire_scope.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let header = v1::UploadTextHeader {
+        scope: Some(wire_scope.clone()),
+        name: "field-notes.txt".into(),
+        ..Default::default()
+    };
+    let body = "unicorn café 🦀\n".repeat(400);
+    let job = server
+        .client
+        .submit_text(upload_frames(&header, body.as_bytes().chunks(97)))
+        .await
+        .unwrap()
+        .into_inner();
+    let operation = job.operation_id.parse().unwrap();
+    assert!(matches!(
+        catalog.index_upload(&scope, operation).await,
+        Err(Error::Busy(_))
+    ));
+    catalog.register_upload(&scope, operation).await.unwrap();
+    storage.interrupt.store(1, Ordering::Relaxed);
+    assert!(matches!(
+        catalog.index_upload(&scope, operation).await,
+        Err(Error::Busy(_))
+    ));
+    let executor =
+        sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(15)).unwrap();
+    let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
+    let generation = executor.generation(&unit).await.unwrap();
+    server.stop().await;
+
+    let mut server = start(catalog.clone()).await;
+    catalog.index_upload(&scope, operation).await.unwrap();
+    assert_eq!(executor.generation(&unit).await.unwrap(), generation);
+    let job = server
+        .client
+        .get_ingestion_job(v1::IngestionJobRequest {
+            scope: Some(wire_scope.clone()),
+            operation_id: job.operation_id,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(job.state(), v1::IngestionState::TextReady);
+    assert_eq!(job.processed_bytes, body.len() as u64);
+    assert!(job.text_revision.as_ref().unwrap().chunks > 1);
+    let query = |term: &str| v1::SearchTextRequest {
+        scope: Some(wire_scope.clone()),
+        query: term.into(),
+        mode: v1::SearchMode::Hybrid.into(),
+        ..Default::default()
+    };
+    let hits = server
+        .client
+        .search_text(query("unicorn"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(hits.mode(), v1::SearchMode::Lexical);
+    assert_eq!(hits.degraded_reason.as_deref(), Some("embedding_disabled"));
+    assert!(hits.hits.len() > 1);
+    let hit = hits.hits.iter().find(|hit| hit.start_byte > 0).unwrap();
+    assert_eq!(
+        hit.excerpt,
+        body[hit.start_byte as usize..hit.end_byte as usize]
+    );
+    assert_eq!(
+        server
+            .client
+            .fetch_chunk(v1::FetchChunkRequest {
+                chunk: hit.chunk.clone()
+            })
+            .await
+            .unwrap()
+            .into_inner(),
+        *hit
+    );
+
+    let replacement = v1::UploadTextHeader {
+        name: "field-notes.rtf".into(),
+        retain_original: true,
+        replacement: Some(v1::Replacement {
+            source_id: Some(job.source_id),
+            expected_revision_id: Some(job.revision_id),
+        }),
+        ..header
+    };
+    let old = server
+        .client
+        .submit_text(upload_frames(
+            &replacement,
+            [br"{\rtf1\ansi obsolete}".as_slice()],
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let old_operation = old.operation_id.parse().unwrap();
+    catalog
+        .register_upload(&scope, old_operation)
+        .await
+        .unwrap();
+    let rtf = br"{\rtf1\ansi replacement caf\'e9\par next}";
+    let new = server
+        .client
+        .submit_text(upload_frames(&replacement, [rtf.as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let new_operation = new.operation_id.parse().unwrap();
+    catalog
+        .register_upload(&scope, new_operation)
+        .await
+        .unwrap();
+    let stale = catalog.index_upload(&scope, old_operation).await.unwrap();
+    assert!(
+        matches!(stale.state, sanctum_service::HostedJobState::Failed { code, .. } if code == "stale_revision")
+    );
+    catalog.index_upload(&scope, new_operation).await.unwrap();
+    let hits = server
+        .client
+        .search_text(query("replacement"))
+        .await
+        .unwrap()
+        .into_inner()
+        .hits;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].excerpt, "replacement café\nnext");
+    assert!(
+        server
+            .client
+            .search_text(query("unicorn"))
+            .await
+            .unwrap()
+            .into_inner()
+            .hits
+            .is_empty()
+    );
+    let new = server
+        .client
+        .get_ingestion_job(v1::IngestionJobRequest {
+            scope: Some(wire_scope),
+            operation_id: new.operation_id,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let content = new.text_revision.unwrap();
+    assert_eq!(content.extractor.as_deref(), Some("rtf-text-v1"));
+    assert!(content.retain_original);
+    assert_ne!(content.content_blake3, content.original_blake3);
+
+    let scratch = tempfile::tempdir().unwrap();
+    let snapshot = executor.read(&unit, scratch.path()).await.unwrap().unwrap();
+    let connection = rusqlite::Connection::open(snapshot.path()).unwrap();
+    let original: String = connection
+        .query_row(
+            "SELECT original_key FROM hosted_revision_objects WHERE revision_id = ?1",
+            [content.revision_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut original_body = Vec::new();
+    storage
+        .get(&Key::parse(original).unwrap())
+        .await
+        .unwrap()
+        .reader
+        .read_to_end(&mut original_body)
+        .await
+        .unwrap();
+    assert_eq!(original_body, rtf);
+    let malformed = v1::UploadTextHeader {
+        scope: Some(v1::Scope {
+            tenant: "default".into(),
+            collection: "notes".into(),
+        }),
+        name: "malformed.rtf".into(),
+        external: Some(v1::ExternalSource {
+            namespace: "editor".into(),
+            id: "retryable-external".into(),
+        }),
+        ..Default::default()
+    };
+    let invalid = server
+        .client
+        .submit_text(upload_frames(&malformed, [b"invalid".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let invalid_id = invalid.operation_id.parse().unwrap();
+    catalog.register_upload(&scope, invalid_id).await.unwrap();
+    let failure = catalog.index_upload(&scope, invalid_id).await.unwrap();
+    assert!(
+        matches!(failure.state, sanctum_service::HostedJobState::Failed { code, .. } if code == "invalid_source")
+    );
+    let valid = server
+        .client
+        .submit_text(upload_frames(&malformed, [br"{\rtf1 valid}".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let valid_id = valid.operation_id.parse().unwrap();
+    assert!(matches!(
+        catalog
+            .register_upload(&scope, valid_id)
+            .await
+            .unwrap()
+            .state,
+        sanctum_service::HostedJobState::Registered
+    ));
+    assert!(matches!(
+        catalog.index_upload(&scope, valid_id).await.unwrap().state,
+        sanctum_service::HostedJobState::TextReady
+    ));
     server.stop().await;
 }
 

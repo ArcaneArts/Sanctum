@@ -459,5 +459,24 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   endpoint with out-of-order deliveries and a conflicting external ID.
   After restart, both deliveries replayed without changing the published
   snapshot. The CLI reported registered and failed states.
-- The next hosted cycle will process registered input and publish searchable
-  text. Cloud Tasks, scheduled dispatch repair, and cleanup remain open.
+- Delivered in [PR #29](https://github.com/ArcaneArts/Sanctum/pull/29).
+
+## Hosted lexical publication and ranges
+
+- The worker validates and indexes registered UTF-8 and RTF uploads.
+  A fenced transaction commits the lexical index, canonical object
+  locator, and indexing receipt. A second conditional write advances
+  the envelope to `TEXT_READY`. A stale replacement loses inside the
+  transaction, even if it already prepared its input.
+- Hosted `SearchText` and `FetchChunk` resolve the committed snapshot
+  and read validated, half-open byte ranges from object storage. Hybrid
+  currently falls back to lexical results.
+- The gRPC integration test interrupts the indexing checkpoint, replays
+  the receipt after restart, and checks the exact Unicode range, RTF
+  original retention, replacement fencing, and invalid-input recovery.
+- A standalone server and CLI against MinIO verified both worker stages,
+  Unicode byte-range fetch, RTF replacement, hybrid fallback, and prior
+  revision fetch. After restart, duplicate indexing left the published
+  snapshot unchanged.
+- Hosted embedding work, automatic task dispatch, scheduled repair,
+  and authoritative source cleanup remain open.

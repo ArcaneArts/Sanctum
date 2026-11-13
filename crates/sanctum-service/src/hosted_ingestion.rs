@@ -12,7 +12,9 @@ use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
-use crate::{HostedCatalog, TextUpload};
+use crate::{HostedCatalog, RevisionContent, TextUpload};
+
+mod indexing;
 
 const FORMAT: u8 = 1;
 // Expire unregistered work before the publication executor can reclaim its receipt.
@@ -36,11 +38,13 @@ pub struct HostedJob {
     pub created_at: u64,
     pub update_sequence: u64,
     pub state: HostedJobState,
+    pub content: Option<RevisionContent>,
 }
 
 pub enum HostedJobState {
     Accepted,
     Registered,
+    TextReady,
     Failed { code: String, message: String },
 }
 
@@ -48,8 +52,19 @@ pub enum HostedJobState {
 #[serde(tag = "stage", rename_all = "snake_case")]
 enum Stage {
     PendingRegistration,
-    PendingIndexing { registration: Registration },
-    Failed { code: String, message: String },
+    PendingIndexing {
+        registration: Registration,
+    },
+    TextReady {
+        registration: Registration,
+        content: Box<RevisionContent>,
+    },
+    Failed {
+        code: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        registration: Option<Registration>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -147,9 +162,26 @@ impl HostedCatalog {
             RegistrationOutcome::Registered(registration) => {
                 Stage::PendingIndexing { registration }
             }
-            RegistrationOutcome::Failed { code, message } => Stage::Failed { code, message },
+            RegistrationOutcome::Failed { code, message } => Stage::Failed {
+                code,
+                message,
+                registration: None,
+            },
         };
-        let envelope = envelope_key(&prefix)?;
+        self.checkpoint(&prefix, record, version, |stage| {
+            matches!(stage, Stage::PendingRegistration)
+        })
+        .await
+    }
+
+    async fn checkpoint(
+        &self,
+        prefix: &Key,
+        record: Operation,
+        version: Version,
+        still_pending: impl FnOnce(&Stage) -> bool,
+    ) -> Result<HostedJob> {
+        let envelope = envelope_key(prefix)?;
         let body = serde_json::to_vec(&record).map_err(|error| Error::Internal(Box::new(error)))?;
         match self
             .storage
@@ -158,10 +190,10 @@ impl HostedCatalog {
         {
             Ok(_) => Ok(record.job()),
             Err(Error::Conflict(_)) => {
-                let (current, _) = self.require_operation(&prefix, operation).await?;
-                if matches!(current.stage, Stage::PendingRegistration) {
+                let (current, _) = self.require_operation(prefix, record.operation).await?;
+                if still_pending(&current.stage) {
                     return Err(Error::Busy(
-                        "ingestion envelope changed during registration".into(),
+                        "ingestion envelope changed during checkpoint".into(),
                     ));
                 }
                 Ok(current.job())
@@ -321,25 +353,32 @@ impl Operation {
     }
 
     fn job(self) -> HostedJob {
-        let (state, source, external, update_sequence) = match self.stage {
-            Stage::PendingRegistration => (
-                HostedJobState::Accepted,
-                self.source,
-                self.upload.external,
-                0,
+        let (state, registration, content) = match self.stage {
+            Stage::PendingRegistration => (HostedJobState::Accepted, None, None),
+            Stage::PendingIndexing { registration } => {
+                (HostedJobState::Registered, Some(registration), None)
+            }
+            Stage::TextReady {
+                registration,
+                content,
+            } => (
+                HostedJobState::TextReady,
+                Some(registration),
+                Some(*content),
             ),
-            Stage::PendingIndexing { registration } => (
-                HostedJobState::Registered,
+            Stage::Failed {
+                code,
+                message,
+                registration,
+            } => (HostedJobState::Failed { code, message }, registration, None),
+        };
+        let (source, external, update_sequence) = match registration {
+            Some(registration) => (
                 Some(registration.source),
                 registration.external,
                 registration.update_sequence,
             ),
-            Stage::Failed { code, message } => (
-                HostedJobState::Failed { code, message },
-                self.source,
-                self.upload.external,
-                0,
-            ),
+            None => (self.source, self.upload.external, 0),
         };
         HostedJob {
             operation: self.operation,
@@ -351,6 +390,7 @@ impl Operation {
             created_at: self.created_at,
             update_sequence,
             state,
+            content,
         }
     }
 

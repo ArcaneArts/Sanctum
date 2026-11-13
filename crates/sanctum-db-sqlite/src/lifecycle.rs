@@ -2,7 +2,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sanctum_core::{Error, ExternalSource, GitProvenance, Result};
 use uuid::Uuid;
 
-use super::{CollectionDb, Revision, RevisionWriter, database_error, query_all, read_json};
+use super::{CollectionDb, Revision, RevisionWrite, database_error, query_all, read_json};
 
 pub const RETIRE_GRACE_SECONDS: i64 = 300;
 const DELETION_RECEIPT_SECONDS: i64 = 24 * 60 * 60;
@@ -111,7 +111,7 @@ pub(super) fn find_source(
     Ok(source)
 }
 
-impl RevisionWriter<'_> {
+impl<T: std::ops::Deref<Target = rusqlite::Connection>> RevisionWrite<T> {
     pub fn find_source(
         &self,
         id: Option<Uuid>,

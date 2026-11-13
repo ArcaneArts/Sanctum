@@ -218,6 +218,16 @@ impl Publication {
     }
 
     pub async fn receipt(&self, unit: &Unit, operation: Uuid) -> Result<Option<String>> {
+        self.stage_receipt(unit, operation, "").await
+    }
+
+    pub async fn stage_receipt(
+        &self,
+        unit: &Unit,
+        operation: Uuid,
+        stage: &str,
+    ) -> Result<Option<String>> {
+        let id = receipt_id(operation, stage);
         let scratch = tempfile::tempdir()?;
         let Some(database) = self.read(unit, scratch.path()).await? else {
             return Ok(None);
@@ -233,7 +243,7 @@ impl Publication {
             connection
                 .query_row(
                     "SELECT outcome FROM applied_commands WHERE id = ?1",
-                    [operation.to_string()],
+                    [id],
                     |row| row.get(0),
                 )
                 .optional()
@@ -368,6 +378,20 @@ impl Lease {
         T: Send + 'static,
         F: FnMut(&Transaction<'_>, T) -> Result<String> + Send + 'static,
     {
+        self.apply_stage("", commands, apply).await
+    }
+
+    /// Stage names distinguish several idempotent commands from the same operation.
+    pub async fn apply_stage<T, F>(
+        &mut self,
+        stage: &'static str,
+        commands: Vec<Command<T>>,
+        apply: F,
+    ) -> Result<(Generation, Vec<Receipt>)>
+    where
+        T: Send + 'static,
+        F: FnMut(&Transaction<'_>, T) -> Result<String> + Send + 'static,
+    {
         self.ensure_live()?;
         if commands.is_empty() || commands.len() > MAX_BATCH {
             return Err(Error::Invalid(
@@ -384,10 +408,11 @@ impl Lease {
             ),
             None => None,
         };
-        let prepared =
-            tokio::task::spawn_blocking(move || apply_snapshot(directory, source, commands, apply))
-                .await
-                .map_err(|error| Error::Internal(Box::new(error)))??;
+        let prepared = tokio::task::spawn_blocking(move || {
+            apply_snapshot(directory, source, stage, commands, apply)
+        })
+        .await
+        .map_err(|error| Error::Internal(Box::new(error)))??;
         self.ensure_live()?;
         let (staged, generation, receipts) = match prepared {
             Prepared::Changed {
@@ -556,9 +581,18 @@ enum Prepared {
     },
 }
 
+fn receipt_id(operation: Uuid, stage: &str) -> String {
+    if stage.is_empty() {
+        operation.to_string()
+    } else {
+        format!("{operation}:{stage}")
+    }
+}
+
 fn apply_snapshot<T>(
     directory: TempDir,
     source: Option<Materialized>,
+    stage: &str,
     commands: Vec<Command<T>>,
     mut apply: impl FnMut(&Transaction<'_>, T) -> Result<String>,
 ) -> Result<Prepared> {
@@ -581,7 +615,7 @@ fn apply_snapshot<T>(
     let mut changed = false;
     let now = (unix_ms()? / 1000) as i64;
     for command in commands {
-        let id = command.operation.to_string();
+        let id = receipt_id(command.operation, stage);
         let previous: Option<String> = tx
             .query_row(
                 "SELECT outcome FROM applied_commands WHERE id = ?1",

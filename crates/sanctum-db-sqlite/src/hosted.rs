@@ -108,3 +108,80 @@ fn require_unclaimed(transaction: &Transaction<'_>, external: &ExternalSource) -
     }
     Ok(())
 }
+
+pub struct RevisionObjects {
+    pub text_key: String,
+    pub original_key: Option<String>,
+}
+
+impl crate::CollectionDb {
+    pub fn hosted_text_key(&self, source: Uuid, revision: Uuid) -> Result<String> {
+        use rusqlite::OptionalExtension;
+        self.0
+            .query_row(
+                "SELECT text_key FROM hosted_revision_objects WHERE source_id = ?1 AND revision_id = ?2",
+                params![source.to_string(), revision.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error)?
+            .ok_or_else(|| Error::Internal("hosted revision has no canonical text object".into()))
+    }
+}
+
+pub fn is_registered(
+    tx: &Transaction<'_>,
+    operation: Uuid,
+    revision: Uuid,
+    registration: &Registration,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM hosted_revision_intents
+         WHERE source_id = ?1 AND operation_id = ?2 AND revision_id = ?3 AND update_sequence = ?4)",
+        params![
+            registration.source.to_string(),
+            operation.to_string(),
+            revision.to_string(),
+            crate::sql_integer(registration.update_sequence)?,
+        ],
+        |row| row.get(0),
+    )
+    .map_err(database_error)
+}
+
+pub fn release_intent(tx: &Transaction<'_>, source: Uuid) -> Result<()> {
+    // Preserve the last sequence even when a failed creation releases its external ID.
+    tx.execute(
+        "UPDATE hosted_revision_intents SET creating = 0, external_namespace = NULL,
+         external_id = NULL WHERE source_id = ?1 AND creating = 1",
+        [source.to_string()],
+    )
+    .map_err(database_error)?;
+    Ok(())
+}
+
+pub fn publish_revision(
+    tx: &Transaction<'_>,
+    revision: &crate::Revision,
+    objects: &RevisionObjects,
+    replacement: bool,
+    profile: Option<&str>,
+    add_chunks: impl FnOnce(&crate::RevisionWrite<&rusqlite::Connection>) -> Result<()>,
+) -> Result<()> {
+    let writer = crate::RevisionWrite(&**tx);
+    add_chunks(&writer)?;
+    writer.register(revision, replacement, profile)?;
+    tx.execute(
+        "INSERT INTO hosted_revision_objects (source_id, revision_id, text_key, original_key)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            revision.source.to_string(),
+            revision.revision.to_string(),
+            objects.text_key,
+            objects.original_key
+        ],
+    )
+    .map_err(database_error)?;
+    release_intent(tx, revision.source)?;
+    Ok(())
+}

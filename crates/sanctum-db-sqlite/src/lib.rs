@@ -1,4 +1,4 @@
-use std::{fs, path::Path, time::Duration};
+use std::{fs, ops::Deref, path::Path, time::Duration};
 
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
@@ -29,6 +29,7 @@ const COLLECTION_MIGRATIONS: &[&str] = &[
     include_str!("collection_v6.sql"),
     include_str!("collection_v7.sql"),
     include_str!("collection_v8.sql"),
+    include_str!("collection_v9.sql"),
 ];
 
 #[derive(Debug)]
@@ -40,7 +41,7 @@ pub struct Revision {
     pub content: RevisionContent,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct RevisionContent {
     pub bytes: u64,
     pub chunks: u64,
@@ -198,11 +199,11 @@ impl CollectionDb {
     }
 
     pub fn write(&mut self) -> Result<RevisionWriter<'_>> {
-        Ok(RevisionWriter(
-            self.0
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(database_error)?,
-        ))
+        let transaction = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        Ok(RevisionWrite(transaction))
     }
 
     pub fn read_snapshot<T>(&self, read: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
@@ -287,9 +288,17 @@ impl CollectionDb {
     }
 }
 
-pub struct RevisionWriter<'db>(Transaction<'db>);
+pub type RevisionWriter<'db> = RevisionWrite<Transaction<'db>>;
 
-impl RevisionWriter<'_> {
+pub struct RevisionWrite<T>(T);
+
+impl RevisionWrite<Transaction<'_>> {
+    pub fn commit(self) -> Result<()> {
+        self.0.commit().map_err(database_error)
+    }
+}
+
+impl<T: Deref<Target = Connection>> RevisionWrite<T> {
     pub fn add_chunk(
         &self,
         reference: &ChunkRef,
@@ -383,10 +392,6 @@ impl RevisionWriter<'_> {
         }
 
         Ok(())
-    }
-
-    pub fn commit(self) -> Result<()> {
-        self.0.commit().map_err(database_error)
     }
 }
 

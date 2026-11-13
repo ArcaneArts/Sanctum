@@ -690,17 +690,20 @@ impl Sanctum for Grpc {
             .map(metadata_filter::parse)
             .transpose()
             .map_err(status)?;
-        let result = self
-            .local()?
-            .retrieve(
-                scope.clone(),
-                request.query,
-                request.limit.unwrap_or(10),
-                filter,
-                mode,
-            )
-            .await
-            .map_err(status)?;
+        let limit = request.limit.unwrap_or(10);
+        let result = match &self.0 {
+            Backend::Local(service) => {
+                service
+                    .retrieve(scope.clone(), request.query, limit, filter, mode)
+                    .await
+            }
+            Backend::Hosted(service) => {
+                service
+                    .retrieve(scope.clone(), request.query, limit, filter, mode)
+                    .await
+            }
+        }
+        .map_err(status)?;
         Ok(Response::new(v1::SearchTextResponse {
             hits: result
                 .hits
@@ -787,10 +790,15 @@ impl Sanctum for Grpc {
                 .map_err(|_| Status::invalid_argument("invalid revision ID"))?,
             ordinal: reference.ordinal,
         };
-        let service = self.local()?.clone();
-        work(move || Ok(wire_hit(&scope, service.fetch(&scope, &reference)?)))
-            .await
-            .map(Response::new)
+        let hit = match &self.0 {
+            Backend::Local(service) => {
+                let service = service.clone();
+                let scope = scope.clone();
+                work(move || service.fetch(&scope, &reference)).await?
+            }
+            Backend::Hosted(service) => service.fetch(&scope, reference).await.map_err(status)?,
+        };
+        Ok(Response::new(wire_hit(&scope, hit)))
     }
 
     async fn delete_source(
@@ -979,23 +987,50 @@ fn wire_hosted_job(scope: &Scope, job: HostedJob) -> v1::IngestionJob {
     let (state, error_code, error_message) = match job.state {
         HostedJobState::Accepted => (v1::IngestionState::Accepted, None, None),
         HostedJobState::Registered => (v1::IngestionState::Registered, None, None),
+        HostedJobState::TextReady => (v1::IngestionState::TextReady, None, None),
         HostedJobState::Failed { code, message } => {
             (v1::IngestionState::Failed, Some(code), Some(message))
         }
     };
+    let scope = wire_scope(scope);
+    let source_id = job
+        .source
+        .map_or_else(String::new, |source| source.to_string());
+    let revision_id = job.revision.to_string();
+    let external = job.external.map(wire_external);
+    let text_revision = job.content.map(|content| v1::TextRevision {
+        scope: Some(scope.clone()),
+        source_id: source_id.clone(),
+        revision_id: revision_id.clone(),
+        name: job.name.clone(),
+        external: external.clone(),
+        bytes: content.bytes,
+        chunks: content.chunks,
+        content_blake3: content.hash,
+        original_blake3: content.original_hash,
+        source_encoding: content.encoding,
+        extractor: content.extractor,
+        retain_original: content.retain_original,
+        url: content.url.map(wire_url),
+        git: content.git.map(wire_git),
+    });
     v1::IngestionJob {
-        scope: Some(wire_scope(scope)),
+        scope: Some(scope),
         operation_id: job.operation.to_string(),
-        source_id: job
-            .source
-            .map_or_else(String::new, |source| source.to_string()),
-        revision_id: job.revision.to_string(),
+        source_id,
+        revision_id,
         name: job.name,
-        external: job.external.map(wire_external),
+        external,
         total_bytes: job.bytes,
+        processed_bytes: if state == v1::IngestionState::TextReady {
+            job.bytes
+        } else {
+            0
+        },
         state: state.into(),
         error_code,
         error_message,
+        text_revision,
         update_sequence: job.update_sequence,
         created_at_unix_seconds: job.created_at,
         ..Default::default()
