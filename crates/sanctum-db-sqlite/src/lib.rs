@@ -528,15 +528,23 @@ impl<T: Deref<Target = Connection>> RevisionWrite<T> {
     pub fn set_initial_metadata(
         &self,
         revision: &Revision,
-        edits: &[metadata::Mutation],
+        source: &[metadata::Mutation],
+        chunks: &[metadata::ChunkMetadata],
     ) -> Result<()> {
-        if !edits.is_empty() {
+        let target = metadata::RevisionTarget {
+            source: revision.source,
+            revision: revision.revision,
+            ordinal: None,
+        };
+        if !source.is_empty() {
+            metadata::revision_entries(&self.0, target, Some(source))?;
+        }
+        for chunk in chunks {
             let target = metadata::RevisionTarget {
-                source: revision.source,
-                revision: revision.revision,
-                ordinal: None,
+                ordinal: Some(chunk.ordinal),
+                ..target
             };
-            metadata::revision_entries(&self.0, target, Some(edits))?;
+            metadata::revision_entries(&self.0, target, Some(&chunk.entries))?;
         }
         Ok(())
     }

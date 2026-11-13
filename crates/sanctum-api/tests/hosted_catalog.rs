@@ -38,6 +38,10 @@ async fn hosted_upload_metadata_survives_restart_and_replay() {
         name: "notes.txt".into(),
         request_id: Some(uuid::Uuid::new_v4().to_string()),
         source_metadata: vec![entry("list", "[null,2]"), entry("active", "true")],
+        chunk_metadata: vec![v1::UploadChunkMetadata {
+            ordinal: 0,
+            entries: vec![entry("section", "2"), entry("kind", "\"quote\"")],
+        }],
         ..Default::default()
     };
     let body = [b"published metadata quartz".as_slice()];
@@ -79,6 +83,7 @@ async fn hosted_upload_metadata_survives_restart_and_replay() {
     let restarted = service();
     let mut server = start(restarted.clone()).await;
     header.source_metadata.reverse();
+    header.chunk_metadata[0].entries.reverse();
     let replayed = server
         .client
         .submit_text(upload_frames(&header, body))
@@ -88,8 +93,11 @@ async fn hosted_upload_metadata_survives_restart_and_replay() {
     assert_eq!(replayed.operation_id, accepted.operation_id);
     assert_eq!(replayed.revision_id, accepted.revision_id);
     let conflicting = v1::UploadTextHeader {
-        source_metadata: vec![entry("active", "false")],
-        ..header
+        chunk_metadata: vec![v1::UploadChunkMetadata {
+            ordinal: 0,
+            entries: vec![entry("section", "3")],
+        }],
+        ..header.clone()
     };
     assert_eq!(
         server
@@ -106,13 +114,64 @@ async fn hosted_upload_metadata_survives_restart_and_replay() {
     restarted.index_upload(&scope, operation).await.unwrap();
     let metadata = server
         .client
-        .get_metadata(target)
+        .get_metadata(target.clone())
         .await
         .unwrap()
         .into_inner();
     assert_eq!(
         metadata.entries,
         vec![entry("active", "true"), entry("list", "[null,2]")]
+    );
+    let chunk = v1::MetadataTarget {
+        chunk_ordinal: Some(0),
+        ..target.clone()
+    };
+    let chunk_values = server
+        .client
+        .get_metadata(chunk.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        chunk_values.entries,
+        vec![entry("kind", "\"quote\""), entry("section", "2")]
+    );
+
+    let invalid_replacement = v1::UploadTextHeader {
+        request_id: None,
+        replacement: Some(v1::Replacement {
+            source_id: target.source_id,
+            expected_revision_id: target.revision_id,
+        }),
+        chunk_metadata: vec![v1::UploadChunkMetadata {
+            ordinal: 1,
+            entries: vec![entry("section", "3")],
+        }],
+        ..header
+    };
+    let accepted = server
+        .client
+        .submit_text(upload_frames(
+            &invalid_replacement,
+            [b"replacement".as_slice()],
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let operation = accepted.operation_id.parse().unwrap();
+    restarted.register_upload(&scope, operation).await.unwrap();
+    let failed = restarted.index_upload(&scope, operation).await.unwrap();
+    assert!(
+        matches!(failed.state, sanctum_service::HostedJobState::Failed { code, message } if code == "invalid_source" && message.contains("ordinal 1"))
+    );
+    assert_eq!(
+        server
+            .client
+            .get_metadata(chunk)
+            .await
+            .unwrap()
+            .into_inner(),
+        chunk_values
     );
     server.stop().await;
 }
@@ -649,6 +708,7 @@ async fn hosted_collection_reclamation_keeps_open_snapshots_and_resumes() {
                 replacement: None,
                 retain_original: false,
                 initial_metadata: Vec::new(),
+                initial_chunk_metadata: Vec::new(),
             },
             None,
         )
@@ -846,6 +906,7 @@ async fn hosted_upload_keeps_accepted_chunk_settings_across_worker_restart() {
                 replacement: None,
                 retain_original: false,
                 initial_metadata: Vec::new(),
+                initial_chunk_metadata: Vec::new(),
             },
             None,
         )
@@ -3605,6 +3666,7 @@ async fn upload_sweep_reclaims_only_unreferenced_candidates_and_resumes() {
                 replacement: None,
                 retain_original: true,
                 initial_metadata: Vec::new(),
+                initial_chunk_metadata: Vec::new(),
             },
             Some(operation),
         )
@@ -3743,6 +3805,7 @@ async fn hosted_upload_retention_rejects_old_work_and_preserves_published_bytes(
         replacement: None,
         retain_original: false,
         initial_metadata: Vec::new(),
+        initial_chunk_metadata: Vec::new(),
     };
     let age = |path: &std::path::Path| {
         std::fs::OpenOptions::new()
@@ -3858,6 +3921,7 @@ async fn upload_sweep_fences_an_in_flight_acceptance_before_reclaiming() {
         replacement: None,
         retain_original: false,
         initial_metadata: Vec::new(),
+        initial_chunk_metadata: Vec::new(),
     };
     let upload = catalog
         .stage_upload(scope.clone(), input(), Some(operation))

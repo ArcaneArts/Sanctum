@@ -148,6 +148,7 @@ impl HostedCatalog {
         let revision = record.revision;
         let chunking = record.chunking;
         let initial_metadata = record.upload.initial_metadata.clone();
+        let initial_chunk_metadata = record.upload.initial_chunk_metadata.clone();
         let registration = Registration {
             source: registration.source,
             external: registration.external.clone(),
@@ -186,7 +187,7 @@ impl HostedCatalog {
                                     &prepared.objects,
                                     replacement,
                                     profile.as_deref(),
-                                    &initial_metadata,
+                                    (&initial_metadata, &initial_chunk_metadata),
                                     |writer| {
                                         let mut ordinal = 0;
                                         index_utf8_with_settings(
@@ -257,6 +258,10 @@ impl HostedCatalog {
             tokio::task::spawn_blocking(move || prepare_text(staged, is_rtf, expected, chunking))
                 .await
                 .map_err(|error| Error::Internal(Box::new(error)))??;
+        crate::db::metadata::validate_metadata_ordinals(
+            &record.upload.initial_chunk_metadata,
+            content.chunks,
+        )?;
         content.retain_original = record.upload.retain_original;
         let mut objects = RevisionObjects {
             text_key: input_key.to_string(),

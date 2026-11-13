@@ -368,6 +368,12 @@ message UploadTextHeader {
   optional string request_id = 6;
   // Namespaced JSON values attached to the new source revision on publication.
   repeated MetadataEntry source_metadata = 7;
+  repeated UploadChunkMetadata chunk_metadata = 8;
+}
+
+message UploadChunkMetadata {
+  uint64 ordinal = 1;
+  repeated MetadataEntry entries = 2;
 }
 
 message Replacement {

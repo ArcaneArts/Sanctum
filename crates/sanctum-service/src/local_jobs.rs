@@ -157,8 +157,16 @@ impl Service {
             git: job.git.clone(),
         };
         let revision = revision_for(job, content);
+        crate::db::metadata::validate_metadata_ordinals(
+            &job.initial_chunk_metadata,
+            revision.content.chunks,
+        )?;
         writer.register(&revision, job.replacement, self.embedding_profile())?;
-        writer.set_initial_metadata(&revision, &job.initial_metadata)?;
+        writer.set_initial_metadata(
+            &revision,
+            &job.initial_metadata,
+            &job.initial_chunk_metadata,
+        )?;
         if !self.queue.begin_publish(job.id)? {
             return Err(Error::Conflict("indexing canceled".into()));
         }
@@ -271,6 +279,7 @@ impl StagedUpload {
         job.retain_original = self.upload.retain_original;
         job.chunking = self.service.chunking;
         job.initial_metadata = self.upload.initial_metadata;
+        job.initial_chunk_metadata = self.upload.initial_chunk_metadata;
         if job.extract_rtf {
             self.service
                 .files
@@ -323,6 +332,7 @@ pub(crate) fn new_job(
         git: None,
         chunking: Default::default(),
         initial_metadata: Vec::new(),
+        initial_chunk_metadata: Vec::new(),
     }
 }
 

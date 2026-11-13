@@ -128,6 +128,9 @@ enum Command {
         /// JSON array of namespaced metadata entries to attach to the revision.
         #[arg(long)]
         source_metadata: Option<PathBuf>,
+        /// JSON array of chunk ordinal and metadata entry groups.
+        #[arg(long)]
+        chunk_metadata: Option<PathBuf>,
         #[arg(long)]
         retain_original: bool,
         #[arg(long)]
@@ -542,6 +545,7 @@ async fn main() -> anyhow::Result<()> {
             background,
             request_id,
             source_metadata,
+            chunk_metadata,
             retain_original,
             replace_source,
             replace_external,
@@ -575,7 +579,22 @@ async fn main() -> anyhow::Result<()> {
                 retain_original,
                 request_id,
                 source_metadata: match source_metadata {
-                    Some(path) => read_source_metadata(path).await?,
+                    Some(path) => wire_initial_metadata(read_metadata_file(path).await?)?,
+                    None => Vec::new(),
+                },
+                chunk_metadata: match chunk_metadata {
+                    Some(path) => {
+                        let chunks: Vec<ChunkMetadata> = read_metadata_file(path).await?;
+                        chunks
+                            .into_iter()
+                            .map(|chunk| {
+                                Ok(v1::UploadChunkMetadata {
+                                    ordinal: chunk.ordinal,
+                                    entries: wire_initial_metadata(chunk.entries)?,
+                                })
+                            })
+                            .collect::<anyhow::Result<_>>()?
+                    }
                     None => Vec::new(),
                 },
             };
@@ -803,7 +822,13 @@ struct SourceMetadata {
     value: serde_json::Value,
 }
 
-async fn read_source_metadata(path: PathBuf) -> anyhow::Result<Vec<v1::MetadataEntry>> {
+#[derive(serde::Deserialize)]
+struct ChunkMetadata {
+    ordinal: u64,
+    entries: Vec<SourceMetadata>,
+}
+
+async fn read_metadata_file<T: serde::de::DeserializeOwned>(path: PathBuf) -> anyhow::Result<T> {
     const MAX_FILE_BYTES: u64 = 1024 * 1024;
     let file = tokio::fs::File::open(&path)
         .await
@@ -813,10 +838,13 @@ async fn read_source_metadata(path: PathBuf) -> anyhow::Result<Vec<v1::MetadataE
         .read_to_end(&mut input)
         .await?;
     if input.len() as u64 > MAX_FILE_BYTES {
-        return Err(anyhow!("source metadata file exceeds 1 MiB"));
+        return Err(anyhow!("metadata file exceeds 1 MiB"));
     }
-    let metadata: Vec<SourceMetadata> = serde_json::from_slice(&input)
-        .with_context(|| format!("parse metadata from {}", path.display()))?;
+    serde_json::from_slice(&input)
+        .with_context(|| format!("parse metadata from {}", path.display()))
+}
+
+fn wire_initial_metadata(metadata: Vec<SourceMetadata>) -> anyhow::Result<Vec<v1::MetadataEntry>> {
     metadata
         .into_iter()
         .map(|entry| {

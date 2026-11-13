@@ -116,6 +116,9 @@ struct Ingest {
     /// Namespaced JSON values attached to the new revision on publication.
     #[serde(default)]
     source_metadata: Vec<InitialMetadata>,
+    /// Metadata for zero-based chunk ordinals in the published revision.
+    #[serde(default)]
+    chunk_metadata: Vec<InitialChunkMetadata>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -123,6 +126,22 @@ struct InitialMetadata {
     namespace: String,
     key: String,
     value: Value,
+}
+
+impl From<InitialMetadata> for MetadataMutation {
+    fn from(entry: InitialMetadata) -> Self {
+        Self {
+            namespace: entry.namespace,
+            key: entry.key,
+            edit: MetadataEdit::Set(entry.value),
+        }
+    }
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct InitialChunkMetadata {
+    ordinal: u64,
+    entries: Vec<InitialMetadata>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -369,13 +388,13 @@ impl Tools {
                 }),
                 replacement,
                 retain_original: false,
-                initial_metadata: args
-                    .source_metadata
+                initial_metadata: args.source_metadata.into_iter().map(Into::into).collect(),
+                initial_chunk_metadata: args
+                    .chunk_metadata
                     .into_iter()
-                    .map(|entry| MetadataMutation {
-                        namespace: entry.namespace,
-                        key: entry.key,
-                        edit: MetadataEdit::Set(entry.value),
+                    .map(|chunk| sanctum_service::ChunkMetadata {
+                        ordinal: chunk.ordinal,
+                        entries: chunk.entries.into_iter().map(Into::into).collect(),
                     })
                     .collect(),
             };

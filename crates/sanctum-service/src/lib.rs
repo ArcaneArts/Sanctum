@@ -6,8 +6,8 @@ use std::{
 pub use context::ChunkContext;
 pub use database_sessions::{DatabaseSession, DatabaseTarget};
 pub use db::metadata::{
-    Change, Edit as MetadataEdit, Entry as MetadataEntry, Mutation as MetadataMutation,
-    RevisionTarget,
+    Change, ChunkMetadata, Edit as MetadataEdit, Entry as MetadataEntry,
+    Mutation as MetadataMutation, RevisionTarget,
 };
 pub use db::{metadata_filter, metadata_query, snapshot as database_snapshot};
 pub use hit_metadata::{HitMetadata, HitMetadataEntry};
@@ -90,6 +90,8 @@ pub struct TextUpload {
     pub retain_original: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initial_metadata: Vec<MetadataMutation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub initial_chunk_metadata: Vec<ChunkMetadata>,
 }
 
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -100,10 +102,19 @@ pub struct Replacement {
 
 impl TextUpload {
     fn validate(&mut self) -> Result<()> {
-        db::metadata::validate_initial_metadata(&self.initial_metadata)?;
-        self.initial_metadata.sort_unstable_by(|left, right| {
+        db::metadata::validate_initial_metadata(
+            &self.initial_metadata,
+            &self.initial_chunk_metadata,
+        )?;
+        let by_key = |left: &MetadataMutation, right: &MetadataMutation| {
             (&left.namespace, &left.key).cmp(&(&right.namespace, &right.key))
-        });
+        };
+        self.initial_metadata.sort_unstable_by(by_key);
+        self.initial_chunk_metadata
+            .sort_unstable_by_key(|chunk| chunk.ordinal);
+        for chunk in &mut self.initial_chunk_metadata {
+            chunk.entries.sort_unstable_by(by_key);
+        }
         if self.name.trim().is_empty() || self.name.len() > 1024 {
             return Err(Error::Invalid(
                 "source name must contain 1 to 1024 bytes".into(),

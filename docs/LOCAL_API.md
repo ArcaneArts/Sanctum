@@ -130,10 +130,11 @@ its verified content hash.
 
 ## Metadata on upload
 
-`SubmitText` and `UploadText` accept `source_metadata` on the upload header.
-Each entry contains `namespace`, `key`, and `value_json`. Use up to 32 unique
-namespace/key pairs, 64 KiB per JSON value, and 512 KiB of values in total.
-The queue stores the entries at acceptance. The same transaction that makes
+`SubmitText` and `UploadText` accept `source_metadata` and `chunk_metadata`
+on the upload header. Each entry contains `namespace`, `key`, and `value_json`.
+Use unique namespace/key pairs within each target, up to 32 entries across
+all targets, 64 KiB per JSON value, and 512 KiB of values in total. The queue
+stores the entries at acceptance. The same transaction that makes
 text searchable attaches them to the new revision. On replacement, readers
 see the previous revision and its metadata until the replacement commits.
 The new revision starts with the metadata supplied for that upload.
@@ -142,6 +143,13 @@ The CLI reads a JSON array from `--source-metadata FILE`. For example,
 `[{"namespace":"editor","key":"tags","value":["sample",null]}]` attaches one
 array value. Hosted replay with the same request UUID requires the same
 metadata values and accepts a different entry order.
+
+For chunk metadata, supply each zero-based ordinal once with its entries.
+The CLI accepts `--chunk-metadata FILE` with a JSON array such as
+`[{"ordinal":0,"entries":[{"namespace":"editor","key":"section","value":2}]}]`.
+Ordinals refer to the canonical text and the chunk settings captured at
+acceptance. An ordinal outside the computed revision fails the entire
+publication and preserves the prior revision and metadata.
 
 ## Literal scan of pending text
 

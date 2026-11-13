@@ -1952,6 +1952,7 @@ fn header(tenant: &str) -> v1::UploadTextFrame {
             retain_original: false,
             request_id: None,
             source_metadata: Vec::new(),
+            chunk_metadata: Vec::new(),
         })),
     }
 }
@@ -3196,6 +3197,10 @@ async fn local_upload_metadata_publishes_with_replacement_after_restart() {
     let with_metadata = |mut frame: v1::UploadTextFrame, metadata| {
         if let Some(Frame::Header(header)) = &mut frame.frame {
             header.source_metadata = metadata;
+            header.chunk_metadata = vec![v1::UploadChunkMetadata {
+                ordinal: 0,
+                entries: vec![entry("chunk", "true")],
+            }];
         }
         frame
     };
@@ -3212,17 +3217,13 @@ async fn local_upload_metadata_publishes_with_replacement_after_restart() {
         .set_local_queue(v1::SetLocalQueueRequest { paused: true })
         .await
         .unwrap();
-    let replacement = with_metadata(
+    let candidate = with_metadata(
         replacement(Some(&first.source_id), Some(&first.revision_id)),
         vec![entry("new", "[1,null]")],
     );
     let accepted = running
         .client
-        .submit_text(tokio_stream::iter([
-            replacement,
-            data(b"new quartz"),
-            end(),
-        ]))
+        .submit_text(tokio_stream::iter([candidate, data(b"new quartz"), end()]))
         .await
         .unwrap()
         .into_inner();
@@ -3251,13 +3252,13 @@ async fn local_upload_metadata_publishes_with_replacement_after_restart() {
         .unwrap();
     await_ready(&mut running.client, job_request(accepted.operation_id)).await;
     let current = v1::MetadataTarget {
-        revision_id: Some(accepted.revision_id),
+        revision_id: Some(accepted.revision_id.clone()),
         ..target.clone()
     };
     assert_eq!(
         running
             .client
-            .get_metadata(current)
+            .get_metadata(current.clone())
             .await
             .unwrap()
             .into_inner()
@@ -3267,11 +3268,50 @@ async fn local_upload_metadata_publishes_with_replacement_after_restart() {
     assert_eq!(
         running
             .client
-            .get_metadata(target)
+            .get_metadata(target.clone())
             .await
             .unwrap_err()
             .code(),
         Code::FailedPrecondition
+    );
+    let chunk = v1::MetadataTarget {
+        chunk_ordinal: Some(0),
+        ..current.clone()
+    };
+    assert_eq!(
+        running
+            .client
+            .get_metadata(chunk.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .entries,
+        vec![entry("chunk", "true")]
+    );
+    let mut invalid = replacement(Some(&first.source_id), Some(&accepted.revision_id));
+    if let Some(Frame::Header(header)) = &mut invalid.frame {
+        header.chunk_metadata = vec![v1::UploadChunkMetadata {
+            ordinal: 1,
+            entries: vec![entry("chunk", "false")],
+        }];
+    }
+    let bad = running
+        .client
+        .submit_text(tokio_stream::iter([invalid, data(b"failed quartz"), end()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let failed = await_failure(&mut running.client, job_request(bad.operation_id)).await;
+    assert_eq!(failed.error_code.as_deref(), Some("invalid_source"));
+    assert_eq!(
+        running
+            .client
+            .get_metadata(chunk)
+            .await
+            .unwrap()
+            .into_inner()
+            .entries,
+        vec![entry("chunk", "true")]
     );
     running.stop().await;
 }

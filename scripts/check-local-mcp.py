@@ -261,7 +261,8 @@ def check_hosted(bin_dir):
                         after=first_page["next_after"])["collections"] == ["reference"]
         initial_metadata = {"namespace": "field", "key": "labels", "value": ["original", None]}
         args = scope | {"name": "notes.md", "text": text, "request_id": request,
-                        "source_metadata": [initial_metadata]}
+                        "source_metadata": [initial_metadata],
+                        "chunk_metadata": [{"ordinal": 0, "entries": [initial_metadata]}]}
         accepted = rpc.tool("ingest_text", **args)
         assert accepted["state"] == "accepted" and accepted["operation_id"] == request
         rpc.exchange = second_http
@@ -300,12 +301,14 @@ def check_hosted(bin_dir):
         reference = {key: hit[key] for key in ("tenant", "collection", "source_id", "revision_id", "ordinal")}
         source_ref = {key: value for key, value in reference.items() if key != "ordinal"}
         assert rpc.tool("get_metadata", **source_ref)["entries"] == [initial_metadata]
+        assert rpc.tool("get_metadata", **reference)["entries"] == [initial_metadata]
         exact = rpc.tool("fetch_chunk", **reference)
         context = rpc.tool("fetch_context", **reference)
         assert context["text"] == text and context["hit"] == exact
         rpc.tool("mutate_metadata", **reference, edits=[edit])
         rpc.exchange = second_http
-        assert rpc.tool("get_metadata", **reference)["entries"][0]["value"] == edit["value"]
+        entries = {entry["key"]: entry["value"] for entry in rpc.tool("get_metadata", **reference)["entries"]}
+        assert entries == {edit["key"]: edit["value"], initial_metadata["key"]: initial_metadata["value"]}
         assert exact["excerpt"] == text.encode()[exact["start_byte"]:exact["end_byte"]].decode() == text
         missing = rpc.request("tools/call", {"name": "fetch_chunk",
                                              "arguments": reference | {"tenant": "other"}})
