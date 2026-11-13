@@ -1,0 +1,10 @@
+[package]
+name = "sanctum-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sanctum-core = { path = "../sanctum-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }

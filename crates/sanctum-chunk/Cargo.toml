@@ -1,0 +1,9 @@
+[package]
+name = "sanctum-chunk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sanctum-core = { path = "../sanctum-core" }
+blake3 = { workspace = true }

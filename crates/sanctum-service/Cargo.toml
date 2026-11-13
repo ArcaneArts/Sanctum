@@ -1,0 +1,14 @@
+[package]
+name = "sanctum-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sanctum-core = { path = "../sanctum-core" }
+sanctum-storage-fs = { path = "../sanctum-storage-fs" }
+sanctum-db-sqlite = { path = "../sanctum-db-sqlite" }
+sanctum-chunk = { path = "../sanctum-chunk" }
+blake3 = { workspace = true }
+tempfile = { workspace = true }
+uuid = { workspace = true }
