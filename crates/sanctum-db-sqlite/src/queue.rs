@@ -104,6 +104,7 @@ impl LocalQueue {
                 include_str!("runtime_v10.sql"),
                 include_str!("runtime_v11.sql"),
                 include_str!("runtime_v12.sql"),
+                include_str!("runtime_v13.sql"),
             ],
         )?;
         connection
@@ -125,19 +126,40 @@ impl LocalQueue {
 
     /// Removes a bounded page of terminal jobs after their operational retention.
     pub fn prune_finished(&self) -> Result<usize> {
-        self.connect()?
-            .execute(
-                "DELETE FROM ingestion_jobs WHERE operation_id IN (
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let expired = {
+            let mut statement = transaction
+                .prepare(
+                    "DELETE FROM ingestion_jobs WHERE operation_id IN (
                     SELECT operation_id FROM ingestion_jobs
                     WHERE finished_at <= unixepoch() - ?1 AND (
                         status IN ('text_ready', 'canceled')
                         OR (status = 'failed' AND error_code IS NOT 'retryable')
                     )
                     ORDER BY finished_at, operation_id LIMIT 256
-                )",
-                [45 * 24 * 3600],
-            )
-            .map_err(database_error)
+                ) RETURNING operation_id",
+                )
+                .map_err(database_error)?;
+            statement
+                .query_map([45 * 24 * 3600], |row| row.get::<_, String>(0))
+                .map_err(database_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(database_error)?
+        };
+        for operation in &expired {
+            transaction
+                .execute(
+                    "UPDATE local_upload_requests SET operation_id = NULL, fingerprint = NULL
+                 WHERE operation_id = ?1",
+                    [operation],
+                )
+                .map_err(database_error)?;
+        }
+        transaction.commit().map_err(database_error)?;
+        Ok(expired.len())
     }
 
     pub fn purge_collection(&self, scope: &Scope) -> Result<()> {
@@ -145,7 +167,12 @@ impl LocalQueue {
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
-        for table in ["ingestion_jobs", "replacement_sequences", "watched_folders"] {
+        for table in [
+            "ingestion_jobs",
+            "replacement_sequences",
+            "watched_folders",
+            "local_upload_requests",
+        ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE tenant = ?1 AND collection = ?2"),
                 params![scope.tenant.as_str(), scope.collection.as_str()],
@@ -155,7 +182,55 @@ impl LocalQueue {
         tx.commit().map_err(database_error)
     }
 
-    pub fn insert(&self, job: &mut Job) -> Result<()> {
+    pub fn replay_upload(
+        &self,
+        scope: &Scope,
+        request: Uuid,
+        fingerprint: &str,
+    ) -> Result<Option<Job>> {
+        let existing = self
+            .connect()?
+            .query_row(
+                "SELECT operation_id, fingerprint FROM local_upload_requests
+             WHERE tenant = ?1 AND collection = ?2 AND request_id = ?3",
+                params![
+                    scope.tenant.as_str(),
+                    scope.collection.as_str(),
+                    request.to_string()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error)?;
+        let Some((operation, digest)) = existing else {
+            return Ok(None);
+        };
+        let operation = operation.ok_or_else(|| {
+            Error::Conflict("upload request ID has expired; use a new request ID".into())
+        })?;
+        if digest.as_deref() != Some(fingerprint) {
+            return Err(Error::Conflict(
+                "request ID already applies to a different upload".into(),
+            ));
+        }
+        let operation = operation
+            .parse()
+            .map_err(|error| Error::Internal(Box::new(error)))?;
+        match self.get(scope, operation) {
+            Ok(job) => Ok(Some(job)),
+            Err(Error::NotFound(_)) => Err(Error::Conflict(
+                "upload request ID has expired; use a new request ID".into(),
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn insert(&self, job: &mut Job, request: Option<(Uuid, &str)>) -> Result<()> {
         let namespace = job.external.as_ref().map(|external| &external.namespace);
         let external_id = job.external.as_ref().map(|external| &external.id);
         let mut connection = self.connect()?;
@@ -210,6 +285,13 @@ impl LocalQueue {
                 |row| unsigned_column(row, 0),
             )
             .map_err(database_error)?;
+        if let Some((request, fingerprint)) = request {
+            transaction.execute(
+                "INSERT INTO local_upload_requests (tenant, collection, request_id, operation_id, fingerprint)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![job.scope.tenant.as_str(), job.scope.collection.as_str(), request.to_string(), job.id.to_string(), fingerprint],
+            ).map_err(database_error)?;
+        }
         transaction.commit().map_err(database_error)
     }
 

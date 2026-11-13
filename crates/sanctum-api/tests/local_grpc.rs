@@ -99,6 +99,126 @@ impl Running {
 }
 
 #[tokio::test]
+async fn local_upload_request_ids_replay_across_concurrency_restart_and_expiry() {
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start_with_workers(&dir, None, false).await;
+    create(&mut running.client, "default").await;
+    create(&mut running.client, "other").await;
+    let uuid = uuid::Uuid::new_v4();
+    let with_id = |mut frame: v1::UploadTextFrame| {
+        if let Some(Frame::Header(header)) = &mut frame.frame {
+            header.request_id = Some(uuid.to_string());
+        }
+        frame
+    };
+    let frames = |frame, bytes| tokio_stream::iter([frame, data(bytes), end()]);
+    let input = with_id(header("default"));
+    let text = b"local idempotency quartz".as_slice();
+    let mut second = running.client.clone();
+    let (left, right) = tokio::join!(
+        running.client.submit_text(frames(input.clone(), text)),
+        second.submit_text(frames(input.clone(), text)),
+    );
+    let first = left.unwrap().into_inner();
+    assert_eq!(first, right.unwrap().into_inner());
+    assert_eq!(
+        running
+            .client
+            .submit_text(frames(input.clone(), b"different"))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    let other = running
+        .client
+        .submit_text(frames(with_id(header("other")), text))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(first.operation_id, other.operation_id);
+    drop(second);
+    running.stop().await;
+
+    let mut running = Running::start_with_workers(&dir, None, false).await;
+    assert_eq!(
+        running
+            .client
+            .submit_text(frames(input.clone(), text))
+            .await
+            .unwrap()
+            .into_inner(),
+        first
+    );
+    assert!(running.service.process_next().unwrap());
+    if running
+        .client
+        .get_ingestion_job(job_request(first.operation_id.clone()))
+        .await
+        .unwrap()
+        .into_inner()
+        .state()
+        != v1::IngestionState::TextReady
+    {
+        assert!(running.service.process_next().unwrap());
+    }
+    let replay = running
+        .client
+        .upload_text(frames(input.clone(), text))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(replay.revision_id, first.revision_id);
+    let db = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM ingestion_jobs WHERE tenant = 'default'",
+            [],
+            |row| row.get::<_, u32>(0)
+        )
+        .unwrap(),
+        1
+    );
+    db.execute(
+        "UPDATE ingestion_jobs SET finished_at = 0 WHERE operation_id = ?1",
+        [&first.operation_id],
+    )
+    .unwrap();
+    drop(db);
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let maintenance = tokio::spawn(run_local_maintenance(running.service.clone(), shutdown));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if running
+                .client
+                .get_ingestion_job(job_request(first.operation_id.clone()))
+                .await
+                .is_err_and(|error| error.code() == Code::NotFound)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    maintenance.await.unwrap();
+    let expired = running
+        .client
+        .submit_text(frames(input, text))
+        .await
+        .unwrap_err();
+    assert_eq!(expired.code(), Code::AlreadyExists);
+    assert!(expired.message().contains("expired"));
+    assert_eq!(
+        search(&mut running.client, "default", "quartz").await.len(),
+        1
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn local_pending_literal_scan_does_not_require_lexical_publication() {
     use v1::pending_text_scan_event::Event;
     let dir = TempDir::new().unwrap();

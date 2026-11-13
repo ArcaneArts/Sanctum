@@ -220,16 +220,42 @@ fn revision_for(job: &Job, content: RevisionContent) -> Revision {
 
 impl StagedUpload {
     pub fn enqueue(self) -> Result<Job> {
-        let service = self.service.clone();
-        let _reader = service
-            .retrieval
-            .read()
-            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
+        self.enqueue_with_request(None)
+    }
+
+    pub fn enqueue_with_request(self, request: Option<Uuid>) -> Result<Job> {
         let bytes = self.file.as_file().metadata()?.len();
         if bytes > self.service.max_source_bytes {
             return Err(Error::Invalid(
                 "source exceeds the configured upload limit".into(),
             ));
+        }
+        if request.is_some_and(|id| id.is_nil()) {
+            return Err(Error::Invalid("request ID must be a nonzero UUID".into()));
+        }
+        let fingerprint = request.map(|_| self.upload_fingerprint()).transpose()?;
+        let receipt = request.zip(fingerprint.as_deref());
+        let service = self.service.clone();
+        let _guard = receipt
+            .map(|(request, _)| {
+                service.upload_requests
+                    [usize::from(request.as_bytes()[15]) % service.upload_requests.len()]
+                .lock()
+                .map_err(|_| Error::Busy("upload request lock is unavailable".into()))
+            })
+            .transpose()?;
+        let _reader = service
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
+        if let Some((request, fingerprint)) = receipt {
+            service.require_collection(&self.scope)?;
+            if let Some(job) = service
+                .queue
+                .replay_upload(&self.scope, request, fingerprint)?
+            {
+                return Ok(job);
+            }
         }
         let mut database = self.service.database(&self.scope)?;
         let writer = database.write()?;
@@ -266,16 +292,30 @@ impl StagedUpload {
             bytes,
             replacement.is_some(),
         );
-        self.publish_job(job)
+        self.publish_job_locked(job, receipt)
     }
 
-    pub(crate) fn publish_job(self, mut job: Job) -> Result<Job> {
+    fn upload_fingerprint(&self) -> Result<String> {
+        let header =
+            serde_json::to_vec(&self.upload).map_err(|error| Error::Internal(Box::new(error)))?;
+        let mut hash = blake3::Hasher::new();
+        hash.update(&(header.len() as u64).to_le_bytes());
+        hash.update(&header);
+        hash.update_reader(self.file.reopen()?)?;
+        Ok(hash.finalize().to_hex().to_string())
+    }
+
+    pub(crate) fn publish_job(self, job: Job) -> Result<Job> {
         let service = self.service.clone();
         let _reader = service
             .retrieval
             .read()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
-        service.require_collection(&job.scope)?;
+        self.publish_job_locked(job, None)
+    }
+
+    fn publish_job_locked(self, mut job: Job, request: Option<(Uuid, &str)>) -> Result<Job> {
+        self.service.require_collection(&job.scope)?;
         job.retain_original = self.upload.retain_original;
         job.chunking = self.service.chunking;
         job.initial_metadata = self.upload.initial_metadata;
@@ -289,7 +329,7 @@ impl StagedUpload {
                 .files
                 .publish(&job.scope, job.source, job.revision, self.file)?;
         }
-        self.service.queue.insert(&mut job)?;
+        self.service.queue.insert(&mut job, request)?;
         Ok(job)
     }
 }

@@ -369,7 +369,7 @@ message UploadTextHeader {
   Replacement replacement = 4;
   // Retain the original after extraction. UTF-8 input shares its canonical file.
   bool retain_original = 5;
-  // Optional nonzero UUID for replaying hosted submissions within a collection.
+  // Optional nonzero UUID for replaying submissions within a collection.
   optional string request_id = 6;
   // Namespaced JSON values attached to the new source revision on publication.
   repeated MetadataEntry source_metadata = 7;

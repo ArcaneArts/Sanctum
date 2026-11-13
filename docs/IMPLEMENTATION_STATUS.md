@@ -44,7 +44,7 @@ Merged in [PR #3](https://github.com/ArcaneArts/Sanctum/pull/3).
   recorded, the next attempt recovers that receipt without indexing twice.
 - The gRPC tests cover persisted pause and acceptance, tenant-scoped cancellation,
   recovery from a missing receipt, and retry after a storage read failure.
-- Caller-provided request idempotency remains open.
+- Caller-provided upload request IDs were added in a later cycle.
 
 ## Local source lifecycle
 
@@ -962,3 +962,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   pages, tenant isolation, and pending and canceled operation states.
 - Live MinIO and the CLI verify that a hosted continuation survives a
   restart and returns pending and canceled records across collections.
+- Delivered in [PR #65](https://github.com/ArcaneArts/Sanctum/pull/65).
+
+## Local upload request replay
+
+- Local uploads and MCP deposits accept a scoped request UUID. The queue
+  commits its receipt with the accepted job, and finished-job maintenance
+  keeps a compact reservation after expiry.
+- The local gRPC test verifies concurrent replay, distinct tenant scope,
+  restart, conflicting bytes, and UUID expiry with published text intact.
+- Local MCP HTTP smoke submits the same request twice and verifies the
+  original operation and revision IDs.

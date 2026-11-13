@@ -1197,11 +1197,6 @@ async fn submit_local(
     mut stream: Streaming<v1::UploadTextFrame>,
 ) -> std::result::Result<Job, Status> {
     let (scope, upload, request_id) = read_upload_header(&mut stream).await?;
-    if request_id.is_some() {
-        return Err(Status::invalid_argument(
-            "upload request IDs are supported for hosted submissions",
-        ));
-    }
     let service = service.clone();
     let max_bytes = service.max_source_bytes();
     let (staged, file) = work(move || {
@@ -1211,7 +1206,7 @@ async fn submit_local(
     })
     .await?;
     receive_upload(&mut stream, file, max_bytes).await?;
-    work(move || staged.enqueue()).await
+    work(move || staged.enqueue_with_request(request_id)).await
 }
 
 async fn submit_hosted(
