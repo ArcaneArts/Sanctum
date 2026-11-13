@@ -173,16 +173,12 @@ impl HostedCatalog {
                 "collection page limit must be between 1 and 100".into(),
             ));
         }
-        let catalog = Unit::catalog(self.prefix.as_ref(), tenant)?;
-        let Some(database) = self.snapshots.read(&self.publication, &catalog).await? else {
-            return Ok(Vec::new());
-        };
-        let after = after.map(ToString::to_string);
-        tokio::task::spawn_blocking(move || {
-            db::list_collections_page(database.path(), after.as_deref(), limit)
-        })
-        .await
-        .map_err(|error| Error::Internal(Box::new(error)))?
+        Ok(self
+            .list_collection_details(tenant, after, limit)
+            .await?
+            .into_iter()
+            .map(|row| row.id)
+            .collect())
     }
 
     pub async fn storage_usage(&self, scope: &UsageScope) -> Result<UsageMeasurement> {

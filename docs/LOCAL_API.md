@@ -154,6 +154,18 @@ deleted sources are absent. Use `GetIngestionJob` for pending work and
 `GetEmbeddingStatus` for processing coverage. Hosted results also
 include the database generation used for the read.
 
+## Collection names
+
+`ListCollections` returns each collection's stable scope, display name,
+and creation time. Existing collections default to their ID as the
+display name. `UpdateCollection` changes the display name in the tenant
+catalog. It trims surrounding whitespace and accepts 1–256 UTF-8 bytes.
+Existing chunk references and source paths keep their collection IDs.
+
+```sh
+cargo run --locked -p sanctum-cli -- rename-collection notes 'Field notes'
+```
+
 ## Collection deletion
 
 `DeleteCollection` removes a collection, its sources, and its queued

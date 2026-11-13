@@ -5,6 +5,7 @@ package sanctum.v1;
 service Sanctum {
   rpc GetRuntimeInfo(Empty) returns (RuntimeInfo);
   rpc CreateCollection(CreateCollectionRequest) returns (Collection);
+  rpc UpdateCollection(UpdateCollectionRequest) returns (Collection);
   rpc DeleteCollection(DeleteCollectionRequest) returns (Empty);
   rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
   rpc UploadText(stream UploadTextFrame) returns (TextRevision);
@@ -325,8 +326,16 @@ message DeleteCollectionRequest {
   optional string request_id = 2;
 }
 
+message UpdateCollectionRequest {
+  Scope scope = 1;
+  string display_name = 2;
+}
+
 message Collection {
   Scope scope = 1;
+  // Catalog reads and updates populate these fields.
+  optional string display_name = 2;
+  optional uint64 created_at_unix_seconds = 3;
 }
 
 message ListCollectionsRequest {

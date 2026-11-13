@@ -113,6 +113,18 @@ async fn local_collection_deletion_purges_jobs_and_recovers_from_a_tombstone() {
     assert!(info.capabilities.contains(&"local_import".into()));
     create(&mut api.client, "default").await;
     create(&mut api.client, "other").await;
+    let renamed = api
+        .client
+        .update_collection(v1::UpdateCollectionRequest {
+            scope: scope("default"),
+            display_name: "Local notes".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(renamed.scope, scope("default"));
+    assert_eq!(renamed.display_name.as_deref(), Some("Local notes"));
+
     let uploaded = upload(&mut api.client, header("default"), b"indexed quartz").await;
     let session = api
         .client

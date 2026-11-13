@@ -834,3 +834,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - The gRPC test checks typed values and omission of a value over
   budget. Local and hosted MCP checks verify filter metadata on
   cited results, including a hosted multi-collection query.
+- Delivered in [PR #54](https://github.com/ArcaneArts/Sanctum/pull/54).
+
+## Collection names
+
+- Catalog lists expose display names and creation times. gRPC and
+  the CLI can update the display name without changing the stable
+  collection ID or its source paths. Old snapshots default to their
+  existing IDs as names.
+- Local and hosted integration checks verify the stable scope. A
+  CLI and generated Python MinIO check verifies Unicode display names
+  and an unchanged creation time after restart.
