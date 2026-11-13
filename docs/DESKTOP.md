@@ -37,6 +37,13 @@ The Rust host serializes the active configuration into the child process's
 `SANCTUM_CONFIG_JSON`. Choose port zero to assign an ephemeral loopback port.
 The Connect page always shows the active MCP address.
 
+The embedding settings also support **OpenAI-compatible** and **Google Cloud**.
+For a bearer-authenticated endpoint, enter the environment variable name
+and launch Sanctum from an environment where that variable is set. For
+Google, configure Application Default Credentials and enter the project and
+location. The settings file stores the provider parameters and the variable
+name. [Embedding provider configuration](LOCAL_API.md#openai-compatible-embeddings).
+
 Closing the window leaves the server running. Use **Open Sanctum** in the
 tray menu to show it again. **Quit Sanctum** closes the host's control pipe,
 allows the server to stop, and exits. Accepted work resumes the next time

@@ -234,6 +234,8 @@ Merged in [PR #15](https://github.com/ArcaneArts/Sanctum/pull/15).
 
 ## Google Cloud embeddings
 
+Merged in [PR #16](https://github.com/ArcaneArts/Sanctum/pull/16).
+
 - The adapter uses Vertex AI text prediction with Application Default
   Credentials, distinct query and document tasks, requested dimensions, and
   truncation disabled. Its tests exercise the wire contract and response
@@ -242,3 +244,11 @@ Merged in [PR #15](https://github.com/ArcaneArts/Sanctum/pull/15).
   persists while ingestion and lexical fallback remain available.
 - Live prediction requires an authorized Sanctum Google Cloud project and
   a credential with Vertex AI prediction access.
+
+## Desktop embedding settings
+
+- The desktop supports Ollama, OpenAI-compatible endpoints, and Google
+  Cloud using the headless server's provider configuration. Earlier
+  desktop Ollama settings load with their saved profile intact.
+- The Rust settings test covers old settings, provider round trips, and
+  credential references. Hosted provider verification remains open.

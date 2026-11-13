@@ -1,12 +1,19 @@
-export type EmbeddingSettings = {
-  endpoint: string
+export type EmbeddingProfile = {
   model: string
   revision: string
   dimensions: number
-  timeout_seconds: number
   document_prefix: string
   query_prefix: string
 }
+
+export type EmbeddingSettings = {
+  profile: EmbeddingProfile
+  timeout_seconds: number
+} & (
+  | { provider: "ollama", endpoint: string }
+  | { provider: "openai", base_url: string, api_key_env: string | null, send_dimensions: boolean }
+  | { provider: "google", project: string, location: string }
+)
 
 export type Settings = {
   storage_root: string

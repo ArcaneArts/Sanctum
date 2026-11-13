@@ -5,16 +5,27 @@ import { useEffect, useState, type ReactNode } from "react"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
-import type { EmbeddingSettings, Settings } from "@/contracts"
+import type { EmbeddingProfile, EmbeddingSettings, Settings } from "@/contracts"
 
-const defaultEmbedding: EmbeddingSettings = {
-  endpoint: "http://127.0.0.1:11434",
-  model: "",
-  revision: "",
-  dimensions: 768,
-  timeout_seconds: 30,
-  document_prefix: "",
-  query_prefix: "",
+function defaultEmbedding(provider: string): EmbeddingSettings | null {
+  const profile = { model: "", revision: "", dimensions: 768, document_prefix: "", query_prefix: "" }
+  const common = { profile, timeout_seconds: 30 }
+  switch (provider) {
+    case "ollama":
+      return { ...common, provider, endpoint: "http://127.0.0.1:11434" }
+    case "openai":
+      return {
+        ...common, provider, base_url: "https://api.openai.com/v1", api_key_env: "OPENAI_API_KEY", send_dimensions: true,
+        profile: { ...profile, model: "text-embedding-3-small", dimensions: 1536 },
+      }
+    case "google":
+      return {
+        ...common, provider, project: "", location: "us-central1",
+        profile: { ...profile, model: "gemini-embedding-001" },
+      }
+    default:
+      return null
+  }
 }
 
 function Field({ label, children }: { label: string, children: ReactNode }) {
@@ -43,8 +54,8 @@ export function SettingsPanel({ run, pending, busy }: {
     setSettings(current => current && { ...current, ...change })
     setDirty(true)
   }
-  function updateEmbedding(change: Partial<EmbeddingSettings>) {
-    if (embedding) update({ embedding: { ...embedding, ...change } })
+  function updateProfile(change: Partial<EmbeddingProfile>) {
+    if (embedding) update({ embedding: { ...embedding, profile: { ...embedding.profile, ...change } } })
   }
 
   return <form className="space-y-4" onSubmit={event => {
@@ -80,28 +91,50 @@ export function SettingsPanel({ run, pending, busy }: {
       <div className="flex items-center justify-between gap-4">
         <h2 className="font-semibold">Embeddings</h2>
         <Field label="Provider">
-          <select className="rounded-md border border-border bg-background px-3 py-2 text-sm" value={embedding ? "ollama" : "disabled"}
-            onChange={event => update({ embedding: event.currentTarget.value === "ollama" ? { ...defaultEmbedding } : null })}>
+          <select className="rounded-md border border-border bg-background px-3 py-2 text-sm" value={embedding?.provider ?? "disabled"}
+            onChange={event => update({ embedding: defaultEmbedding(event.currentTarget.value) })}>
             <option value="disabled">Disabled</option><option value="ollama">Ollama</option>
+            <option value="openai">OpenAI-compatible</option><option value="google">Google Cloud</option>
           </select>
         </Field>
       </div>
       {embedding && <>
-        <Field label="Ollama URL"><Input type="url" required value={embedding.endpoint}
-          onChange={event => updateEmbedding({ endpoint: event.currentTarget.value })} /></Field>
+        {embedding.provider === "ollama" && <Field label="Ollama URL"><Input type="url" required value={embedding.endpoint}
+          onChange={event => update({ embedding: { ...embedding, endpoint: event.currentTarget.value } })} /></Field>}
+        {embedding.provider === "openai" && <>
+          <Field label="API base URL"><Input type="url" required value={embedding.base_url}
+            onChange={event => update({ embedding: { ...embedding, base_url: event.currentTarget.value } })} /></Field>
+          <Field label="API key environment variable"><Input value={embedding.api_key_env ?? ""} placeholder="OPENAI_API_KEY"
+            onChange={event => update({ embedding: { ...embedding, api_key_env: event.currentTarget.value || null } })} /></Field>
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={embedding.send_dimensions}
+              onChange={event => update({ embedding: { ...embedding, send_dimensions: event.currentTarget.checked } })} />
+            Send dimensions in the request
+          </label>
+        </>}
+        {embedding.provider === "google" && <>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Google Cloud project"><Input required value={embedding.project}
+              onChange={event => update({ embedding: { ...embedding, project: event.currentTarget.value } })} /></Field>
+            <Field label="Vertex AI location"><Input required value={embedding.location}
+              onChange={event => update({ embedding: { ...embedding, location: event.currentTarget.value } })} /></Field>
+          </div>
+          <p className="text-xs text-muted-foreground">Uses Google Application Default Credentials.</p>
+        </>}
         <div className="grid grid-cols-2 gap-3">
-          <Field label="Model"><Input required value={embedding.model} placeholder="embeddinggemma-2:740m"
-            onChange={event => updateEmbedding({ model: event.currentTarget.value })} /></Field>
-          <Field label="Model revision"><Input required value={embedding.revision} placeholder="Digest from ollama list"
-            onChange={event => updateEmbedding({ revision: event.currentTarget.value })} /></Field>
-          <Field label="Dimensions"><Input type="number" min={1} max={8192} required value={embedding.dimensions}
-            onChange={event => updateEmbedding({ dimensions: event.currentTarget.valueAsNumber })} /></Field>
+          <Field label="Model"><Input required value={embedding.profile.model}
+            onChange={event => updateProfile({ model: event.currentTarget.value })} /></Field>
+          <Field label="Model revision"><Input required value={embedding.profile.revision}
+            placeholder={embedding.provider === "ollama" ? "Digest from ollama list" : "Model version"}
+            onChange={event => updateProfile({ revision: event.currentTarget.value })} /></Field>
+          <Field label="Dimensions"><Input type="number" min={1} max={8192} required value={embedding.profile.dimensions}
+            onChange={event => updateProfile({ dimensions: event.currentTarget.valueAsNumber })} /></Field>
           <Field label="Request timeout (seconds)"><Input type="number" min={1} max={300} required value={embedding.timeout_seconds}
-            onChange={event => updateEmbedding({ timeout_seconds: event.currentTarget.valueAsNumber })} /></Field>
-          <Field label="Document prefix"><Input value={embedding.document_prefix}
-            onChange={event => updateEmbedding({ document_prefix: event.currentTarget.value })} /></Field>
-          <Field label="Query prefix"><Input value={embedding.query_prefix}
-            onChange={event => updateEmbedding({ query_prefix: event.currentTarget.value })} /></Field>
+            onChange={event => update({ embedding: { ...embedding, timeout_seconds: event.currentTarget.valueAsNumber } })} /></Field>
+          <Field label="Document prefix"><Input value={embedding.profile.document_prefix}
+            onChange={event => updateProfile({ document_prefix: event.currentTarget.value })} /></Field>
+          <Field label="Query prefix"><Input value={embedding.profile.query_prefix}
+            onChange={event => updateProfile({ query_prefix: event.currentTarget.value })} /></Field>
         </div>
       </>}
     </Card>

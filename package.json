@@ -4,7 +4,7 @@
   "packageManager": "pnpm@11.15.1",
   "scripts": {
     "devtop": "pnpm --filter @sanctum/desktop tauri dev",
-    "desktop:check": "node scripts/desktop-sidecars.mjs && pnpm --filter @sanctum/desktop build && cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check && cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --all-targets -- -D warnings",
+    "desktop:check": "node scripts/desktop-sidecars.mjs && pnpm --filter @sanctum/desktop build && cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check && cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --all-targets -- -D warnings && cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked",
     "check": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked"
   }
 }

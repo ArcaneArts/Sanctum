@@ -10,7 +10,6 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 anyhow = "1"
 sanctum-config = { path = "../../../crates/sanctum-config" }
-sanctum-embedding-ollama = { path = "../../../crates/sanctum-embedding-ollama" }
 sanctum-proto = { path = "../../../crates/sanctum-proto" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
