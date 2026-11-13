@@ -3,7 +3,7 @@ use std::{fs, path::Path, time::Duration};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
 };
-use sanctum_core::{ByteRange, Error, ExternalSource, Result, UrlProvenance};
+use sanctum_core::{ByteRange, Error, ExternalSource, GitProvenance, Result, UrlProvenance};
 use uuid::Uuid;
 
 pub mod embedding;
@@ -24,6 +24,7 @@ const COLLECTION_MIGRATIONS: &[&str] = &[
     include_str!("collection_v4.sql"),
     include_str!("collection_v5.sql"),
     include_str!("collection_v6.sql"),
+    include_str!("collection_v7.sql"),
 ];
 
 #[derive(Debug)]
@@ -45,6 +46,7 @@ pub struct RevisionContent {
     pub extractor: Option<String>,
     pub retain_original: bool,
     pub url: Option<UrlProvenance>,
+    pub git: Option<GitProvenance>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -158,7 +160,7 @@ impl CollectionDb {
         self.0
             .query_row(
                 "SELECT content_hash, chunk_count, bytes, COALESCE(original_hash, content_hash),
-                    source_encoding, extractor, retain_original, url_provenance
+                    source_encoding, extractor, retain_original, url_provenance, git_provenance
                  FROM revisions WHERE source_id = ?1 AND id = ?2",
                 params![source.to_string(), revision.to_string()],
                 |row| {
@@ -170,7 +172,8 @@ impl CollectionDb {
                         encoding: row.get(4)?,
                         extractor: row.get(5)?,
                         retain_original: row.get(6)?,
-                        url: read_url(row, 7)?,
+                        url: read_json(row, 7)?,
+                        git: read_json(row, 8)?,
                     })
                 },
             )
@@ -315,8 +318,8 @@ impl RevisionWriter<'_> {
         self.0
             .execute(
                 "INSERT INTO revisions (source_id, id, content_hash, bytes, chunk_count, chunker,
-                    original_hash, source_encoding, extractor, retain_original, url_provenance)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'utf8-overlap-v1', ?6, ?7, ?8, ?9, ?10)",
+                    original_hash, source_encoding, extractor, retain_original, url_provenance, git_provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'utf8-overlap-v1', ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     data.source.to_string(),
                     data.revision.to_string(),
@@ -327,7 +330,8 @@ impl RevisionWriter<'_> {
                     data.content.encoding,
                     data.content.extractor,
                     data.content.retain_original,
-                    write_url(data.content.url.as_ref())?
+                    write_json(data.content.url.as_ref())?,
+                    write_json(data.content.git.as_ref())?
                 ],
             )
             .map_err(database_error)?;
@@ -473,7 +477,10 @@ fn sql_integer(value: u64) -> Result<i64> {
         .map_err(|_| Error::Invalid("integer exceeds SQLite's supported range".into()))
 }
 
-fn read_url(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<UrlProvenance>> {
+fn read_json<T: serde::de::DeserializeOwned>(
+    row: &Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<T>> {
     row.get::<_, Option<String>>(column)?
         .map(|value| {
             serde_json::from_str(&value).map_err(|error| {
@@ -487,7 +494,7 @@ fn read_url(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<UrlProvenan
         .transpose()
 }
 
-fn write_url(value: Option<&UrlProvenance>) -> Result<Option<String>> {
+fn write_json<T: serde::Serialize>(value: Option<&T>) -> Result<Option<String>> {
     value
         .map(serde_json::to_string)
         .transpose()

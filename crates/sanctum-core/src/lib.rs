@@ -108,6 +108,15 @@ pub struct UrlProvenance {
     pub content_type: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct GitProvenance {
+    pub repository: String,
+    pub reference: String,
+    pub commit: String,
+    pub path: String,
+    pub blob: String,
+}
+
 pub const UPLOAD_FRAME_BYTES: usize = 256 * 1024;
 
 pub fn is_rtf(name: &str) -> bool {

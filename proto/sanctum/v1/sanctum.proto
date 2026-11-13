@@ -20,6 +20,7 @@ service Sanctum {
   rpc DeleteSource(DeleteSourceRequest) returns (DeletedSource);
   rpc ImportLocal(ImportLocalRequest) returns (stream ImportLocalEvent);
   rpc ImportUrl(ImportUrlRequest) returns (ImportUrlResponse);
+  rpc ImportGit(ImportGitRequest) returns (stream ImportGitEvent);
   rpc WatchFolder(WatchFolderRequest) returns (WatchedFolder);
   rpc ListWatchedFolders(ListWatchedFoldersRequest) returns (ListWatchedFoldersResponse);
   rpc UnwatchFolder(UnwatchFolderRequest) returns (Empty);
@@ -146,6 +147,7 @@ message IngestionJob {
   uint64 update_sequence = 14;
   uint64 created_at_unix_seconds = 15;
   UrlProvenance url = 16;
+  GitProvenance git = 17;
 }
 
 message LocalQueueStatus {
@@ -241,6 +243,34 @@ message ImportUrlResponse {
   UrlProvenance url = 5;
 }
 
+message ImportGitRequest {
+  Scope scope = 1;
+  oneof repository {
+    string local_path = 2;
+    string https_url = 3;
+  }
+  // Defaults to HEAD. Use a full ref or a full local commit ID.
+  string reference = 4;
+  repeated string include = 5;
+  repeated string exclude = 6;
+  bool prune_missing = 7;
+  bool retain_original = 8;
+}
+
+message GitProvenance {
+  string repository = 1;
+  string reference = 2;
+  string commit = 3;
+  string path = 4;
+  string blob = 5;
+}
+
+message ImportGitEvent {
+  ImportLocalEvent file = 1;
+  // Present for files observed in the selected commit.
+  GitProvenance git = 2;
+}
+
 message WatchFolderRequest {
   Scope scope = 1;
   string path = 2;
@@ -323,6 +353,7 @@ message TextRevision {
   optional string extractor = 11;
   bool retain_original = 12;
   UrlProvenance url = 13;
+  GitProvenance git = 14;
 }
 
 message SearchTextRequest {

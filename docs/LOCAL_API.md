@@ -401,3 +401,38 @@ is outside the operator's control.
   }
 }
 ```
+
+## Git imports
+
+```sh
+cargo run --locked -p sanctum-cli -- import-git notes --path /path/to/repo \
+  --ref refs/heads/main --include 'docs/**'
+cargo run --locked -p sanctum-cli -- import-git notes \
+  --https-url https://github.com/ArcaneArts/Sanctum.git --include 'docs/**'
+```
+
+`ImportGit` requires a `git` executable on the server's PATH. It resolves
+one commit from a local repository or fetches one ref into a temporary bare
+repository over HTTPS. The default ref is `HEAD`. Use a full branch or tag ref,
+such as `refs/heads/main` or `refs/tags/v1`. A local import can also use a full
+commit ID. Local paths are resolved on the server.
+
+The adapter enumerates committed regular files and streams raw blobs to
+staging. It skips worktree changes, symbolic links, and submodule entries.
+It reads Git LFS pointer files as ordinary committed text. Fetching uses the
+configured HTTPS origin policy and credential from [URL imports](#url-imports).
+Git's configuration and credential helpers from the operator's home directory
+are bypassed, HTTPS redirects are disabled, and the adapter creates no checkout
+or hook directory.
+
+The import stream reports each selected path, its commit and blob IDs, and
+the ingestion operation when one was accepted. A repository and ref define
+an independent source namespace, with each path as its external ID. An
+unchanged blob preserves the revision. An edit preserves the source ID and
+queues a replacement. The accepted operation and committed revision record
+the repository, ref, commit, path, and blob that produced that revision.
+
+An import reports selected paths missing from the new commit. Use
+`--prune-missing` to delete them and supersede their pending operations. Pruning
+runs after the tree is read successfully and all selected blobs are accepted.
+Includes and excludes use the same globs as local directory imports.

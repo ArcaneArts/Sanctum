@@ -7,7 +7,10 @@ use reqwest::{
 use sanctum_core::{Error, ExternalSource, Result, Scope, UrlProvenance, is_rtf};
 use tokio::io::AsyncWriteExt;
 
-use crate::{ImportEvent, Service, TextUpload, local_import::default_text};
+use crate::{
+    ImportEvent, Service, TextUpload,
+    local_import::{ImportProvenance, default_text},
+};
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_URL_BYTES: usize = 4096;
@@ -44,6 +47,19 @@ impl UrlImporter {
         }
     }
 
+    pub(crate) fn token(&self, url: &Url) -> Result<Option<String>> {
+        self.token_env(url)?
+            .map(|env| {
+                std::env::var(env)
+                    .ok()
+                    .filter(|token| !token.is_empty())
+                    .ok_or_else(|| {
+                        Error::Invalid("configured import credential is unavailable".into())
+                    })
+            })
+            .transpose()
+    }
+
     async fn get(&self, requested: &Url) -> Result<reqwest::Response> {
         let mut url = requested.clone();
         for redirect in 0..=MAX_REDIRECTS {
@@ -51,13 +67,7 @@ impl UrlImporter {
                 .client
                 .get(url.clone())
                 .header(header::ACCEPT_ENCODING, "identity");
-            if let Some(env) = self.token_env(&url)? {
-                let token = std::env::var(env)
-                    .ok()
-                    .filter(|token| !token.is_empty())
-                    .ok_or_else(|| {
-                        Error::Invalid("configured URL import credential is unavailable".into())
-                    })?;
+            if let Some(token) = self.token(&url)? {
                 request = request.bearer_auth(token);
             }
             let response = request.send().await.map_err(request_error)?;
@@ -215,7 +225,11 @@ impl Service {
         drop(output);
         let saved = provenance.clone();
         let event = tokio::task::spawn_blocking(move || {
-            staged.enqueue_import(bytes, hasher.finalize().to_hex().to_string(), Some(saved))
+            staged.enqueue_import(
+                bytes,
+                hasher.finalize().to_hex().to_string(),
+                Some(ImportProvenance::Url(saved)),
+            )
         })
         .await
         .map_err(task_error)??;
@@ -223,7 +237,7 @@ impl Service {
     }
 }
 
-fn parse_url(input: &str) -> Result<Url> {
+pub(crate) fn parse_url(input: &str) -> Result<Url> {
     if input.len() > MAX_URL_BYTES {
         return Err(Error::Invalid("URL import address is too long".into()));
     }

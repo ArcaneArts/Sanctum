@@ -1,8 +1,8 @@
 use rusqlite::{OptionalExtension, params};
-use sanctum_core::{Error, ExternalSource, Result};
+use sanctum_core::{Error, ExternalSource, GitProvenance, Result};
 use uuid::Uuid;
 
-use super::{CollectionDb, Revision, RevisionWriter, database_error, query_all};
+use super::{CollectionDb, Revision, RevisionWriter, database_error, query_all, read_json};
 
 pub const RETIRE_GRACE_SECONDS: i64 = 300;
 const DELETION_RECEIPT_SECONDS: i64 = 24 * 60 * 60;
@@ -20,6 +20,7 @@ pub struct SourceIdentity {
     pub hash: String,
     pub retain_original: bool,
     pub extracted: bool,
+    pub git: Option<GitProvenance>,
 }
 
 impl CollectionDb {
@@ -83,7 +84,7 @@ impl RevisionWriter<'_> {
             .0
             .query_row(
                 "SELECT s.id, s.current_revision, s.external_namespace, s.external_id,
-                        COALESCE(r.original_hash, r.content_hash), r.retain_original, r.extractor IS NOT NULL
+                        COALESCE(r.original_hash, r.content_hash), r.retain_original, r.extractor IS NOT NULL, r.git_provenance
              FROM sources s JOIN revisions r ON r.source_id = s.id AND r.id = s.current_revision
              WHERE s.deleted = 0 AND
                 ((?1 IS NOT NULL AND s.id = ?1) OR
@@ -102,6 +103,7 @@ impl RevisionWriter<'_> {
                         hash: row.get(4)?,
                         retain_original: row.get(5)?,
                         extracted: row.get(6)?,
+                        git: read_json(row, 7)?,
                     })
                 },
             )
