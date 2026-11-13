@@ -96,6 +96,18 @@ pub fn list_collections(path: &Path) -> Result<Vec<String>> {
     }
 }
 
+pub fn list_collections_page(path: &Path, after: Option<&str>, limit: u32) -> Result<Vec<String>> {
+    if !path.try_exists()? {
+        return Ok(Vec::new());
+    }
+    query_all(
+        &open(path, false)?,
+        "SELECT id FROM collections WHERE id > ?1 ORDER BY id LIMIT ?2",
+        params![after.unwrap_or_default(), limit],
+        |row| row.get(0),
+    )
+}
+
 pub fn require_collection(path: &Path, collection: &str) -> Result<()> {
     if path.try_exists()? {
         let found = open(path, false)?

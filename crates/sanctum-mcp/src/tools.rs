@@ -1,0 +1,457 @@
+use std::io::Write;
+
+use rmcp::{
+    ServerHandler,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{CallToolResult, ServerCapabilities, ServerConfig},
+    schemars, tool, tool_handler, tool_router,
+};
+use sanctum_core::{Error, ExternalSource, Result as SanctumResult, Scope};
+use sanctum_service::{
+    ChunkRef, Hit, Job, JobState, MetadataEdit, MetadataEntry, MetadataMutation, Replacement,
+    RevisionTarget, SearchMode, Service, TextUpload,
+};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::filter::MetadataFilter;
+
+const INLINE_LIMIT: usize = 128 * 1024;
+
+#[derive(Clone)]
+pub(crate) struct Tools {
+    service: Service,
+    tool_router: ToolRouter<Self>,
+}
+
+impl Tools {
+    pub(crate) fn new(service: Service) -> Self {
+        Self {
+            service,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    async fn execute(
+        &self,
+        work: impl FnOnce(Service) -> SanctumResult<Value> + Send + 'static,
+    ) -> CallToolResult {
+        let service = self.service.clone();
+        match tokio::task::spawn_blocking(move || work(service)).await {
+            Ok(result) => response(result),
+            Err(error) => response(Err(Error::Internal(Box::new(error)))),
+        }
+    }
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct Collection {
+    /// Tenant ID. Defaults to the local tenant.
+    #[serde(default = "default_tenant")]
+    tenant: String,
+    /// Collection ID.
+    collection: String,
+}
+
+impl Collection {
+    fn scope(&self) -> SanctumResult<Scope> {
+        Ok(Scope {
+            tenant: self.tenant.parse()?,
+            collection: self.collection.parse()?,
+        })
+    }
+}
+
+fn default_tenant() -> String {
+    "default".into()
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct Collections {
+    #[serde(default = "default_tenant")]
+    tenant: String,
+    /// Resume after this collection ID using next_after from the previous response.
+    after: Option<String>,
+    /// Maximum collections to return. Defaults to 25 and allows 1 to 99.
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SourceLink {
+    namespace: String,
+    id: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct Ingest {
+    #[serde(flatten)]
+    scope: Collection,
+    /// Name of the text source, with a file extension when applicable.
+    name: String,
+    /// UTF-8 text, up to 128 KiB. Use the gRPC upload for larger inputs.
+    text: String,
+    external: Option<SourceLink>,
+    /// Reuse the ID of an existing source by replacing its content.
+    replace_source_id: Option<String>,
+    /// Reject the replacement if the current revision differs.
+    expected_revision_id: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum Mode {
+    Lexical,
+    Semantic,
+    Hybrid,
+}
+
+impl From<Mode> for SearchMode {
+    fn from(mode: Mode) -> Self {
+        match mode {
+            Mode::Lexical => Self::Lexical,
+            Mode::Semantic => Self::Semantic,
+            Mode::Hybrid => Self::Hybrid,
+        }
+    }
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct Search {
+    #[serde(flatten)]
+    scope: Collection,
+    query: String,
+    /// Maximum hits. Defaults to 5 and allows 1 to 10.
+    limit: Option<u32>,
+    /// Defaults to hybrid. The result reports the mode used and any fallback.
+    mode: Option<Mode>,
+    /// Optional metadata predicate applied before ranking.
+    metadata_filter: Option<MetadataFilter>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct Fetch {
+    #[serde(flatten)]
+    scope: Collection,
+    source_id: String,
+    revision_id: String,
+    ordinal: u64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct Operation {
+    #[serde(flatten)]
+    scope: Collection,
+    operation_id: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct Target {
+    #[serde(flatten)]
+    scope: Collection,
+    /// Provide both IDs for source or chunk metadata. Omit both for collection metadata.
+    source_id: Option<String>,
+    revision_id: Option<String>,
+    /// Provide the ordinal for chunk metadata, including zero.
+    ordinal: Option<u64>,
+}
+
+impl Target {
+    fn revision(&self) -> SanctumResult<Option<RevisionTarget>> {
+        match (&self.source_id, &self.revision_id, self.ordinal) {
+            (None, None, None) => Ok(None),
+            (Some(source), Some(revision), ordinal) => Ok(Some(RevisionTarget {
+                source: id(source)?,
+                revision: id(revision)?,
+                ordinal,
+            })),
+            _ => Err(Error::Invalid(
+                "metadata requires both source and revision IDs".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum Edit {
+    Set { value: Value },
+    Patch { value: Value },
+    Remove,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct Mutation {
+    namespace: String,
+    key: String,
+    #[serde(flatten)]
+    edit: Edit,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct MetadataUpdate {
+    #[serde(flatten)]
+    target: Target,
+    edits: Vec<Mutation>,
+}
+
+#[tool_router]
+impl Tools {
+    #[tool(description = "List a page of collection IDs within a tenant.")]
+    async fn list_collections(&self, Parameters(args): Parameters<Collections>) -> CallToolResult {
+        self.execute(move |service| {
+            let tenant = args.tenant.parse()?;
+            let after = args.after.as_deref().map(str::parse).transpose()?;
+            let limit = args.limit.unwrap_or(25);
+            if !(1..=99).contains(&limit) {
+                return Err(Error::Invalid(
+                    "collection limit must be between 1 and 99".into(),
+                ));
+            }
+            let mut ids = service.list_collections_page(&tenant, after.as_ref(), limit + 1)?;
+            let next = if ids.len() > limit as usize {
+                ids.pop();
+                ids.last().cloned()
+            } else {
+                None
+            };
+            Ok(json!({"tenant": tenant.as_str(), "collections": ids, "next_after": next}))
+        })
+        .await
+    }
+
+    #[tool(description = "Create a collection to hold searchable text in a tenant.")]
+    async fn create_collection(&self, Parameters(args): Parameters<Collection>) -> CallToolResult {
+        self.execute(move |service| {
+            let scope = args.scope()?;
+            service.create_collection(&scope)?;
+            Ok(scope_value(&scope))
+        })
+        .await
+    }
+
+    #[tool(description = "Queue inline UTF-8 text for indexing and return a durable operation ID.")]
+    async fn ingest_text(&self, Parameters(args): Parameters<Ingest>) -> CallToolResult {
+        self.execute(move |service| {
+            let scope = args.scope.scope()?;
+            if args.text.len() > INLINE_LIMIT || args.text.len() as u64 > service.max_source_bytes()
+            {
+                return Err(Error::Invalid(
+                    "text exceeds the inline or configured source limit".into(),
+                ));
+            }
+            if args.expected_revision_id.is_some() && args.replace_source_id.is_none() {
+                return Err(Error::Invalid(
+                    "expected revision requires a replacement source ID".into(),
+                ));
+            }
+            let replacement = args
+                .replace_source_id
+                .as_deref()
+                .map(|source| -> SanctumResult<_> {
+                    Ok(Replacement {
+                        source: Some(id(source)?),
+                        expected_revision: args
+                            .expected_revision_id
+                            .as_deref()
+                            .map(id)
+                            .transpose()?,
+                    })
+                })
+                .transpose()?;
+            let upload = service.stage_upload(
+                scope,
+                TextUpload {
+                    name: args.name,
+                    external: args.external.map(|external| ExternalSource {
+                        namespace: external.namespace,
+                        id: external.id,
+                    }),
+                    replacement,
+                    retain_original: false,
+                },
+            )?;
+            upload.reopen()?.write_all(args.text.as_bytes())?;
+            Ok(job_value(upload.enqueue()?))
+        })
+        .await
+    }
+
+    #[tool(description = "Search one collection and return excerpts with exact source references.")]
+    async fn search(&self, Parameters(args): Parameters<Search>) -> CallToolResult {
+        let result = async {
+            let scope = args.scope.scope()?;
+            let limit = args.limit.unwrap_or(5);
+            if !(1..=10).contains(&limit) {
+                return Err(Error::Invalid("search limit must be between 1 and 10".into()));
+            }
+            let filter = args.metadata_filter.map(TryInto::try_into).transpose()?;
+            let result = self.service.retrieve(scope.clone(), args.query, limit, filter, args.mode.unwrap_or(Mode::Hybrid).into()).await?;
+            let mode = match result.mode {
+                SearchMode::Lexical => "lexical",
+                SearchMode::Semantic => "semantic",
+                SearchMode::Hybrid => "hybrid",
+            };
+            Ok(json!({
+                "mode": mode,
+                "degraded_reason": result.degraded,
+                "embedding_coverage": {
+                    "profile_id": result.profile,
+                    "total_chunks": result.coverage.total,
+                    "embedded_chunks": result.coverage.embedded,
+                    "failed_chunks": result.coverage.failed,
+                },
+                "hits": result.hits.into_iter().map(|hit| hit_value(&scope, hit)).collect::<Vec<_>>(),
+            }))
+        }.await;
+        response(result)
+    }
+
+    #[tool(description = "Read the exact canonical UTF-8 range for a chunk reference from search.")]
+    async fn fetch_chunk(&self, Parameters(args): Parameters<Fetch>) -> CallToolResult {
+        self.execute(move |service| {
+            let scope = args.scope.scope()?;
+            let reference = ChunkRef {
+                source: id(&args.source_id)?,
+                revision: id(&args.revision_id)?,
+                ordinal: args.ordinal,
+            };
+            Ok(hit_value(&scope, service.fetch(&scope, &reference)?))
+        })
+        .await
+    }
+
+    #[tool(description = "Check a durable ingestion operation for progress and errors.")]
+    async fn ingestion_status(&self, Parameters(args): Parameters<Operation>) -> CallToolResult {
+        self.execute(move |service| {
+            let scope = args.scope.scope()?;
+            Ok(job_value(service.job(&scope, id(&args.operation_id)?)?))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Read namespaced JSON metadata on a collection, current source, or chunk."
+    )]
+    async fn get_metadata(&self, Parameters(args): Parameters<Target>) -> CallToolResult {
+        self.execute(move |service| {
+            let scope = args.scope.scope()?;
+            metadata_value(service.metadata(&scope, args.revision()?, None)?)
+        })
+        .await
+    }
+
+    #[tool(description = "Atomically set, merge-patch, or remove namespaced JSON metadata.")]
+    async fn mutate_metadata(
+        &self,
+        Parameters(args): Parameters<MetadataUpdate>,
+    ) -> CallToolResult {
+        self.execute(move |service| {
+            let scope = args.target.scope.scope()?;
+            let edits: Vec<_> = args
+                .edits
+                .into_iter()
+                .map(|edit| MetadataMutation {
+                    namespace: edit.namespace,
+                    key: edit.key,
+                    edit: match edit.edit {
+                        Edit::Set { value } => MetadataEdit::Set(value),
+                        Edit::Patch { value } => MetadataEdit::Patch(value),
+                        Edit::Remove => MetadataEdit::Remove,
+                    },
+                })
+                .collect();
+            metadata_value(service.metadata(&scope, args.target.revision()?, Some(&edits))?)
+        })
+        .await
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for Tools {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(crate::INSTRUCTIONS)
+    }
+}
+
+fn id(value: &str) -> SanctumResult<Uuid> {
+    Uuid::parse_str(value).map_err(|_| Error::Invalid("expected a UUID".into()))
+}
+
+fn scope_value(scope: &Scope) -> Value {
+    json!({"tenant": scope.tenant.as_str(), "collection": scope.collection.as_str()})
+}
+
+fn job_value(job: Job) -> Value {
+    let state = match job.state {
+        JobState::Accepted => "accepted",
+        JobState::Indexing if job.extracting => "extracting",
+        JobState::Indexing => "indexing",
+        JobState::Publishing => "publishing",
+        JobState::TextReady => "text_ready",
+        JobState::Failed => "failed",
+        JobState::Canceled => "canceled",
+    };
+    json!({
+        "scope": scope_value(&job.scope),
+        "operation_id": job.id.to_string(),
+        "source_id": job.source.to_string(),
+        "revision_id": job.revision.to_string(),
+        "state": state,
+        "total_bytes": job.bytes,
+        "processed_bytes": job.processed_bytes,
+        "attempts": job.attempts,
+        "failure": job.failure.map(|error| json!({"code": error.code, "message": error.message})),
+    })
+}
+
+fn hit_value(scope: &Scope, hit: Hit) -> Value {
+    let chunk = hit.chunk;
+    json!({
+        "tenant": scope.tenant.as_str(),
+        "collection": scope.collection.as_str(),
+        "source_id": chunk.reference.source.to_string(),
+        "revision_id": chunk.reference.revision.to_string(),
+        "ordinal": chunk.reference.ordinal,
+        "name": chunk.name,
+        "start_byte": chunk.range.start,
+        "end_byte": chunk.range.end,
+        "content_blake3": chunk.hash,
+        "external": chunk.external.map(|source| json!({"namespace": source.namespace, "id": source.id})),
+        "excerpt": hit.excerpt,
+        "score": hit.score,
+    })
+}
+
+fn metadata_value(entries: Vec<MetadataEntry>) -> SanctumResult<Value> {
+    let mut metadata = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let value: Value =
+            serde_json::from_str(&entry.json).map_err(|error| Error::Internal(Box::new(error)))?;
+        metadata.push(json!({"namespace": entry.namespace, "key": entry.key, "value": value}));
+    }
+    Ok(json!({"entries": metadata}))
+}
+
+fn response(result: SanctumResult<Value>) -> CallToolResult {
+    match result {
+        Ok(value) => CallToolResult::structured(value),
+        Err(error) => {
+            let code = match &error {
+                Error::Invalid(_) => "invalid_argument",
+                Error::NotFound(_) => "not_found",
+                Error::Conflict(_) => "conflict",
+                Error::StaleRevision(_) => "stale_revision",
+                Error::Busy(_) => "unavailable",
+                Error::Io(_) | Error::Internal(_) => {
+                    tracing::warn!(%error, "MCP tool failed");
+                    return CallToolResult::structured_error(
+                        json!({"code": "internal", "message": "operation failed"}),
+                    );
+                }
+            };
+            CallToolResult::structured_error(json!({"code": code, "message": error.to_string()}))
+        }
+    }
+}

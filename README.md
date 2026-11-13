@@ -2,8 +2,8 @@
 
 Sanctum is a Rust service for storing, indexing, and retrieving text for
 agents and other applications. Its Protobuf/gRPC API supports ingestion and
-retrieval with source references and namespaced integration metadata. MCP is
-planned for the first desktop milestone.
+retrieval with source references and namespaced integration metadata. Agents
+can connect to the local server through [MCP HTTP or stdio](docs/MCP.md).
 
 **Status:** early implementation. The local gRPC service and CLI support
 streamed UTF-8 and RTF uploads, directory imports, full-text search, optional

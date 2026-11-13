@@ -5,7 +5,7 @@ which parts have working implementations and where to find the evidence.
 
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
-| 1. Local desktop and MCP | Local Rust service and gRPC CLI with streamed UTF-8 and RTF ingestion, directory imports, byte-range fetch, source lifecycle, metadata and filters, filesystem usage, and Ollama-backed semantic and hybrid search | MCP, tray app, per-source embedding progress, desktop acceptance |
+| 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, text ingestion and directory imports, byte-range fetch, source lifecycle, metadata and filters, filesystem usage, and Ollama-backed semantic and hybrid search | Tray app, per-source embedding progress, desktop and LLM client acceptance |
 | 2. Providers and local integrations | Pending | Hosted provider adapters, rebuilds, watchers, URL and Git imports, metadata queries and cursors, SQL access, multi-collection retrieval, platform packaging and verification |
 | 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
@@ -134,6 +134,8 @@ Merged in [PR #9](https://github.com/ArcaneArts/Sanctum/pull/9).
 
 ## Local embeddings and retrieval
 
+Merged in [PR #10](https://github.com/ArcaneArts/Sanctum/pull/10).
+
 - The server can use an existing Ollama endpoint with a configured model
   revision, dimensions, and separate document and query prefixes. The
   background worker reuses matching inputs within a collection, tracks
@@ -152,3 +154,16 @@ Merged in [PR #9](https://github.com/ArcaneArts/Sanctum/pull/9).
   It also exercised hybrid search.
 - Per-source embedding progress, explicit retry of permanent failures,
   cross-collection ranking, and capacity measurement remain open.
+
+## Local MCP
+
+- The server hosts MCP Streamable HTTP on a configurable loopback listener.
+  The CLI's `mcp-stdio` bridges tool discovery and calls to that listener.
+- MCP tools call the same application service as gRPC for collection
+  operations, inline ingestion, status, search, exact fetch, and metadata.
+  The [tool reference](MCP.md) documents pagination, response limits, and
+  client configuration.
+- The standalone integration check starts the server and CLI, verifies
+  tool discovery and shared state over HTTP, stdio, and gRPC, and checks
+  cross-tenant fetch rejection and HTTP Host and Origin validation.
+- Next, implement the desktop host, configuration, tray, and first-use flow.

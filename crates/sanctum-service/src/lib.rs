@@ -141,6 +141,24 @@ impl Service {
         db::list_collections(&self.files.catalog_path(tenant))
     }
 
+    pub fn list_collections_page(
+        &self,
+        tenant: &ScopeId,
+        after: Option<&ScopeId>,
+        limit: u32,
+    ) -> Result<Vec<String>> {
+        if !(1..=100).contains(&limit) {
+            return Err(Error::Invalid(
+                "collection page limit must be between 1 and 100".into(),
+            ));
+        }
+        db::list_collections_page(
+            &self.files.catalog_path(tenant),
+            after.map(ScopeId::as_str),
+            limit,
+        )
+    }
+
     pub fn stage_upload(&self, scope: Scope, upload: TextUpload) -> Result<StagedUpload> {
         if upload.name.trim().is_empty() || upload.name.len() > 1024 {
             return Err(Error::Invalid(

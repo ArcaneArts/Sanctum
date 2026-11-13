@@ -20,6 +20,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Serve MCP on stdio by connecting to the running Sanctum server.
+    McpStdio {
+        #[arg(long, default_value = "http://127.0.0.1:47551/mcp")]
+        mcp_url: String,
+    },
     Create {
         collection: String,
     },
@@ -100,6 +105,9 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if let Command::McpStdio { mcp_url } = args.command {
+        return sanctum_mcp::run_stdio_bridge(&mcp_url).await;
+    }
     let scope = |collection| {
         Some(v1::Scope {
             tenant: args.tenant.clone(),
@@ -108,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut client = SanctumClient::connect(args.endpoint).await?;
     match args.command {
+        Command::McpStdio { .. } => unreachable!("handled before opening a gRPC connection"),
         Command::Usage {
             collection,
             cluster,
