@@ -46,6 +46,30 @@ enum Command {
         #[arg(long)]
         retain_original: bool,
     },
+    /// Keep a directory synchronized with a collection.
+    Watch {
+        collection: String,
+        path: PathBuf,
+        #[arg(long)]
+        include: Vec<String>,
+        #[arg(long)]
+        exclude: Vec<String>,
+        #[arg(long)]
+        prune_missing: bool,
+        #[arg(long)]
+        retain_original: bool,
+        #[arg(long, default_value_t = 60)]
+        interval_seconds: u32,
+    },
+    /// List directory watches and the outcome of their latest scan.
+    Watches {
+        collection: String,
+    },
+    /// Stop watching a directory.
+    Unwatch {
+        collection: String,
+        id: String,
+    },
     Upload {
         collection: String,
         path: PathBuf,
@@ -120,6 +144,75 @@ async fn main() -> anyhow::Result<()> {
     let mut client = SanctumClient::connect(args.endpoint).await?;
     match args.command {
         Command::McpStdio { .. } => unreachable!("handled before opening a gRPC connection"),
+        Command::Watch {
+            collection,
+            path,
+            include,
+            exclude,
+            prune_missing,
+            retain_original,
+            interval_seconds,
+        } => {
+            let path = std::path::absolute(path)?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| anyhow!("watch path is not UTF-8"))?;
+            let folder = client
+                .watch_folder(v1::WatchFolderRequest {
+                    scope: scope(collection),
+                    path,
+                    include,
+                    exclude,
+                    prune_missing,
+                    retain_original,
+                    interval_seconds: Some(interval_seconds),
+                })
+                .await?
+                .into_inner();
+            println!("{}", folder.id);
+        }
+        Command::Watches { collection } => {
+            let mut after = None;
+            loop {
+                let response = client
+                    .list_watched_folders(v1::ListWatchedFoldersRequest {
+                        scope: scope(collection.clone()),
+                        after_id: after,
+                        limit: Some(25),
+                    })
+                    .await?
+                    .into_inner();
+                for folder in response.folders {
+                    let definition = folder
+                        .definition
+                        .context("server omitted watch definition")?;
+                    println!(
+                        "{} {} ({} queued, {} missing, {} deleted, {} failed)",
+                        folder.id,
+                        definition.path,
+                        folder.last_queued,
+                        folder.last_missing,
+                        folder.last_deleted,
+                        folder.last_failed
+                    );
+                    if let Some(error) = folder.last_error {
+                        eprintln!("{error}");
+                    }
+                }
+                after = response.next_after_id;
+                if after.is_none() {
+                    break;
+                }
+            }
+        }
+        Command::Unwatch { collection, id } => {
+            client
+                .unwatch_folder(v1::UnwatchFolderRequest {
+                    scope: scope(collection),
+                    id,
+                })
+                .await?;
+        }
         Command::Usage {
             collection,
             cluster,

@@ -19,6 +19,9 @@ service Sanctum {
   rpc FetchChunk(FetchChunkRequest) returns (TextHit);
   rpc DeleteSource(DeleteSourceRequest) returns (DeletedSource);
   rpc ImportLocal(ImportLocalRequest) returns (stream ImportLocalEvent);
+  rpc WatchFolder(WatchFolderRequest) returns (WatchedFolder);
+  rpc ListWatchedFolders(ListWatchedFoldersRequest) returns (ListWatchedFoldersResponse);
+  rpc UnwatchFolder(UnwatchFolderRequest) returns (Empty);
   rpc GetMetadata(MetadataTarget) returns (MetadataResponse);
   rpc MutateMetadata(MutateMetadataRequest) returns (MetadataResponse);
   rpc ListChanges(ListChangesRequest) returns (ListChangesResponse);
@@ -211,6 +214,43 @@ message ImportLocalRequest {
   repeated string exclude = 4;
   bool prune_missing = 5;
   bool retain_original = 6;
+}
+
+message WatchFolderRequest {
+  Scope scope = 1;
+  string path = 2;
+  repeated string include = 3;
+  repeated string exclude = 4;
+  bool prune_missing = 5;
+  bool retain_original = 6;
+  optional uint32 interval_seconds = 7;
+}
+
+message ListWatchedFoldersRequest {
+  Scope scope = 1;
+  optional string after_id = 2;
+  optional uint32 limit = 3;
+}
+
+message ListWatchedFoldersResponse {
+  repeated WatchedFolder folders = 1;
+  optional string next_after_id = 2;
+}
+
+message UnwatchFolderRequest {
+  Scope scope = 1;
+  string id = 2;
+}
+
+message WatchedFolder {
+  string id = 1;
+  WatchFolderRequest definition = 2;
+  optional uint64 last_scan_at_unix_seconds = 3;
+  uint64 last_queued = 4;
+  uint64 last_missing = 5;
+  uint64 last_deleted = 6;
+  uint64 last_failed = 7;
+  optional string last_error = 8;
 }
 
 enum ImportState {

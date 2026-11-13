@@ -6,7 +6,7 @@ use sanctum_proto::v1::{
 };
 use sanctum_service::{
     ChunkRef, Hit, ImportEvent, ImportOptions, ImportState, Job, JobState, Replacement, Service,
-    TextUpload,
+    TextUpload, WatchedFolder,
 };
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -148,6 +148,69 @@ impl Sanctum for Grpc {
             }
         });
         Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+
+    async fn watch_folder(
+        &self,
+        request: Request<v1::WatchFolderRequest>,
+    ) -> Reply<v1::WatchedFolder> {
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        let service = self.0.clone();
+        work(move || {
+            let options = ImportOptions {
+                include: request.include,
+                exclude: request.exclude,
+                prune_missing: request.prune_missing,
+                retain_original: request.retain_original,
+            };
+            service
+                .watch_folder(
+                    &scope,
+                    std::path::Path::new(&request.path),
+                    &options,
+                    request.interval_seconds.unwrap_or(60),
+                )
+                .map(wire_folder)
+        })
+        .await
+        .map(Response::new)
+    }
+
+    async fn list_watched_folders(
+        &self,
+        request: Request<v1::ListWatchedFoldersRequest>,
+    ) -> Reply<v1::ListWatchedFoldersResponse> {
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        let after = parse_optional_id(request.after_id, "invalid watched folder cursor")?;
+        let service = self.0.clone();
+        work(move || {
+            let (folders, next) =
+                service.watched_folders(&scope, after, request.limit.unwrap_or(10))?;
+            Ok(v1::ListWatchedFoldersResponse {
+                folders: folders.into_iter().map(wire_folder).collect(),
+                next_after_id: next.map(|id| id.to_string()),
+            })
+        })
+        .await
+        .map(Response::new)
+    }
+
+    async fn unwatch_folder(&self, request: Request<v1::UnwatchFolderRequest>) -> Reply<v1::Empty> {
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        let id = request
+            .id
+            .parse()
+            .map_err(|_| Status::invalid_argument("invalid watched folder ID"))?;
+        let service = self.0.clone();
+        work(move || {
+            service.unwatch_folder(&scope, id)?;
+            Ok(v1::Empty {})
+        })
+        .await
+        .map(Response::new)
     }
 
     async fn create_collection(
@@ -648,6 +711,27 @@ fn wire_job(job: Job) -> v1::IngestionJob {
 }
 
 type Reply<T> = std::result::Result<Response<T>, Status>;
+
+fn wire_folder(folder: WatchedFolder) -> v1::WatchedFolder {
+    v1::WatchedFolder {
+        id: folder.id.to_string(),
+        definition: Some(v1::WatchFolderRequest {
+            scope: Some(wire_scope(&folder.scope)),
+            path: folder.path,
+            include: folder.options.include,
+            exclude: folder.options.exclude,
+            prune_missing: folder.options.prune_missing,
+            retain_original: folder.options.retain_original,
+            interval_seconds: Some(folder.interval),
+        }),
+        last_scan_at_unix_seconds: folder.scanned,
+        last_queued: folder.counts.queued,
+        last_missing: folder.counts.missing,
+        last_deleted: folder.counts.deleted,
+        last_failed: folder.counts.failed,
+        last_error: folder.error,
+    }
+}
 
 #[allow(clippy::result_large_err)]
 fn search_mode(

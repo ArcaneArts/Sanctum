@@ -277,6 +277,28 @@ Missing files are reported and kept in search by default. Pass
 by the current filters and supersede their pending imports. A scan with
 file or traversal errors skips missing-file reconciliation.
 
+## Watched folders
+
+```sh
+cargo run --locked -p sanctum-cli -- watch notes ./library --include '**/*.md'
+cargo run --locked -p sanctum-cli -- watches notes
+cargo run --locked -p sanctum-cli -- unwatch notes WATCH_ID
+```
+
+`WatchFolder` persists a canonical directory, filters, and reconciliation
+interval in the local queue. The server scans when a watch is added, after
+restart, and at the configured interval (60 seconds by default). Periodic
+reconciliation coalesces edits between scans and uses content hashes.
+Pausing the local queue prevents new scans. Scans already in progress may
+finish after pause or removal.
+
+Missing files are reported by default. Use `--prune-missing` to delete
+selected sources whose files disappeared. An unavailable root or an
+incomplete scan preserves sources and records the error. Removing a watch
+leaves existing source data and accepted jobs available. `ListWatchedFolders`
+reports the most recent scan outcome and returns an `after_id` cursor for
+pagination.
+
 ## Metadata and changes
 
 `GetMetadata` and `MutateMetadata` accept a scope and an optional source

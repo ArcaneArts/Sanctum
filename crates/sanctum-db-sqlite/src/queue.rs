@@ -88,6 +88,7 @@ impl LocalQueue {
                 include_str!("runtime_v3.sql"),
                 include_str!("runtime_v4.sql"),
                 include_str!("runtime_v5.sql"),
+                include_str!("runtime_v6.sql"),
             ],
         )?;
         connection
@@ -95,6 +96,12 @@ impl LocalQueue {
                 "UPDATE ingestion_jobs
              SET status = 'accepted', processed_bytes = 0
              WHERE status IN ('indexing', 'publishing')",
+                [],
+            )
+            .map_err(database_error)?;
+        connection
+            .execute(
+                "UPDATE watched_folders SET next_scan_at = 0 WHERE next_scan_at <> 0",
                 [],
             )
             .map_err(database_error)?;
@@ -453,7 +460,7 @@ impl LocalQueue {
             .map_err(database_error)
     }
 
-    fn connect(&self) -> Result<Connection> {
+    pub(super) fn connect(&self) -> Result<Connection> {
         open(Path::new(&self.0), false)
     }
 
@@ -544,7 +551,7 @@ fn map_job(row: &Row<'_>) -> rusqlite::Result<Job> {
     })
 }
 
-fn uuid(row: &Row<'_>, column: usize) -> rusqlite::Result<Uuid> {
+pub(super) fn uuid(row: &Row<'_>, column: usize) -> rusqlite::Result<Uuid> {
     let value: String = row.get(column)?;
     Uuid::parse_str(&value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -555,7 +562,7 @@ fn uuid(row: &Row<'_>, column: usize) -> rusqlite::Result<Uuid> {
     })
 }
 
-fn scope_id(row: &Row<'_>, column: usize) -> rusqlite::Result<ScopeId> {
+pub(super) fn scope_id(row: &Row<'_>, column: usize) -> rusqlite::Result<ScopeId> {
     let value: String = row.get(column)?;
     ScopeId::from_str(&value).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(

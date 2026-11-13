@@ -11,6 +11,7 @@ mod lifecycle;
 pub mod metadata;
 pub mod metadata_filter;
 pub mod queue;
+pub mod watched_folders;
 pub use lifecycle::{RevisionKey, SourceIdentity};
 
 const CATALOG_SCHEMA: &str = include_str!("catalog.sql");

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use sanctum_config::{Config, EmbeddingConfig};
-use sanctum_service::{Service, run_embedding_worker, run_local_maintenance, run_local_worker};
+use sanctum_service::{
+    Service, run_embedding_worker, run_local_maintenance, run_local_worker, run_watched_folders,
+};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -40,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
         workers.spawn(run_local_worker(service.clone(), shutdown.clone()));
     }
     workers.spawn(run_embedding_worker(service.clone(), shutdown.clone()));
+    workers.spawn(run_watched_folders(service.clone(), shutdown.clone()));
     workers.spawn(run_local_maintenance(service.clone(), shutdown));
 
     if let Some(listener) = &mcp_listener {
