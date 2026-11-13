@@ -24,6 +24,7 @@ const CATALOG_MIGRATIONS: &[&str] = &[
     include_str!("catalog_v2.sql"),
     include_str!("catalog_v3.sql"),
     include_str!("catalog_v4.sql"),
+    include_str!("catalog_v5.sql"),
 ];
 const COLLECTION_SCHEMA: &str = include_str!("collection.sql");
 const COLLECTION_MIGRATIONS: &[&str] = &[
@@ -210,15 +211,83 @@ pub fn list_collections(path: &Path) -> Result<Vec<String>> {
 }
 
 pub fn list_collections_page(path: &Path, after: Option<&str>, limit: u32) -> Result<Vec<String>> {
+    Ok(list_collection_details(path, after, Some(limit))?
+        .into_iter()
+        .map(|row| row.id)
+        .collect())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct CollectionDetails {
+    pub id: String,
+    pub name: String,
+    pub created_at: u64,
+}
+
+pub fn list_collection_details(
+    path: &Path,
+    after: Option<&str>,
+    limit: Option<u32>,
+) -> Result<Vec<CollectionDetails>> {
     if !path.try_exists()? {
         return Ok(Vec::new());
     }
+    let connection = open_read_only(path)?;
+    let name = if schema_version(&connection)? < 5 {
+        "id"
+    } else {
+        "COALESCE(display_name, id)"
+    };
     query_all(
-        &open_read_only(path)?,
-        "SELECT id FROM collections WHERE id > ?1 ORDER BY id LIMIT ?2",
-        params![after.unwrap_or_default(), limit],
-        |row| row.get(0),
+        &connection,
+        &format!(
+            "SELECT id, {name}, created_at FROM collections WHERE id > ?1 ORDER BY id LIMIT ?2"
+        ),
+        params![after.unwrap_or_default(), limit.map_or(-1, i64::from)],
+        row_collection_details,
     )
+}
+
+pub fn update_collection_details(
+    tx: &Transaction<'_>,
+    collection: &str,
+    display_name: &str,
+) -> Result<CollectionDetails> {
+    tx.query_row(
+        "UPDATE collections SET display_name = ?2 WHERE id = ?1
+         RETURNING id, display_name, created_at",
+        params![collection, display_name],
+        row_collection_details,
+    )
+    .optional()
+    .map_err(database_error)?
+    .ok_or_else(|| Error::NotFound(format!("collection {collection} was not found")))
+}
+
+pub fn update_local_collection_details(
+    path: &Path,
+    collection: &str,
+    display_name: &str,
+) -> Result<CollectionDetails> {
+    if !path.try_exists()? {
+        return Err(Error::NotFound("tenant catalog was not found".into()));
+    }
+    let mut connection = open(path, false)?;
+    migrate(&mut connection, CATALOG_MIGRATIONS)?;
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    let details = update_collection_details(&tx, collection, display_name)?;
+    tx.commit().map_err(database_error)?;
+    Ok(details)
+}
+
+fn row_collection_details(row: &Row<'_>) -> rusqlite::Result<CollectionDetails> {
+    Ok(CollectionDetails {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        created_at: unsigned_column(row, 2)?,
+    })
 }
 
 pub fn require_collection(path: &Path, collection: &str) -> Result<()> {

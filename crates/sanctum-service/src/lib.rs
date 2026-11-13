@@ -13,11 +13,12 @@ pub use db::{metadata_filter, metadata_query, snapshot as database_snapshot};
 pub use hit_metadata::{HitMetadata, HitMetadataEntry};
 use sanctum_core::{Error, ExternalSource, Result, Scope, ScopeId, UsageMeasurement, UsageScope};
 use sanctum_db_sqlite::{self as db, CollectionDb};
-pub use sanctum_db_sqlite::{Chunk, ChunkRef, Revision, RevisionContent};
+pub use sanctum_db_sqlite::{Chunk, ChunkRef, CollectionDetails, Revision, RevisionContent};
 use sanctum_storage_fs::LocalFiles;
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+mod collection_details;
 mod context;
 mod database_sessions;
 mod embedding;

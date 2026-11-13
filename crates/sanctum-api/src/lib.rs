@@ -524,7 +524,28 @@ impl Sanctum for Grpc {
         }
         Ok(Response::new(v1::Collection {
             scope: Some(wire_scope(&scope)),
+            ..Default::default()
         }))
+    }
+
+    async fn update_collection(
+        &self,
+        request: Request<v1::UpdateCollectionRequest>,
+    ) -> Reply<v1::Collection> {
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        let row = match &self.0 {
+            Backend::Local(service) => {
+                let service = service.clone();
+                let scope = scope.clone();
+                work(move || service.update_collection(&scope, &request.display_name)).await?
+            }
+            Backend::Hosted(catalog) => catalog
+                .update_collection(&scope, request.display_name)
+                .await
+                .map_err(status)?,
+        };
+        Ok(Response::new(wire_collection(&scope.tenant, row)))
     }
 
     async fn delete_collection(
@@ -573,37 +594,33 @@ impl Sanctum for Grpc {
                 "collection page limit must be between 1 and 99",
             ));
         }
-        let mut ids = if let Backend::Hosted(catalog) = &self.0 {
-            catalog
-                .list_collections(&tenant, after.as_ref(), limit + 1)
+        let mut rows = match &self.0 {
+            Backend::Hosted(catalog) => catalog
+                .list_collection_details(&tenant, after.as_ref(), limit + 1)
                 .await
-                .map_err(status)?
-        } else {
-            let service = self.local()?.clone();
-            let tenant = tenant.clone();
-            work(move || {
-                if paginated {
-                    service.list_collections_page(&tenant, after.as_ref(), limit + 1)
-                } else {
-                    service.list_collections(&tenant)
-                }
-            })
-            .await?
+                .map_err(status)?,
+            Backend::Local(service) => {
+                let service = service.clone();
+                let tenant = tenant.clone();
+                work(move || {
+                    service.list_collection_details(
+                        &tenant,
+                        after.as_ref(),
+                        paginated.then_some(limit + 1),
+                    )
+                })
+                .await?
+            }
         };
-        let next_after = if paginated && ids.len() > limit as usize {
-            ids.pop();
-            ids.last().cloned()
+        let next_after = if paginated && rows.len() > limit as usize {
+            rows.pop();
+            rows.last().map(|row| row.id.clone())
         } else {
             None
         };
-        let collections = ids
+        let collections = rows
             .into_iter()
-            .map(|collection| v1::Collection {
-                scope: Some(v1::Scope {
-                    tenant: tenant.to_string(),
-                    collection,
-                }),
-            })
+            .map(|row| wire_collection(&tenant, row))
             .collect();
         Ok(Response::new(v1::ListCollectionsResponse {
             collections,
@@ -1588,6 +1605,20 @@ fn wire_external(value: ExternalSource) -> v1::ExternalSource {
     v1::ExternalSource {
         namespace: value.namespace,
         id: value.id,
+    }
+}
+
+fn wire_collection(
+    tenant: &sanctum_core::ScopeId,
+    row: sanctum_service::CollectionDetails,
+) -> v1::Collection {
+    v1::Collection {
+        scope: Some(v1::Scope {
+            tenant: tenant.to_string(),
+            collection: row.id,
+        }),
+        display_name: Some(row.name),
+        created_at_unix_seconds: Some(row.created_at),
     }
 }
 

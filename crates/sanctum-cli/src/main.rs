@@ -33,6 +33,10 @@ enum Command {
         #[arg(long)]
         request_id: Option<String>,
     },
+    RenameCollection {
+        collection: String,
+        name: String,
+    },
     DeleteCollection {
         collection: String,
         #[arg(long)]
@@ -467,6 +471,14 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .await?;
             println!("{collection}");
+        }
+        Command::RenameCollection { collection, name } => {
+            client
+                .update_collection(v1::UpdateCollectionRequest {
+                    scope: scope(collection),
+                    display_name: name,
+                })
+                .await?;
         }
         Command::DeleteCollection {
             collection,

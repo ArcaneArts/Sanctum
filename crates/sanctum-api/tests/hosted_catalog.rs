@@ -134,6 +134,33 @@ async fn hosted_catalog_recovers_across_server_restart_and_stays_in_scope() {
         "notes"
     );
     assert!(page.next_after.is_none());
+    let initial = &page.collections[0];
+    assert_eq!(initial.display_name.as_deref(), Some("notes"));
+    let renamed = state
+        .client
+        .update_collection(v1::UpdateCollectionRequest {
+            scope: initial.scope.clone(),
+            display_name: "Field notes 🦀".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(renamed.scope, initial.scope);
+    assert_eq!(
+        renamed.created_at_unix_seconds,
+        initial.created_at_unix_seconds
+    );
+    let listed = state
+        .client
+        .list_collections(v1::ListCollectionsRequest {
+            tenant: "default".into(),
+            after: Some("catalog".into()),
+            limit: Some(1),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.collections, vec![renamed]);
 
     use v1::storage_usage_request::Scope;
     let tenant = state
