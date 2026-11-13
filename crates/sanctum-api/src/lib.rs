@@ -620,23 +620,27 @@ impl Sanctum for Grpc {
                 ));
             }
         };
-        let service = self.local()?.clone();
-        work(move || {
-            let status = service.embedding_status(&scope, target)?;
-            Ok(v1::EmbeddingStatus {
-                coverage: Some(v1::EmbeddingCoverage {
-                    profile_id: status.profile,
-                    total_chunks: status.coverage.total,
-                    embedded_chunks: status.coverage.embedded,
-                    failed_chunks: status.coverage.failed,
-                }),
-                retrying_chunks: status.retrying,
-                next_retry_at_unix_seconds: status.next_retry,
-                sample_error: status.sample_error,
-            })
-        })
-        .await
-        .map(Response::new)
+        let status = match &self.0 {
+            Backend::Local(service) => {
+                let service = service.clone();
+                work(move || service.embedding_status(&scope, target)).await?
+            }
+            Backend::Hosted(service) => service
+                .embedding_status(&scope, target)
+                .await
+                .map_err(status)?,
+        };
+        Ok(Response::new(v1::EmbeddingStatus {
+            coverage: Some(v1::EmbeddingCoverage {
+                profile_id: status.profile,
+                total_chunks: status.coverage.total,
+                embedded_chunks: status.coverage.embedded,
+                failed_chunks: status.coverage.failed,
+            }),
+            retrying_chunks: status.retrying,
+            next_retry_at_unix_seconds: status.next_retry,
+            sample_error: status.sample_error,
+        }))
     }
 
     async fn cancel_ingestion_job(

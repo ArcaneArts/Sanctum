@@ -195,8 +195,8 @@ its index.
 `GetIngestionJob` reports `TEXT_READY` with the committed revision.
 `SearchText` serves collection-scoped lexical hits, including hybrid
 requests when hosted embeddings are unavailable. `FetchChunk` reads
-the hit's exact byte range and verifies its fingerprint. Hosted vectors,
-source cleanup, and multi-collection retrieval remain open.
+the hit's exact byte range and verifies its fingerprint. Source cleanup
+and hosted multi-collection retrieval remain open.
 
 ### Cloud Tasks dispatch
 
@@ -242,3 +242,21 @@ with at most 16 retained files and a 2 GiB default byte budget. Set
 disable reuse. Oversized snapshots and files still in use can add to
 active temporary storage. Hosted gRPC search and fetch hits report the
 database generation that supplied their chunk ranges.
+
+### Hosted embedding batches
+
+Set the same server-level `embedding` configuration on the API and
+worker. For a private worker, submit one bounded batch with the
+following request. Repeat until `processed` is zero.
+
+```sh
+curl --fail-with-body http://127.0.0.1:47552/internal/tasks/embed-collection \
+  -H 'Content-Type: application/json' \
+  -d '{"tenant":"default","collection":"notes"}'
+```
+
+`GetEmbeddingStatus` reports coverage and retry state for the configured
+profile. Changing that profile immediately excludes previous vectors.
+Semantic queries require matching vectors. Hybrid queries fall back to
+lexical results while embeddings are pending or the query provider is
+unavailable. Automatic scheduling of hosted embedding batches remains open.

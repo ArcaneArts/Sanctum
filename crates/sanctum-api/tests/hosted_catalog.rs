@@ -845,6 +845,182 @@ async fn hosted_indexing_publishes_searchable_text_and_fences_old_replacements()
 }
 
 #[tokio::test]
+async fn hosted_embeddings_reuse_current_inputs_and_isolate_profiles() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let provider = Arc::new(HostedEmbeddingFixture {
+        profile: "fixture-v1",
+        fail: AtomicU8::new(0),
+    });
+    let catalog = HostedCatalog::new(storage.clone(), None, 1024)
+        .unwrap()
+        .with_embedding(Some(provider.clone()));
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    catalog.create_collection(&scope, None).await.unwrap();
+    let wire_scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    let header = v1::UploadTextHeader {
+        scope: Some(wire_scope.clone()),
+        name: "notes.txt".into(),
+        ..Default::default()
+    };
+    let mut server = start(catalog.clone()).await;
+    let body = [b"unicorn field notes".as_slice()];
+    let first = server
+        .client
+        .submit_text(upload_frames(&header, body))
+        .await
+        .unwrap()
+        .into_inner();
+    let operation = first.operation_id.parse().unwrap();
+    catalog.register_upload(&scope, operation).await.unwrap();
+    catalog.index_upload(&scope, operation).await.unwrap();
+    let hybrid = v1::SearchTextRequest {
+        scope: Some(wire_scope.clone()),
+        query: "unicorn".into(),
+        mode: v1::SearchMode::Hybrid.into(),
+        ..Default::default()
+    };
+    let pending = server
+        .client
+        .search_text(hybrid.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(pending.mode(), v1::SearchMode::Lexical);
+    assert_eq!(
+        pending.degraded_reason.as_deref(),
+        Some("embeddings_unavailable")
+    );
+    assert_eq!(catalog.embed_collection(&scope).await.unwrap(), 1);
+    assert_eq!(catalog.embed_collection(&scope).await.unwrap(), 0);
+
+    let ready = server
+        .client
+        .get_embedding_status(v1::EmbeddingStatusRequest {
+            scope: Some(wire_scope.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .coverage
+        .unwrap();
+    assert_eq!((ready.total_chunks, ready.embedded_chunks), (1, 1));
+    assert_eq!(ready.profile_id.as_deref(), Some("fixture-v1"));
+    let semantic = v1::SearchTextRequest {
+        query: "imaginary horse".into(),
+        mode: v1::SearchMode::Semantic.into(),
+        ..hybrid.clone()
+    };
+    let result = server
+        .client
+        .search_text(semantic.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(result.mode(), v1::SearchMode::Semantic);
+    assert_eq!(result.hits[0].excerpt, "unicorn field notes");
+    provider.fail.store(1, Ordering::Relaxed);
+    let fallback = server
+        .client
+        .search_text(hybrid.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fallback.mode(), v1::SearchMode::Lexical);
+    assert_eq!(
+        fallback.degraded_reason.as_deref(),
+        Some("embedding_provider_unavailable")
+    );
+    assert_eq!(fallback.hits.len(), 1);
+
+    let replacement = v1::UploadTextHeader {
+        replacement: Some(v1::Replacement {
+            source_id: Some(first.source_id),
+            expected_revision_id: Some(first.revision_id),
+        }),
+        ..header
+    };
+    let second = server
+        .client
+        .submit_text(upload_frames(&replacement, body))
+        .await
+        .unwrap()
+        .into_inner();
+    let operation = second.operation_id.parse().unwrap();
+    catalog.register_upload(&scope, operation).await.unwrap();
+    catalog.index_upload(&scope, operation).await.unwrap();
+    assert_eq!(catalog.embed_collection(&scope).await.unwrap(), 0);
+    server.stop().await;
+
+    let catalog = HostedCatalog::new(storage, None, 1024)
+        .unwrap()
+        .with_embedding(Some(Arc::new(HostedEmbeddingFixture {
+            profile: "fixture-v2",
+            fail: AtomicU8::new(0),
+        })));
+    let mut server = start(catalog.clone()).await;
+    let changed = server
+        .client
+        .search_text(hybrid)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(changed.mode(), v1::SearchMode::Lexical);
+    let coverage = changed.embedding_coverage.unwrap();
+    assert_eq!(coverage.profile_id.as_deref(), Some("fixture-v2"));
+    assert_eq!(coverage.embedded_chunks, 0);
+    assert_eq!(catalog.embed_collection(&scope).await.unwrap(), 1);
+    let rebuilt = server
+        .client
+        .search_text(semantic)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(rebuilt.mode(), v1::SearchMode::Semantic);
+    assert_eq!(
+        rebuilt.hits[0].chunk.as_ref().unwrap().revision_id,
+        second.revision_id
+    );
+    server.stop().await;
+}
+
+struct HostedEmbeddingFixture {
+    profile: &'static str,
+    fail: AtomicU8,
+}
+
+#[async_trait::async_trait]
+impl sanctum_embedding::Provider for HostedEmbeddingFixture {
+    fn profile_id(&self) -> &str {
+        self.profile
+    }
+
+    fn dimensions(&self) -> usize {
+        2
+    }
+
+    async fn embed(
+        &self,
+        _purpose: sanctum_embedding::Purpose,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>, sanctum_embedding::EmbedError> {
+        if self.fail.load(Ordering::Relaxed) != 0 {
+            return Err(sanctum_embedding::EmbedError::Transient(
+                "fixture outage".into(),
+            ));
+        }
+        Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+    }
+}
+
+#[tokio::test]
 async fn dispatch_reconciliation_recovers_a_failed_handoff_and_advances_its_cursor() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());

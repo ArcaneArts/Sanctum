@@ -16,11 +16,9 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let mut config = Config::from_env()?;
-    if let Some(storage) = config.object_storage.take() {
-        return hosted::serve(config, storage).await;
-    }
     let embedding: Option<Arc<dyn sanctum_embedding::Provider>> = config
         .embedding
+        .take()
         .map(|embedding| match embedding {
             EmbeddingConfig::Ollama(config) => sanctum_embedding_ollama::Ollama::new(config)
                 .map(|provider| Arc::new(provider) as Arc<dyn sanctum_embedding::Provider>),
@@ -30,6 +28,9 @@ async fn main() -> anyhow::Result<()> {
                 .map(|provider| Arc::new(provider) as Arc<dyn sanctum_embedding::Provider>),
         })
         .transpose()?;
+    if let Some(storage) = config.object_storage.take() {
+        return hosted::serve(config, storage, embedding).await;
+    }
     let service =
         Service::open_with_embedding(&config.storage_root, config.max_source_bytes, embedding)?
             .with_url_origins(config.url_import_origins)?;

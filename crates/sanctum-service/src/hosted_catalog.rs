@@ -15,6 +15,7 @@ pub struct HostedCatalog {
     pub(crate) publication: Publication,
     pub(crate) snapshots: Arc<SnapshotCache>,
     pub(crate) dispatcher: Option<Arc<dyn Dispatch>>,
+    pub(crate) embedding: Option<Arc<dyn sanctum_embedding::Provider>>,
 }
 
 impl HostedCatalog {
@@ -34,7 +35,16 @@ impl HostedCatalog {
             publication,
             snapshots: Arc::new(SnapshotCache::new(2 * 1024 * 1024 * 1024)),
             dispatcher: None,
+            embedding: None,
         })
+    }
+
+    pub fn with_embedding(
+        mut self,
+        embedding: Option<Arc<dyn sanctum_embedding::Provider>>,
+    ) -> Self {
+        self.embedding = embedding;
+        self
     }
 
     pub fn with_snapshot_cache_bytes(mut self, max_bytes: u64) -> Self {
