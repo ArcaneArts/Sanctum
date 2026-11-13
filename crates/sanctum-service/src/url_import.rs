@@ -204,6 +204,7 @@ impl Service {
                     replacement: None,
                     retain_original,
                     initial_metadata: Vec::new(),
+                    initial_chunk_metadata: Vec::new(),
                 },
             )?;
             let output = staged.reopen()?;

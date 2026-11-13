@@ -158,6 +158,7 @@ impl Service {
                         replacement: None,
                         retain_original: options.retain_original,
                         initial_metadata: Vec::new(),
+                        initial_chunk_metadata: Vec::new(),
                     },
                 )
             };

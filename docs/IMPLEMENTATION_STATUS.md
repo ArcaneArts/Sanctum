@@ -940,3 +940,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   replay with reordered metadata, and rejection of changed replay values.
 - Live MinIO verifies that metadata submitted through one hosted MCP
   process is visible after the worker publishes the revision.
+- Delivered in [PR #63](https://github.com/ArcaneArts/Sanctum/pull/63).
+
+## Chunk metadata on upload
+
+- The upload header, CLI, and MCP accept namespaced entries per chunk
+  ordinal. Source and chunk metadata share one upload budget and publish
+  with the new revision. An invalid ordinal aborts publication.
+- Local and hosted tests verify durable metadata and a failed replacement
+  that preserves the old revision and its metadata.
+- The live MinIO MCP smoke submits and reads chunk metadata after the
+  hosted worker publishes the revision.

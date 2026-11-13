@@ -38,6 +38,12 @@ pub struct Mutation {
     pub edit: Edit,
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ChunkMetadata {
+    pub ordinal: u64,
+    pub entries: Vec<Mutation>,
+}
+
 pub struct Entry {
     pub namespace: String,
     pub key: String,
@@ -53,7 +59,42 @@ pub struct Change {
     pub ordinal: Option<u64>,
 }
 
-pub fn validate_initial_metadata(edits: &[Mutation]) -> Result<()> {
+pub fn validate_initial_metadata(source: &[Mutation], chunks: &[ChunkMetadata]) -> Result<()> {
+    let mut targets = std::collections::HashSet::new();
+    let mut entries = source.len();
+    let mut bytes = initial_metadata_bytes(source)?;
+    for chunk in chunks {
+        sql_integer(chunk.ordinal)?;
+        if chunk.entries.is_empty() || !targets.insert(chunk.ordinal) {
+            return Err(Error::Invalid(
+                "chunk metadata requires unique ordinals with entries".into(),
+            ));
+        }
+        entries += chunk.entries.len();
+        if entries > 32 {
+            return Err(Error::Invalid(
+                "initial metadata allows at most 32 entries".into(),
+            ));
+        }
+        bytes += initial_metadata_bytes(&chunk.entries)?;
+    }
+    if bytes > 512 * 1024 {
+        return Err(Error::Invalid("initial metadata exceeds 512 KiB".into()));
+    }
+    Ok(())
+}
+
+pub fn validate_metadata_ordinals(chunks: &[ChunkMetadata], chunk_count: u64) -> Result<()> {
+    if let Some(chunk) = chunks.iter().find(|chunk| chunk.ordinal >= chunk_count) {
+        return Err(Error::Invalid(format!(
+            "initial metadata chunk ordinal {} exceeds revision chunk count {chunk_count}",
+            chunk.ordinal
+        )));
+    }
+    Ok(())
+}
+
+fn initial_metadata_bytes(edits: &[Mutation]) -> Result<usize> {
     if edits.len() > 32 {
         return Err(Error::Invalid(
             "initial metadata allows at most 32 entries".into(),
@@ -81,10 +122,7 @@ pub fn validate_initial_metadata(edits: &[Mutation]) -> Result<()> {
         }
         bytes += length;
     }
-    if bytes > 512 * 1024 {
-        return Err(Error::Invalid("initial metadata exceeds 512 KiB".into()));
-    }
-    Ok(())
+    Ok(bytes)
 }
 
 pub fn catalog_metadata(

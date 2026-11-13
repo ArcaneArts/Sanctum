@@ -1290,22 +1290,36 @@ async fn read_upload_header(
         }),
         replacement,
         retain_original: header.retain_original,
-        initial_metadata: header
-            .source_metadata
+        initial_metadata: initial_metadata(header.source_metadata)?,
+        initial_chunk_metadata: header
+            .chunk_metadata
             .into_iter()
-            .map(|entry| {
-                Ok(sanctum_service::MetadataMutation {
-                    namespace: entry.namespace,
-                    key: entry.key,
-                    edit: sanctum_service::MetadataEdit::Set(parse_metadata_json(
-                        &entry.value_json,
-                    )?),
+            .map(|chunk| {
+                Ok(sanctum_service::ChunkMetadata {
+                    ordinal: chunk.ordinal,
+                    entries: initial_metadata(chunk.entries)?,
                 })
             })
             .collect::<std::result::Result<_, Status>>()?,
     };
     let request_id = parse_optional_id(header.request_id, "invalid request ID")?;
     Ok((scope, upload, request_id))
+}
+
+#[allow(clippy::result_large_err)]
+fn initial_metadata(
+    entries: Vec<v1::MetadataEntry>,
+) -> std::result::Result<Vec<sanctum_service::MetadataMutation>, Status> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            Ok(sanctum_service::MetadataMutation {
+                namespace: entry.namespace,
+                key: entry.key,
+                edit: sanctum_service::MetadataEdit::Set(parse_metadata_json(&entry.value_json)?),
+            })
+        })
+        .collect()
 }
 
 async fn receive_upload(
