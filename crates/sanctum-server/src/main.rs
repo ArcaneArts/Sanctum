@@ -1,5 +1,5 @@
 use sanctum_config::Config;
-use sanctum_service::{Service, run_local_worker};
+use sanctum_service::{Service, run_local_maintenance, run_local_worker};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -14,6 +14,7 @@ async fn main() -> anyhow::Result<()> {
     for _ in 0..config.local_worker_concurrency {
         workers.spawn(run_local_worker(service.clone(), shutdown.clone()));
     }
+    workers.spawn(run_local_maintenance(service.clone(), shutdown));
     tracing::info!(address = %listener.local_addr()?, "Sanctum gRPC listening");
     let result = tonic::transport::Server::builder()
         .add_service(sanctum_api::grpc(service))

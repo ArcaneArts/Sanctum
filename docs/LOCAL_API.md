@@ -38,6 +38,24 @@ returns `ALREADY_EXISTS`. `UploadText` waits up to 30 seconds for lexical public
 If its wait expires, the response message contains the operation ID. The
 accepted work can continue after the client disconnects.
 
+To replace a source, submit an upload with a `Replacement` target. Provide
+either its Sanctum source ID or its external namespace and ID. An optional
+expected revision rejects updates based on a stale view. Competing replacements
+receive a durable `update_sequence` and only the newest registered update can
+publish. The original remains searchable until its replacement is indexed.
+
+```sh
+cargo run --locked -p sanctum-cli -- upload notes /path/to/notes.md \
+  --replace-source SOURCE_ID --expected-revision REVISION_ID
+cargo run --locked -p sanctum-cli -- delete notes SOURCE_ID --expected-revision REVISION_ID
+```
+
+For an external target, pass `--replace-external --namespace NAME --external-id ID`.
+Deletion immediately removes the source from search and prevents queued
+replacements from publishing. The local lexical service retains replaced
+bytes for five minutes before reclaiming them. Fetching a reclaimed revision
+returns `FAILED_PRECONDITION` while the source or its deletion receipt is known.
+
 Use `SubmitText` for background ingestion. It returns a durable operation
 ID and source and revision IDs once the input and queue record are stored.
 Poll `GetIngestionJob` in the same tenant and collection to see processed

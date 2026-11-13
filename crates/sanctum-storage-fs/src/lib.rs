@@ -47,6 +47,52 @@ impl LocalFiles {
         self.root.join("runtime.db")
     }
 
+    pub fn tenants(&self) -> Result<Vec<ScopeId>> {
+        let mut tenants = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && let Some(name) = entry.file_name().to_str()
+                && let Ok(tenant) = name.parse()
+            {
+                tenants.push(tenant);
+            }
+        }
+        Ok(tenants)
+    }
+
+    pub fn clear_staging(&self, scope: &Scope) -> Result<()> {
+        for entry in entries_if_present(&self.collection_path(scope).join("staging"))? {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry.file_name().to_string_lossy().starts_with(".tmp")
+            {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn visit_revisions(
+        &self,
+        scope: &Scope,
+        mut visit: impl FnMut(Uuid, Uuid) -> Result<()>,
+    ) -> Result<()> {
+        for source in entries_if_present(&self.collection_path(scope).join("sources"))? {
+            let source = source?;
+            let Some(source_id) = uuid_dir(&source)? else {
+                continue;
+            };
+            for revision in entries_if_present(&source.path())? {
+                let revision = revision?;
+                if let Some(revision_id) = uuid_dir(&revision)? {
+                    visit(source_id, revision_id)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn open_text(&self, scope: &Scope, source: Uuid, revision: Uuid) -> Result<File> {
         Ok(File::open(self.text_path(scope, source, revision))?)
     }
@@ -56,14 +102,22 @@ impl LocalFiles {
         let parent = text.parent().expect("text path has a revision directory");
         match fs::remove_file(&text) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        fs::remove_dir(parent)?;
+        match fs::remove_dir(parent) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let source_dir = parent.parent().expect("revision has a source directory");
         match fs::remove_dir(source_dir) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
             Err(error) => return Err(error.into()),
         }
         Ok(())
@@ -124,6 +178,27 @@ impl LocalFiles {
             .join(revision.to_string())
             .join("text.utf8")
     }
+}
+
+fn entries_if_present(path: &Path) -> Result<impl Iterator<Item = std::io::Result<fs::DirEntry>>> {
+    match fs::read_dir(path) {
+        Ok(entries) => Ok(Some(entries).into_iter().flatten()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None.into_iter().flatten())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn uuid_dir(entry: &fs::DirEntry) -> Result<Option<Uuid>> {
+    if !entry.file_type()?.is_dir() {
+        return Ok(None);
+    }
+    Ok(entry.file_name().to_str().and_then(|name| {
+        Uuid::parse_str(name)
+            .ok()
+            .filter(|id| id.to_string() == name)
+    }))
 }
 
 #[cfg(unix)]

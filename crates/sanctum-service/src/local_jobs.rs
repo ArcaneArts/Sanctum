@@ -69,6 +69,21 @@ impl Service {
         }
         let input = self.files.open_text(&job.scope, job.source, job.revision)?;
         let writer = database.write()?;
+        if job.replacement {
+            writer
+                .find_source(Some(job.source), None)
+                .map_err(|error| match error {
+                    Error::NotFound(_) => {
+                        Error::Conflict("replacement source is no longer active".into())
+                    }
+                    error => error,
+                })?;
+            if !self.queue.is_latest_replacement(job)? {
+                return Err(Error::Conflict(
+                    "a newer replacement superseded this operation".into(),
+                ));
+            }
+        }
         let mut ordinal = 0;
         let mut last_progress = 0;
         let indexed = index_utf8(input, |range, text| {
@@ -99,7 +114,7 @@ impl Service {
             )));
         }
         let revision = revision_for(job, indexed.hash, indexed.chunks);
-        writer.register(&revision)?;
+        writer.register(&revision, job.replacement)?;
         if !self.queue.begin_publish(job.id)? {
             return Err(Error::Conflict("indexing canceled".into()));
         }
@@ -128,13 +143,40 @@ impl StagedUpload {
                 "source exceeds the configured upload limit".into(),
             ));
         }
-        let job = Job {
+        let mut database = self.service.database(&self.scope)?;
+        let writer = database.write()?;
+        let replacement = self.upload.replacement.as_ref();
+        let (source, external) = if let Some(replacement) = replacement {
+            let current = writer.find_source(replacement.source, self.upload.external.as_ref())?;
+            if replacement
+                .expected_revision
+                .is_some_and(|expected| expected != current.revision)
+            {
+                return Err(Error::StaleRevision(
+                    "the current source revision has changed".into(),
+                ));
+            }
+            if self
+                .upload
+                .external
+                .as_ref()
+                .is_some_and(|external| Some(external) != current.external.as_ref())
+            {
+                return Err(Error::Conflict(
+                    "replacement must preserve the external source reference".into(),
+                ));
+            }
+            (current.source, current.external)
+        } else {
+            (Uuid::new_v4(), self.upload.external)
+        };
+        let mut job = Job {
             id: Uuid::new_v4(),
-            source: Uuid::new_v4(),
+            source,
             revision: Uuid::new_v4(),
             scope: self.scope,
             name: self.upload.name,
-            external: self.upload.external,
+            external,
             bytes,
             processed_bytes: 0,
             attempts: 0,
@@ -142,11 +184,13 @@ impl StagedUpload {
             failure: None,
             hash: None,
             chunks: None,
+            replacement: replacement.is_some(),
+            update_sequence: 0,
         };
         self.service
             .files
             .publish(&job.scope, job.source, job.revision, self.file)?;
-        self.service.queue.insert(&job)?;
+        self.service.queue.insert(&mut job)?;
         Ok(job)
     }
 }

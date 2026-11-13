@@ -1,14 +1,19 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{Arc, RwLock},
+};
 
 use sanctum_core::{Error, ExternalSource, Result, Scope, ScopeId};
 use sanctum_db_sqlite::{self as db, CollectionDb};
 pub use sanctum_db_sqlite::{Chunk, ChunkRef, Revision};
 use sanctum_storage_fs::LocalFiles;
 use tempfile::NamedTempFile;
+use uuid::Uuid;
 
 mod local_jobs;
+mod maintenance;
 mod worker;
-pub use worker::run_local_worker;
+pub use worker::{run_local_maintenance, run_local_worker};
 
 use db::queue::LocalQueue;
 pub use db::queue::{Job, JobState};
@@ -18,11 +23,18 @@ pub struct Service {
     files: Arc<LocalFiles>,
     queue: LocalQueue,
     max_source_bytes: u64,
+    retrieval: Arc<RwLock<()>>,
 }
 
 pub struct TextUpload {
     pub name: String,
     pub external: Option<ExternalSource>,
+    pub replacement: Option<Replacement>,
+}
+
+pub struct Replacement {
+    pub source: Option<Uuid>,
+    pub expected_revision: Option<Uuid>,
 }
 
 pub struct StagedUpload {
@@ -47,11 +59,16 @@ impl Service {
         }
         let files = Arc::new(LocalFiles::open(root)?);
         let queue = LocalQueue::open(files.runtime_path())?;
-        Ok(Self {
+        let service = Self {
             files,
             queue,
             max_source_bytes,
-        })
+            retrieval: Arc::new(RwLock::new(())),
+        };
+        if let Err(error) = service.reclaim_startup_orphans() {
+            tracing::warn!(%error, "could not reclaim all unreferenced local uploads");
+        }
+        Ok(service)
     }
 
     pub fn max_source_bytes(&self) -> u64 {
@@ -86,6 +103,14 @@ impl Service {
                 "external source requires a namespace and ID within their size limits".into(),
             ));
         }
+        if let Some(replacement) = &upload.replacement
+            && replacement.source.is_none()
+            && upload.external.is_none()
+        {
+            return Err(Error::Invalid(
+                "replacement requires a source ID or external reference".into(),
+            ));
+        }
         self.require_collection(&scope)?;
         let file = self.files.stage(&scope)?;
         Ok(StagedUpload {
@@ -112,6 +137,10 @@ impl Service {
             .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" AND ");
+        let _reader = self
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         self.database(scope)?
             .search(&expression, limit)?
             .into_iter()
@@ -120,6 +149,10 @@ impl Service {
     }
 
     pub fn fetch(&self, scope: &Scope, reference: &ChunkRef) -> Result<Hit> {
+        let _reader = self
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         self.hit(scope, self.database(scope)?.fetch(reference)?)
     }
 

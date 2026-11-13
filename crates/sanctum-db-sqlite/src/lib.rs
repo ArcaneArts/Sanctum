@@ -6,10 +6,13 @@ use rusqlite::{
 use sanctum_core::{ByteRange, Error, ExternalSource, Result};
 use uuid::Uuid;
 
+mod lifecycle;
 pub mod queue;
+pub use lifecycle::{RevisionKey, SourceIdentity};
 
 const CATALOG_SCHEMA: &str = include_str!("catalog.sql");
 const COLLECTION_SCHEMA: &str = include_str!("collection.sql");
+const COLLECTION_MIGRATIONS: &[&str] = &[COLLECTION_SCHEMA, include_str!("collection_v2.sql")];
 
 #[derive(Debug)]
 pub struct Revision {
@@ -41,7 +44,7 @@ pub struct Chunk {
 pub fn create_collection(catalog_path: &Path, db_path: &Path, collection: &str) -> Result<()> {
     fs::create_dir_all(catalog_path.parent().expect("catalog has a parent"))?;
     let mut catalog = open(catalog_path, true)?;
-    migrate(&mut catalog, CATALOG_SCHEMA)?;
+    migrate(&mut catalog, &[CATALOG_SCHEMA])?;
     let transaction = catalog
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
@@ -58,7 +61,7 @@ pub fn create_collection(catalog_path: &Path, db_path: &Path, collection: &str) 
     }
 
     fs::create_dir_all(db_path.parent().expect("database has a parent"))?;
-    migrate(&mut open(db_path, true)?, COLLECTION_SCHEMA)?;
+    migrate(&mut open(db_path, true)?, COLLECTION_MIGRATIONS)?;
     transaction.commit().map_err(database_error)
 }
 
@@ -97,7 +100,9 @@ pub struct CollectionDb(Connection);
 
 impl CollectionDb {
     pub fn open(path: &Path) -> Result<Self> {
-        Ok(Self(open(path, false)?))
+        let mut connection = open(path, false)?;
+        migrate(&mut connection, COLLECTION_MIGRATIONS)?;
+        Ok(Self(connection))
     }
 
     pub fn revision_summary(&self, source: Uuid, revision: Uuid) -> Result<Option<(String, u64)>> {
@@ -127,6 +132,7 @@ impl CollectionDb {
              FROM chunks_fts
              JOIN chunks c ON c.id = chunks_fts.rowid
              JOIN sources s ON s.id = c.source_id AND s.current_revision = c.revision_id
+                AND s.deleted = 0
              WHERE chunks_fts MATCH ?1
              ORDER BY chunks_fts.rank, c.id LIMIT ?2",
             params![phrase, limit],
@@ -135,12 +141,14 @@ impl CollectionDb {
     }
 
     pub fn fetch(&self, reference: &ChunkRef) -> Result<Chunk> {
-        self.0
+        let chunk = self
+            .0
             .query_row(
                 "SELECT c.source_id, c.revision_id, c.ordinal, s.name, s.external_namespace,
                         s.external_id, c.start_byte, c.end_byte, c.content_hash
                  FROM chunks c JOIN sources s ON s.id = c.source_id
-                 WHERE c.source_id = ?1 AND c.revision_id = ?2 AND c.ordinal = ?3",
+                 WHERE c.source_id = ?1 AND c.revision_id = ?2 AND c.ordinal = ?3
+                    AND s.deleted = 0",
                 params![
                     reference.source.to_string(),
                     reference.revision.to_string(),
@@ -149,8 +157,25 @@ impl CollectionDb {
                 row_chunk,
             )
             .optional()
-            .map_err(database_error)?
-            .ok_or_else(|| Error::NotFound("chunk was not found".into()))
+            .map_err(database_error)?;
+        if let Some(chunk) = chunk {
+            return Ok(chunk);
+        }
+        let stale = self
+            .0
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM deleted_sources WHERE id = ?1)
+                 OR EXISTS(SELECT 1 FROM sources WHERE id = ?1 AND current_revision <> ?2)",
+                params![reference.source.to_string(), reference.revision.to_string()],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(database_error)?;
+        if stale {
+            return Err(Error::StaleRevision(
+                "source revision is no longer available".into(),
+            ));
+        }
+        Err(Error::NotFound("chunk was not found".into()))
     }
 }
 
@@ -179,7 +204,30 @@ impl RevisionWriter<'_> {
         Ok(())
     }
 
-    pub fn register(&self, data: &Revision) -> Result<()> {
+    pub fn register(&self, data: &Revision, replacement: bool) -> Result<()> {
+        if replacement {
+            self.replace_current(data)?;
+        } else {
+            self.register_source(data)?;
+        }
+        self.0
+            .execute(
+                "INSERT INTO revisions (source_id, id, content_hash, bytes, chunk_count, chunker)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'utf8-overlap-v1')",
+                params![
+                    data.source.to_string(),
+                    data.revision.to_string(),
+                    data.hash,
+                    sql_integer(data.bytes)?,
+                    sql_integer(data.chunks)?
+                ],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    fn register_source(&self, data: &Revision) -> Result<()> {
+        self.reject_deleted(data.source)?;
         let namespace = data.external.as_ref().map(|external| &external.namespace);
         let id = data.external.as_ref().map(|external| &external.id);
         let inserted = self
@@ -203,19 +251,6 @@ impl RevisionWriter<'_> {
             ));
         }
 
-        self.0
-            .execute(
-                "INSERT INTO revisions (source_id, id, content_hash, bytes, chunk_count, chunker)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'utf8-overlap-v1')",
-                params![
-                    data.source.to_string(),
-                    data.revision.to_string(),
-                    data.hash,
-                    sql_integer(data.bytes)?,
-                    sql_integer(data.chunks)?
-                ],
-            )
-            .map_err(database_error)?;
         Ok(())
     }
 
@@ -242,31 +277,39 @@ fn open(path: &Path, create: bool) -> Result<Connection> {
     Ok(connection)
 }
 
-fn migrate(connection: &mut Connection, schema: &str) -> Result<()> {
-    connection
-        .pragma_update(None, "journal_mode", "WAL")
-        .map_err(database_error)?;
+fn migrate(connection: &mut Connection, schemas: &[&str]) -> Result<()> {
+    let version = schema_version(connection)?;
+    if version == schemas.len() {
+        return Ok(());
+    }
+    if version == 0 {
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(database_error)?;
+    }
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
-    let version: u32 = transaction
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(database_error)?;
-    match version {
-        0 => {
-            transaction.execute_batch(schema).map_err(database_error)?;
-            transaction
-                .pragma_update(None, "user_version", 1)
-                .map_err(database_error)?;
-        }
-        1 => {}
-        _ => {
-            return Err(Error::Invalid(format!(
-                "unsupported database schema {version}"
-            )));
-        }
+    let version = schema_version(&transaction)?;
+    if version > schemas.len() {
+        return Err(Error::Invalid(format!(
+            "unsupported database schema {version}"
+        )));
+    }
+    for (index, schema) in schemas.iter().enumerate().skip(version) {
+        transaction.execute_batch(schema).map_err(database_error)?;
+        transaction
+            .pragma_update(None, "user_version", (index + 1) as u32)
+            .map_err(database_error)?;
     }
     transaction.commit().map_err(database_error)
+}
+
+fn schema_version(connection: &Connection) -> Result<usize> {
+    connection
+        .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+        .map(|version| version as usize)
+        .map_err(database_error)
 }
 
 fn query_all<T>(

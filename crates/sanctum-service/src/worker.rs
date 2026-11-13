@@ -23,3 +23,23 @@ pub async fn run_local_worker(service: Service, mut stop: watch::Receiver<bool>)
         }
     }
 }
+
+pub async fn run_local_maintenance(service: Service, mut stop: watch::Receiver<bool>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    while !*stop.borrow_and_update() {
+        tokio::select! {
+            _ = interval.tick() => {
+                let service = service.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || service.sweep_retired()).await {
+                    tracing::warn!(%error, "local cleanup worker failed");
+                }
+            }
+            changed = stop.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
