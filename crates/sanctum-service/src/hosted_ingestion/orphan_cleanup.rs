@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
-use super::{HostedCatalog, REGISTRATION_WINDOW};
+use super::{AcceptanceFence, Envelope, HostedCatalog, REGISTRATION_WINDOW, envelope_key};
 
 const READER_GRACE: Duration = Duration::from_secs(900);
 const SCAN_PAGE: u32 = 64;
@@ -129,9 +129,30 @@ impl HostedCatalog {
         let abandoned = match candidate {
             Candidate::Input { operation, attempt } => {
                 let prefix = self.operation_prefix(scope, operation)?;
-                self.read_operation(&prefix, operation)
-                    .await?
-                    .is_some_and(|(record, _)| record.attempt != attempt)
+                match self.read_envelope(&prefix, operation).await? {
+                    Some((Envelope::Accepted(record), _)) => record.attempt != attempt,
+                    existing => {
+                        let condition = existing
+                            .map_or(Condition::Create, |(_, version)| Condition::Match(version));
+                        // Compete with admission on the same key. If acceptance wins,
+                        // its reference must be checked afresh on a later pass.
+                        let fence = AcceptanceFence {
+                            operation,
+                            fence_id: Uuid::new_v4(),
+                        };
+                        let bytes = serde_json::to_vec(&fence)
+                            .map_err(|error| Error::Internal(Box::new(error)))?;
+                        match self
+                            .storage
+                            .put_control(&envelope_key(&prefix)?, bytes.into(), condition)
+                            .await
+                        {
+                            Ok(_) => true,
+                            Err(Error::Conflict(_)) => false,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
             }
             Candidate::Extracted { source, revision } => {
                 let object = object.to_string();

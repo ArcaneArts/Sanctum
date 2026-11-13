@@ -103,6 +103,20 @@ struct Operation {
     stage: Stage,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum Envelope {
+    Accepted(Box<Operation>),
+    Fence(AcceptanceFence),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptanceFence {
+    operation: Uuid,
+    fence_id: Uuid,
+}
+
 impl HostedCatalog {
     pub fn max_source_bytes(&self) -> u64 {
         self.max_source_bytes
@@ -301,6 +315,17 @@ impl HostedCatalog {
         prefix: &Key,
         operation: Uuid,
     ) -> Result<Option<(Operation, Version)>> {
+        Ok(match self.read_envelope(prefix, operation).await? {
+            Some((Envelope::Accepted(record), version)) => Some((*record, version)),
+            _ => None,
+        })
+    }
+
+    async fn read_envelope(
+        &self,
+        prefix: &Key,
+        operation: Uuid,
+    ) -> Result<Option<(Envelope, Version)>> {
         let key = envelope_key(prefix)?;
         let download = match self.storage.get(&key).await {
             Ok(download) => download,
@@ -319,14 +344,18 @@ impl HostedCatalog {
         if body.len() as u64 != download.object.length {
             return Err(Error::Internal("ingestion envelope length mismatch".into()));
         }
-        let record: Operation =
+        let envelope: Envelope =
             serde_json::from_slice(&body).map_err(|error| Error::Internal(Box::new(error)))?;
-        if record.format != FORMAT || record.operation != operation {
+        let valid = match &envelope {
+            Envelope::Accepted(record) => record.format == FORMAT && record.operation == operation,
+            Envelope::Fence(fence) => fence.operation == operation,
+        };
+        if !valid {
             return Err(Error::Internal(
                 "ingestion envelope identity mismatch".into(),
             ));
         }
-        Ok(Some((record, download.object.version)))
+        Ok(Some((envelope, download.object.version)))
     }
 }
 
@@ -368,21 +397,25 @@ impl HostedUpload {
             dispatched_at: None,
             stage: Stage::PendingRegistration,
         };
-        if let Some((saved, _)) = self.service.read_operation(&prefix, self.operation).await? {
-            let job = saved.replay(&candidate)?;
-            if self.service.dispatcher.is_some()
-                && matches!(
-                    job.state,
-                    HostedJobState::Accepted | HostedJobState::Registered
-                )
-            {
-                self.service
-                    .record_dispatch_hint(&self.scope, self.operation)
-                    .await?;
-                self.service.try_dispatch(&self.scope, self.operation).await;
+        let condition = match self.service.read_envelope(&prefix, self.operation).await? {
+            Some((Envelope::Accepted(saved), _)) => {
+                let job = saved.replay(&candidate)?;
+                if self.service.dispatcher.is_some()
+                    && matches!(
+                        job.state,
+                        HostedJobState::Accepted | HostedJobState::Registered
+                    )
+                {
+                    self.service
+                        .record_dispatch_hint(&self.scope, self.operation)
+                        .await?;
+                    self.service.try_dispatch(&self.scope, self.operation).await;
+                }
+                return Ok(job);
             }
-            return Ok(job);
-        }
+            Some((Envelope::Fence(_), version)) => Condition::Match(version),
+            None => Condition::Create,
+        };
         let key = envelope_key(&prefix)?;
         let input = candidate.input_key(&prefix)?;
         let body =
@@ -393,10 +426,7 @@ impl HostedUpload {
         self.service
             .record_dispatch_hint(&self.scope, self.operation)
             .await?;
-        let job = match store
-            .put_control(&key, body.into(), Condition::Create)
-            .await
-        {
+        let job = match store.put_control(&key, body.into(), condition).await {
             Ok(_) => Ok(candidate.job()),
             Err(Error::Conflict(_)) => {
                 let (saved, _) = self
