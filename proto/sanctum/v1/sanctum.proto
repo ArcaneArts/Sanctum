@@ -308,6 +308,13 @@ message IngestionJob {
   uint64 created_at_unix_seconds = 15;
   UrlProvenance url = 16;
   GitProvenance git = 17;
+  // Durable worker checkpoint after hosted lexical publication, when present.
+  HostedEmbeddingWork embedding_work = 18;
+}
+
+message HostedEmbeddingWork {
+  uint32 next_batch = 1;
+  optional uint64 not_before_unix_seconds = 2;
 }
 
 message LocalQueueStatus {

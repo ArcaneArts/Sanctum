@@ -46,6 +46,12 @@ pub struct HostedJob {
     pub update_sequence: u64,
     pub state: HostedJobState,
     pub content: Option<RevisionContent>,
+    pub embedding_work: Option<HostedEmbeddingWork>,
+}
+
+pub struct HostedEmbeddingWork {
+    pub next_batch: u32,
+    pub not_before: Option<u64>,
 }
 
 pub enum HostedJobState {
@@ -618,6 +624,16 @@ impl Operation {
     }
 
     fn job(self) -> HostedJob {
+        let embedding_work = match &self.stage {
+            Stage::TextReady {
+                embedding: Some(step),
+                ..
+            } => Some(HostedEmbeddingWork {
+                next_batch: step.step,
+                not_before: step.not_before,
+            }),
+            _ => None,
+        };
         let (state, registration, content) = match self.stage {
             Stage::PendingRegistration => (HostedJobState::Accepted, None, None),
             Stage::PendingIndexing { registration } => {
@@ -658,6 +674,7 @@ impl Operation {
             update_sequence,
             state,
             content,
+            embedding_work,
         }
     }
 

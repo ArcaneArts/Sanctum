@@ -202,7 +202,11 @@ The snapshot commits text-object locators, the lexical index, and the
 indexing receipt together. Replaying a published receipt avoids rebuilding
 its index.
 
-`GetIngestionJob` reports `TEXT_READY` with the committed revision.
+`GetIngestionJob` reports `TEXT_READY` with the committed revision. While
+embedding work remains queued, `embedding_work` reports the next durable
+batch number and its earliest eligible dispatch time, when scheduled.
+`ListIngestionJobs` and MCP `ingestion_status` report the same checkpoint.
+Use `GetEmbeddingStatus` for vector coverage and failures.
 `SearchText` serves collection-scoped lexical hits, including hybrid
 requests when hosted embeddings are unavailable. `FetchChunk` reads
 the hit's exact byte range and verifies its fingerprint. Hosted
