@@ -775,3 +775,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   between tombstone publication and physical reclamation.
 - A standalone CLI smoke deleted and replayed a local collection and
   checked that the other tenant's database was preserved.
+- Delivered in [PR #49](https://github.com/ArcaneArts/Sanctum/pull/49).
+
+## Source listing and inspection
+
+- Both gRPC backends list current published sources with UUID
+  pagination and inspect a revision with an optional expected ID.
+  Responses preserve provenance, exact canonical size, hashes, and
+  original retention. Hosted reads include the snapshot generation.
+- The hosted integration test verifies pagination, RTF provenance and
+  retention, pending and deleted source visibility, and tenant scope.
+- A generated Python client against MinIO verified that an accepted
+  upload is absent from listing until publication and inspected the
+  extracted UTF-8 size and external ID afterward.

@@ -860,6 +860,87 @@ impl Sanctum for Grpc {
         Ok(Response::new(wire_hit(&scope, hit)))
     }
 
+    async fn list_sources(
+        &self,
+        request: Request<v1::ListSourcesRequest>,
+    ) -> Reply<v1::ListSourcesResponse> {
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        let after = parse_optional_id(request.after_source_id, "invalid source cursor")?;
+        let limit = request.limit.unwrap_or(25);
+        if !(1..=100).contains(&limit) {
+            return Err(Status::invalid_argument(
+                "source page limit must be between 1 and 100",
+            ));
+        }
+        let (mut sources, generation) = match &self.0 {
+            Backend::Local(service) => {
+                let service = service.clone();
+                let scope = scope.clone();
+                (
+                    work(move || service.list_sources(&scope, after, limit + 1)).await?,
+                    None,
+                )
+            }
+            Backend::Hosted(catalog) => {
+                let (rows, generation) = catalog
+                    .list_sources(&scope, after, limit + 1)
+                    .await
+                    .map_err(status)?;
+                (rows, Some(generation.to_string()))
+            }
+        };
+        let next_after_source_id = if sources.len() > limit as usize {
+            sources.pop();
+            sources.last().map(|revision| revision.source.to_string())
+        } else {
+            None
+        };
+        Ok(Response::new(v1::ListSourcesResponse {
+            sources: sources
+                .into_iter()
+                .map(|revision| wire_revision(&scope, revision))
+                .collect(),
+            next_after_source_id,
+            database_generation: generation,
+        }))
+    }
+
+    async fn get_source(
+        &self,
+        request: Request<v1::GetSourceRequest>,
+    ) -> Reply<v1::GetSourceResponse> {
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        let source = request
+            .source_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("invalid source ID"))?;
+        let expected =
+            parse_optional_id(request.expected_revision_id, "invalid expected revision ID")?;
+        let (revision, generation) = match &self.0 {
+            Backend::Local(service) => {
+                let service = service.clone();
+                let scope = scope.clone();
+                (
+                    work(move || service.source(&scope, source, expected)).await?,
+                    None,
+                )
+            }
+            Backend::Hosted(catalog) => {
+                let (revision, generation) = catalog
+                    .source(&scope, source, expected)
+                    .await
+                    .map_err(status)?;
+                (revision, Some(generation.to_string()))
+            }
+        };
+        Ok(Response::new(v1::GetSourceResponse {
+            current_revision: Some(wire_revision(&scope, revision)),
+            database_generation: generation,
+        }))
+    }
+
     async fn delete_source(
         &self,
         request: Request<v1::DeleteSourceRequest>,
@@ -1104,6 +1185,26 @@ fn text_revision(job: &Job) -> Option<v1::TextRevision> {
         url: job.url.clone().map(wire_url),
         git: job.git.clone().map(wire_git),
     })
+}
+
+fn wire_revision(scope: &Scope, revision: sanctum_service::Revision) -> v1::TextRevision {
+    let content = revision.content;
+    v1::TextRevision {
+        scope: Some(wire_scope(scope)),
+        source_id: revision.source.to_string(),
+        revision_id: revision.revision.to_string(),
+        name: revision.name,
+        external: revision.external.map(wire_external),
+        bytes: content.bytes,
+        chunks: content.chunks,
+        content_blake3: content.hash,
+        original_blake3: content.original_hash,
+        source_encoding: content.encoding,
+        extractor: content.extractor,
+        retain_original: content.retain_original,
+        url: content.url.map(wire_url),
+        git: content.git.map(wire_git),
+    }
 }
 
 fn wire_hosted_job(scope: &Scope, job: HostedJob) -> v1::IngestionJob {
