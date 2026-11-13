@@ -168,3 +168,19 @@ to match an explicit null. Existence tests omit the operand.
 SQLite applies the predicates to lexical candidates before returning the
 requested number of ranked hits. The filter allows 64 expression nodes,
 eight expression levels, and 16 segments per path.
+
+## Storage usage
+
+`GetStorageUsage` walks the local storage directory for the selected
+collection, tenant, or cluster. It returns regular-file counts and byte
+lengths, including databases, staging files, and retained revisions still
+on disk. The cluster total also includes shared files inside the storage
+root. Symbolic links are skipped. Each response includes its scope and
+start and finish timestamps in Unix milliseconds. Concurrent writes may
+change files during a measurement.
+
+```sh
+cargo run --locked -p sanctum-cli -- usage notes
+cargo run --locked -p sanctum-cli -- --tenant default usage
+cargo run --locked -p sanctum-cli -- usage --cluster
+```

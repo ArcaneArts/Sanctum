@@ -8,6 +8,8 @@ use sanctum_core::{ByteRange, Error, Result, Scope, ScopeId};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+mod usage;
+
 pub struct LocalFiles {
     root: PathBuf,
     _owner: File,

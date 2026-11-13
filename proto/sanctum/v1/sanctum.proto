@@ -19,9 +19,26 @@ service Sanctum {
   rpc GetMetadata(MetadataTarget) returns (MetadataResponse);
   rpc MutateMetadata(MutateMetadataRequest) returns (MetadataResponse);
   rpc ListChanges(ListChangesRequest) returns (ListChangesResponse);
+  rpc GetStorageUsage(StorageUsageRequest) returns (StorageUsage);
 }
 
 message Empty {}
+
+message StorageUsageRequest {
+  oneof scope {
+    Scope collection = 1;
+    string tenant = 2;
+    Empty cluster = 3;
+  }
+}
+
+message StorageUsage {
+  StorageUsageRequest scope = 1;
+  uint64 bytes = 2;
+  uint64 files = 3;
+  uint64 started_at_unix_ms = 4;
+  uint64 finished_at_unix_ms = 5;
+}
 
 message MetadataTarget {
   Scope scope = 1;

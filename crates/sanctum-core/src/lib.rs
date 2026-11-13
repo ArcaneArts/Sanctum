@@ -66,6 +66,19 @@ pub struct Scope {
     pub collection: ScopeId,
 }
 
+pub enum UsageScope {
+    Collection(Scope),
+    Tenant(ScopeId),
+    Cluster,
+}
+
+pub struct UsageMeasurement {
+    pub bytes: u64,
+    pub files: u64,
+    pub started_at: std::time::SystemTime,
+    pub finished_at: std::time::SystemTime,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ByteRange {
     pub start: u64,

@@ -1,4 +1,4 @@
-use sanctum_core::{Error, ExternalSource, Result, Scope, UPLOAD_FRAME_BYTES};
+use sanctum_core::{Error, ExternalSource, Result, Scope, UPLOAD_FRAME_BYTES, UsageScope};
 use sanctum_proto::v1::{
     self,
     sanctum_server::{Sanctum, SanctumServer},
@@ -23,6 +23,34 @@ pub struct Grpc(Service);
 
 #[tonic::async_trait]
 impl Sanctum for Grpc {
+    async fn get_storage_usage(
+        &self,
+        request: Request<v1::StorageUsageRequest>,
+    ) -> Reply<v1::StorageUsage> {
+        use v1::storage_usage_request::Scope as WireScope;
+        let request = request.into_inner();
+        let scope = match &request.scope {
+            Some(WireScope::Collection(collection)) => {
+                UsageScope::Collection(parse_scope(Some(collection.clone()))?)
+            }
+            Some(WireScope::Tenant(tenant)) => UsageScope::Tenant(tenant.parse().map_err(status)?),
+            Some(WireScope::Cluster(_)) => UsageScope::Cluster,
+            None => return Err(Status::invalid_argument("storage usage scope is required")),
+        };
+        let service = self.0.clone();
+        work(move || {
+            let measured = service.storage_usage(&scope)?;
+            Ok(v1::StorageUsage {
+                scope: Some(request),
+                bytes: measured.bytes,
+                files: measured.files,
+                started_at_unix_ms: unix_ms(measured.started_at)?,
+                finished_at_unix_ms: unix_ms(measured.finished_at)?,
+            })
+        })
+        .await
+        .map(Response::new)
+    }
     async fn get_metadata(
         &self,
         request: Request<v1::MetadataTarget>,
@@ -334,6 +362,13 @@ impl Sanctum for Grpc {
         .await
         .map(Response::new)
     }
+}
+
+fn unix_ms(time: std::time::SystemTime) -> Result<u64> {
+    let elapsed = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| Error::Internal(Box::new(error)))?;
+    u64::try_from(elapsed.as_millis()).map_err(|error| Error::Internal(Box::new(error)))
 }
 
 async fn submit(
