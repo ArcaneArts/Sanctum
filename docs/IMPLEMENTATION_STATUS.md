@@ -222,6 +222,8 @@ Merged in [PR #14](https://github.com/ArcaneArts/Sanctum/pull/14).
 
 ## OpenAI-compatible embeddings
 
+Merged in [PR #15](https://github.com/ArcaneArts/Sanctum/pull/15).
+
 - The server supports a configurable OpenAI-compatible embedding endpoint,
   optional dimensions in the request, and credentials read by environment
   variable name. Response indices map embeddings back to their inputs
@@ -229,3 +231,14 @@ Merged in [PR #14](https://github.com/ArcaneArts/Sanctum/pull/14).
 - The standalone local server exercises the adapter against Ollama's
   OpenAI-compatible endpoint. Hosted OpenAI and OpenRouter verification
   remains open.
+
+## Google Cloud embeddings
+
+- The adapter uses Vertex AI text prediction with Application Default
+  Credentials, distinct query and document tasks, requested dimensions, and
+  truncation disabled. Its tests exercise the wire contract and response
+  validation using local fixtures.
+- A standalone run with missing credentials verified that retry state
+  persists while ingestion and lexical fallback remain available.
+- Live prediction requires an authorized Sanctum Google Cloud project and
+  a credential with Vertex AI prediction access.

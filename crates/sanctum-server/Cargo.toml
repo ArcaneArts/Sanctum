@@ -9,6 +9,7 @@ sanctum-api = { path = "../sanctum-api" }
 sanctum-config = { path = "../sanctum-config" }
 sanctum-embedding-ollama = { path = "../sanctum-embedding-ollama" }
 sanctum-embedding-openai = { path = "../sanctum-embedding-openai" }
+sanctum-embedding-google = { path = "../sanctum-embedding-google" }
 sanctum-embedding = { path = "../sanctum-embedding" }
 sanctum-mcp = { path = "../sanctum-mcp", features = ["http"] }
 sanctum-proto = { path = "../sanctum-proto" }

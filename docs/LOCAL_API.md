@@ -199,6 +199,34 @@ The local Ollama compatibility endpoint uses `http://127.0.0.1:11434/v1`.
 Its native adapter remains available under `provider: ollama`.
 [Ollama compatibility](https://docs.ollama.com/api/openai-compatibility).
 
+## Google Cloud embeddings
+
+Set `embedding.provider` to `google` with an authorized Google Cloud project
+and a Vertex AI location serving the selected model. The server uses
+Application Default Credentials for the caller identity. The project must
+allow Vertex AI prediction for that identity.
+
+```json
+{
+  "provider": "google",
+  "project": "your-sanctum-project",
+  "location": "us-central1",
+  "profile": {
+    "model": "gemini-embedding-001",
+    "revision": "1",
+    "dimensions": 768
+  }
+}
+```
+
+This adapter uses the Vertex AI text embedding `predict` endpoint. It sends
+one input per prediction, sets separate retrieval tasks for documents and
+queries, and disables truncation. The profile includes the project,
+location, and preprocessing settings. Credential discovery and refresh
+happen when an embedding request needs them, so the lexical service can
+start before credentials become available.
+[Vertex AI text embeddings](https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/models/text-embeddings-api).
+
 ## Search across collections
 
 `SearchCollections` accepts one tenant and up to eight distinct collection

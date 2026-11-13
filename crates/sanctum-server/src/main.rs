@@ -17,6 +17,8 @@ async fn main() -> anyhow::Result<()> {
                 .map(|provider| Arc::new(provider) as Arc<dyn sanctum_embedding::Provider>),
             EmbeddingConfig::OpenAi(config) => sanctum_embedding_openai::OpenAi::new(config)
                 .map(|provider| Arc::new(provider) as Arc<dyn sanctum_embedding::Provider>),
+            EmbeddingConfig::Google(config) => sanctum_embedding_google::Vertex::new(config)
+                .map(|provider| Arc::new(provider) as Arc<dyn sanctum_embedding::Provider>),
         })
         .transpose()?;
     let service =

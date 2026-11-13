@@ -10,3 +10,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sanctum-embedding-ollama = { path = "../sanctum-embedding-ollama" }
 sanctum-embedding-openai = { path = "../sanctum-embedding-openai" }
+sanctum-embedding-google = { path = "../sanctum-embedding-google" }

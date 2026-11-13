@@ -222,12 +222,12 @@ impl Service {
         Ok(prepared)
     }
 
-    fn embedding_batch(&self, scope: &Scope, profile: &str) -> Result<Batch> {
+    fn embedding_batch(&self, scope: &Scope, profile: &str, limit: u32) -> Result<Batch> {
         let _reader = self
             .retrieval
             .read()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
-        let chunks = self.database(scope)?.pending_embeddings(profile)?;
+        let chunks = self.database(scope)?.pending_embeddings(profile, limit)?;
         let mut batch = Batch {
             hashes: Vec::new(),
             texts: Vec::new(),
@@ -278,6 +278,7 @@ pub async fn run_embedding_worker(service: Service, mut stop: watch::Receiver<bo
         return;
     };
     let profile = provider.profile_id().to_owned();
+    let limit = provider.max_batch_size().clamp(1, 16);
     while !*stop.borrow_and_update() {
         let current = service.clone();
         let scopes = blocking(move || {
@@ -298,7 +299,8 @@ pub async fn run_embedding_worker(service: Service, mut stop: watch::Receiver<bo
                     let current = service.clone();
                     let scoped = scope.clone();
                     let selected = profile.clone();
-                    let batch = blocking(move || current.embedding_batch(&scoped, &selected)).await;
+                    let batch =
+                        blocking(move || current.embedding_batch(&scoped, &selected, limit)).await;
                     match batch {
                         Ok(batch) if !batch.texts.is_empty() => {
                             let outcomes = tokio::select! {
