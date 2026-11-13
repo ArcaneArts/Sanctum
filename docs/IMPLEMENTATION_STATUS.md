@@ -9,7 +9,7 @@ which parts have working implementations and where to find the evidence.
 | 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, platform packaging and verification |
 | 3. Object storage and publication | Shared object contract, filesystem and MinIO-tested S3 adapters, and a fenced SQLite snapshot executor, a native GCS adapter, and a hosted catalog | Live GCS verification, hosted source operations, and deployment recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
-| 5. Capacity | Pending | Representative 200 MB sources, GB-scale collections and database snapshots, cold/warm cloud performance, measured optimization |
+| 5. Capacity | [SQLite snapshot transfer and publication benchmark](CAPACITY.md) | Representative 200 MB sources, GB-scale collections and database snapshots, cold/warm cloud performance, measured optimization |
 
 ## Local text ingestion and retrieval
 
@@ -812,3 +812,13 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   the CLI, and both hosted health routes with unreachable dependency
   endpoints. The response omitted configured resource names and
   credential environment references.
+- Delivered in [PR #52](https://github.com/ArcaneArts/Sanctum/pull/52).
+
+## Large SQLite snapshot measurements
+
+- The opt-in MinIO benchmark uses the production writer and cache.
+  It records exact snapshot sizes, three cold and warm samples,
+  SQLite point query latency, and the cost of publishing a one-row
+  update. [Method and measurements](CAPACITY.md).
+- Representative text and vector query workloads, concurrent
+  collections, and actual Cloud Run capacity remain open.
