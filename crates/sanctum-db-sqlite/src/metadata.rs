@@ -141,14 +141,32 @@ impl CollectionDb {
         Ok(entries)
     }
 
+    pub fn change_cursor(&self) -> Result<u64> {
+        self.0
+            .query_row(
+                "SELECT COALESCE(max(cursor), 0) FROM source_changes",
+                [],
+                |row| unsigned_column(row, 0),
+            )
+            .map_err(database_error)
+    }
+
     pub fn changes(&mut self, after: u64, limit: u32) -> Result<Vec<Change>> {
         let after = sql_integer(after)?;
         let snapshot = self.0.transaction().map_err(database_error)?;
-        let oldest: Option<i64> = snapshot
-            .query_row("SELECT min(cursor) FROM source_changes", [], |row| {
-                row.get(0)
-            })
+        let (oldest, newest): (Option<i64>, i64) = snapshot
+            .query_row(
+                "SELECT (SELECT min(cursor) FROM source_changes),
+                    COALESCE((SELECT max(cursor) FROM source_changes), 0)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .map_err(database_error)?;
+        if after > newest {
+            return Err(Error::Invalid(
+                "change cursor is ahead of the collection".into(),
+            ));
+        }
         if oldest.is_some_and(|oldest| after < oldest - 1) {
             return Err(Error::StaleRevision(
                 "change cursor expired; rescan the collection".into(),

@@ -10,6 +10,7 @@ sanctum-proto = { path = "../sanctum-proto" }
 sanctum-service = { path = "../sanctum-service" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util.workspace = true
 tonic = { workspace = true }
 tracing = { workspace = true }
 serde_json.workspace = true

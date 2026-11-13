@@ -13,16 +13,17 @@ use sanctum_service::{
 };
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 
 mod metadata_filter;
 
-pub fn grpc(service: Service) -> SanctumServer<Grpc> {
+pub fn grpc(service: Service, shutdown: CancellationToken) -> SanctumServer<Grpc> {
     // Metadata batches can contain 32 values of up to 64 KiB each.
-    SanctumServer::new(Grpc(service)).max_decoding_message_size(3 * 1024 * 1024)
+    SanctumServer::new(Grpc(service, shutdown)).max_decoding_message_size(3 * 1024 * 1024)
 }
 
-pub struct Grpc(Service);
+pub struct Grpc(Service, CancellationToken);
 
 #[tonic::async_trait]
 impl Sanctum for Grpc {
@@ -90,26 +91,48 @@ impl Sanctum for Grpc {
     ) -> Reply<v1::ListChangesResponse> {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
+        changes_page(
+            self.0.clone(),
+            scope,
+            request.after_cursor,
+            request.limit.unwrap_or(100),
+        )
+        .await
+        .map(Response::new)
+    }
+
+    type WatchChangesStream = ReceiverStream<std::result::Result<v1::ListChangesResponse, Status>>;
+
+    async fn watch_changes(
+        &self,
+        request: Request<v1::ListChangesRequest>,
+    ) -> Reply<Self::WatchChangesStream> {
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        let limit = request.limit.unwrap_or(100);
+        let service = self.0.clone();
+        let first =
+            changes_page(service.clone(), scope.clone(), request.after_cursor, limit).await?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let shutdown = self.1.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown.cancelled() => {}
+                _ = stream_changes(service, scope, limit, first, sender) => {}
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+
+    async fn get_change_cursor(
+        &self,
+        request: Request<v1::ChangeCursorRequest>,
+    ) -> Reply<v1::ChangeCursor> {
+        let scope = parse_scope(request.into_inner().scope)?;
         let service = self.0.clone();
         work(move || {
-            let changes =
-                service.changes(&scope, request.after_cursor, request.limit.unwrap_or(100))?;
-            let next_cursor = changes
-                .last()
-                .map_or(request.after_cursor, |change| change.cursor);
-            Ok(v1::ListChangesResponse {
-                next_cursor,
-                changes: changes
-                    .into_iter()
-                    .map(|change| v1::SourceChange {
-                        cursor: change.cursor,
-                        kind: change.kind,
-                        source_id: change.source,
-                        revision_id: change.revision,
-                        previous_revision_id: change.previous_revision,
-                        chunk_ordinal: change.ordinal,
-                    })
-                    .collect(),
+            Ok(v1::ChangeCursor {
+                cursor: service.change_cursor(&scope)?,
             })
         })
         .await
@@ -880,6 +903,73 @@ fn wire_import(event: ImportEvent) -> v1::ImportLocalEvent {
         operation_id: event.operation.map(|id| id.to_string()),
         message: event.message,
     }
+}
+
+async fn stream_changes(
+    service: Service,
+    scope: Scope,
+    limit: u32,
+    first: v1::ListChangesResponse,
+    sender: tokio::sync::mpsc::Sender<std::result::Result<v1::ListChangesResponse, Status>>,
+) {
+    let mut at_head = first.changes.len() < limit as usize;
+    let mut cursor = first.next_cursor;
+    if sender.send(Ok(first)).await.is_err() {
+        return;
+    }
+    let mut heartbeat = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if at_head {
+            tokio::select! {
+                _ = sender.closed() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+            }
+        }
+        let Ok(permit) = sender.reserve().await else {
+            return;
+        };
+        match changes_page(service.clone(), scope.clone(), cursor, limit).await {
+            Ok(page) => {
+                at_head = page.changes.len() < limit as usize;
+                if !page.changes.is_empty() || tokio::time::Instant::now() >= heartbeat {
+                    cursor = page.next_cursor;
+                    permit.send(Ok(page));
+                    heartbeat = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+                }
+            }
+            Err(error) => {
+                permit.send(Err(error));
+                return;
+            }
+        }
+    }
+}
+
+async fn changes_page(
+    service: Service,
+    scope: Scope,
+    after_cursor: u64,
+    limit: u32,
+) -> std::result::Result<v1::ListChangesResponse, Status> {
+    work(move || {
+        let changes = service.changes(&scope, after_cursor, limit)?;
+        let next_cursor = changes.last().map_or(after_cursor, |change| change.cursor);
+        Ok(v1::ListChangesResponse {
+            next_cursor,
+            changes: changes
+                .into_iter()
+                .map(|change| v1::SourceChange {
+                    cursor: change.cursor,
+                    kind: change.kind,
+                    source_id: change.source,
+                    revision_id: change.revision,
+                    previous_revision_id: change.previous_revision,
+                    chunk_ordinal: change.ordinal,
+                })
+                .collect(),
+        })
+    })
+    .await
 }
 
 async fn work<T: Send + 'static>(

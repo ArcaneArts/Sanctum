@@ -13,6 +13,7 @@ use sanctum_service::{Service, run_embedding_worker, run_local_worker, run_watch
 use tempfile::TempDir;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
+use tokio_util::sync::CancellationToken;
 use tonic::{
     Code,
     transport::{Channel, Server},
@@ -63,10 +64,12 @@ impl Running {
                     tokio::spawn(run_watched_folders(server_service.clone(), worker_stop));
                 (worker, embedding, watcher)
             });
+            let cancellation = CancellationToken::new();
             let result = Server::builder()
-                .add_service(sanctum_api::grpc(server_service))
+                .add_service(sanctum_api::grpc(server_service, cancellation.clone()))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                     let _ = shutdown.await;
+                    cancellation.cancel();
                 })
                 .await;
             let _ = stop_worker.send(true);
@@ -91,6 +94,186 @@ impl Running {
         self.stop.send(()).unwrap();
         self.server.await.unwrap().unwrap();
     }
+}
+
+#[tokio::test]
+async fn change_stream_replays_and_resumes_in_scope() {
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    create(&mut running.client, "other").await;
+    let first = upload(
+        &mut running.client,
+        header("default"),
+        b"before the subscription",
+    )
+    .await;
+    let cursor = running
+        .client
+        .get_change_cursor(v1::ChangeCursorRequest {
+            scope: scope("default"),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .cursor;
+    assert!(cursor > 0);
+    let mut request = v1::ListChangesRequest {
+        scope: scope("default"),
+        after_cursor: cursor,
+        limit: Some(1),
+    };
+    let mut stream = running
+        .client
+        .watch_changes(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let initial = next_changes(&mut stream).await;
+    assert!(initial.changes.is_empty());
+    assert_eq!(initial.next_cursor, cursor);
+    upload(&mut running.client, header("other"), b"from another tenant").await;
+    let revision = upload(
+        &mut running.client,
+        replacement(Some(&first.source_id), Some(&first.revision_id)),
+        b"replacement content",
+    )
+    .await;
+    let replaced = next_changes(&mut stream).await;
+    assert_eq!(replaced.changes.len(), 1);
+    assert_eq!(replaced.changes[0].kind, "source_replaced");
+    assert_eq!(replaced.changes[0].revision_id, revision.revision_id);
+    drop(stream);
+
+    request.after_cursor = replaced.next_cursor;
+    let mut resumed = running
+        .client
+        .watch_changes(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let reset = next_changes(&mut resumed).await;
+    assert_eq!(reset.changes.len(), 1);
+    assert_eq!(reset.changes[0].kind, "metadata_reset");
+    assert_eq!(reset.changes[0].source_id, first.source_id);
+    assert!(reset.next_cursor > replaced.next_cursor);
+    let current = running
+        .client
+        .get_change_cursor(v1::ChangeCursorRequest {
+            scope: scope("default"),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(current.cursor, reset.next_cursor);
+    request.after_cursor = current.cursor + 1;
+    assert_eq!(
+        running
+            .client
+            .watch_changes(request)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), running.stop())
+        .await
+        .unwrap();
+    assert!(resumed.message().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn change_stream_reports_an_expired_cursor_and_can_restart_at_head() {
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    let revision = upload(&mut running.client, header("default"), b"old event").await;
+    let db = rusqlite::Connection::open(dir.path().join("default/notes/meta.db")).unwrap();
+    db.execute(
+        "WITH RECURSIVE events(n) AS (
+            VALUES (1) UNION ALL SELECT n + 1 FROM events WHERE n < 10000
+        ) INSERT INTO source_changes (kind, source, revision)
+          SELECT 'metadata_changed', ?1, ?2 FROM events",
+        rusqlite::params![revision.source_id, revision.revision_id],
+    )
+    .unwrap();
+    let newest = upload(
+        &mut running.client,
+        v1::UploadTextFrame {
+            frame: Some(Frame::Header(v1::UploadTextHeader {
+                scope: scope("default"),
+                name: "retention.md".into(),
+                ..Default::default()
+            })),
+        },
+        b"trigger retention",
+    )
+    .await;
+    let (oldest, retained): (i64, i64) = db
+        .query_row(
+            "SELECT min(cursor), count(*) FROM source_changes",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((oldest, retained), (3, 10000));
+    assert_ne!(newest.revision_id, revision.revision_id);
+    drop(db);
+
+    let mut request = v1::ListChangesRequest {
+        scope: scope("default"),
+        after_cursor: 0,
+        limit: None,
+    };
+    let error = running
+        .client
+        .watch_changes(request.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("rescan"));
+    assert_eq!(
+        running
+            .client
+            .list_changes(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    request.after_cursor = running
+        .client
+        .get_change_cursor(v1::ChangeCursorRequest {
+            scope: scope("default"),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .cursor;
+    assert_eq!(request.after_cursor, 10002);
+    let mut stream = running
+        .client
+        .watch_changes(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        next_changes(&mut stream).await.next_cursor,
+        request.after_cursor
+    );
+    drop(stream);
+    running.stop().await;
+}
+
+async fn next_changes(
+    stream: &mut tonic::Streaming<v1::ListChangesResponse>,
+) -> v1::ListChangesResponse {
+    tokio::time::timeout(Duration::from_secs(5), stream.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
 }
 
 #[tokio::test]
@@ -2014,6 +2197,27 @@ async fn folder_watch_reconciles_offline_edits_and_prunes_explicitly() {
     let updated = await_watch_hit(&mut running.client, "andalusite").await;
     assert_eq!(initial.source_id, updated.source_id);
     assert_ne!(initial.revision_id, updated.revision_id);
+    // The edit can be searchable while the same scan is still pruning removals.
+    let folder = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = running
+                .client
+                .list_watched_folders(list("default"))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(response.folders.len(), 1);
+            let folder = response.folders.into_iter().next().unwrap();
+            if folder.last_deleted == 1 {
+                break folder;
+            }
+            assert_eq!(folder.last_failed, 0, "{folder:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(folder.id, watch.id);
     assert!(
         search(&mut running.client, "default", "spinel")
             .await
@@ -2024,15 +2228,6 @@ async fn folder_watch_reconciles_offline_edits_and_prunes_explicitly() {
             .await
             .is_empty()
     );
-    let response = running
-        .client
-        .list_watched_folders(list("default"))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(response.folders.len(), 1);
-    assert_eq!(response.folders[0].id, watch.id);
-    assert_eq!(response.folders[0].last_deleted, 1);
     let request = v1::UnwatchFolderRequest {
         scope: scope("other"),
         id: watch.id,

@@ -127,6 +127,10 @@ impl Service {
         }
     }
 
+    pub fn change_cursor(&self, scope: &Scope) -> Result<u64> {
+        self.database(scope)?.change_cursor()
+    }
+
     pub fn changes(&self, scope: &Scope, after: u64, limit: u32) -> Result<Vec<Change>> {
         if !(1..=200).contains(&limit) {
             return Err(Error::Invalid(
