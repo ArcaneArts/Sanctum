@@ -5,7 +5,7 @@ which parts have working implementations and where to find the evidence.
 
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
-| 1. Local desktop and MCP | Local Rust service and gRPC CLI with streamed UTF-8 and RTF ingestion, original retention, directory imports, SQLite FTS5, byte-range fetch, restartable lexical jobs, source lifecycle, and metadata CRUD, filters, and reset events | Embedding reuse and readiness, usage, Ollama and vector search, MCP, tray app, desktop acceptance |
+| 1. Local desktop and MCP | Local Rust service and gRPC CLI with streamed UTF-8 and RTF ingestion, original retention, directory imports, SQLite FTS5, byte-range fetch, restartable lexical jobs, source lifecycle, metadata CRUD and filters, and filesystem storage usage | Embedding reuse and readiness, Ollama and vector search, MCP, tray app, desktop acceptance |
 | 2. Providers and local integrations | Pending | Hosted provider adapters, rebuilds, watchers, URL and Git imports, metadata queries and cursors, SQL access, multi-collection retrieval, platform packaging and verification |
 | 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
@@ -109,6 +109,8 @@ Merged in [PR #7](https://github.com/ArcaneArts/Sanctum/pull/7).
 
 ## Lexical candidate filtering
 
+Merged in [PR #8](https://github.com/ArcaneArts/Sanctum/pull/8).
+
 - `SearchText` supports structured collection, source, and chunk metadata
   predicates with nested paths, typed comparisons, array membership, and
   Boolean composition. SQLite applies source and chunk predicates to
@@ -117,4 +119,14 @@ Merged in [PR #7](https://github.com/ArcaneArts/Sanctum/pull/7).
   one-hit limit. It also covers literal path segments, large integer
   comparisons, JSON null versus missing, and tenant scope.
 - Semantic and hybrid search must reuse the candidate filtering semantics.
-  Next, add scoped storage usage for the local desktop workflow.
+
+## Local storage usage
+
+- `GetStorageUsage` and `sanctum-cli usage` measure real filesystem lengths
+  at the collection, tenant, and cluster scopes. The response includes file
+  count and the scan's start and finish timestamps.
+- The integration test compares all three scopes with an independent
+  filesystem walk and verifies staging, retained originals, symbolic links,
+  and refresh after removal.
+- Object storage usage remains part of the object storage milestone.
+  Next, add Ollama profile configuration, embedding persistence, and retrieval.

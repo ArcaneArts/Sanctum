@@ -1601,3 +1601,102 @@ async fn metadata_filters_apply_to_candidates_before_limit_and_preserve_json_typ
     );
     running.stop().await;
 }
+
+#[tokio::test]
+async fn storage_usage_counts_retained_and_staged_files_at_each_scope() {
+    use v1::storage_usage_request::Scope as UsageScope;
+    let dir = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    create(&mut running.client, "other").await;
+    let revision = upload(
+        &mut running.client,
+        rtf_header(true, "usage-rtf"),
+        br"{\rtf1 Peridot}",
+    )
+    .await;
+    let canonical = text_path(&dir, &revision.source_id, &revision.revision_id);
+    let collection = dir.path().join("default/notes");
+    let staged = collection.join("staging/working-file");
+    std::fs::write(&staged, b"pending bytes").unwrap();
+    std::fs::write(outside.path().join("unmanaged"), vec![0; 64 * 1024]).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.path(), collection.join("external")).unwrap();
+
+    let expected = |path: &std::path::Path| {
+        let mut totals = (0u64, 0u64);
+        fn collect(path: &std::path::Path, totals: &mut (u64, u64)) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    collect(&entry.path(), totals);
+                } else if kind.is_file() {
+                    totals.0 += entry.metadata().unwrap().len();
+                    totals.1 += 1;
+                }
+            }
+        }
+        collect(path, &mut totals);
+        totals
+    };
+    let collection_request = v1::StorageUsageRequest {
+        scope: Some(UsageScope::Collection(scope("default").unwrap())),
+    };
+    let first = running
+        .client
+        .get_storage_usage(collection_request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((first.bytes, first.files), expected(&collection));
+    assert_eq!(first.scope.as_ref(), Some(&collection_request));
+    assert!(first.started_at_unix_ms > 0 && first.finished_at_unix_ms >= first.started_at_unix_ms);
+    assert!(canonical.with_file_name("original").is_file());
+
+    let tenant_request = v1::StorageUsageRequest {
+        scope: Some(UsageScope::Tenant("default".into())),
+    };
+    let tenant = running
+        .client
+        .get_storage_usage(tenant_request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (tenant.bytes, tenant.files),
+        expected(&dir.path().join("default"))
+    );
+    assert!(tenant.bytes > first.bytes);
+    let cluster_request = v1::StorageUsageRequest {
+        scope: Some(UsageScope::Cluster(v1::Empty {})),
+    };
+    let cluster = running
+        .client
+        .get_storage_usage(cluster_request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((cluster.bytes, cluster.files), expected(dir.path()));
+    assert!(cluster.bytes > tenant.bytes);
+
+    std::fs::remove_file(staged).unwrap();
+    let refreshed = running
+        .client
+        .get_storage_usage(collection_request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(refreshed.bytes + b"pending bytes".len() as u64, first.bytes);
+    assert_eq!(refreshed.files + 1, first.files);
+    let missing = running
+        .client
+        .get_storage_usage(v1::StorageUsageRequest {
+            scope: Some(UsageScope::Tenant("missing".into())),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), Code::NotFound);
+    running.stop().await;
+}

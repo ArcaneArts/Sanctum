@@ -8,7 +8,7 @@ pub use db::metadata::{
     RevisionTarget,
 };
 pub use db::metadata_filter;
-use sanctum_core::{Error, ExternalSource, Result, Scope, ScopeId};
+use sanctum_core::{Error, ExternalSource, Result, Scope, ScopeId, UsageMeasurement, UsageScope};
 use sanctum_db_sqlite::{self as db, CollectionDb};
 pub use sanctum_db_sqlite::{Chunk, ChunkRef, Revision, RevisionContent};
 use sanctum_storage_fs::LocalFiles;
@@ -59,6 +59,12 @@ pub struct Hit {
 }
 
 impl Service {
+    pub fn storage_usage(&self, scope: &UsageScope) -> Result<UsageMeasurement> {
+        if let UsageScope::Collection(collection) = scope {
+            self.require_collection(collection)?;
+        }
+        self.files.usage(scope)
+    }
     pub fn metadata(
         &self,
         scope: &Scope,

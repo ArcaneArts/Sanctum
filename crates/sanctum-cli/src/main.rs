@@ -24,6 +24,11 @@ enum Command {
         collection: String,
     },
     List,
+    Usage {
+        collection: Option<String>,
+        #[arg(long, conflicts_with = "collection")]
+        cluster: bool,
+    },
     Import {
         collection: String,
         path: PathBuf,
@@ -101,6 +106,28 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut client = SanctumClient::connect(args.endpoint).await?;
     match args.command {
+        Command::Usage {
+            collection,
+            cluster,
+        } => {
+            use v1::storage_usage_request::Scope as WireScope;
+            let scope = match collection {
+                Some(collection) => WireScope::Collection(v1::Scope {
+                    tenant: args.tenant,
+                    collection,
+                }),
+                None if cluster => WireScope::Cluster(v1::Empty {}),
+                None => WireScope::Tenant(args.tenant),
+            };
+            let usage = client
+                .get_storage_usage(v1::StorageUsageRequest { scope: Some(scope) })
+                .await?
+                .into_inner();
+            println!(
+                "{} bytes in {} files ({}..{} Unix ms)",
+                usage.bytes, usage.files, usage.started_at_unix_ms, usage.finished_at_unix_ms
+            );
+        }
         Command::Import {
             collection,
             path,
