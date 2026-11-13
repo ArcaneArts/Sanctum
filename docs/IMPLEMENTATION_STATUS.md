@@ -5,7 +5,7 @@ which parts have working implementations and where to find the evidence.
 
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
-| 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, text ingestion and directory imports, byte-range fetch, source lifecycle, metadata and filters, filesystem usage, and Ollama-backed search with queue and embedding status | Tray app, desktop and LLM client acceptance |
+| 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | End-to-end acceptance in an LLM client |
 | 2. Providers and local integrations | Pending | Hosted provider adapters, rebuilds, watchers, URL and Git imports, metadata queries and cursors, SQL access, multi-collection retrieval, platform packaging and verification |
 | 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
@@ -171,6 +171,8 @@ Merged in [PR #11](https://github.com/ArcaneArts/Sanctum/pull/11).
 
 ## Local activity and embedding status
 
+Merged in [PR #12](https://github.com/ArcaneArts/Sanctum/pull/12).
+
 - `ListIngestionJobs` pages durable ingestion activity across a tenant or
   within one collection, using the stored acceptance timestamp and operation
   ID. The existing queue operations still control individual jobs.
@@ -180,4 +182,24 @@ Merged in [PR #11](https://github.com/ArcaneArts/Sanctum/pull/11).
 - The local gRPC tests cover pagination across restart, cursor tenant
   isolation, current and stale revision checks, and recorded embedding
   failures.
-- Next, implement the desktop host, configuration, tray, and first-use flow.
+
+## Desktop tray and first-use flow
+
+- `pnpm devtop` builds server and CLI sidecars and starts the Tauri/React
+  app. The host persists settings and owns one server process. It passes
+  configuration through the environment and stops the child through its
+  control pipe.
+- Activity shows persistent ingestion operations, embedding coverage, and
+  measured storage usage. The app can create collections and queue file
+  and directory imports. Settings cover the local store, Ollama, worker
+  concurrency, and listener ports. Connect shows live MCP settings.
+- Setup and build commands are in the [desktop guide](DESKTOP.md).
+- On Apple Silicon macOS, the unsigned debug app bundle was exercised with
+  a temporary store. It created a collection, imported a folder through
+  the native picker, showed indexing and storage totals, applied Ollama
+  settings on restart, and reported a real embedded chunk. A protocol
+  client searched the live desktop MCP endpoint and fetched the citation
+  through the bundled stdio bridge. Closing the window kept the app
+  running, and quitting stopped the sidecar.
+- A model-driven client workflow, Windows and Linux tray behavior, and
+  release signing and installers remain unverified.

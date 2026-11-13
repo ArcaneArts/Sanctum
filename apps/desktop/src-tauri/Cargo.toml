@@ -1,0 +1,26 @@
+[package]
+name = "sanctum-desktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+sanctum-config = { path = "../../../crates/sanctum-config" }
+sanctum-embedding-ollama = { path = "../../../crates/sanctum-embedding-ollama" }
+sanctum-proto = { path = "../../../crates/sanctum-proto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "net", "process", "signal", "sync", "time"] }
+tonic = "0.14"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

@@ -1942,6 +1942,7 @@ dependencies = [
  "sanctum-mcp",
  "sanctum-proto",
  "sanctum-service",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tokio-util",

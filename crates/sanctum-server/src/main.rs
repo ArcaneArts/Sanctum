@@ -41,6 +41,16 @@ async fn main() -> anyhow::Result<()> {
     if let Some(listener) = &mcp_listener {
         tracing::info!(address = %listener.local_addr()?, "Sanctum MCP listening");
     }
+    if managed() {
+        let mcp = mcp_listener
+            .as_ref()
+            .map(|listener| listener.local_addr())
+            .transpose()?;
+        println!(
+            "{}",
+            serde_json::json!({"grpc": listener.local_addr()?, "mcp": mcp})
+        );
+    }
     let mcp = serve_mcp(mcp_listener, service.clone(), cancellation.child_token());
     tracing::info!(address = %listener.local_addr()?, "Sanctum gRPC listening");
     let grpc = tonic::transport::Server::builder()
@@ -50,6 +60,12 @@ async fn main() -> anyhow::Result<()> {
             cancellation.clone().cancelled_owned(),
         );
     tokio::pin!(grpc, mcp);
+    let shutdown = async {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => signal,
+            _ = host_shutdown() => Ok(()),
+        }
+    };
     let result = tokio::select! {
         result = &mut grpc => {
             cancellation.cancel();
@@ -61,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
             let _ = stop.send(true);
             result.and(grpc.await.map_err(anyhow::Error::from))
         }
-        signal = tokio::signal::ctrl_c() => {
+        signal = shutdown => {
             cancellation.cancel();
             let _ = stop.send(true);
             let (grpc, mcp) = tokio::join!(grpc, mcp);
@@ -73,6 +89,23 @@ async fn main() -> anyhow::Result<()> {
     }
     result?;
     Ok(())
+}
+
+async fn host_shutdown() {
+    if !managed() {
+        std::future::pending::<()>().await;
+        return;
+    }
+    let (stopped, stop) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8]);
+        let _ = stopped.send(());
+    });
+    let _ = stop.await;
+}
+
+fn managed() -> bool {
+    std::env::var_os("SANCTUM_MANAGED_STDIO").is_some()
 }
 
 async fn serve_mcp(

@@ -1,0 +1,32 @@
+@import "@fontsource-variable/geist";
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: "Geist Variable", system-ui, sans-serif;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-ring: var(--primary);
+}
+
+:root {
+  color-scheme: dark;
+  --background: #10161f;
+  --foreground: #e8edf5;
+  --card: #17212d;
+  --muted: #233344;
+  --muted-foreground: #a7b6c8;
+  --border: #2b3a4b;
+  --primary: #78dccb;
+  --primary-foreground: #10231f;
+}
+
+body { margin: 0; background: var(--background); color: var(--foreground); }
+button:not(:disabled) { cursor: pointer; }
+progress { accent-color: var(--primary); }

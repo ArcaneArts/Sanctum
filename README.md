@@ -11,8 +11,8 @@ Ollama-backed semantic and hybrid search, and exact byte-range retrieval.
 See the [local quick start](docs/LOCAL_API.md) and
 [implementation status](docs/IMPLEMENTATION_STATUS.md).
 
-The first usable milestone is a desktop tray application running a local MCP
-server, ready to connect to an LLM client for personal use.
+The desktop tray app runs a local MCP server and manages storage, imports,
+and Ollama settings. See the [desktop quick start](docs/DESKTOP.md).
 
 ## What Sanctum will do
 
@@ -40,12 +40,10 @@ has not been chosen.
 
 ## Local and hosted operation
 
-The desktop application will use **Tauri, React, and shadcn/ui**, with PNPM for
-frontend tooling and development commands. Business logic, configuration
-handling, and server lifecycle management will live in Rust. The tray UI will
-show activity, progress, storage usage, and settings. The planned `pnpm devtop`
-command will launch the desktop development environment and its server; that
-command does not exist yet.
+The desktop application uses **Tauri, React, and shadcn/ui**, with PNPM for
+frontend tooling and development commands. Rust handles configuration, the
+server lifecycle, and API calls. Run `pnpm devtop` to launch the desktop app
+and its managed server during development.
 
 The hosted deployment targets **Google Cloud Run, Cloud Storage, and Cloud
 Tasks**, with Linux server builds. Filesystem storage and S3 storage through
