@@ -474,10 +474,14 @@ impl Sanctum for Grpc {
                 .delete_collection(&scope, operation)
                 .await
                 .map_err(status)?,
-            Backend::Local(_) => {
-                return Err(Status::unimplemented(
-                    "collection deletion currently requires hosted storage",
-                ));
+            Backend::Local(service) => {
+                if operation.is_some() {
+                    return Err(Status::invalid_argument(
+                        "deletion request IDs are supported by hosted storage",
+                    ));
+                }
+                let service = service.clone();
+                work(move || service.delete_collection(&scope)).await?;
             }
         }
         Ok(Response::new(v1::Empty {}))

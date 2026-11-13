@@ -35,6 +35,9 @@ pub async fn run_local_maintenance(service: Service, mut stop: watch::Receiver<b
                     if let Err(error) = service.database_sessions.prune() {
                         tracing::warn!(%error, "database session cleanup failed");
                     }
+                    if let Err(error) = service.reclaim_deleted_collections() {
+                        tracing::warn!(%error, "deleted collection cleanup failed");
+                    }
                     service.sweep_retired();
                 }).await {
                     tracing::warn!(%error, "local cleanup worker failed");

@@ -110,6 +110,21 @@ single chunk using SQLite FTS5 tokenization. Results include byte offsets as
 the canonical UTF-8 representation. Pass the result's `ChunkRef` unchanged
 to `FetchChunk` to retrieve that range.
 
+## Collection deletion
+
+`DeleteCollection` removes a collection, its sources, and its queued
+work from the selected tenant. Deleted IDs remain reserved. A local
+restart or periodic maintenance resumes cleanup if the process stops
+after committing the catalog tombstone. Previously opened local
+database sessions keep their independent snapshots until expiry.
+
+```sh
+cargo run --locked -p sanctum-cli -- delete-collection notes
+```
+
+For hosted deletion, pass `--request-id` to replay an ambiguous response.
+[Hosted collection lifecycle](STORAGE.md#hosted-collection-deletion).
+
 ## Ollama and search modes
 
 Add an `embedding` block to the JSON configuration to enable background

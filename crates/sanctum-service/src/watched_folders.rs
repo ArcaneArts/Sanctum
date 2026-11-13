@@ -61,6 +61,10 @@ impl Service {
                 "watch filters allow 64 patterns of at most 1024 bytes".into(),
             ));
         }
+        let _reader = self
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         let path = self.validate_watch(scope, path, options)?;
         let path = path
             .to_str()

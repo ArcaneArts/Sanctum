@@ -248,6 +248,9 @@ impl Service {
             retrieval: Arc::new(RwLock::new(())),
             embedding,
         };
+        if let Err(error) = service.reclaim_deleted_collections() {
+            tracing::warn!(%error, "could not reclaim all deleted local collections");
+        }
         if let Err(error) = service.reclaim_startup_orphans() {
             tracing::warn!(%error, "could not reclaim all unreferenced local uploads");
         }
@@ -259,6 +262,10 @@ impl Service {
     }
 
     pub fn create_collection(&self, scope: &Scope) -> Result<()> {
+        let _reader = self
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         db::create_collection(
             &self.files.catalog_path(&scope.tenant),
             &self.files.database_path(scope),
@@ -289,6 +296,10 @@ impl Service {
     }
 
     pub fn stage_upload(&self, scope: Scope, upload: TextUpload) -> Result<StagedUpload> {
+        let _reader = self
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         upload.validate()?;
         self.require_collection(&scope)?;
         let file = self.files.stage(&scope)?;

@@ -762,4 +762,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - The live MinIO worker route preserved a recently retired snapshot.
   After advancing the stored deletion timestamp in the test fixture,
   the worker removed the collection objects and preserved the fence.
-- Local collection deletion remains open.
+- Delivered in [PR #48](https://github.com/ArcaneArts/Sanctum/pull/48).
+
+## Filesystem collection deletion
+
+- Local gRPC and the CLI delete a collection by committing its tenant
+  tombstone, removing its runtime jobs and watches, and reclaiming its
+  directory. The catalog tracks unfinished reclamation for startup and
+  periodic repair. An open operator session keeps its SQLite copy.
+- The integration test verifies tenant scope, removal of queued work,
+  preservation of an open snapshot, retry, and recovery from a stop
+  between tombstone publication and physical reclamation.
+- A standalone CLI smoke deleted and replayed a local collection and
+  checked that the other tenant's database was preserved.

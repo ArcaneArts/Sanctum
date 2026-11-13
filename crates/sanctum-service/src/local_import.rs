@@ -311,6 +311,10 @@ impl StagedUpload {
         provenance: Option<ImportProvenance>,
     ) -> Result<ImportEvent> {
         let service = self.service.clone();
+        let _reader = service
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         let scope = &self.scope;
         let external = self.import_external();
         let id = external.id.clone();
@@ -502,6 +506,10 @@ impl Service {
         id: &str,
         prune: bool,
     ) -> Result<Option<ImportEvent>> {
+        let _reader = self
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         let mut database = self.database(scope)?;
         let writer = database.write()?;
         let external = ExternalSource {

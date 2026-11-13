@@ -114,6 +114,21 @@ impl LocalQueue {
         Ok(Self(path))
     }
 
+    pub fn purge_collection(&self, scope: &Scope) -> Result<()> {
+        let mut connection = self.connect()?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        for table in ["ingestion_jobs", "replacement_sequences", "watched_folders"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE tenant = ?1 AND collection = ?2"),
+                params![scope.tenant.as_str(), scope.collection.as_str()],
+            )
+            .map_err(database_error)?;
+        }
+        tx.commit().map_err(database_error)
+    }
+
     pub fn insert(&self, job: &mut Job) -> Result<()> {
         let namespace = job.external.as_ref().map(|external| &external.namespace);
         let external_id = job.external.as_ref().map(|external| &external.id);
