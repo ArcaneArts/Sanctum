@@ -4,7 +4,14 @@
   "version": "0.1.0",
   "identifier": "com.arcanearts.sanctum",
   "build": {
-    "beforeDevCommand": "node ../../scripts/desktop-sidecars.mjs && pnpm dev",
+    "beforeDevCommand": "pnpm dev",
+    "additionalWatchFolders": [
+      "../../../crates",
+      "../../../proto",
+      "../../../Cargo.toml",
+      "../../../Cargo.lock",
+      "../../../scripts/desktop-sidecars.mjs"
+    ],
     "beforeBuildCommand": "node ../../scripts/desktop-sidecars.mjs --release && pnpm build",
     "devUrl": "http://127.0.0.1:1420",
     "frontendDist": "../dist"

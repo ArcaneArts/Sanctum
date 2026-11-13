@@ -12,8 +12,9 @@ pnpm devtop
 The development command builds the server and CLI sidecars, starts Vite, and
 launches Tauri. Tauri owns the server process. The desktop host prevents a
 second window process and the server holds exclusive ownership of its data
-directory. Restart `pnpm devtop` after changing server source so it rebuilds
-the sidecar.
+directory. Changes to the Rust crates, Protobuf sources, or workspace
+manifests rebuild the sidecars before Tauri restarts the app. Vite handles
+frontend edits. [Tauri development file watching](https://v2.tauri.app/develop/).
 
 ## First use
 

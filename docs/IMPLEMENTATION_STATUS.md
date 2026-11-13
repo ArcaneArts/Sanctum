@@ -973,3 +973,13 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   restart, conflicting bytes, and UUID expiry with published text intact.
 - Local MCP HTTP smoke submits the same request twice and verifies the
   original operation and revision IDs.
+- Delivered in [PR #66](https://github.com/ArcaneArts/Sanctum/pull/66).
+
+## Desktop sidecar rebuilds
+
+- `pnpm devtop` watches server and CLI crates, Protobuf, and workspace
+  manifests. The Tauri build prepares sidecars before restarting the host.
+  Tauri owns the Vite process and the desktop host owns the server.
+- The Apple Silicon `pnpm devtop` smoke edited a server log string,
+  verified the new binary and child PID, and checked that a collection
+  survived both rebuilds. Ctrl+C released the frontend and API ports.
