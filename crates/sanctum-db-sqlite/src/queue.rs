@@ -99,6 +99,7 @@ impl LocalQueue {
                 include_str!("runtime_v7.sql"),
                 include_str!("runtime_v8.sql"),
                 include_str!("runtime_v9.sql"),
+                include_str!("runtime_v10.sql"),
             ],
         )?;
         connection
@@ -116,6 +117,23 @@ impl LocalQueue {
             )
             .map_err(database_error)?;
         Ok(Self(path))
+    }
+
+    /// Removes a bounded page of terminal jobs after their operational retention.
+    pub fn prune_finished(&self) -> Result<usize> {
+        self.connect()?
+            .execute(
+                "DELETE FROM ingestion_jobs WHERE operation_id IN (
+                    SELECT operation_id FROM ingestion_jobs
+                    WHERE finished_at <= unixepoch() - ?1 AND (
+                        status IN ('text_ready', 'canceled')
+                        OR (status = 'failed' AND error_code IS NOT 'retryable')
+                    )
+                    ORDER BY finished_at, operation_id LIMIT 256
+                )",
+                [45 * 24 * 3600],
+            )
+            .map_err(database_error)
     }
 
     pub fn purge_collection(&self, scope: &Scope) -> Result<()> {
@@ -418,7 +436,8 @@ impl LocalQueue {
                 "UPDATE ingestion_jobs
              SET status = 'text_ready', content_hash = ?2, chunks = ?3, extracting = 0,
                  canonical_bytes = ?4, original_hash = ?5, source_encoding = ?6, extractor = ?7,
-                 processed_bytes = total_bytes, error_code = NULL, error_message = NULL
+                 processed_bytes = total_bytes, error_code = NULL, error_message = NULL,
+                 finished_at = unixepoch()
              WHERE operation_id = ?1 AND status IN ('indexing', 'publishing')",
                 params![
                     id.to_string(),
@@ -440,7 +459,8 @@ impl LocalQueue {
                 "UPDATE ingestion_jobs SET
                  status = CASE WHEN cancel_requested = 1 THEN 'canceled' ELSE 'failed' END,
                  error_code = CASE WHEN cancel_requested = 0 THEN ?2 END,
-                 error_message = CASE WHEN cancel_requested = 0 THEN ?3 END
+                 error_message = CASE WHEN cancel_requested = 0 THEN ?3 END,
+                 finished_at = unixepoch()
              WHERE operation_id = ?1 AND status IN ('indexing', 'publishing')",
                 params![id.to_string(), code, message],
             )
@@ -453,7 +473,8 @@ impl LocalQueue {
             scope,
             id,
             "SET cancel_requested = 1,
-                 status = CASE WHEN status = 'accepted' THEN 'canceled' ELSE status END",
+                 status = CASE WHEN status = 'accepted' THEN 'canceled' ELSE status END,
+                 finished_at = CASE WHEN status = 'accepted' THEN unixepoch() END",
             "status IN ('accepted', 'indexing') AND publication_started = 0",
             "only queued or indexing operations can be canceled",
         )
@@ -463,7 +484,8 @@ impl LocalQueue {
         self.update_scoped(
             scope,
             id,
-            "SET status = 'accepted', error_code = NULL, error_message = NULL, processed_bytes = 0",
+            "SET status = 'accepted', error_code = NULL, error_message = NULL,
+                 processed_bytes = 0, finished_at = NULL",
             "status = 'failed' AND error_code = 'retryable'",
             "only retryable failures can be retried",
         )

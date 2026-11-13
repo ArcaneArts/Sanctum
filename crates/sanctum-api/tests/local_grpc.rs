@@ -9,7 +9,9 @@ use std::{
 
 use sanctum_embedding::{EmbedError, Provider, Purpose};
 use sanctum_proto::v1::{self, sanctum_client::SanctumClient, upload_text_frame::Frame};
-use sanctum_service::{Service, run_embedding_worker, run_local_worker, run_watched_folders};
+use sanctum_service::{
+    Service, run_embedding_worker, run_local_maintenance, run_local_worker, run_watched_folders,
+};
 use tempfile::TempDir;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -1648,6 +1650,145 @@ fn scope(tenant: &str) -> Option<v1::Scope> {
         tenant: tenant.into(),
         collection: "notes".into(),
     })
+}
+
+#[tokio::test]
+async fn local_job_retention_preserves_published_and_retryable_inputs() {
+    let directory = TempDir::new().unwrap();
+    let mut server = Running::start_with_workers(&directory, None, false).await;
+    create(&mut server.client, "default").await;
+    let mut jobs = Vec::new();
+    for (index, bytes) in [
+        b"published quartz".as_slice(),
+        &[0xff],
+        b"canceled",
+        b"retryable",
+        b"pending",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut upload = header("default");
+        if let Some(Frame::Header(header)) = &mut upload.frame {
+            header.external.as_mut().unwrap().id = index.to_string();
+        }
+        jobs.push(
+            server
+                .client
+                .submit_text(tokio_stream::iter([upload, data(bytes), end()]))
+                .await
+                .unwrap()
+                .into_inner(),
+        );
+    }
+    let [published, failed, canceled, retryable, pending] = jobs.as_slice() else {
+        unreachable!();
+    };
+    let text_path_for =
+        |job: &v1::IngestionJob| text_path(&directory, &job.source_id, &job.revision_id);
+    let db_path = directory.path().join("runtime.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute(
+        "UPDATE ingestion_jobs SET created_at = unixepoch() - 60 * 86400",
+        [],
+    )
+    .unwrap();
+    server
+        .client
+        .cancel_ingestion_job(job_request(canceled.operation_id.clone()))
+        .await
+        .unwrap();
+    // Make each claim deterministic without running a concurrent ingestion worker.
+    for (index, job) in [published, failed, retryable, pending]
+        .into_iter()
+        .enumerate()
+    {
+        db.execute(
+            "UPDATE ingestion_jobs SET created_at = ?1 WHERE operation_id = ?2",
+            rusqlite::params![index as i64, job.operation_id],
+        )
+        .unwrap();
+    }
+    assert!(server.service.process_next().unwrap());
+    assert!(server.service.process_next().unwrap());
+    let path = text_path_for(retryable);
+    let backup = path.with_extension("backup");
+    std::fs::rename(&path, &backup).unwrap();
+    assert!(server.service.process_next().is_err());
+    std::fs::rename(&backup, &path).unwrap();
+    for job in [published, failed, canceled, retryable] {
+        let finished: i64 = db
+            .query_row(
+                "SELECT finished_at FROM ingestion_jobs WHERE operation_id = ?1",
+                [&job.operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(finished > 0);
+        db.execute(
+            "UPDATE ingestion_jobs SET finished_at = 0 WHERE operation_id = ?1",
+            [&job.operation_id],
+        )
+        .unwrap();
+    }
+    drop(db);
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let maintenance = tokio::spawn(run_local_maintenance(server.service.clone(), shutdown));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if server
+                .client
+                .get_ingestion_job(job_request(published.operation_id.clone()))
+                .await
+                .is_err_and(|error| error.code() == Code::NotFound)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    maintenance.await.unwrap();
+    server.stop().await;
+
+    let mut server = Running::start_with_workers(&directory, None, false).await;
+    for job in [published, failed, canceled] {
+        assert_eq!(
+            server
+                .client
+                .get_ingestion_job(job_request(job.operation_id.clone()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::NotFound
+        );
+    }
+    for (job, state) in [
+        (retryable, v1::IngestionState::Failed),
+        (pending, v1::IngestionState::Accepted),
+    ] {
+        assert_eq!(
+            server
+                .client
+                .get_ingestion_job(job_request(job.operation_id.clone()))
+                .await
+                .unwrap()
+                .into_inner()
+                .state(),
+            state
+        );
+        assert!(text_path_for(job).exists());
+    }
+    assert_eq!(
+        search(&mut server.client, "default", "quartz").await[0].excerpt,
+        "published quartz"
+    );
+    assert!(text_path_for(published).exists());
+    assert!(!text_path_for(failed).exists());
+    assert!(!text_path_for(canceled).exists());
+    server.stop().await;
 }
 
 #[tokio::test]

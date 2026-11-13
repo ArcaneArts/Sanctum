@@ -515,10 +515,10 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   non-root Debian containers and completed upload, HTTP registration,
   indexing, and gRPC search against MinIO. The Dockerfile static check
   passed.
-- A direct Linux arm64 Dockerfile build also ran both non-root roles
-  against MinIO. The container smoke verified upload, task delivery,
-  gRPC search, and SIGTERM shutdown. Live Cloud Run and GCS verification
-  are still open.
+- Direct Dockerfile builds for Linux amd64 and arm64 ran both non-root
+  roles against MinIO. The container smoke verified upload, task delivery,
+  gRPC search, and SIGTERM shutdown on each architecture. Live Cloud Run
+  and GCS verification are still open.
 - Delivered in [PR #32](https://github.com/ArcaneArts/Sanctum/pull/32).
 
 ## Hosted snapshot reuse
@@ -907,3 +907,12 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   the durable retry checkpoint and verifies dispatch repair after restart.
 - A live MinIO and CLI check verified the retry checkpoint across restart,
   stable upload identity, and duplicate worker delivery after retry.
+- Delivered in [PR #60](https://github.com/ArcaneArts/Sanctum/pull/60).
+
+## Local operation retention
+
+- Local maintenance removes at most 256 terminal queue records per pass
+  after 45 days. The migration gives existing terminal records the same
+  window. Pending and retryable jobs retain their input and status.
+- The local gRPC test runs maintenance, restarts the service, and verifies
+  expiration, searchable published bytes, and retained pending inputs.
