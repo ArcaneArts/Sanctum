@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     let mcp = serve_mcp(mcp_listener, service.clone(), cancellation.child_token());
     tracing::info!(address = %listener.local_addr()?, "Sanctum gRPC listening");
     let grpc = tonic::transport::Server::builder()
-        .add_service(sanctum_api::grpc(service))
+        .add_service(sanctum_api::grpc(service, cancellation.child_token()))
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
             cancellation.clone().cancelled_owned(),

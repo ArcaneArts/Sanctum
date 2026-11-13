@@ -6,7 +6,7 @@ which parts have working implementations and where to find the evidence.
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | End-to-end acceptance in an LLM client |
-| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, advanced metadata queries and cursors, SQL access, platform packaging and verification |
+| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, advanced metadata queries, SQL access, platform packaging and verification |
 | 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
 | 5. Capacity | Pending | Representative 200 MB sources, GB-scale collections and database snapshots, cold/warm cloud performance, measured optimization |
@@ -105,7 +105,7 @@ Merged in [PR #7](https://github.com/ArcaneArts/Sanctum/pull/7).
   expired cursors. Collection metadata stays independent of source changes.
 - The gRPC integration test covers JSON null and merge behavior, transaction
   rollback, tenant scope, cursor pages, and stale writes after replacement.
-- Metadata sorting, aggregation, and optional subscriptions remain open.
+- Metadata sorting and aggregation remain open.
 
 ## Lexical candidate filtering
 
@@ -288,6 +288,8 @@ Merged in [PR #19](https://github.com/ArcaneArts/Sanctum/pull/19).
 
 ## Git imports
 
+Merged in [PR #20](https://github.com/ArcaneArts/Sanctum/pull/20).
+
 - `ImportGit` and `sanctum-cli import-git` stream committed regular files
   selected by ref and path filters from a local repository or an HTTPS
   shallow fetch. The Rust adapter uses Git plumbing without a checkout.
@@ -300,3 +302,24 @@ Merged in [PR #19](https://github.com/ArcaneArts/Sanctum/pull/19).
   size failures, and explicit pruning. A standalone CLI smoke test fetched
   and indexed the public Sanctum README over HTTPS and reused its revision
   on a second fetch. Authenticated private Git retrieval remains unverified.
+
+## Resumable changes and Python gRPC client
+
+- `WatchChanges` streams the same retained records as `ListChanges`.
+  A bounded channel applies backpressure and an idle heartbeat preserves
+  the resume cursor. `GetChangeCursor` captures the position to resume
+  from after a rescan. Server shutdown closes live subscriptions.
+- Local gRPC tests verify tenant scope, replay, reconnect after a single
+  event page, cursor expiry, rescan recovery, and shutdown with an open
+  stream.
+- The [Python client example](../examples/python/README.md) generates
+  code from the repository's Protobuf, streams uploads, waits for
+  publication, observes the change event, and queries the resulting
+  collection.
+- A generated Python client used the standalone server to upload a UTF-8
+  file spanning multiple frames, receive the publication event, and
+  retrieve matching Unicode text. A second connection verified that a
+  live subscription closed cleanly when the server shut down.
+- The watched-folder regression test waits for the scan's deletion
+  count before checking that the removed source is absent. Publishing
+  an edited source can finish before the same scan reconciles removals.

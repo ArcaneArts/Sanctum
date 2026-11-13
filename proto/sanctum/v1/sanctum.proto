@@ -27,6 +27,8 @@ service Sanctum {
   rpc GetMetadata(MetadataTarget) returns (MetadataResponse);
   rpc MutateMetadata(MutateMetadataRequest) returns (MetadataResponse);
   rpc ListChanges(ListChangesRequest) returns (ListChangesResponse);
+  rpc WatchChanges(ListChangesRequest) returns (stream ListChangesResponse);
+  rpc GetChangeCursor(ChangeCursorRequest) returns (ChangeCursor);
   rpc GetStorageUsage(StorageUsageRequest) returns (StorageUsage);
 }
 
@@ -86,6 +88,14 @@ message ListChangesRequest {
   Scope scope = 1;
   uint64 after_cursor = 2;
   optional uint32 limit = 3;
+}
+
+message ChangeCursorRequest {
+  Scope scope = 1;
+}
+
+message ChangeCursor {
+  uint64 cursor = 1;
 }
 
 message SourceChange {

@@ -2,7 +2,9 @@
 
 The versioned [Protobuf definition](../proto/sanctum/v1/sanctum.proto) is the
 wire contract. The `sanctum-proto` crate generates Rust clients and servers and
-exports the serialized descriptor as `v1::FILE_DESCRIPTOR_SET`.
+exports the serialized descriptor as `v1::FILE_DESCRIPTOR_SET`. A
+[Python example](../examples/python/README.md) generates its client from the
+same contract.
 
 Run the server on the default loopback address:
 
@@ -323,6 +325,18 @@ changes. Replacement records a `source_replaced` event followed by a
 `metadata_reset` event in the same commit. The change log keeps the most
 recent 10,000 events. An expired cursor returns `FAILED_PRECONDITION` and
 requires a rescan.
+
+`WatchChanges` streams the same pages in cursor order. It sends an initial
+page, waits for new events when caught up, and sends an empty heartbeat about
+every 15 seconds while idle. Save `next_cursor` only after processing its
+page. Use that cursor with the same scope after reconnecting. A page can
+contain up to 200 events and a cursor applies to exactly one collection.
+
+`GetChangeCursor` returns the collection's latest cursor, or zero for an
+empty log. To recover from expiry, capture this cursor before rebuilding
+the integration's view, then replay changes after it. Clients should
+handle changes idempotently because the rescan can already include some
+of those updates. A cursor ahead of the log returns `INVALID_ARGUMENT`.
 
 `SearchText.metadata_filter` accepts a tree of `test`, `all`, `any`, and
 `not` expressions. A test selects a namespace and key at the collection,
