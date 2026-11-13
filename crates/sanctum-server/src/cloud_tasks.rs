@@ -110,29 +110,34 @@ impl CloudTasks {
     }
 
     fn payload(&self, task: Task<'_>) -> Result<Value> {
-        let stage = match task.stage {
-            TaskStage::Register => "register",
-            TaskStage::Index => "index",
+        let (stage, step) = match task.stage {
+            TaskStage::Register => ("register-upload", None),
+            TaskStage::Index => ("index-upload", None),
+            TaskStage::Embed { step } => ("embed-upload", Some(step)),
         };
         let mut worker = self.worker.clone();
-        worker.set_path(&format!("/internal/tasks/{stage}-upload"));
+        worker.set_path(&format!("/internal/tasks/{stage}"));
         let identity = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             self.worker,
             task.scope.tenant,
             task.scope.collection,
             task.operation,
             stage,
+            step.unwrap_or(0),
             task.window,
         );
         let id = blake3::hash(identity.as_bytes());
-        let body = serde_json::to_vec(&json!({
+        let mut body = json!({
             "tenant": task.scope.tenant.as_str(),
             "collection": task.scope.collection.as_str(),
             "operation_id": task.operation,
-        }))
-        .map_err(|error| Error::Internal(Box::new(error)))?;
-        Ok(json!({
+        });
+        if let Some(step) = step {
+            body["step"] = json!(step);
+        }
+        let body = serde_json::to_vec(&body).map_err(|error| Error::Internal(Box::new(error)))?;
+        let mut payload = json!({
             "task": {
                 "name": format!("{}/tasks/{id}", self.config.queue),
                 "dispatchDeadline": "600s",
@@ -147,7 +152,18 @@ impl CloudTasks {
                     }
                 }
             }
-        }))
+        });
+        if let Some(seconds) = task.not_before {
+            let timestamp = i64::try_from(seconds)
+                .ok()
+                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+                .ok_or_else(|| {
+                    Error::Internal("task schedule time is outside its supported range".into())
+                })?;
+            payload["task"]["scheduleTime"] =
+                json!(timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        }
+        Ok(payload)
     }
 
     async fn send_with_token(&self, task: Task<'_>, token: &str) -> Result<()> {
@@ -228,6 +244,7 @@ mod tests {
             operation,
             stage,
             window,
+            not_before: None,
         };
         dispatcher
             .send_with_token(task(TaskStage::Register, 1), "fixture")
@@ -245,6 +262,23 @@ mod tests {
             .send_with_token(task(TaskStage::Register, 2), "fixture")
             .await
             .unwrap();
+
+        let scheduled = dispatcher
+            .payload(Task {
+                not_before: Some(1_800_000_000),
+                ..task(TaskStage::Embed { step: 2 }, 2)
+            })
+            .unwrap();
+        let http = &scheduled["task"]["httpRequest"];
+        assert_eq!(
+            http["url"],
+            "https://sanctum-worker.example/internal/tasks/embed-upload"
+        );
+        assert_eq!(scheduled["task"]["scheduleTime"], "2027-01-15T08:00:00Z");
+        let body = STANDARD.decode(http["body"].as_str().unwrap()).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["step"], 2);
+        assert_eq!(body["operation_id"], operation.to_string());
 
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 4);

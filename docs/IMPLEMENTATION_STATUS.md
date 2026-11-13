@@ -549,5 +549,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   and a profile change followed by a rebuild. A standalone MinIO run used
   Ollama's 768-dimensional embeddinggemma-2:740m model and verified
   semantic and hybrid retrieval, a no-work replay, and restart persistence.
-- Automatic dispatch for embedding batches and profile rebuilds, and
-  hosted multi-collection retrieval remain open.
+- Delivered in [PR #34](https://github.com/ArcaneArts/Sanctum/pull/34).
+
+## Hosted embedding dispatch
+
+- Lexical publication records the first embedding step before returning.
+  Each worker delivery processes one bounded batch, checkpoints the next
+  step, and uses the same partitioned dispatch repair as uploads. Transient
+  provider failures persist retry times and can schedule delayed tasks.
+- Batch receipts are keyed by operation, step, and provider profile.
+  The integration test interrupts an envelope checkpoint after vector
+  publication, then verifies redelivery without publishing another
+  snapshot. It also verifies out-of-order rejection and hint cleanup.
+- Standalone worker deliveries against MinIO and real Ollama verified
+  both embedding steps, duplicate delivery, and semantic search after
+  restart. The Cloud Tasks payload fixture checks delayed delivery.
+- Automatic rebuilds for collections already idle when the profile
+  changes, and hosted multi-collection retrieval remain open.

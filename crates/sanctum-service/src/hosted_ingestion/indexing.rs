@@ -13,7 +13,9 @@ use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
-use super::{HostedCatalog, HostedJob, Operation, REGISTRATION_WINDOW, Stage, unix_seconds};
+use super::{
+    EmbeddingStep, HostedCatalog, HostedJob, Operation, REGISTRATION_WINDOW, Stage, unix_seconds,
+};
 use crate::{ChunkRef, Revision, RevisionContent};
 
 const INDEX_STAGE: &str = "index";
@@ -59,10 +61,19 @@ impl HostedCatalog {
         };
         record.dispatched_at = None;
         record.stage = match outcome {
-            Outcome::Ready(content) => Stage::TextReady {
-                registration,
-                content,
-            },
+            Outcome::Ready(content) => {
+                if self.embedding.is_some() {
+                    self.record_dispatch_hint(scope, operation).await?;
+                }
+                Stage::TextReady {
+                    registration,
+                    content,
+                    embedding: self.embedding.as_ref().map(|_| EmbeddingStep {
+                        step: 0,
+                        not_before: None,
+                    }),
+                }
+            }
             Outcome::Failed { code, message } => Stage::Failed {
                 code,
                 message,

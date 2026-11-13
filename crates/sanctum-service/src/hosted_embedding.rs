@@ -29,11 +29,38 @@ impl HostedCatalog {
 
     /// Runs one bounded provider batch for the current configured profile.
     pub async fn embed_collection(&self, scope: &Scope) -> Result<usize> {
+        self.embed_collection_batch(scope, Uuid::new_v4(), false)
+            .await
+    }
+
+    pub(crate) async fn embed_collection_with_id(
+        &self,
+        scope: &Scope,
+        batch_id: Uuid,
+    ) -> Result<usize> {
+        self.embed_collection_batch(scope, batch_id, true).await
+    }
+
+    async fn embed_collection_batch(
+        &self,
+        scope: &Scope,
+        batch_id: Uuid,
+        replay: bool,
+    ) -> Result<usize> {
         let provider = self
             .embedding
             .as_ref()
             .ok_or_else(|| Error::Invalid("hosted embeddings are disabled".into()))?;
         let profile = provider.profile_id().to_owned();
+        let unit = Unit::collection(self.prefix.as_ref(), scope)?;
+        if replay
+            && let Some(receipt) = self
+                .publication
+                .stage_receipt(&unit, batch_id, "embed")
+                .await?
+        {
+            return parse_count(&receipt);
+        }
         let limit = provider.max_batch_size().clamp(1, 16);
         let selected = profile.clone();
         let (chunks, generation) = self
@@ -58,13 +85,12 @@ impl HostedCatalog {
         }
         let count = batch.hashes.len();
         let outcomes = embed_batch(provider.as_ref(), batch).await;
-        let unit = Unit::collection(self.prefix.as_ref(), scope)?;
         let mut writer = self.publication.acquire(&unit).await?;
         let saved = writer
             .apply_stage(
                 "embed",
                 vec![Command {
-                    operation: Uuid::new_v4(),
+                    operation: batch_id,
                     payload: outcomes,
                 }],
                 move |tx, outcomes| {
@@ -88,13 +114,19 @@ impl HostedCatalog {
                         }
                         Ok(())
                     })?;
-                    Ok("committed".into())
+                    Ok(count.to_string())
                 },
             )
             .await;
         let released = writer.release().await;
-        saved?;
+        let (_, receipts) = saved?;
         released?;
-        Ok(count)
+        parse_count(&receipts[0].outcome)
     }
+}
+
+fn parse_count(receipt: &str) -> Result<usize> {
+    receipt
+        .parse()
+        .map_err(|error| Error::Internal(Box::new(error)))
 }

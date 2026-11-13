@@ -15,6 +15,7 @@ pub(crate) fn router(service: HostedCatalog) -> Router {
         .route("/internal/tasks/register-upload", post(register))
         .route("/internal/tasks/index-upload", post(index))
         .route("/internal/tasks/embed-collection", post(embed))
+        .route("/internal/tasks/embed-upload", post(embed_upload))
         .route("/internal/maintenance/dispatch/{shard}", post(reconcile))
         .layer(DefaultBodyLimit::max(4096))
         .with_state(service)
@@ -109,6 +110,43 @@ async fn embed(
         Err(error) => {
             tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection, "hosted embedding task will need a retry");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbedUpload {
+    tenant: String,
+    collection: String,
+    operation_id: Uuid,
+    step: u32,
+}
+
+async fn embed_upload(
+    State(service): State<HostedCatalog>,
+    Json(task): Json<EmbedUpload>,
+) -> StatusCode {
+    let (Ok(tenant), Ok(collection)) = (task.tenant.parse(), task.collection.parse()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if task.operation_id.is_nil() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let scope = Scope { tenant, collection };
+    match service
+        .embed_upload(&scope, task.operation_id, task.step)
+        .await
+    {
+        Ok(()) => {
+            service.try_dispatch(&scope, task.operation_id).await;
+            StatusCode::NO_CONTENT
+        }
+        Err(Error::NotFound(_)) => StatusCode::NOT_FOUND,
+        Err(error) => {
+            tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
+                operation = %task.operation_id, step = task.step, "hosted embedding task will need a retry");
+            StatusCode::SERVICE_UNAVAILABLE
         }
     }
 }
