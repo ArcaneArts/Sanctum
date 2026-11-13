@@ -3,11 +3,12 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+pub use database_sessions::{DatabaseSession, DatabaseTarget};
 pub use db::metadata::{
     Change, Edit as MetadataEdit, Entry as MetadataEntry, Mutation as MetadataMutation,
     RevisionTarget,
 };
-pub use db::{metadata_filter, metadata_query};
+pub use db::{metadata_filter, metadata_query, snapshot as database_snapshot};
 use sanctum_core::{Error, ExternalSource, Result, Scope, ScopeId, UsageMeasurement, UsageScope};
 use sanctum_db_sqlite::{self as db, CollectionDb};
 pub use sanctum_db_sqlite::{Chunk, ChunkRef, Revision, RevisionContent};
@@ -15,6 +16,7 @@ use sanctum_storage_fs::LocalFiles;
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+mod database_sessions;
 mod embedding;
 mod git_import;
 mod local_import;
@@ -40,6 +42,7 @@ pub struct Service {
     max_source_bytes: u64,
     url_importer: url_import::UrlImporter,
     git_imports: git_import::ActiveImports,
+    database_sessions: database_sessions::DatabaseSessions,
     retrieval: Arc<RwLock<()>>,
     embedding: Option<Arc<dyn sanctum_embedding::Provider>>,
 }
@@ -181,12 +184,14 @@ impl Service {
         }
         let files = Arc::new(LocalFiles::open(root)?);
         let queue = LocalQueue::open(files.runtime_path())?;
+        let database_sessions = database_sessions::DatabaseSessions::open(files.root());
         let service = Self {
             files,
             queue,
             max_source_bytes,
             url_importer: url_import::UrlImporter::new()?,
             git_imports: Default::default(),
+            database_sessions,
             retrieval: Arc::new(RwLock::new(())),
             embedding,
         };

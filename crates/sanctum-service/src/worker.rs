@@ -31,7 +31,12 @@ pub async fn run_local_maintenance(service: Service, mut stop: watch::Receiver<b
         tokio::select! {
             _ = interval.tick() => {
                 let service = service.clone();
-                if let Err(error) = tokio::task::spawn_blocking(move || service.sweep_retired()).await {
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    if let Err(error) = service.database_sessions.prune() {
+                        tracing::warn!(%error, "database session cleanup failed");
+                    }
+                    service.sweep_retired();
+                }).await {
                     tracing::warn!(%error, "local cleanup worker failed");
                 }
             }

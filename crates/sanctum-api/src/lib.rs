@@ -16,6 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 
+mod database;
 mod metadata_filter;
 
 pub fn grpc(service: Service, shutdown: CancellationToken) -> SanctumServer<Grpc> {
@@ -27,6 +28,36 @@ pub struct Grpc(Service, CancellationToken);
 
 #[tonic::async_trait]
 impl Sanctum for Grpc {
+    async fn open_database_session(
+        &self,
+        request: Request<v1::DatabaseTarget>,
+    ) -> Reply<v1::DatabaseSession> {
+        database::open(&self.0, self.1.child_token(), request.into_inner()).await
+    }
+
+    async fn query_database(
+        &self,
+        request: Request<v1::QueryDatabaseRequest>,
+    ) -> Reply<v1::QueryDatabaseResponse> {
+        database::query(&self.0, self.1.child_token(), request.into_inner()).await
+    }
+
+    type DownloadDatabaseStream = ReceiverStream<std::result::Result<v1::DatabaseFrame, Status>>;
+
+    async fn download_database(
+        &self,
+        request: Request<v1::DatabaseSessionRef>,
+    ) -> Reply<Self::DownloadDatabaseStream> {
+        database::download(&self.0, self.1.clone(), request.into_inner()).await
+    }
+
+    async fn close_database_session(
+        &self,
+        request: Request<v1::DatabaseSessionRef>,
+    ) -> Reply<v1::Empty> {
+        database::close(&self.0, request.into_inner()).await
+    }
+
     async fn get_storage_usage(
         &self,
         request: Request<v1::StorageUsageRequest>,

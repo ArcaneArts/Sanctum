@@ -6,7 +6,7 @@ which parts have working implementations and where to find the evidence.
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | End-to-end acceptance in an LLM client |
-| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, SQL access, platform packaging and verification |
+| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, platform packaging and verification |
 | 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
 | 5. Capacity | Pending | Representative 200 MB sources, GB-scale collections and database snapshots, cold/warm cloud performance, measured optimization |
@@ -328,6 +328,8 @@ Merged in [PR #21](https://github.com/ArcaneArts/Sanctum/pull/21).
 
 ## Structured metadata queries
 
+Merged in [PR #22](https://github.com/ArcaneArts/Sanctum/pull/22).
+
 - `QueryMetadata` lists current collections, sources, and chunks with
   typed filters, optional sorting, and bounded result pages. Counts can
   be grouped by a field on the target or an ancestor.
@@ -340,3 +342,20 @@ Merged in [PR #21](https://github.com/ArcaneArts/Sanctum/pull/21).
 - Local storage explicitly releases its ownership lock when the final
   owner drops. A regression test exercises restart with a duplicate
   descriptor still open, as can happen during a concurrent process launch.
+
+## Read-only SQL sessions and snapshot export
+
+- The operator gRPC API pins one catalog or collection generation with
+  SQLite's online backup API, exposes its schema, and serves typed
+  parameterized SELECT pages and streamed snapshot downloads.
+- Session copies expire after five minutes and share a four-copy limit.
+  Closing a session removes its handle. In-flight downloads retain their
+  copy until completion. Startup reclaims abandoned copies.
+- The gRPC test replaces a source while the original session stays open,
+  verifies scope and SQL restrictions, and opens the streamed database
+  directly to check the original revision and SQLite integrity.
+- Hosted snapshot publication and generation fencing remain part of
+  the object storage milestone.
+- A generated Python client opened a session on the standalone server,
+  ran a parameterized query, downloaded the advertised byte count,
+  and read the same revision using Python's SQLite library.

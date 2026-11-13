@@ -97,6 +97,228 @@ impl Running {
 }
 
 #[tokio::test]
+async fn database_sessions_pin_and_download_a_scoped_read_only_generation() {
+    use std::io::Write;
+    use v1::sql_value::Value;
+
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    let client = &mut running.client;
+    create(client, "default").await;
+    create(client, "other").await;
+    let first = upload(client, header("default"), b"original copper note").await;
+
+    let target = v1::DatabaseTarget {
+        tenant: "default".into(),
+        collection: Some("notes".into()),
+    };
+    let opened = client
+        .open_database_session(target.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(opened.schema_version > 0);
+    assert!(opened.schema.iter().any(|entry| entry.name == "chunks_fts"));
+    assert_eq!(opened.sqlite_features, ["FTS5"]);
+    assert!(opened.bytes > 0);
+    let handle = opened.session.unwrap();
+    let newer = upload(
+        client,
+        replacement(Some(&first.source_id), Some(&first.revision_id)),
+        b"updated copper note",
+    )
+    .await;
+    assert_ne!(first.revision_id, newer.revision_id);
+
+    let mut query = v1::QueryDatabaseRequest {
+        session: Some(handle.clone()),
+        sql: "SELECT current_revision, ?2, ?3, ?4 FROM sources WHERE id = ?1".into(),
+        parameters: vec![
+            v1::SqlValue {
+                value: Some(Value::Text(first.source_id.clone())),
+            },
+            v1::SqlValue {
+                value: Some(Value::Integer(i64::MAX)),
+            },
+            v1::SqlValue {
+                value: Some(Value::Blob(vec![0, 255, 32])),
+            },
+            v1::SqlValue {
+                value: Some(Value::Null(v1::Empty {})),
+            },
+        ],
+        ..Default::default()
+    };
+    let page = client
+        .query_database(query.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        page.rows[0].values[0].value,
+        Some(Value::Text(first.revision_id.clone()))
+    );
+    assert_eq!(&page.rows[0].values[1..], &query.parameters[1..]);
+
+    query.sql = "SELECT name FROM sqlite_schema ORDER BY name".into();
+    query.parameters.clear();
+    query.limit = Some(1);
+    let page = client
+        .query_database(query.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(page.rows.len(), 1);
+    query.offset = page.next_offset.unwrap();
+    let next = client
+        .query_database(query.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(page.rows, next.rows);
+
+    let mut wrong_scope = handle.clone();
+    wrong_scope.target.as_mut().unwrap().tenant = "other".into();
+    query.session = Some(wrong_scope.clone());
+    assert_eq!(
+        client
+            .query_database(query.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    assert_eq!(
+        client
+            .close_database_session(wrong_scope.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    assert_eq!(
+        client
+            .download_database(wrong_scope)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+
+    query.session = Some(handle.clone());
+    query.offset = 0;
+    for sql in [
+        "UPDATE sources SET name = 'forbidden'",
+        "SELECT 1; SELECT 2",
+        "SELECT load_extension('forbidden')",
+        "ATTACH DATABASE ':memory:' AS other",
+        "PRAGMA query_only = OFF",
+    ] {
+        query.sql = sql.into();
+        assert_eq!(
+            client
+                .query_database(query.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument,
+            "{sql}"
+        );
+    }
+
+    let session = running
+        .service
+        .database_session(
+            &sanctum_service::DatabaseTarget {
+                tenant: "default".parse().unwrap(),
+                collection: Some("notes".parse().unwrap()),
+            },
+            handle.generation.parse().unwrap(),
+        )
+        .unwrap();
+    let checks = AtomicUsize::new(0);
+    let interrupted = session.query(
+        "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000000)
+         SELECT sum(x) FROM n",
+        Vec::new(),
+        0,
+        1,
+        move || checks.fetch_add(1, Ordering::Relaxed) > 3,
+    );
+    assert!(matches!(interrupted, Err(sanctum_core::Error::Busy(_))));
+    drop(session);
+
+    let mut stream = client
+        .download_database(handle.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let mut downloaded = tempfile::NamedTempFile::new().unwrap();
+    let mut bytes = 0;
+    while let Some(frame) = stream.message().await.unwrap() {
+        assert!(frame.data.len() <= sanctum_core::UPLOAD_FRAME_BYTES);
+        downloaded.write_all(&frame.data).unwrap();
+        bytes += frame.data.len() as u64;
+    }
+    downloaded.flush().unwrap();
+    assert_eq!(bytes, opened.bytes);
+    let db = rusqlite::Connection::open_with_flags(
+        downloaded.path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let result: (String, String) = db.query_row(
+        "SELECT current_revision, (SELECT integrity_check FROM pragma_integrity_check LIMIT 1) FROM sources",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(result, (first.revision_id, "ok".into()));
+    let mode: String = db
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    drop(db);
+
+    client.close_database_session(handle.clone()).await.unwrap();
+    assert_eq!(
+        client.download_database(handle).await.unwrap_err().code(),
+        Code::NotFound
+    );
+    let catalog = client
+        .open_database_session(v1::DatabaseTarget {
+            tenant: "default".into(),
+            collection: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(catalog.sqlite_features.is_empty());
+    assert!(
+        catalog
+            .schema
+            .iter()
+            .any(|entry| entry.name == "collection_metadata")
+    );
+    let catalog_handle = catalog.session.unwrap();
+    running.stop().await;
+    let mut running = Running::start(&dir).await;
+    assert_eq!(
+        running
+            .client
+            .download_database(catalog_handle)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path().join(".database-sessions")).map_or(0, Iterator::count),
+        0
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn change_stream_replays_and_resumes_in_scope() {
     let dir = TempDir::new().unwrap();
     let mut running = Running::start(&dir).await;
