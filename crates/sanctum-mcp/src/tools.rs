@@ -647,7 +647,16 @@ fn hosted_job_value(scope: &Scope, job: HostedJob) -> Value {
 }
 
 fn hit_value(scope: &Scope, hit: Hit) -> Value {
+    use sanctum_service::metadata_filter::Level;
     let chunk = hit.chunk;
+    let metadata = hit.metadata.entries.into_iter().map(|entry| {
+        let level = match entry.level {
+            Level::Collection => "collection",
+            Level::Source => "source",
+            Level::Chunk => "chunk",
+        };
+        json!({"level": level, "namespace": entry.namespace, "key": entry.key, "value_json": entry.json})
+    }).collect::<Vec<_>>();
     let mut value = json!({
         "tenant": scope.tenant.as_str(),
         "collection": scope.collection.as_str(),
@@ -658,6 +667,9 @@ fn hit_value(scope: &Scope, hit: Hit) -> Value {
         "start_byte": chunk.range.start,
         "end_byte": chunk.range.end,
         "content_blake3": chunk.hash,
+        "representation": "canonical_utf8",
+        "metadata": metadata,
+        "metadata_omitted": hit.metadata.omitted,
         "external": chunk.external.map(|source| json!({"namespace": source.namespace, "id": source.id})),
         "excerpt": hit.excerpt,
         "score": hit.score,

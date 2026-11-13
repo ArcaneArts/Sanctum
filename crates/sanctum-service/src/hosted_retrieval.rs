@@ -11,7 +11,10 @@ use crate::embedding::{
     collections::{Candidates, collection_scopes, merge, rank_collection},
     fuse, lexical_expression, limit_hits,
 };
-use crate::{Chunk, ChunkRef, Hit, HostedCatalog, SearchMode, db, metadata_filter::Filter};
+use crate::{
+    Chunk, ChunkRef, Hit, HostedCatalog, SearchMode, db, hit_metadata::metadata_for_hit,
+    metadata_filter::Filter,
+};
 
 impl HostedCatalog {
     pub async fn fetch(&self, scope: &Scope, reference: ChunkRef) -> Result<Hit> {
@@ -81,15 +84,24 @@ impl HostedCatalog {
                     SearchMode::Hybrid => fuse(lexical, semantic),
                 };
                 let chunks = limit_hits(ranked, actual_mode, limit)
-                    .map(|(chunk, score)| Ok((locate(database, chunk)?, score)))
+                    .map(|(chunk, score)| {
+                        let fields = metadata_for_hit(
+                            database,
+                            &chunk.reference,
+                            filter.as_ref(),
+                            &metadata,
+                        )?;
+                        Ok((locate(database, chunk)?, score, fields))
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 Ok((chunks, coverage, actual_mode, degraded))
             })
             .await?;
         let mut hits = Vec::with_capacity(chunks.len());
-        for ((chunk, key), score) in chunks {
+        for ((chunk, key), score, fields) in chunks {
             let mut hit = self.read_hit(&scope, chunk, key, generation).await?;
             hit.score = score;
+            hit.metadata = fields;
             hits.push(hit);
         }
         Ok(SearchResult {
@@ -134,7 +146,15 @@ impl HostedCatalog {
                     )?;
                     let located = ranked
                         .into_iter()
-                        .map(|chunk| locate(database, chunk))
+                        .map(|chunk| {
+                            let fields = metadata_for_hit(
+                                database,
+                                &chunk.reference,
+                                filter.as_deref(),
+                                &metadata,
+                            )?;
+                            Ok((locate(database, chunk)?, fields))
+                        })
                         .collect::<Result<Vec<_>>>()?;
                     Ok((located, current))
                 })
@@ -147,15 +167,16 @@ impl HostedCatalog {
                 coverage: current,
                 ranked: ranked
                     .into_iter()
-                    .map(|(chunk, key)| (chunk, (key, generation)))
+                    .map(|((chunk, key), fields)| (chunk, (key, generation, fields)))
                     .collect(),
             });
         }
         let (mode, degraded) = prepared.strategy(requested, coverage)?;
         let mut hits = Vec::with_capacity(limit as usize);
-        for (scope, chunk, (key, generation), score) in merge(all, limit) {
+        for (scope, chunk, (key, generation, fields), score) in merge(all, limit) {
             let mut hit = self.read_hit(&scope, chunk, key, generation).await?;
             hit.score = Some(score);
+            hit.metadata = fields;
             hits.push((scope, hit));
         }
         Ok(CollectionSearchResult {

@@ -9,7 +9,7 @@ use super::{
     metadata::{Entry, valid_name},
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
     Collection,
     Source,
@@ -52,6 +52,18 @@ pub enum Filter {
 }
 
 impl Filter {
+    pub fn visit_fields(&self, visit: &mut impl FnMut(Level, &str, &str)) {
+        match self {
+            Self::Test(test) => visit(test.level, &test.namespace, &test.key),
+            Self::All(children) | Self::Any(children) => {
+                for child in children {
+                    child.visit_fields(visit);
+                }
+            }
+            Self::Not(child) => child.visit_fields(visit),
+        }
+    }
+
     pub fn uses_collection_metadata(&self) -> bool {
         match self {
             Self::Test(test) => matches!(test.level, Level::Collection),

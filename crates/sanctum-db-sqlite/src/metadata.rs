@@ -132,6 +132,29 @@ impl CollectionDb {
         revision_entries(&self.0, target, None)
     }
 
+    pub fn read_chunk_metadata_field(
+        &self,
+        reference: &super::ChunkRef,
+        level: super::metadata_filter::Level,
+        namespace: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        use super::metadata_filter::Level;
+        let ordinal = match level {
+            Level::Source => -1,
+            Level::Chunk => sql_integer(reference.ordinal)?,
+            Level::Collection => {
+                return Err(Error::Invalid("expected source or chunk metadata".into()));
+            }
+        };
+        self.0.query_row(
+            "SELECT value FROM revision_metadata
+                WHERE source = ?1 AND revision = ?2 AND ordinal = ?3 AND namespace = ?4 AND key = ?5",
+            params![reference.source.to_string(), reference.revision.to_string(), ordinal, namespace, key],
+            |row| row.get(0),
+        ).optional().map_err(database_error)
+    }
+
     pub fn change_cursor(&self) -> Result<u64> {
         self.0
             .query_row(

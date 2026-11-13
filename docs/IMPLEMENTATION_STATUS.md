@@ -822,3 +822,15 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   update. [Method and measurements](CAPACITY.md).
 - Representative text and vector query workloads, concurrent
   collections, and actual Cloud Run capacity remain open.
+- Delivered in [PR #53](https://github.com/ArcaneArts/Sanctum/pull/53).
+
+## Retrieval metadata
+
+- gRPC and MCP hits identify their canonical UTF-8 representation.
+  Filtered searches include the relevant stored metadata fields from
+  the snapshot used for ranking. Each hit has a bounded metadata
+  budget and reports omitted values. Full metadata reads remain
+  available through the target APIs.
+- The gRPC test checks typed values and omission of a value over
+  budget. Local and hosted MCP checks verify filter metadata on
+  cited results, including a hosted multi-collection query.

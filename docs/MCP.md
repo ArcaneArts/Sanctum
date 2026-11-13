@@ -73,6 +73,11 @@ Call `ingestion_status` with the returned operation ID until it reports
 [gRPC CLI](LOCAL_API.md) for large files and directory imports. MCP HTTP
 requests have a 2 MiB JSON body limit.
 
+Search hits identify their canonical UTF-8 representation and include
+the metadata keys used in the filter, with their level and JSON-encoded
+value. Each hit has a 4 KiB metadata budget. Use `get_metadata` when
+`metadata_omitted` is true or you need other fields.
+
 For example, search for quartz in chunks whose current source metadata
 contains the `sample` tag.
 

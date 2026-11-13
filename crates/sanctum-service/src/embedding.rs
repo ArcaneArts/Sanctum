@@ -99,7 +99,7 @@ impl Service {
                 _ => Vec::new(),
             };
             let db = service.database(&scope)?;
-            let (ranked, actual_mode, coverage, degraded) = db.read_snapshot(|db| {
+            let (hits, actual_mode, coverage, degraded) = db.read_snapshot(|db| {
                 let coverage = db.embedding_coverage(prepared.profile.as_deref())?;
                 let (actual_mode, degraded) = prepared.strategy(mode, coverage)?;
                 let candidate_limit = if actual_mode == SearchMode::Lexical {
@@ -136,14 +136,22 @@ impl Service {
                         .collect(),
                     SearchMode::Hybrid => fuse(lexical, semantic),
                 };
-                Ok((ranked, actual_mode, coverage, degraded))
+                let hits = limit_hits(ranked, actual_mode, limit)
+                    .map(|(chunk, score)| {
+                        let fields = crate::hit_metadata::metadata_for_hit(
+                            db,
+                            &chunk.reference,
+                            filter.as_ref(),
+                            &metadata,
+                        )?;
+                        let mut hit = service.hit(&scope, chunk)?;
+                        hit.metadata = fields;
+                        hit.score = score;
+                        Ok(hit)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((hits, actual_mode, coverage, degraded))
             })?;
-            let mut hits = Vec::with_capacity(limit as usize);
-            for (chunk, score) in limit_hits(ranked, actual_mode, limit) {
-                let mut hit = service.hit(&scope, chunk)?;
-                hit.score = score;
-                hits.push(hit);
-            }
             Ok(SearchResult {
                 hits,
                 mode: actual_mode,

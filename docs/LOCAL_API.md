@@ -110,6 +110,13 @@ single chunk using SQLite FTS5 tokenization. Results include byte offsets as
 the canonical UTF-8 representation. Pass the result's `ChunkRef` unchanged
 to `FetchChunk` to retrieve that range.
 
+Search hits identify the `canonical_utf8` representation and include
+stored metadata fields referenced by the query filter. Entries preserve
+their collection, source, or chunk level and JSON type. Missing keys
+are absent. If a value would exceed the 4 KiB per-hit metadata budget,
+the hit sets `metadata_omitted`. Fetch the complete target metadata
+with `GetMetadata`.
+
 Use `FetchContext` with the same reference and up to 16 KiB before
 and after the cited chunk. Omitted gRPC budgets default to zero. The
 server clips the window to the source and trims incomplete UTF-8 code
