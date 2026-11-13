@@ -111,7 +111,7 @@ struct Ingest {
     replace_source_id: Option<String>,
     /// Reject the replacement if the current revision differs.
     expected_revision_id: Option<String>,
-    /// Optional hosted request UUID. Retry with the same UUID and identical input.
+    /// Optional request UUID. Retry with the same UUID and identical input.
     request_id: Option<String>,
     /// Namespaced JSON values attached to the new revision on publication.
     #[serde(default)]
@@ -401,15 +401,10 @@ impl Tools {
             let request = args.request_id.as_deref().map(id).transpose()?;
             match &self.backend {
                 Backend::Local(service) => {
-                    if request.is_some() {
-                        return Err(Error::Invalid(
-                            "request ID is supported on hosted ingestion".into(),
-                        ));
-                    }
                     local(service, move |service| {
                         let upload = service.stage_upload(scope, upload)?;
                         upload.reopen()?.write_all(args.text.as_bytes())?;
-                        Ok(job_value(upload.enqueue()?))
+                        Ok(job_value(upload.enqueue_with_request(request)?))
                     })
                     .await
                 }

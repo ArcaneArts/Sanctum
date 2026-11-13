@@ -137,8 +137,11 @@ def check(bin_dir):
             assert http.tool("list_collections", after=first["next_after"])["collections"] == ["reference"]
 
             content = "Snow crystals near the ridge ❄️ and a quartz sample."
-            job = http.tool("ingest_text", collection="notes", name="field.md", text=content,
-                            external={"namespace": "field", "id": "note-1"})
+            upload = {"collection": "notes", "name": "field.md", "text": content,
+                      "external": {"namespace": "field", "id": "note-1"}, "request_id": str(uuid.uuid4())}
+            job = http.tool("ingest_text", **upload)
+            replay = http.tool("ingest_text", **upload)
+            assert (replay["operation_id"], replay["revision_id"]) == (job["operation_id"], job["revision_id"])
             for _ in range(100):
                 status = http.tool("ingestion_status", collection="notes", operation_id=job["operation_id"])
                 if status["state"] == "text_ready":

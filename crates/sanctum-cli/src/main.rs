@@ -122,7 +122,7 @@ enum Command {
         external_id: Option<String>,
         #[arg(long)]
         background: bool,
-        /// Replay an accepted hosted submission with the same UUID and input.
+        /// Replay an accepted submission with the same UUID and input.
         #[arg(long)]
         request_id: Option<String>,
         /// JSON array of namespaced metadata entries to attach to the revision.

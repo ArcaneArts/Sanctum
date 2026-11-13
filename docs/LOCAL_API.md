@@ -35,9 +35,9 @@ results.
 Each `UploadText` stream starts with one header containing the tenant,
 collection, and source name. It follows with data frames of up to 256 KiB and
 an explicit end frame. Close the sending side of the stream after the end
-frame. A successful response identifies the committed revision. In this
-initial version, retrying an upload with the same external namespace and ID
-returns `ALREADY_EXISTS`. `UploadText` waits up to 30 seconds for lexical publication.
+frame. A successful response identifies the committed revision. Creating a
+new source with an existing external namespace and ID returns `ALREADY_EXISTS`.
+`UploadText` waits up to 30 seconds for lexical publication.
 If its wait expires, the response message contains the operation ID. The
 accepted work can continue after the client disconnects.
 
@@ -129,6 +129,15 @@ server clips the window to the source and trims incomplete UTF-8 code
 points at either outer boundary. The returned half-open range identifies
 the context. The nested hit still describes the exact cited chunk and
 its verified content hash.
+
+## Upload request IDs
+
+Supply a nonzero `request_id` UUID on the upload header or use
+`sanctum-cli upload --request-id UUID`. An identical retry in the same
+collection returns the original operation and revision, including after a
+server restart. Reuse with different content, metadata, or upload settings
+returns `ALREADY_EXISTS`. When an operation expires, its request UUID
+stays reserved. Use a fresh UUID for new work.
 
 ## Metadata on upload
 

@@ -1,6 +1,6 @@
 use std::{
     path::Path,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 pub use context::ChunkContext;
@@ -81,6 +81,7 @@ pub struct Service {
     git_imports: git_import::ActiveImports,
     database_sessions: database_sessions::DatabaseSessions,
     retrieval: Arc<RwLock<()>>,
+    upload_requests: Arc<[Mutex<()>; 64]>,
     embedding: Option<Arc<dyn sanctum_embedding::Provider>>,
 }
 
@@ -279,6 +280,7 @@ impl Service {
             git_imports: Default::default(),
             database_sessions,
             retrieval: Arc::new(RwLock::new(())),
+            upload_requests: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
             embedding,
         };
         if let Err(error) = service.reclaim_deleted_collections() {
