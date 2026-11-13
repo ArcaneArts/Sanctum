@@ -91,6 +91,20 @@ PNPM dependencies.
 | Debian-based Linux | `pnpm --filter @sanctum/desktop tauri build --bundles deb` | `apps/desktop/src-tauri/target/release/bundle/deb/*.deb` |
 | Windows | `pnpm --filter @sanctum/desktop tauri build --bundles nsis` | `apps/desktop/src-tauri/target/release/bundle/nsis/*-setup.exe` |
 
+To cross-build the unsigned Windows x64 NSIS installer from macOS, install
+LLVM, LLD, NSIS, and `cargo-xwin`, and add LLVM's tools to `PATH`. The same
+runner must build the desktop executable and both Rust sidecars.
+[Tauri Windows cross-compilation](https://v2.tauri.app/distribute/windows-installer/#build-windows-apps-on-linux-and-macos).
+
+```sh
+rustup target add x86_64-pc-windows-msvc
+SANCTUM_DESKTOP_CARGO_XWIN=1 pnpm --filter @sanctum/desktop tauri build \
+  --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis --no-sign
+```
+
+The cross-build outputs the installer under
+`apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/`.
+
 The package includes `sanctum-server` and `sanctum-cli` next to the desktop
 executable. On Debian-based systems install the built package with
 `sudo apt install ./path/to/the-built-package.deb` and launch **Sanctum** from a desktop
