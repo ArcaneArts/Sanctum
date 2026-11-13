@@ -612,5 +612,17 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - A standalone MinIO smoke verified text-only RTF retention, deletion
   replay after restart, search exclusion, and the worker sweep preserving
   bytes during the grace period.
-- Automatic snapshot reclamation and abandoned candidate-object cleanup
-  remain open.
+- Delivered in [PR #38](https://github.com/ArcaneArts/Sanctum/pull/38).
+
+## Scheduled hosted snapshot reclamation
+
+- The private worker snapshot sweep persists discovery and per-unit
+  cursors. It marks and deletes superseded catalog and collection
+  snapshots under their writer fences, with a 15-minute grace from the
+  first observed retirement.
+- The integration test exercises a busy writer, cursor resumption,
+  marker aging, and preservation of the current snapshot.
+- A standalone MinIO smoke verified that the scheduled HTTP endpoint
+  marks the retired catalog, preserves the current generation and
+  reader grace, and continues after restart.
+- Abandoned input and extraction candidates still need a cleanup path.

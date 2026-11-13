@@ -146,9 +146,16 @@ impl Publication {
     }
 
     pub async fn acquire(&self, unit: &Unit) -> Result<Lease> {
+        self.acquire_unit(unit, true).await
+    }
+
+    async fn acquire_unit(&self, unit: &Unit, create: bool) -> Result<Lease> {
         let key = unit.head()?;
         let (mut head, condition) = match self.read_head(unit).await? {
             Some((head, version)) => (head, Condition::Match(version)),
+            None if !create => {
+                return Err(Error::NotFound("database manifest was not found".into()));
+            }
             None => (
                 Head {
                     format: FORMAT,
@@ -214,7 +221,7 @@ impl Publication {
                 "snapshot cleanup requires at least five minutes of grace".into(),
             ));
         }
-        let mut lease = self.acquire(unit).await?;
+        let mut lease = self.acquire_unit(unit, false).await?;
         let result = lease.reclaim(grace, cursor).await;
         let release = lease.release().await;
         result.and_then(|page| release.map(|()| page))

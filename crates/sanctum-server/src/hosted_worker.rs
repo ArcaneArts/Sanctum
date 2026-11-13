@@ -26,6 +26,10 @@ pub(crate) fn router(service: HostedCatalog) -> Router {
         )
         .route("/internal/maintenance/dispatch/{shard}", post(reconcile))
         .route("/internal/maintenance/source-sweep", post(sweep_sources))
+        .route(
+            "/internal/maintenance/snapshot-sweep",
+            post(sweep_snapshots),
+        )
         .layer(DefaultBodyLimit::max(4096))
         .with_state(service)
 }
@@ -214,6 +218,22 @@ async fn sweep_sources(State(service): State<HostedCatalog>) -> Response {
         .into_response(),
         Err(error) => {
             tracing::warn!(%error, "hosted source sweep will need a retry");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
+}
+
+async fn sweep_snapshots(State(service): State<HostedCatalog>) -> Response {
+    match service.sweep_hosted_snapshots().await {
+        Ok(report) => Json(serde_json::json!({
+            "deleted": report.deleted,
+            "units": report.units,
+            "failed": report.failed,
+            "more": report.more,
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "hosted snapshot sweep will need a retry");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }

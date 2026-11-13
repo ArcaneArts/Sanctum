@@ -1635,6 +1635,65 @@ async fn hosted_deletion_replays_and_defers_object_reclamation() {
 }
 
 #[tokio::test]
+async fn snapshot_sweep_resumes_units_and_protects_published_generations() {
+    use std::time::{Duration, SystemTime};
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let service = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let tenant = "default".parse().unwrap();
+    let catalog = sanctum_db::Unit::catalog(None, &tenant).unwrap();
+    let executor = sanctum_db::Publication::new(storage.clone(), Duration::from_secs(15)).unwrap();
+    let mut first = None;
+    for index in 0..10 {
+        let scope = sanctum_core::Scope {
+            tenant: "default".parse().unwrap(),
+            collection: format!("notes-{index}").parse().unwrap(),
+        };
+        service.create_collection(&scope, None).await.unwrap();
+        if index == 0 {
+            first = executor.generation(&catalog).await.unwrap();
+        }
+    }
+    let first = first.unwrap();
+    let current = executor.generation(&catalog).await.unwrap().unwrap();
+    let held = executor.acquire(&catalog).await.unwrap();
+    let report = service.sweep_hosted_snapshots().await.unwrap();
+    assert_eq!((report.units, report.deleted, report.failed), (7, 0, 1));
+    assert!(report.more);
+    held.release().await.unwrap();
+    let service = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let report = service.sweep_hosted_snapshots().await.unwrap();
+    assert_eq!((report.units, report.deleted, report.failed), (3, 0, 0));
+    assert!(!report.more);
+    let report = service.sweep_hosted_snapshots().await.unwrap();
+    assert_eq!((report.units, report.deleted, report.failed), (8, 0, 0));
+
+    let marker = format!("default/catalog/snapshots/{}/retired.json", first.id);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(directory.path().join(&marker))
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(901))
+        .unwrap();
+    assert!(!service.sweep_hosted_snapshots().await.unwrap().more);
+    let report = service.sweep_hosted_snapshots().await.unwrap();
+    assert_eq!(report.deleted, 1);
+    let retired = Key::parse(format!("default/catalog/snapshots/{}/root.db", first.id)).unwrap();
+    assert!(matches!(
+        storage.head(&retired).await,
+        Err(Error::NotFound(_))
+    ));
+    let current_key =
+        Key::parse(format!("default/catalog/snapshots/{}/root.db", current.id)).unwrap();
+    assert!(storage.head(&current_key).await.is_ok());
+    assert_eq!(
+        executor.generation(&catalog).await.unwrap().unwrap(),
+        current
+    );
+}
+
+#[tokio::test]
 async fn hosted_submissions_recover_from_interrupted_acceptance() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance {
