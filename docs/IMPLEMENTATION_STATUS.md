@@ -532,3 +532,22 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   MinIO publication contract also checks warm reuse.
 - Hosted reads currently reopen SQLite connections on the warm file.
   Capacity measurements and the hosted vector path remain open.
+
+- Delivered in [PR #33](https://github.com/ArcaneArts/Sanctum/pull/33).
+
+## Hosted embedding batches and search
+
+- The hosted API and worker use the configured server-level provider.
+  A private worker request processes up to 16 distinct pending chunk
+  inputs and publishes one SQLite snapshot. Its transaction writes only
+  vectors whose inputs are still current. Collection and revision status
+  report coverage for the configured profile.
+- Hosted single-collection search supports lexical, semantic, and hybrid
+  modes. Hybrid stays lexical when coverage or the provider is unavailable.
+  Incompatible profiles are excluded immediately.
+- The hosted gRPC test verifies outage fallback, unchanged-input reuse,
+  and a profile change followed by a rebuild. A standalone MinIO run used
+  Ollama's 768-dimensional embeddinggemma-2:740m model and verified
+  semantic and hybrid retrieval, a no-work replay, and restart persistence.
+- Automatic dispatch for embedding batches and profile rebuilds, and
+  hosted multi-collection retrieval remain open.

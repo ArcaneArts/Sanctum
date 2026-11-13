@@ -148,7 +148,8 @@ unset SANCTUM_GRPC_ID_TOKEN
 ```
 
 The CLI adds the ID token only on HTTPS connections. This guide covers
-the hosted lexical path. Hosted MCP and embedding search remain open.
+the hosted lexical path. The private worker also supports manual embedding
+batches. Hosted MCP and automatic embedding dispatch remain open.
 The [storage guide](STORAGE.md) documents the worker stages, retry behavior,
 and MinIO configuration. Live Cloud Run, GCS, and IAM verification requires
 an authorized deployment environment.

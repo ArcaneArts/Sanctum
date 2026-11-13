@@ -292,3 +292,14 @@ impl<T: std::ops::Deref<Target = rusqlite::Connection>> RevisionWrite<T> {
         Ok(())
     }
 }
+
+/// Writes a provider batch inside the caller's fenced collection transaction.
+pub fn apply_hosted_embeddings(
+    transaction: &rusqlite::Transaction<'_>,
+    profile: &str,
+    batch: impl FnOnce(&RevisionWrite<&rusqlite::Connection>) -> Result<()>,
+) -> Result<()> {
+    let writer = RevisionWrite(&**transaction);
+    batch(&writer)?;
+    writer.release_retirements(Some(profile))
+}

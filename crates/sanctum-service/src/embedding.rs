@@ -26,15 +26,15 @@ pub struct SearchResult {
     pub degraded: Option<&'static str>,
 }
 
-struct PreparedQuery {
-    expression: String,
-    profile: Option<String>,
-    vector: Option<Arc<[f32]>>,
-    degraded: Option<&'static str>,
+pub(crate) struct PreparedQuery {
+    pub(crate) expression: String,
+    pub(crate) profile: Option<String>,
+    pub(crate) vector: Option<Arc<[f32]>>,
+    pub(crate) degraded: Option<&'static str>,
 }
 
 impl PreparedQuery {
-    fn strategy(
+    pub(crate) fn strategy(
         &self,
         requested: SearchMode,
         coverage: Coverage,
@@ -56,14 +56,14 @@ impl PreparedQuery {
     }
 }
 
-struct Batch {
-    hashes: Vec<String>,
-    texts: Vec<String>,
+pub(crate) struct Batch {
+    pub(crate) hashes: Vec<String>,
+    pub(crate) texts: Vec<String>,
 }
 
-struct BatchOutcome {
-    hashes: Vec<String>,
-    result: std::result::Result<Vec<Vec<f32>>, EmbedError>,
+pub(crate) struct BatchOutcome {
+    pub(crate) hashes: Vec<String>,
+    pub(crate) result: std::result::Result<Vec<Vec<f32>>, EmbedError>,
 }
 
 impl Service {
@@ -138,26 +138,10 @@ impl Service {
                 Ok((ranked, actual_mode, coverage, degraded))
             })?;
             let mut hits = Vec::with_capacity(limit as usize);
-            let mut ranges: HashMap<_, Vec<ByteRange>> = HashMap::new();
-            for (chunk, score) in ranked {
-                if actual_mode != SearchMode::Lexical {
-                    let ranges = ranges
-                        .entry((chunk.reference.source, chunk.reference.revision))
-                        .or_default();
-                    if ranges
-                        .iter()
-                        .any(|range| range.start < chunk.range.end && chunk.range.start < range.end)
-                    {
-                        continue;
-                    }
-                    ranges.push(chunk.range);
-                }
+            for (chunk, score) in limit_hits(ranked, actual_mode, limit) {
                 let mut hit = service.hit(&scope, chunk)?;
                 hit.score = score;
                 hits.push(hit);
-                if hits.len() == limit as usize {
-                    break;
-                }
             }
             Ok(SearchResult {
                 hits,
@@ -337,7 +321,7 @@ pub async fn run_embedding_worker(service: Service, mut stop: watch::Receiver<bo
     }
 }
 
-async fn embed_batch(provider: &dyn Provider, batch: Batch) -> Vec<BatchOutcome> {
+pub(crate) async fn embed_batch(provider: &dyn Provider, batch: Batch) -> Vec<BatchOutcome> {
     let mut pending: Vec<_> = std::iter::once(0..batch.texts.len()).collect();
     let mut outcomes = Vec::new();
     while let Some(range) = pending.pop() {
@@ -382,7 +366,34 @@ async fn blocking<T: Send + 'static>(
         .map_err(|error| Error::Internal(Box::new(error)))?
 }
 
-fn fuse(lexical: Vec<Chunk>, semantic: Vec<ScoredChunk>) -> Vec<(Chunk, Option<f64>)> {
+pub(crate) fn limit_hits(
+    ranked: Vec<(Chunk, Option<f64>)>,
+    mode: SearchMode,
+    limit: u32,
+) -> impl Iterator<Item = (Chunk, Option<f64>)> {
+    let mut ranges: HashMap<_, Vec<ByteRange>> = HashMap::new();
+    ranked
+        .into_iter()
+        .filter(move |(chunk, _)| {
+            if mode == SearchMode::Lexical {
+                return true;
+            }
+            let accepted = ranges
+                .entry((chunk.reference.source, chunk.reference.revision))
+                .or_default();
+            if accepted
+                .iter()
+                .any(|range| range.start < chunk.range.end && chunk.range.start < range.end)
+            {
+                return false;
+            }
+            accepted.push(chunk.range);
+            true
+        })
+        .take(limit as usize)
+}
+
+pub(crate) fn fuse(lexical: Vec<Chunk>, semantic: Vec<ScoredChunk>) -> Vec<(Chunk, Option<f64>)> {
     let mut ranks: HashMap<ChunkRef, (Chunk, f64)> = HashMap::new();
     for list in [lexical, semantic.into_iter().map(|hit| hit.chunk).collect()] {
         for (rank, chunk) in list.into_iter().enumerate() {

@@ -7,7 +7,11 @@ use sanctum_storage_gcs::GcsStorage;
 use sanctum_storage_s3::{S3Config, S3Storage};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) async fn serve(config: Config, storage: ObjectStorageConfig) -> anyhow::Result<()> {
+pub(crate) async fn serve(
+    config: Config,
+    storage: ObjectStorageConfig,
+    embedding: Option<Arc<dyn sanctum_embedding::Provider>>,
+) -> anyhow::Result<()> {
     let (grpc_address, worker_address) = if let Some(role) = config.cloud_run_role {
         let port = std::env::var("PORT")?.parse::<u16>()?;
         anyhow::ensure!(port != 0, "Cloud Run PORT must be positive");
@@ -43,7 +47,8 @@ pub(crate) async fn serve(config: Config, storage: ObjectStorageConfig) -> anyho
         storage,
         prefix.map(Key::parse).transpose()?,
         config.max_source_bytes,
-    )?;
+    )?
+    .with_embedding(embedding);
     if let Some(max_bytes) = config.hosted_snapshot_cache_bytes {
         catalog = catalog.with_snapshot_cache_bytes(max_bytes);
     }

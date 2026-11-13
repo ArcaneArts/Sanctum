@@ -14,6 +14,7 @@ pub(crate) fn router(service: HostedCatalog) -> Router {
     Router::new()
         .route("/internal/tasks/register-upload", post(register))
         .route("/internal/tasks/index-upload", post(index))
+        .route("/internal/tasks/embed-collection", post(embed))
         .route("/internal/maintenance/dispatch/{shard}", post(reconcile))
         .layer(DefaultBodyLimit::max(4096))
         .with_state(service)
@@ -81,6 +82,32 @@ async fn reconcile(State(service): State<HostedCatalog>, Path(shard): Path<u8>) 
         Err(Error::Invalid(_)) => StatusCode::BAD_REQUEST.into_response(),
         Err(error) => {
             tracing::warn!(%error, shard, "could not advance hosted dispatch scan");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbedCollection {
+    tenant: String,
+    collection: String,
+}
+
+async fn embed(
+    State(service): State<HostedCatalog>,
+    Json(task): Json<EmbedCollection>,
+) -> Response {
+    let (Ok(tenant), Ok(collection)) = (task.tenant.parse(), task.collection.parse()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let scope = Scope { tenant, collection };
+    match service.embed_collection(&scope).await {
+        Ok(processed) => Json(serde_json::json!({ "processed": processed })).into_response(),
+        Err(Error::Invalid(_)) => StatusCode::BAD_REQUEST.into_response(),
+        Err(Error::NotFound(_)) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection, "hosted embedding task will need a retry");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }

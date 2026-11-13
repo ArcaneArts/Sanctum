@@ -105,6 +105,10 @@ impl HostedCatalog {
                 Err(error) => return Err(error),
             }
         };
+        let profile = self
+            .embedding
+            .as_ref()
+            .map(|provider| provider.profile_id().to_owned());
         let operation = record.operation;
         let revision = record.revision;
         let registration = Registration {
@@ -144,7 +148,7 @@ impl HostedCatalog {
                                     &prepared.revision,
                                     &prepared.objects,
                                     replacement,
-                                    None,
+                                    profile.as_deref(),
                                     |writer| {
                                         let mut ordinal = 0;
                                         index_utf8(
