@@ -26,6 +26,7 @@ mod hosted_ingestion;
 mod hosted_lifecycle;
 mod hosted_rebuild;
 mod hosted_retrieval;
+mod hosted_snapshots;
 mod local_import;
 mod local_jobs;
 mod maintenance;
