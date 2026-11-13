@@ -126,6 +126,17 @@ impl HostedCatalog {
     }
 
     pub(crate) async fn require_collection(&self, scope: &Scope) -> Result<()> {
+        self.with_catalog(scope, |path, collection| {
+            db::require_collection(path, &collection)
+        })
+        .await
+    }
+
+    pub(crate) async fn with_catalog<T: Send + 'static>(
+        &self,
+        scope: &Scope,
+        read: impl FnOnce(&std::path::Path, String) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         let scratch = tempfile::tempdir()?;
         let unit = Unit::catalog(self.prefix.as_ref(), &scope.tenant)?;
         let database = self
@@ -136,7 +147,7 @@ impl HostedCatalog {
         let collection = scope.collection.to_string();
         tokio::task::spawn_blocking(move || {
             let _scratch = scratch;
-            db::require_collection(database.path(), &collection)
+            read(database.path(), collection)
         })
         .await
         .map_err(|error| Error::Internal(Box::new(error)))?

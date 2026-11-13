@@ -180,3 +180,21 @@ replacement. A stale expected revision or a duplicate external source
 returns a durable failed status. HTTP 204 confirms the outcome was recorded.
 An operation without a recorded registration outcome expires after 30 days.
 A recorded outcome can be replayed while its database receipt is retained.
+
+### Hosted lexical publication
+
+After registration, deliver the same reference to
+`/internal/tasks/index-upload`. The worker verifies the accepted input,
+extracts canonical UTF-8 for RTF, and indexes overlapping chunks. It
+checks the registered sequence inside the publishing transaction.
+An older replacement cannot displace a newer registered revision.
+The snapshot commits text-object locators, the lexical index, and the
+indexing receipt together. Replaying a published receipt avoids rebuilding
+its index.
+
+`GetIngestionJob` reports `TEXT_READY` with the committed revision.
+`SearchText` serves collection-scoped lexical hits, including hybrid
+requests when hosted embeddings are unavailable. `FetchChunk` reads
+the hit's exact byte range and verifies its fingerprint. Hosted vectors,
+automatic dispatch, source cleanup, and multi-collection retrieval
+remain open.

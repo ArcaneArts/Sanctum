@@ -12,6 +12,7 @@ use uuid::Uuid;
 pub(crate) fn router(service: HostedCatalog) -> Router {
     Router::new()
         .route("/internal/tasks/register-upload", post(register))
+        .route("/internal/tasks/index-upload", post(index))
         .layer(DefaultBodyLimit::max(4096))
         .with_state(service)
 }
@@ -28,6 +29,17 @@ async fn register(
     State(service): State<HostedCatalog>,
     Json(task): Json<RegisterUpload>,
 ) -> StatusCode {
+    apply(service, task, false).await
+}
+
+async fn index(
+    State(service): State<HostedCatalog>,
+    Json(task): Json<RegisterUpload>,
+) -> StatusCode {
+    apply(service, task, true).await
+}
+
+async fn apply(service: HostedCatalog, task: RegisterUpload, indexing: bool) -> StatusCode {
     let (Ok(tenant), Ok(collection)) = (task.tenant.parse(), task.collection.parse()) else {
         return StatusCode::BAD_REQUEST;
     };
@@ -35,13 +47,18 @@ async fn register(
         return StatusCode::BAD_REQUEST;
     }
     let scope = Scope { tenant, collection };
-    match service.register_upload(&scope, task.operation_id).await {
+    let result = if indexing {
+        service.index_upload(&scope, task.operation_id).await
+    } else {
+        service.register_upload(&scope, task.operation_id).await
+    };
+    match result {
         Ok(_) => StatusCode::NO_CONTENT,
         Err(Error::NotFound(_)) => StatusCode::NOT_FOUND,
         Err(error) => {
             tracing::warn!(
                 %error, tenant = %scope.tenant, collection = %scope.collection,
-                operation = %task.operation_id, "hosted upload registration will need a retry"
+                operation = %task.operation_id, indexing, "hosted task will need a retry"
             );
             StatusCode::SERVICE_UNAVAILABLE
         }

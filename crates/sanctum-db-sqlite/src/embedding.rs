@@ -4,7 +4,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use super::{
-    Chunk, CollectionDb, RevisionWriter, database_error, metadata, metadata_filter, query_all,
+    Chunk, CollectionDb, RevisionWrite, database_error, metadata, metadata_filter, query_all,
     row_chunk, unsigned_column,
 };
 
@@ -214,7 +214,7 @@ impl CollectionDb {
     }
 }
 
-impl RevisionWriter<'_> {
+impl<T: std::ops::Deref<Target = rusqlite::Connection>> RevisionWrite<T> {
     pub fn store_embedding(&self, profile: &str, hash: &str, vector: &[f32]) -> Result<()> {
         let bytes: Vec<u8> = vector
             .iter()

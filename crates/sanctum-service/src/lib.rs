@@ -21,6 +21,7 @@ mod embedding;
 mod git_import;
 mod hosted_catalog;
 mod hosted_ingestion;
+mod hosted_retrieval;
 mod local_import;
 mod local_jobs;
 mod maintenance;
@@ -309,13 +310,21 @@ impl Service {
             chunk.reference.revision,
             chunk.range,
         )?;
-        if blake3::hash(&bytes).to_hex().as_str() != chunk.hash {
+        Hit::from_bytes(chunk, &bytes)
+    }
+}
+
+impl Hit {
+    fn from_bytes(chunk: Chunk, bytes: &[u8]) -> Result<Self> {
+        if blake3::hash(bytes).to_hex().as_str() != chunk.hash {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "stored chunk does not match its fingerprint",
             )));
         }
-        let excerpt = String::from_utf8(bytes).map_err(|error| Error::Internal(Box::new(error)))?;
+        let excerpt = std::str::from_utf8(bytes)
+            .map_err(|error| Error::Internal(Box::new(error)))?
+            .to_owned();
         Ok(Hit {
             chunk,
             excerpt,
