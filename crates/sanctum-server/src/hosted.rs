@@ -68,11 +68,11 @@ pub(crate) async fn serve(
     if crate::managed() {
         println!(
             "{}",
-            serde_json::json!({"grpc": grpc_address, "mcp": null, "worker": worker_address})
+            serde_json::json!({"grpc": grpc_address, "mcp": grpc_address, "worker": worker_address})
         );
     }
     if let Some(address) = grpc_address {
-        tracing::info!(%address, "Sanctum object-backed gRPC listening");
+        tracing::info!(%address, "Sanctum object-backed gRPC and MCP listening");
     }
     if let Some(address) = worker_address {
         tracing::info!(%address, "Sanctum hosted worker listening");
@@ -81,12 +81,26 @@ pub(crate) async fn serve(
     let cancellation = CancellationToken::new();
     let grpc = async {
         if let Some(grpc) = grpc {
-            tonic::transport::Server::builder()
-                .timeout(std::time::Duration::from_secs(600))
-                .add_service(sanctum_api::hosted_grpc(
+            let grpc_routes = tonic::service::Routes::new(sanctum_api::hosted_grpc(
+                catalog.clone(),
+                cancellation.child_token(),
+            ));
+            let direct_ip = if config.cloud_run_role.is_none() {
+                Some(grpc.local_addr()?.ip())
+            } else {
+                None
+            };
+            let routes = grpc_routes
+                .into_axum_router()
+                .merge(sanctum_mcp::hosted_router(
                     catalog.clone(),
+                    direct_ip,
                     cancellation.child_token(),
-                ))
+                ));
+            tonic::transport::Server::builder()
+                .accept_http1(true)
+                .timeout(std::time::Duration::from_secs(600))
+                .add_routes(routes.into())
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(grpc),
                     cancellation.clone().cancelled_owned(),

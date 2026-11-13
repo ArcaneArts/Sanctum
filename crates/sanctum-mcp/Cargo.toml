@@ -6,13 +6,14 @@ rust-version.workspace = true
 
 [features]
 http = ["dep:axum", "dep:tokio-util", "rmcp/macros", "rmcp/transport-streamable-http-server"]
-bridge = ["dep:anyhow", "dep:reqwest-mcp", "rmcp/client", "rmcp/transport-io", "rmcp/transport-streamable-http-client-reqwest"]
+bridge = ["dep:anyhow", "dep:reqwest-mcp", "dep:rustls", "rmcp/client", "rmcp/transport-io", "rmcp/transport-streamable-http-client-reqwest"]
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 reqwest-mcp = { workspace = true, optional = true }
 rmcp = { workspace = true, features = ["server"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
 sanctum-core = { path = "../sanctum-core" }
 sanctum-service = { path = "../sanctum-service" }
 serde.workspace = true

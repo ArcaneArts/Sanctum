@@ -2523,6 +2523,7 @@ dependencies = [
  "axum",
  "reqwest 0.13.5",
  "rmcp",
+ "rustls",
  "sanctum-core",
  "sanctum-service",
  "serde",

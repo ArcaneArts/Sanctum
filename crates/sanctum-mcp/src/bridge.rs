@@ -71,6 +71,8 @@ pub async fn run_stdio_bridge(endpoint: &str) -> anyhow::Result<()> {
             && url.fragment().is_none(),
         "the local MCP bridge requires a loopback HTTP URL without credentials, query, or fragment"
     );
+    // Building the server and CLI together can unify reqwest's rustls-no-provider feature.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest_mcp::Client::builder()
         .no_proxy()
         .redirect(reqwest_mcp::redirect::Policy::none())

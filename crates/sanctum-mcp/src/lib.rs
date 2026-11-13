@@ -10,7 +10,7 @@ mod tools;
 #[cfg(feature = "bridge")]
 pub use bridge::run_stdio_bridge;
 #[cfg(feature = "http")]
-pub use http::router;
+pub use http::{hosted_router, router};
 
 #[cfg(any(feature = "bridge", feature = "http"))]
 const INSTRUCTIONS: &str = "Search Sanctum collections and cite results by tenant, collection, source ID, revision ID, and byte range.";

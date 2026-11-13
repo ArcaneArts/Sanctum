@@ -151,8 +151,9 @@ ID adopt the winning operation and discard their losing input when possible.
 
 The `ACCEPTED` status can be queried after restart through `GetIngestionJob`.
 A replacement targeting an external reference has an empty `source_id` until
-registration resolves it. Hosted indexing, repair of abandoned input attempts,
-synchronous `UploadText`, retrieval, and MCP remain open.
+registration resolves it. Hosted MCP uses the same acceptance path for inline
+text. Synchronous `UploadText` and abandoned-input reclamation remain open.
+[Hosted MCP](MCP.md#hosted-connection).
 
 ### Hosted revision registration
 

@@ -626,3 +626,18 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   marks the retired catalog, preserves the current generation and
   reader grace, and continues after restart.
 - Abandoned input and extraction candidates still need a cleanup path.
+- Delivered in [PR #39](https://github.com/ArcaneArts/Sanctum/pull/39).
+
+## Hosted MCP ingress
+
+- The object-backed API shares its port between gRPC and stateless MCP.
+  The Cloud Run worker role keeps its separate HTTP task listener.
+- Hosted MCP can create and list collections, durably accept inline
+  text with an optional request UUID, poll ingestion, search one or
+  several collections, and fetch cited ranges. Tools call the same
+  object-backed service as gRPC and preserve the database generation.
+- The MinIO smoke uses two API processes and a separate worker. It
+  verifies request replay across instances, shared gRPC and MCP data,
+  exact UTF-8 ranges, tenant scope, and HTTP/1.1 and h2c on one port.
+- The deployment guide includes an authenticated MCP request. Actual
+  Cloud Run ingress and hosted metadata tools remain open.
