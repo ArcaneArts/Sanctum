@@ -74,12 +74,13 @@ pub(crate) struct Settings {
     pub grpc_port: u16,
     pub mcp_port: u16,
     pub local_worker_concurrency: usize,
-    pub embedding: Option<OllamaSettings>,
+    #[serde(default, deserialize_with = "read_embedding")]
+    pub embedding: Option<EmbeddingConfig>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct OllamaSettings {
+struct LegacyOllamaSettings {
     endpoint: String,
     model: String,
     revision: String,
@@ -87,6 +88,38 @@ pub(crate) struct OllamaSettings {
     timeout_seconds: u64,
     document_prefix: String,
     query_prefix: String,
+}
+
+fn read_embedding<'de, D>(deserializer: D) -> std::result::Result<Option<EmbeddingConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Persisted {
+        Current(EmbeddingConfig),
+        Legacy(LegacyOllamaSettings),
+    }
+    let Some(value) = Option::<Persisted>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    match value {
+        Persisted::Current(config) => Ok(Some(config)),
+        Persisted::Legacy(settings) => serde_json::from_value(serde_json::json!({
+            "provider": "ollama",
+            "endpoint": settings.endpoint,
+            "timeout_seconds": settings.timeout_seconds,
+            "profile": {
+                "model": settings.model,
+                "revision": settings.revision,
+                "dimensions": settings.dimensions,
+                "document_prefix": settings.document_prefix,
+                "query_prefix": settings.query_prefix,
+            }
+        }))
+        .map(Some)
+        .map_err(serde::de::Error::custom),
+    }
 }
 
 #[derive(Serialize)]
@@ -118,35 +151,18 @@ impl Settings {
             self.grpc_port == 0 || self.grpc_port != self.mcp_port,
             "gRPC and MCP must use different ports"
         );
-        let embedding = self.embedding.as_ref().map(|settings| {
-            serde_json::json!({
-                "provider": "ollama",
-                "endpoint": settings.endpoint,
-                "timeout_seconds": settings.timeout_seconds,
-                "profile": {
-                    "model": settings.model,
-                    "revision": settings.revision,
-                    "dimensions": settings.dimensions,
-                    "document_prefix": settings.document_prefix,
-                    "query_prefix": settings.query_prefix,
-                }
-            })
-        });
-        let config = Config::from_json(
+        Config::from_json(
             &serde_json::json!({
                 "version": 1,
                 "storage_root": self.storage_root,
                 "grpc_listen": format!("127.0.0.1:{}", self.grpc_port),
                 "mcp_listen": format!("127.0.0.1:{}", self.mcp_port),
                 "local_worker_concurrency": self.local_worker_concurrency,
-                "embedding": embedding,
+                "embedding": self.embedding,
             })
             .to_string(),
-        )?;
-        if let Some(EmbeddingConfig::Ollama(settings)) = &config.embedding {
-            let _ = sanctum_embedding_ollama::Ollama::new(settings.clone())?;
-        }
-        Ok(config)
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -198,7 +214,9 @@ impl Host {
     }
 
     pub(crate) async fn save_settings(&self, settings: Settings) -> Result<()> {
-        settings.config()?;
+        if let Some(embedding) = settings.config()?.embedding {
+            embedding.validate()?;
+        }
         let mut desired = self.inner.desired.lock().await;
         let path = self.inner.settings_path.clone();
         let persisted = settings.clone();
@@ -440,4 +458,65 @@ fn write_settings(path: &Path, settings: &Settings) -> Result<()> {
     file.as_file().sync_all()?;
     file.persist(path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_existing_ollama_settings_and_accepts_provider_config() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = |embedding| {
+            serde_json::from_value::<Settings>(serde_json::json!({
+                "storage_root": root.path(),
+                "grpc_port": 0,
+                "mcp_port": 0,
+                "local_worker_concurrency": 1,
+                "embedding": embedding
+            }))
+            .unwrap()
+        };
+        let legacy = settings(serde_json::json!({
+            "endpoint": "http://127.0.0.1:11434",
+            "model": "embeddinggemma-2:740m",
+            "revision": "example",
+            "dimensions": 768,
+            "timeout_seconds": 30,
+            "document_prefix": "doc:",
+            "query_prefix": "query:"
+        }));
+        let Some(EmbeddingConfig::Ollama(ollama)) = legacy.config().unwrap().embedding else {
+            panic!("expected the existing Ollama profile");
+        };
+        assert_eq!(ollama.profile.document_prefix, "doc:");
+        assert_eq!(ollama.profile.query_prefix, "query:");
+        let profile = serde_json::json!({"model":"example","revision":"1","dimensions":768});
+        let hosted = settings(serde_json::json!({
+            "provider": "openai",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key_env": "SANCTUM_TEST_EMBEDDINGS",
+            "profile": profile
+        }));
+        let config = hosted.config().unwrap();
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed = Config::from_json(&json).unwrap();
+        let Some(EmbeddingConfig::OpenAi(openai)) = parsed.embedding else {
+            panic!("expected the OpenAI-compatible profile");
+        };
+        assert_eq!(
+            openai.api_key_env.as_deref(),
+            Some("SANCTUM_TEST_EMBEDDINGS")
+        );
+        EmbeddingConfig::OpenAi(openai).validate().unwrap();
+        let google = settings(serde_json::json!({
+            "provider": "google",
+            "project": "sanctum-test",
+            "location": "us-central1",
+            "profile": profile
+        }));
+        let google = google.config().unwrap().embedding.unwrap();
+        assert!(matches!(&google, EmbeddingConfig::Google(_)));
+        google.validate().unwrap();
+    }
 }

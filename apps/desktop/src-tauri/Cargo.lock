@@ -3967,7 +3967,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "sanctum-config",
- "sanctum-embedding-ollama",
  "sanctum-proto",
  "serde",
  "serde_json",

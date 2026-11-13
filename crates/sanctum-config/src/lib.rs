@@ -30,6 +30,23 @@ pub enum EmbeddingConfig {
     Google(sanctum_embedding_google::GoogleConfig),
 }
 
+impl EmbeddingConfig {
+    pub fn validate(&self) -> Result<()> {
+        let result = match self {
+            Self::Ollama(config) => {
+                sanctum_embedding_ollama::Ollama::new(config.clone()).map(|_| ())
+            }
+            Self::OpenAi(config) => {
+                sanctum_embedding_openai::OpenAi::new(config.clone()).map(|_| ())
+            }
+            Self::Google(config) => {
+                sanctum_embedding_google::Vertex::new(config.clone()).map(|_| ())
+            }
+        };
+        result.map_err(|error| Error::Invalid(error.to_string()))
+    }
+}
+
 impl Config {
     pub fn from_json(json: &str) -> Result<Self> {
         let config: Self = serde_json::from_str(json)
