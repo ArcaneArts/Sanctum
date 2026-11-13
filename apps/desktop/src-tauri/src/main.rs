@@ -66,6 +66,7 @@ fn main() {
             commands::create_collection,
             commands::pick_path,
             commands::import_local,
+            commands::upload_file,
             commands::pause_queue,
             commands::retry_job,
             commands::cancel_job,

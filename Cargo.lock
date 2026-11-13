@@ -2401,7 +2401,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "sanctum-core",
  "sanctum-mcp",
  "sanctum-proto",
  "serde",
@@ -2542,6 +2541,8 @@ version = "0.1.0"
 dependencies = [
  "prost",
  "protox",
+ "sanctum-core",
+ "tokio",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

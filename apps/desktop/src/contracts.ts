@@ -15,8 +15,17 @@ export type EmbeddingSettings = {
   | { provider: "google", project: string, location: string }
 )
 
+export type ObjectStorage = {
+  bucket: string
+  prefix: string | null
+} & (
+  | { backend: "s3", region: string, endpoint: string | null, allow_http: boolean, virtual_hosted_style: boolean }
+  | { backend: "gcs" }
+)
+
 export type Settings = {
   storage_root: string
+  object_storage: ObjectStorage | null
   grpc_port: number
   mcp_port: number
   local_worker_concurrency: number
@@ -34,6 +43,8 @@ export type Job = {
   error: string | null
   retryable: boolean
   cancelable: boolean
+  embedding_batch: number | null
+  embedding_retry_at: number | null
 }
 
 export type Overview = {
@@ -41,11 +52,13 @@ export type Overview = {
     phase: "starting" | "running" | "stopping" | "retrying"
     error: string | null
     mcp_url: string | null
+    storage_backend: "filesystem" | ObjectStorage["backend"] | null
+    generation: number
     stdio: { command: string, args: string[] } | null
     restart_pending: boolean
   }
   collections: string[]
-  paused: boolean
+  paused: boolean | null
   jobs: Job[]
   embedding: { enabled: boolean, total: number, embedded: number, failed: number, retrying: number, error: string | null } | null
   api_error: string | null

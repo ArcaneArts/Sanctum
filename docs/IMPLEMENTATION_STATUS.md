@@ -1020,5 +1020,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   that the accepted revision ID survived and the finished hint was removed.
 - A real MinIO and Ollama run recovered a previously accepted job, published a
   synchronous upload, retrieved exact UTF-8 through MCP, and rebuilt embeddings
-  after the configured profile changed. Desktop backend selection is the next
-  integration step.
+  after the configured profile changed.
+- Delivered in [PR #70](https://github.com/ArcaneArts/Sanctum/pull/70).
+
+## Desktop object storage
+
+- Desktop settings select a filesystem folder, S3-compatible storage, or
+  Google Cloud Storage. The Rust host passes object settings to its sidecar,
+  starts its standalone worker, and shows the active gRPC/MCP endpoint.
+- On Apple Silicon, the native settings switched a disposable server from a
+  filesystem folder to live MinIO. The UI created a collection, streamed a
+  file through the native picker, displayed its registered and text-ready
+  states, and measured stored object sizes. gRPC and MCP returned the same
+  41-byte UTF-8 chunk. Google Cloud Storage was checked through configuration
+  tests. Live GCS remains open.
+- `pnpm check` and `pnpm desktop:check` passed. The desktop settings tests
+  cover prior filesystem configuration and both object backend configurations.

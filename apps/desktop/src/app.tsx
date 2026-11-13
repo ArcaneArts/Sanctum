@@ -47,7 +47,12 @@ export function App() {
     async function poll() {
       try {
         const value = await invoke<Overview>("overview", { collection: collection || null })
-        if (active) setOverview(value)
+        if (active) {
+          setOverview(value)
+          if (value.runtime.phase === "running" && !value.api_error && collection && !value.collections.includes(collection)) {
+            setCollection("")
+          }
+        }
       } catch (error) {
         if (active) setOperationError(String(error))
       } finally {
@@ -58,8 +63,13 @@ export function App() {
     return () => { active = false; clearTimeout(timer) }
   }, [collection])
 
+  const mcpUrl = overview?.runtime.mcp_url
+  useEffect(() => { setUsage(null) }, [mcpUrl, overview?.runtime.generation])
+
   const running = overview?.runtime.phase === "running"
-  const target = collection || overview?.collections[0] || ""
+  const filesystem = overview?.runtime.storage_backend === "filesystem"
+  const activeCollection = collection && overview?.collections.includes(collection) ? collection : ""
+  const target = activeCollection || overview?.collections[0] || ""
   const phase = overview?.runtime.phase ?? "starting"
   const warning = operationError || overview?.runtime.error || overview?.api_error
 
@@ -67,6 +77,12 @@ export function App() {
     void run(async () => {
       const path = await invoke<string | null>("pick_path", { folder })
       if (!path) return
+      if (!filesystem) {
+        await invoke("upload_file", { collection: target, path })
+        setNotice("Upload queued")
+        setCollection(target)
+        return
+      }
       let queued = 0
       let unchanged = 0
       let failures = 0
@@ -115,7 +131,7 @@ export function App() {
     <main className="mx-auto w-full max-w-[1080px] px-5 py-7 lg:px-8">
       <header className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-2xl font-semibold tracking-tight">{navigation.find(item => item.id === section)?.label}</h1>
-        {section === "activity" && <Button variant="outline" disabled={!running || busy}
+        {section === "activity" && overview?.paused != null && <Button variant="outline" disabled={!running || busy}
           onClick={() => void run(() => invoke("pause_queue", { paused: !overview?.paused }))}>
           {overview?.paused ? <Play size={15} /> : <Pause size={15} />}
           {overview?.paused ? "Resume queue" : "Pause queue"}
@@ -131,14 +147,14 @@ export function App() {
           <div className="flex items-center gap-2"><Layers size={17} className="text-primary" /><h2 className="font-semibold">Collections</h2></div>
           <div className="flex flex-wrap items-center gap-2">
             <select aria-label="Filter by collection" className="max-w-52 rounded-md border border-border bg-background px-3 py-2 text-sm"
-              value={collection} onChange={event => { setCollection(event.currentTarget.value); setUsage(null) }}>
+              value={activeCollection} onChange={event => { setCollection(event.currentTarget.value); setUsage(null) }}>
               <option value="">All activity</option>
               {overview?.collections.map(id => <option key={id} value={id}>{id}</option>)}
             </select>
-            <Button variant="outline" disabled={!running || !target || busy} onClick={() => importPath(false)}><FilePlus size={15} /> Import file</Button>
-            <Button variant="outline" disabled={!running || !target || busy} onClick={() => importPath(true)}><FolderOpen size={15} /> Import folder</Button>
+            <Button variant="outline" disabled={!running || !target || busy} onClick={() => importPath(false)}><FilePlus size={15} /> {filesystem ? "Import file" : "Upload file"}</Button>
+            {filesystem && <Button variant="outline" disabled={!running || !target || busy} onClick={() => importPath(true)}><FolderOpen size={15} /> Import folder</Button>}
           </div>
-          {!collection && target && <p className="text-xs text-muted-foreground">Imports go to {target}. Select a collection to change the destination.</p>}
+          {!activeCollection && target && <p className="text-xs text-muted-foreground">Files go to {target}. Select a collection to change the destination.</p>}
           <form className="flex max-w-md gap-2" onSubmit={event => {
             event.preventDefault()
             const id = newCollection.trim()
@@ -158,14 +174,18 @@ export function App() {
         <div className="grid gap-4 sm:grid-cols-2">
           <Card className="p-4">
             <div className="flex items-center justify-between gap-2">
-              <h2 className="font-semibold">Storage</h2>
+              <h2 className="font-semibold">Storage
+                {overview?.runtime.storage_backend && <span className="ml-2 text-xs font-normal text-muted-foreground">
+                  {({ filesystem: "Local folder", s3: "S3", gcs: "Google Cloud" })[overview.runtime.storage_backend]}
+                </span>}
+              </h2>
               <Button variant="ghost" size="small" disabled={!running || busy}
-                onClick={() => void run(async () => setUsage(await invoke<Usage>("storage_usage", { collection: collection || null })))}>
+                onClick={() => void run(async () => setUsage(await invoke<Usage>("storage_usage", { collection: activeCollection || null })))}>
                 <RefreshCw size={13} /> Refresh
               </Button>
             </div>
             <p className="mt-2 text-sm text-muted-foreground">
-              {usage ? `${bytes(usage.bytes)} across ${usage.files.toLocaleString()} files` : `Measure ${collection ? collection : "all local storage"}`}
+              {usage ? `${bytes(usage.bytes)} across ${usage.files.toLocaleString()} ${filesystem ? "files" : "objects"}` : `Measure ${activeCollection || "all storage"}`}
             </p>
           </Card>
           <Card className="p-4">
@@ -181,7 +201,7 @@ export function App() {
           </Card>
         </div>
         <Card className="p-4">
-          <h2 className="mb-3 font-semibold">Recent ingestion</h2>
+          <h2 className="mb-3 font-semibold">{filesystem ? "Recent ingestion" : "Ingestion activity"}</h2>
           {!overview?.jobs.length && <p className="text-sm text-muted-foreground">No ingestion activity yet.</p>}
           <ul className="divide-y divide-border">
             {overview?.jobs.map(job => <li key={job.id} className="flex items-start justify-between gap-3 py-3">
@@ -189,6 +209,9 @@ export function App() {
                 <p className="break-all text-sm font-medium">{job.name}</p>
                 <p className="mt-1 text-xs text-muted-foreground">{job.collection} · {job.state} · {bytes(job.processed_bytes)} / {bytes(job.total_bytes)}</p>
                 {job.cancelable && job.total_bytes > 0 && <progress aria-label={`${job.name} ingestion`} className="mt-1 max-w-full" max={job.total_bytes} value={job.processed_bytes} />}
+                {job.embedding_batch != null && <p className="mt-1 text-xs text-muted-foreground">
+                  Embedding batch {job.embedding_batch + 1}{job.embedding_retry_at != null && ` · Retry ${new Date(job.embedding_retry_at * 1000).toLocaleString()}`}
+                </p>}
                 {job.error && <p className="mt-1 break-all text-xs text-amber-200">{job.error}</p>}
               </div>
               {job.retryable && <Button variant="outline" size="small" disabled={busy} onClick={() => actOnJob(job, "retry_job")}>Retry</Button>}

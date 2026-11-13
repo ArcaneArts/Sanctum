@@ -2,8 +2,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, anyhow};
 use clap::{Parser, Subcommand};
-use sanctum_core::UPLOAD_FRAME_BYTES;
-use sanctum_proto::v1::{self, sanctum_client::SanctumClient, upload_text_frame::Frame};
+use sanctum_proto::{
+    upload::send_upload,
+    v1::{self, sanctum_client::SanctumClient},
+};
 use tokio::io::AsyncReadExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Status, metadata::MetadataValue, transport::Endpoint};
@@ -614,18 +616,22 @@ async fn main() -> anyhow::Result<()> {
             let (sender, receiver) = tokio::sync::mpsc::channel(2);
             if background {
                 let request = client.submit_text(ReceiverStream::new(receiver));
-                let (job, ()) = tokio::try_join!(
-                    async { Ok(request.await?.into_inner()) },
-                    send_upload(sender, header, file),
-                )?;
+                let (job, ()) =
+                    tokio::try_join!(async { Ok(request.await?.into_inner()) }, async {
+                        send_upload(sender, header, file)
+                            .await
+                            .context("stream upload file")
+                    },)?;
                 print_job(job);
                 return Ok(());
             }
             let request = client.upload_text(ReceiverStream::new(receiver));
-            let (revision, ()) = tokio::try_join!(
-                async { Ok(request.await?.into_inner()) },
-                send_upload(sender, header, file),
-            )?;
+            let (revision, ()) =
+                tokio::try_join!(async { Ok(request.await?.into_inner()) }, async {
+                    send_upload(sender, header, file)
+                        .await
+                        .context("stream upload file")
+                },)?;
             println!(
                 "{} {} ({} chunks, {} bytes)",
                 revision.source_id, revision.revision_id, revision.chunks, revision.bytes
@@ -896,39 +902,6 @@ fn wire_initial_metadata(metadata: Vec<SourceMetadata>) -> anyhow::Result<Vec<v1
             })
         })
         .collect()
-}
-
-async fn send_upload(
-    sender: tokio::sync::mpsc::Sender<v1::UploadTextFrame>,
-    header: v1::UploadTextHeader,
-    mut file: tokio::fs::File,
-) -> anyhow::Result<()> {
-    sender
-        .send(v1::UploadTextFrame {
-            frame: Some(Frame::Header(header)),
-        })
-        .await?;
-    let mut buffer = vec![0; UPLOAD_FRAME_BYTES];
-    loop {
-        let read = file.read(&mut buffer).await.context("read upload file")?;
-        if read == 0 {
-            sender
-                .send(v1::UploadTextFrame {
-                    frame: Some(Frame::End(v1::UploadTextEnd {})),
-                })
-                .await?;
-            return Ok(());
-        }
-        if sender
-            .send(v1::UploadTextFrame {
-                frame: Some(Frame::Data(buffer[..read].to_vec())),
-            })
-            .await
-            .is_err()
-        {
-            return Err(anyhow!("server closed the upload stream"));
-        }
-    }
 }
 
 fn print_job(job: v1::IngestionJob) {

@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
-use sanctum_config::{Config, EmbeddingConfig};
+use sanctum_config::{Config, EmbeddingConfig, ObjectStorageConfig};
 use sanctum_proto::v1::sanctum_client::SanctumClient;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, menu::MenuItem};
@@ -52,6 +52,7 @@ struct State {
 
 struct Ready {
     listeners: Listeners,
+    storage_backend: &'static str,
     client: SanctumClient<Channel>,
 }
 
@@ -71,6 +72,7 @@ struct Listeners {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Settings {
     pub storage_root: String,
+    pub object_storage: Option<ObjectStorageConfig>,
     pub grpc_port: u16,
     pub mcp_port: u16,
     pub local_worker_concurrency: usize,
@@ -127,6 +129,8 @@ pub(crate) struct RuntimeStatus {
     phase: &'static str,
     error: Option<String>,
     mcp_url: Option<String>,
+    pub(crate) storage_backend: Option<&'static str>,
+    generation: u64,
     stdio: Option<StdioConfig>,
     restart_pending: bool,
 }
@@ -139,24 +143,41 @@ struct StdioConfig {
 
 impl Settings {
     fn config(&self) -> Result<Config> {
-        ensure!(
-            !self.storage_root.trim().is_empty(),
-            "choose a storage folder"
-        );
-        ensure!(
-            Path::new(&self.storage_root).is_absolute(),
-            "storage folder must be an absolute path"
-        );
-        ensure!(
-            self.grpc_port == 0 || self.grpc_port != self.mcp_port,
-            "gRPC and MCP must use different ports"
-        );
+        let object_storage = self.object_storage.as_ref();
+        match object_storage {
+            None => {
+                ensure!(
+                    !self.storage_root.trim().is_empty(),
+                    "choose a storage folder"
+                );
+                ensure!(
+                    Path::new(&self.storage_root).is_absolute(),
+                    "storage folder must be an absolute path"
+                );
+                ensure!(
+                    self.grpc_port == 0 || self.grpc_port != self.mcp_port,
+                    "gRPC and MCP must use different ports"
+                );
+            }
+            Some(ObjectStorageConfig::S3 { bucket, region, .. }) => {
+                ensure!(!bucket.trim().is_empty(), "enter an S3 bucket");
+                ensure!(!region.trim().is_empty(), "enter an S3 region");
+            }
+            Some(ObjectStorageConfig::Gcs { bucket, .. }) => {
+                ensure!(
+                    !bucket.trim().is_empty(),
+                    "enter a Google Cloud Storage bucket"
+                );
+            }
+        }
         Config::from_json(
             &serde_json::json!({
                 "version": 1,
                 "storage_root": self.storage_root,
                 "grpc_listen": format!("127.0.0.1:{}", self.grpc_port),
-                "mcp_listen": format!("127.0.0.1:{}", self.mcp_port),
+                "mcp_listen": object_storage.is_none().then(|| format!("127.0.0.1:{}", self.mcp_port)),
+                "object_storage": object_storage,
+                "standalone_object_worker": object_storage.is_some(),
                 "local_worker_concurrency": self.local_worker_concurrency,
                 "embedding": self.embedding,
             })
@@ -174,6 +195,7 @@ impl Host {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let settings = Settings {
                     storage_root: default_path.to_string_lossy().into_owned(),
+                    object_storage: None,
                     grpc_port: 47550,
                     mcp_port: 47551,
                     local_worker_concurrency: 1,
@@ -244,7 +266,7 @@ impl Host {
         true
     }
 
-    pub(crate) async fn status(&self) -> RuntimeStatus {
+    pub(crate) async fn snapshot(&self) -> (RuntimeStatus, Option<SanctumClient<Channel>>) {
         let generation = self.inner.desired.lock().await.generation;
         let state = self.inner.state.read().await;
         let mcp_url = state
@@ -256,13 +278,19 @@ impl Host {
             command: self.inner.cli.clone(),
             args: ["mcp-stdio".into(), "--mcp-url".into(), url.clone()],
         });
-        RuntimeStatus {
+        let status = RuntimeStatus {
             phase: state.phase,
             error: state.error.clone(),
             mcp_url,
+            storage_backend: state.ready.as_ref().map(|ready| ready.storage_backend),
+            generation: state.generation,
             stdio,
             restart_pending: state.generation != 0 && state.generation != generation,
-        }
+        };
+        (
+            status,
+            state.ready.as_ref().map(|ready| ready.client.clone()),
+        )
     }
 
     pub(crate) async fn client(&self) -> Result<SanctumClient<Channel>> {
@@ -351,7 +379,13 @@ impl Host {
     }
 
     async fn start(&self, settings: Settings) -> Result<Running> {
-        let config = serde_json::to_string(&settings.config()?)?;
+        let config = settings.config()?;
+        let storage_backend = match &config.object_storage {
+            None => "filesystem",
+            Some(ObjectStorageConfig::S3 { .. }) => "s3",
+            Some(ObjectStorageConfig::Gcs { .. }) => "gcs",
+        };
+        let config = serde_json::to_string(&config)?;
         let mut command = Command::new(&self.inner.server);
         command
             .env(sanctum_config::CONFIG_ENV, config)
@@ -395,7 +429,11 @@ impl Host {
                 .connect()
                 .await?;
             let client = SanctumClient::new(client);
-            Ok::<_, anyhow::Error>(Ready { listeners, client })
+            Ok::<_, anyhow::Error>(Ready {
+                listeners,
+                storage_backend,
+                client,
+            })
         })
         .await;
         match ready {
@@ -463,6 +501,40 @@ fn write_settings(path: &Path, settings: &Settings) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_settings_preserve_filesystem_and_enable_the_managed_object_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let old = serde_json::json!({
+            "storage_root": root.path(),
+            "grpc_port": 47550,
+            "mcp_port": 47551,
+            "local_worker_concurrency": 4
+        });
+        let settings: Settings = serde_json::from_value(old.clone()).unwrap();
+        let config = settings.config().unwrap();
+        assert!(config.object_storage.is_none());
+        assert_eq!(config.mcp_listen.unwrap().port(), 47551);
+        assert_eq!(config.local_worker_concurrency, 4);
+        assert!(!config.standalone_object_worker);
+
+        for storage in [
+            serde_json::json!({"backend":"s3", "bucket":"sample", "region":"us-east-1", "prefix":"test", "endpoint":"http://127.0.0.1:9000", "allow_http":true}),
+            serde_json::json!({"backend":"gcs", "bucket":"sample", "prefix":"test"}),
+        ] {
+            let mut value = old.clone();
+            value["object_storage"] = storage;
+            value["mcp_port"] = value["grpc_port"].clone();
+            let settings: Settings = serde_json::from_value(value).unwrap();
+            let config = settings.config().unwrap();
+            assert!(config.object_storage.is_some());
+            assert_eq!(config.grpc_listen, "127.0.0.1:47550".parse().unwrap());
+            assert!(config.mcp_listen.is_none());
+            assert!(config.hosted_worker_listen.is_none());
+            assert!(config.standalone_object_worker);
+            assert_eq!(config.storage_root, root.path());
+        }
+    }
 
     #[test]
     fn preserves_existing_ollama_settings_and_accepts_provider_config() {

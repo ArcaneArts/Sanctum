@@ -3978,6 +3978,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 
@@ -4033,6 +4034,8 @@ version = "0.1.0"
 dependencies = [
  "prost",
  "protox",
+ "sanctum-core",
+ "tokio",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

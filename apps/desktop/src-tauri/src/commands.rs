@@ -1,8 +1,11 @@
-use sanctum_proto::v1;
+use std::path::Path;
+
+use sanctum_proto::{upload::send_upload, v1};
 use serde::Serialize;
 use tauri::{AppHandle, State, ipc::Channel};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::host::{Host, RuntimeStatus, Settings};
 
@@ -12,7 +15,7 @@ type Reply<T> = Result<T, String>;
 pub(crate) struct Overview {
     runtime: RuntimeStatus,
     collections: Vec<String>,
-    paused: bool,
+    paused: Option<bool>,
     jobs: Vec<Job>,
     embedding: Option<Embedding>,
     api_error: Option<String>,
@@ -30,6 +33,8 @@ struct Job {
     error: Option<String>,
     retryable: bool,
     cancelable: bool,
+    embedding_batch: Option<u32>,
+    embedding_retry_at: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -88,47 +93,82 @@ pub(crate) fn apply_settings(host: State<'_, Host>) {
 
 #[tauri::command]
 pub(crate) async fn overview(host: State<'_, Host>, collection: Option<String>) -> Reply<Overview> {
+    let (runtime, client) = host.snapshot().await;
+    let filesystem = runtime.storage_backend == Some("filesystem");
     let mut overview = Overview {
-        runtime: host.status().await,
+        runtime,
         collections: Vec::new(),
-        paused: false,
+        paused: None,
         jobs: Vec::new(),
         embedding: None,
         api_error: None,
     };
-    let Ok(mut client) = host.client().await else {
+    let Some(mut client) = client else {
         return Ok(overview);
     };
     let mut queue_client = client.clone();
-    let mut jobs_client = client.clone();
     let result = tokio::try_join!(
-        client.list_collections(v1::ListCollectionsRequest {
-            tenant: "default".into(),
-            ..Default::default()
-        }),
-        queue_client.get_local_queue(v1::Empty {}),
-        jobs_client.list_ingestion_jobs(v1::ListIngestionJobsRequest {
-            tenant: "default".into(),
-            collection: collection.clone(),
-            limit: Some(25),
-            before_operation_id: None,
-            page_token: None,
-        }),
+        async {
+            let mut collections = Vec::new();
+            let mut after = None;
+            loop {
+                let page = client
+                    .list_collections(v1::ListCollectionsRequest {
+                        tenant: "default".into(),
+                        after,
+                        limit: Some(99),
+                    })
+                    .await?
+                    .into_inner();
+                collections.extend(
+                    page.collections
+                        .into_iter()
+                        .filter_map(|entry| entry.scope.map(|scope| scope.collection)),
+                );
+                match page.next_after {
+                    Some(next) => after = Some(next),
+                    None => return Ok(collections),
+                }
+            }
+        },
+        async {
+            if filesystem {
+                let queue = queue_client
+                    .get_local_queue(v1::Empty {})
+                    .await?
+                    .into_inner();
+                Ok::<_, tonic::Status>(Some(queue.paused))
+            } else {
+                Ok(None)
+            }
+        },
     );
-    let (collections, queue, jobs) = match result {
+    let (collections, queue) = match result {
         Ok(result) => result,
         Err(error) => {
             overview.api_error = Some(error.message().to_owned());
             return Ok(overview);
         }
     };
-    overview.collections = collections
-        .into_inner()
-        .collections
-        .into_iter()
-        .filter_map(|collection| collection.scope.map(|scope| scope.collection))
-        .collect();
-    overview.paused = queue.into_inner().paused;
+    overview.collections = collections;
+    overview.paused = queue;
+    let collection = collection.filter(|id| overview.collections.contains(id));
+    let jobs = match client
+        .list_ingestion_jobs(v1::ListIngestionJobsRequest {
+            tenant: "default".into(),
+            collection: collection.clone(),
+            limit: Some(25),
+            before_operation_id: None,
+            page_token: None,
+        })
+        .await
+    {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            overview.api_error = Some(error.message().to_owned());
+            return Ok(overview);
+        }
+    };
     overview.jobs = jobs
         .into_inner()
         .jobs
@@ -155,13 +195,23 @@ pub(crate) async fn overview(host: State<'_, Host>, collection: Option<String>) 
                 processed_bytes: job.processed_bytes,
                 attempts: job.attempts,
                 error: job.error_message,
-                retryable: job.error_code.as_deref() == Some("retryable"),
+                retryable: job.error_code.as_deref() == Some("retryable")
+                    || (!filesystem
+                        && (matches!(
+                            state,
+                            v1::IngestionState::Accepted | v1::IngestionState::Registered
+                        ) || job.embedding_work.is_some())),
                 cancelable: matches!(
                     state,
                     v1::IngestionState::Accepted
+                        | v1::IngestionState::Registered
                         | v1::IngestionState::Extracting
                         | v1::IngestionState::Indexing
                 ),
+                embedding_batch: job.embedding_work.as_ref().map(|work| work.next_batch),
+                embedding_retry_at: job
+                    .embedding_work
+                    .and_then(|work| work.not_before_unix_seconds),
             }
         })
         .collect();
@@ -271,6 +321,41 @@ pub(crate) async fn import_local(
             })
             .map_err(error)?;
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn upload_file(
+    host: State<'_, Host>,
+    collection: String,
+    path: String,
+) -> Reply<()> {
+    let path = Path::new(&path);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("invalid file name")?;
+    if !tokio::fs::metadata(path).await.map_err(error)?.is_file() {
+        return Err("select a regular file".into());
+    }
+    let file = tokio::fs::File::open(path).await.map_err(error)?;
+    let header = v1::UploadTextHeader {
+        scope: scope(collection),
+        name: name.to_owned(),
+        ..Default::default()
+    };
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    let mut client = host.client().await.map_err(error)?;
+    let (submission, sent) = tokio::join!(
+        client.submit_text(ReceiverStream::new(receiver)),
+        send_upload(sender, header, file),
+    );
+    if let Err(error) = sent
+        && error.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        return Err(format!("read upload file: {error}"));
+    }
+    submission.map_err(|status| status.message().to_owned())?;
     Ok(())
 }
 
