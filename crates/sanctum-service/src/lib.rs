@@ -10,9 +10,11 @@ use sanctum_storage_fs::LocalFiles;
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+mod local_import;
 mod local_jobs;
 mod maintenance;
 mod worker;
+pub use local_import::{ImportEvent, ImportOptions, ImportState};
 pub use worker::{run_local_maintenance, run_local_worker};
 
 use db::queue::LocalQueue;

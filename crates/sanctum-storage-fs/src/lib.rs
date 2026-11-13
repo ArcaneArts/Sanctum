@@ -14,6 +14,9 @@ pub struct LocalFiles {
 }
 
 impl LocalFiles {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
     pub fn open(root: &Path) -> Result<Self> {
         fs::create_dir_all(root)?;
         let root = fs::canonicalize(root)?;

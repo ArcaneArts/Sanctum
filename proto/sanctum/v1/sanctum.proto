@@ -15,6 +15,7 @@ service Sanctum {
   rpc SearchText(SearchTextRequest) returns (SearchTextResponse);
   rpc FetchChunk(FetchChunkRequest) returns (TextHit);
   rpc DeleteSource(DeleteSourceRequest) returns (DeletedSource);
+  rpc ImportLocal(ImportLocalRequest) returns (stream ImportLocalEvent);
 }
 
 message Empty {}
@@ -107,6 +108,34 @@ message DeleteSourceRequest {
 message DeletedSource {
   string source_id = 1;
   string revision_id = 2;
+}
+
+message ImportLocalRequest {
+  Scope scope = 1;
+  // Path on the local server's filesystem.
+  string path = 2;
+  repeated string include = 3;
+  repeated string exclude = 4;
+  bool prune_missing = 5;
+}
+
+enum ImportState {
+  IMPORT_STATE_UNSPECIFIED = 0;
+  IMPORT_STATE_QUEUED = 1;
+  IMPORT_STATE_PENDING = 2;
+  IMPORT_STATE_UNCHANGED = 3;
+  IMPORT_STATE_MISSING = 4;
+  IMPORT_STATE_DELETED = 5;
+  IMPORT_STATE_FAILED = 6;
+}
+
+message ImportLocalEvent {
+  string path = 1;
+  ImportState state = 2;
+  optional string source_id = 3;
+  optional string revision_id = 4;
+  optional string operation_id = 5;
+  optional string message = 6;
 }
 
 message UploadTextEnd {}

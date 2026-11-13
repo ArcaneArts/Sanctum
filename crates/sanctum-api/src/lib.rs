@@ -4,8 +4,12 @@ use sanctum_proto::v1::{
     sanctum_server::{Sanctum, SanctumServer},
     upload_text_frame::Frame,
 };
-use sanctum_service::{ChunkRef, Hit, Job, JobState, Replacement, Service, TextUpload};
+use sanctum_service::{
+    ChunkRef, Hit, ImportEvent, ImportOptions, ImportState, Job, JobState, Replacement, Service,
+    TextUpload,
+};
 use tokio::io::AsyncWriteExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 pub fn grpc(service: Service) -> SanctumServer<Grpc> {
@@ -16,6 +20,42 @@ pub struct Grpc(Service);
 
 #[tonic::async_trait]
 impl Sanctum for Grpc {
+    type ImportLocalStream = ReceiverStream<std::result::Result<v1::ImportLocalEvent, Status>>;
+
+    async fn import_local(
+        &self,
+        request: Request<v1::ImportLocalRequest>,
+    ) -> Reply<Self::ImportLocalStream> {
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        if request.path.is_empty() {
+            return Err(Status::invalid_argument("import path is required"));
+        }
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        let service = self.0.clone();
+        tokio::spawn(async move {
+            let events = sender.clone();
+            let result = work(move || {
+                let options = ImportOptions {
+                    include: request.include,
+                    exclude: request.exclude,
+                    prune_missing: request.prune_missing,
+                };
+                service.import_local(
+                    &scope,
+                    std::path::Path::new(&request.path),
+                    &options,
+                    |event| events.blocking_send(Ok(wire_import(event))).is_ok(),
+                )
+            })
+            .await;
+            if let Err(error) = result {
+                let _ = sender.send(Err(error)).await;
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+
     async fn create_collection(
         &self,
         request: Request<v1::CreateCollectionRequest>,
@@ -363,6 +403,25 @@ fn wire_job(job: Job) -> v1::IngestionJob {
 }
 
 type Reply<T> = std::result::Result<Response<T>, Status>;
+
+fn wire_import(event: ImportEvent) -> v1::ImportLocalEvent {
+    let state = match event.state {
+        ImportState::Queued => v1::ImportState::Queued,
+        ImportState::Pending => v1::ImportState::Pending,
+        ImportState::Unchanged => v1::ImportState::Unchanged,
+        ImportState::Missing => v1::ImportState::Missing,
+        ImportState::Deleted => v1::ImportState::Deleted,
+        ImportState::Failed => v1::ImportState::Failed,
+    };
+    v1::ImportLocalEvent {
+        path: event.path,
+        state: state.into(),
+        source_id: event.source.map(|id| id.to_string()),
+        revision_id: event.revision.map(|id| id.to_string()),
+        operation_id: event.operation.map(|id| id.to_string()),
+        message: event.message,
+    }
+}
 
 async fn work<T: Send + 'static>(
     operation: impl FnOnce() -> Result<T> + Send + 'static,

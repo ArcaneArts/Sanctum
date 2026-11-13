@@ -105,6 +105,17 @@ impl CollectionDb {
         Ok(Self(connection))
     }
 
+    pub fn imported_sources(&self, namespace: &str, after: &str) -> Result<Vec<String>> {
+        query_all(
+            &self.0,
+            "SELECT external_id FROM sources
+             WHERE external_namespace = ?1 AND deleted = 0 AND external_id > ?2
+             ORDER BY external_id LIMIT 128",
+            params![namespace, after],
+            |row| row.get(0),
+        )
+    }
+
     pub fn revision_summary(&self, source: Uuid, revision: Uuid) -> Result<Option<(String, u64)>> {
         self.0
             .query_row(

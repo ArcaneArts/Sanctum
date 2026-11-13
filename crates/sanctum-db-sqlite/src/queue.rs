@@ -56,6 +56,7 @@ pub struct Job {
     pub chunks: Option<u64>,
     pub replacement: bool,
     pub update_sequence: u64,
+    pub import_hash: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -64,7 +65,7 @@ pub struct LocalQueue(PathBuf);
 const COLUMNS: &str = "operation_id, tenant, collection, source_id, revision_id,
     name, external_namespace, external_id, total_bytes, processed_bytes,
     attempts, status, error_code, error_message, content_hash, chunks,
-    replacement, update_sequence";
+    replacement, update_sequence, import_hash";
 
 impl LocalQueue {
     /// The caller holds the storage owner's exclusive lock for this queue.
@@ -72,7 +73,11 @@ impl LocalQueue {
         let mut connection = open(&path, true)?;
         migrate(
             &mut connection,
-            &[include_str!("runtime.sql"), include_str!("runtime_v2.sql")],
+            &[
+                include_str!("runtime.sql"),
+                include_str!("runtime_v2.sql"),
+                include_str!("runtime_v3.sql"),
+            ],
         )?;
         connection
             .execute(
@@ -92,7 +97,7 @@ impl LocalQueue {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
-        if job.replacement {
+        if job.replacement || job.import_hash.is_some() {
             job.update_sequence = transaction
                 .query_row(
                     "INSERT INTO replacement_sequences (tenant, collection, source_id, sequence)
@@ -112,8 +117,8 @@ impl LocalQueue {
             .execute(
                 "INSERT INTO ingestion_jobs (operation_id, tenant, collection, source_id,
                 revision_id, name, external_namespace, external_id, total_bytes,
-                replacement, update_sequence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                replacement, update_sequence, import_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     job.id.to_string(),
                     job.scope.tenant.as_str(),
@@ -125,7 +130,8 @@ impl LocalQueue {
                     external_id,
                     sql_integer(job.bytes)?,
                     job.replacement,
-                    sql_integer(job.update_sequence)?
+                    sql_integer(job.update_sequence)?,
+                    job.import_hash,
                 ],
             )
             .map_err(database_error)?;
@@ -133,7 +139,7 @@ impl LocalQueue {
     }
 
     pub fn is_latest_replacement(&self, job: &Job) -> Result<bool> {
-        if !job.replacement {
+        if job.update_sequence == 0 {
             return Ok(true);
         }
         self.connect()?
@@ -167,6 +173,69 @@ impl LocalQueue {
                 |row| row.get(0),
             )
             .map_err(database_error)
+    }
+
+    pub fn pending_external(
+        &self,
+        scope: &Scope,
+        external: &ExternalSource,
+    ) -> Result<Option<Job>> {
+        self.connect()?.query_row(
+            &format!("SELECT {COLUMNS} FROM ingestion_jobs AS j
+             WHERE j.tenant = ?1 AND j.collection = ?2
+               AND j.external_namespace = ?3 AND j.external_id = ?4
+               AND j.cancel_requested = 0
+               AND (j.status IN ('accepted', 'indexing', 'publishing')
+                    OR (j.status = 'failed' AND j.error_code = 'retryable'))
+               AND (j.update_sequence = 0 OR j.update_sequence = (
+                    SELECT sequence FROM replacement_sequences
+                    WHERE tenant = j.tenant AND collection = j.collection AND source_id = j.source_id
+               ))
+             ORDER BY j.update_sequence DESC, j.created_at DESC, j.operation_id DESC LIMIT 1"),
+            params![scope.tenant.as_str(), scope.collection.as_str(), external.namespace, external.id],
+            map_job,
+        ).optional().map_err(database_error)
+    }
+
+    pub fn pending_import_paths(
+        &self,
+        scope: &Scope,
+        namespace: &str,
+        after: &str,
+    ) -> Result<Vec<String>> {
+        super::query_all(
+            &self.connect()?,
+            "SELECT DISTINCT external_id FROM ingestion_jobs
+             WHERE tenant = ?1 AND collection = ?2 AND external_namespace = ?3 AND external_id > ?4
+               AND import_hash IS NOT NULL AND cancel_requested = 0
+               AND (status IN ('accepted', 'indexing', 'publishing')
+                    OR (status = 'failed' AND error_code = 'retryable'))
+             ORDER BY external_id LIMIT 128",
+            params![
+                scope.tenant.as_str(),
+                scope.collection.as_str(),
+                namespace,
+                after
+            ],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn supersede_import(&self, scope: &Scope, job: &Job) -> Result<bool> {
+        let changed = self
+            .connect()?
+            .execute(
+                "UPDATE replacement_sequences SET sequence = sequence + 1
+             WHERE tenant = ?1 AND collection = ?2 AND source_id = ?3 AND sequence = ?4",
+                params![
+                    scope.tenant.as_str(),
+                    scope.collection.as_str(),
+                    job.source.to_string(),
+                    sql_integer(job.update_sequence)?
+                ],
+            )
+            .map_err(database_error)?;
+        Ok(changed == 1)
     }
 
     pub fn get(&self, scope: &Scope, id: Uuid) -> Result<Job> {
@@ -375,6 +444,7 @@ fn map_job(row: &Row<'_>) -> rusqlite::Result<Job> {
             .transpose()?,
         replacement: row.get(16)?,
         update_sequence: unsigned_column(row, 17)?,
+        import_hash: row.get(18)?,
     })
 }
 

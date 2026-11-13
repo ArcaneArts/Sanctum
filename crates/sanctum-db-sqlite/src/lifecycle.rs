@@ -17,6 +17,7 @@ pub struct SourceIdentity {
     pub source: Uuid,
     pub revision: Uuid,
     pub external: Option<ExternalSource>,
+    pub hash: String,
 }
 
 impl CollectionDb {
@@ -70,10 +71,11 @@ impl RevisionWriter<'_> {
         let source = self
             .0
             .query_row(
-                "SELECT id, current_revision, external_namespace, external_id
-             FROM sources WHERE deleted = 0 AND
-                ((?1 IS NOT NULL AND id = ?1) OR
-                 (?1 IS NULL AND external_namespace = ?2 AND external_id = ?3))",
+                "SELECT s.id, s.current_revision, s.external_namespace, s.external_id, r.content_hash
+             FROM sources s JOIN revisions r ON r.source_id = s.id AND r.id = s.current_revision
+             WHERE s.deleted = 0 AND
+                ((?1 IS NOT NULL AND s.id = ?1) OR
+                 (?1 IS NULL AND s.external_namespace = ?2 AND s.external_id = ?3))",
                 params![id.map(|value| value.to_string()), namespace, external_id],
                 |row| {
                     let reference = key(row)?;
@@ -85,6 +87,7 @@ impl RevisionWriter<'_> {
                         source: reference.source,
                         revision: reference.revision,
                         external,
+                        hash: row.get(4)?,
                     })
                 },
             )

@@ -9,6 +9,7 @@ sanctum-core = { path = "../sanctum-core" }
 sanctum-proto = { path = "../sanctum-proto" }
 sanctum-service = { path = "../sanctum-service" }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
@@ -16,4 +17,3 @@ uuid = { workspace = true }
 [dev-dependencies]
 rusqlite.workspace = true
 tempfile.workspace = true
-tokio-stream.workspace = true
