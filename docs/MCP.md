@@ -39,6 +39,7 @@ local clients. Set `tenant` when operating outside the default tenant.
 | `ingest_text` | Supply `collection`, `name`, and `text` (up to 128 KiB). Optional `external` has `namespace` and `id`. For replacement, set `replace_source_id` and optionally `expected_revision_id`. Returns a durable operation ID. |
 | `ingestion_status` | Supply `collection` and `operation_id`. Reports queue state, processed bytes, attempts, and failure details. |
 | `search` | Supply `collection`, `query`, optional `mode` (default hybrid), optional `metadata_filter`, and optional `limit` (1–10, default 5). Returns excerpts and exact source references, with the strategy used and embedding coverage. |
+| `search_collections` | Supply `collections` with one to eight distinct IDs in the same tenant, `query`, and the same optional arguments as `search`. Returns combined coverage and hits with their original collection IDs. |
 | `fetch_chunk` | Supply `collection`, `source_id`, `revision_id`, and `ordinal` from a hit. Returns the exact UTF-8 excerpt and its half-open byte range. |
 | `get_metadata` | Supply `collection` for collection metadata, both `source_id` and `revision_id` for the current source, or those IDs and `ordinal` for a chunk. Returns up to 64 namespaced entries, subject to the shared 512 KiB value limit. |
 | `mutate_metadata` | Supply the same target as `get_metadata` plus up to 32 `edits`. Each edit uses `namespace`, `key`, and `operation` (`set`, `patch`, or `remove`). Set and patch also take `value`. |

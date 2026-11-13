@@ -1,5 +1,6 @@
 use rusqlite::{OptionalExtension, functions::FunctionFlags, params, params_from_iter};
 use sanctum_core::{Error, Result};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use super::{
@@ -140,7 +141,7 @@ impl CollectionDb {
     pub fn search_vector(
         &self,
         profile: &str,
-        query: Vec<f32>,
+        query: Arc<[f32]>,
         limit: u32,
         filter: Option<&metadata_filter::Filter>,
         collection_metadata: &[metadata::Entry],
@@ -165,7 +166,7 @@ impl CollectionDb {
                     }
                     let score: f64 = bytes
                         .chunks_exact(4)
-                        .zip(&query)
+                        .zip(query.iter())
                         .map(|(bytes, &value)| {
                             f64::from(f32::from_le_bytes(
                                 bytes.try_into().expect("four vector bytes"),

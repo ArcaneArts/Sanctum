@@ -125,7 +125,7 @@ def check(bin_dir):
             http = Rpc(transport)
             http.initialize()
             tools = http.request("tools/list")["tools"]
-            assert len(tools) == 8, tools
+            assert "search_collections" in {tool["name"] for tool in tools}, tools
             http.tool("create_collection", collection="notes")
             http.tool("create_collection", collection="reference")
             first = http.tool("list_collections", limit=1)
@@ -171,6 +171,8 @@ def check(bin_dir):
                 result = stdio.tool("search", collection="notes", query="quartz", metadata_filter=predicate)
                 assert result["mode"] == "lexical" and result["degraded_reason"] == "embedding_disabled"
                 hit, = result["hits"]
+                combined = stdio.tool("search_collections", collections=["reference", "notes"], query="quartz")
+                assert [hit["collection"] for hit in combined["hits"]] == ["notes"], combined
                 reference = {key: hit[key] for key in ("tenant", "collection", "source_id", "revision_id", "ordinal")}
                 exact = stdio.tool("fetch_chunk", **reference)
                 assert exact["excerpt"] == content

@@ -6,7 +6,7 @@ which parts have working implementations and where to find the evidence.
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | End-to-end acceptance in an LLM client |
-| 2. Providers and local integrations | Pending | Hosted provider adapters, rebuilds, watchers, URL and Git imports, metadata queries and cursors, SQL access, multi-collection retrieval, platform packaging and verification |
+| 2. Providers and local integrations | Local profile rebuilds and multi-collection retrieval | Hosted provider adapters, watchers, URL and Git imports, advanced metadata queries and cursors, SQL access, platform packaging and verification |
 | 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
 | 5. Capacity | Pending | Representative 200 MB sources, GB-scale collections and database snapshots, cold/warm cloud performance, measured optimization |
@@ -152,8 +152,7 @@ Merged in [PR #10](https://github.com/ArcaneArts/Sanctum/pull/10).
   `embeddinggemma-2:740m` model, verified two persisted 768-dimensional
   vectors, and ranked a relevant source for a query with no lexical match.
   It also exercised hybrid search.
-- Explicit retry of permanent failures, cross-collection ranking, and
-  capacity measurement remain open.
+- Explicit retry of permanent failures and capacity measurement remain open.
 
 ## Local MCP
 
@@ -185,6 +184,8 @@ Merged in [PR #12](https://github.com/ArcaneArts/Sanctum/pull/12).
 
 ## Desktop tray and first-use flow
 
+Merged in [PR #13](https://github.com/ArcaneArts/Sanctum/pull/13).
+
 - `pnpm devtop` builds server and CLI sidecars and starts the Tauri/React
   app. The host persists settings and owns one server process. It passes
   configuration through the environment and stops the child through its
@@ -203,3 +204,16 @@ Merged in [PR #12](https://github.com/ArcaneArts/Sanctum/pull/12).
   running, and quitting stopped the sidecar.
 - A model-driven client workflow, Windows and Linux tray behavior, and
   release signing and installers remain unverified.
+
+## Search across collections
+
+- gRPC, CLI, and MCP can search up to eight distinct collections in a
+  tenant. Each collection applies the metadata filter before ranking.
+  The service embeds the query at most once and combines ranked lists
+  while retaining the collection ID on each citation.
+- Hybrid retrieval reports partial coverage and includes lexical candidates
+  from collections still waiting for embeddings.
+- The gRPC integration test verifies aggregate coverage, one query
+  embedding per request, stable ranking, metadata filters, and tenant
+  isolation. The standalone MCP check searches multiple collections
+  through the stdio bridge.

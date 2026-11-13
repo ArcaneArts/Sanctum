@@ -15,6 +15,7 @@ service Sanctum {
   rpc GetLocalQueue(Empty) returns (LocalQueueStatus);
   rpc SetLocalQueue(SetLocalQueueRequest) returns (LocalQueueStatus);
   rpc SearchText(SearchTextRequest) returns (SearchTextResponse);
+  rpc SearchCollections(SearchCollectionsRequest) returns (SearchTextResponse);
   rpc FetchChunk(FetchChunkRequest) returns (TextHit);
   rpc DeleteSource(DeleteSourceRequest) returns (DeletedSource);
   rpc ImportLocal(ImportLocalRequest) returns (stream ImportLocalEvent);
@@ -326,6 +327,15 @@ message SearchTextResponse {
   SearchMode mode = 2;
   EmbeddingCoverage embedding_coverage = 3;
   optional string degraded_reason = 4;
+}
+
+message SearchCollectionsRequest {
+  string tenant = 1;
+  repeated string collections = 2;
+  string query = 3;
+  optional uint32 limit = 4;
+  MetadataFilter metadata_filter = 5;
+  SearchMode mode = 6;
 }
 
 message EmbeddingCoverage {
