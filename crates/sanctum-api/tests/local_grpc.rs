@@ -100,6 +100,17 @@ impl Running {
 async fn local_collection_deletion_purges_jobs_and_recovers_from_a_tombstone() {
     let dir = TempDir::new().unwrap();
     let mut api = Running::start(&dir).await;
+    let info = api
+        .client
+        .get_runtime_info(v1::Empty {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (info.status.as_str(), info.storage.as_str()),
+        ("serving", "filesystem")
+    );
+    assert!(info.capabilities.contains(&"local_import".into()));
     create(&mut api.client, "default").await;
     create(&mut api.client, "other").await;
     let uploaded = upload(&mut api.client, header("default"), b"indexed quartz").await;

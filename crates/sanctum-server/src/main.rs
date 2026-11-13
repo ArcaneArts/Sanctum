@@ -31,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(storage) = config.object_storage.take() {
         return hosted::serve(config, storage, embedding).await;
     }
+    let mut runtime = runtime_info(&config, embedding.as_deref());
     let service =
         Service::open_with_embedding(&config.storage_root, config.max_source_bytes, embedding)?
             .with_url_origins(config.url_import_origins)?;
@@ -44,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    runtime.mcp = mcp_listener.is_some();
     let cancellation = CancellationToken::new();
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     let mut workers = tokio::task::JoinSet::new();
@@ -70,7 +72,11 @@ async fn main() -> anyhow::Result<()> {
     let mcp = serve_mcp(mcp_listener, service.clone(), cancellation.child_token());
     tracing::info!(address = %listener.local_addr()?, "Sanctum gRPC listening");
     let grpc = tonic::transport::Server::builder()
-        .add_service(sanctum_api::grpc(service, cancellation.child_token()))
+        .add_service(sanctum_api::grpc_with_runtime(
+            service,
+            cancellation.child_token(),
+            runtime,
+        ))
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
             cancellation.clone().cancelled_owned(),
@@ -99,6 +105,25 @@ async fn main() -> anyhow::Result<()> {
     }
     result?;
     Ok(())
+}
+
+fn runtime_info(
+    config: &Config,
+    embedding: Option<&dyn sanctum_embedding::Provider>,
+) -> sanctum_proto::v1::RuntimeInfo {
+    sanctum_proto::v1::RuntimeInfo {
+        max_source_bytes: config.max_source_bytes,
+        embedding_profile_id: embedding.map(|provider| provider.profile_id().to_owned()),
+        embedding_dimensions: embedding.and_then(|provider| provider.dimensions().try_into().ok()),
+        storage: "filesystem".into(),
+        role: "local".into(),
+        local_worker_concurrency: Some(config.local_worker_concurrency as u32),
+        url_imports: config
+            .url_import_origins
+            .as_ref()
+            .is_none_or(|origins| !origins.is_empty()),
+        ..Default::default()
+    }
 }
 
 async fn shutdown_signal() -> std::io::Result<()> {

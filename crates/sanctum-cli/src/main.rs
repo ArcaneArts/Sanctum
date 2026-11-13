@@ -26,6 +26,8 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:47551/mcp")]
         mcp_url: String,
     },
+    /// Report the API process health and redacted effective settings.
+    Info,
     Create {
         collection: String,
         #[arg(long)]
@@ -432,6 +434,27 @@ async fn main() -> anyhow::Result<()> {
             if failures > 0 {
                 return Err(anyhow!("{failures} import entries failed"));
             }
+        }
+        Command::Info => {
+            let info = client.get_runtime_info(v1::Empty {}).await?.into_inner();
+            println!("Sanctum {} ({}, {})", info.version, info.status, info.role);
+            println!("Storage: {}", info.storage);
+            println!("Source limit: {} bytes", info.max_source_bytes);
+            if let Some(concurrency) = info.local_worker_concurrency {
+                println!("Local workers: {concurrency}");
+            }
+            if let Some(bytes) = info.snapshot_cache_bytes {
+                println!("Snapshot cache: {bytes} bytes");
+            }
+            if let (Some(profile), Some(dimensions)) =
+                (info.embedding_profile_id, info.embedding_dimensions)
+            {
+                println!("Embedding profile: {profile} ({dimensions} dimensions)");
+            }
+            if info.cloud_task_dispatch {
+                println!("Cloud Tasks dispatch enabled");
+            }
+            println!("Capabilities: {}", info.capabilities.join(", "));
         }
         Command::Create {
             collection,

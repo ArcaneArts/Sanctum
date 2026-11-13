@@ -17,6 +17,18 @@ async fn hosted_catalog_recovers_across_server_restart_and_stays_in_scope() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
     let mut state = start(HostedCatalog::new(store.clone(), None, 1024 * 1024).unwrap()).await;
+    let info = state
+        .client
+        .get_runtime_info(v1::Empty {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (info.status.as_str(), info.storage.as_str()),
+        ("serving", "object")
+    );
+    assert!(info.capabilities.contains(&"retrieval".into()));
+    assert!(!info.capabilities.contains(&"local_import".into()));
     let request_id = uuid::Uuid::new_v4().to_string();
     let create =
         |tenant: &str, collection: &str, request_id: Option<String>| v1::CreateCollectionRequest {

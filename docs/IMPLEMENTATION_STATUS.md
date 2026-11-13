@@ -800,3 +800,15 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   clipping at source boundaries, and rejection of oversized budgets.
 - Local stdio and hosted Streamable HTTP smokes verified that the
   context tool returns the same cited hit and exact source text.
+- Delivered in [PR #51](https://github.com/ArcaneArts/Sanctum/pull/51).
+
+## Runtime information
+
+- gRPC and the CLI expose process health, storage mode, effective
+  limits, and feature capabilities. The response constructs an
+  explicit allowlist of fields. Hosted API and worker listeners have
+  HTTP health endpoints. Process health reads do not contact storage or providers.
+- A standalone smoke verified the local and hosted gRPC responses,
+  the CLI, and both hosted health routes with unreachable dependency
+  endpoints. The response omitted configured resource names and
+  credential environment references.
