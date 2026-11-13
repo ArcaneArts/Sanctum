@@ -32,6 +32,21 @@ listener accepts loopback addresses, checks the HTTP Host, and rejects
 requests carrying a browser Origin header. Both transports are for trusted
 local clients. Set `tenant` when operating outside the default tenant.
 
+### Codex CLI
+
+With the local server running, use its active MCP URL. The desktop app shows
+it under **Connect**. For the default local listener, register it with Codex.
+
+```sh
+codex mcp add sanctum --url http://127.0.0.1:47551/mcp
+```
+
+In Codex, ask to search an existing collection, fetch the matching chunk, and
+cite its source ID, revision ID, ordinal, and byte range. The retrieval tools
+advertise MCP's `readOnlyHint` so compatible clients can distinguish them from
+collection creation, ingestion, and metadata changes.
+[Official OpenAI MCP documentation](https://learn.chatgpt.com/docs/mcp#connect-codex-to-an-mcp-server).
+
 ## Hosted connection
 
 An object-backed API process exposes stateless Streamable HTTP at `/mcp`

@@ -289,7 +289,10 @@ struct MetadataUpdate {
 
 #[tool_router]
 impl Tools {
-    #[tool(description = "List a page of collection IDs within a tenant.")]
+    #[tool(
+        description = "List a page of collection IDs within a tenant.",
+        annotations(read_only_hint = true)
+    )]
     async fn list_collections(&self, Parameters(args): Parameters<Collections>) -> CallToolResult {
         let result = async {
             let tenant: ScopeId = args.tenant.parse()?;
@@ -422,7 +425,8 @@ impl Tools {
     }
 
     #[tool(
-        description = "Find a case-sensitive literal in one pending UTF-8 upload. Reports actual scan coverage and exact match ranges."
+        description = "Find a case-sensitive literal in one pending UTF-8 upload. Reports actual scan coverage and exact match ranges.",
+        annotations(read_only_hint = true)
     )]
     async fn scan_pending_text(
         &self,
@@ -468,7 +472,10 @@ impl Tools {
         response(result)
     }
 
-    #[tool(description = "Search one collection and return excerpts with exact source references.")]
+    #[tool(
+        description = "Search one collection and return excerpts with exact source references.",
+        annotations(read_only_hint = true)
+    )]
     async fn search(&self, Parameters(args): Parameters<Search>) -> CallToolResult {
         let result = async {
             let scope = args.scope.scope()?;
@@ -502,7 +509,10 @@ impl Tools {
         response(result)
     }
 
-    #[tool(description = "Read the exact canonical UTF-8 range for a chunk reference from search.")]
+    #[tool(
+        description = "Read the exact canonical UTF-8 range for a chunk reference from search.",
+        annotations(read_only_hint = true)
+    )]
     async fn fetch_chunk(&self, Parameters(args): Parameters<Fetch>) -> CallToolResult {
         let result = async {
             let scope = args.scope.scope()?;
@@ -523,7 +533,10 @@ impl Tools {
         response(result)
     }
 
-    #[tool(description = "Read bounded canonical UTF-8 context around a cited chunk.")]
+    #[tool(
+        description = "Read bounded canonical UTF-8 context around a cited chunk.",
+        annotations(read_only_hint = true)
+    )]
     async fn fetch_context(&self, Parameters(args): Parameters<FetchContext>) -> CallToolResult {
         let result = async {
             let scope = args.chunk.scope.scope()?;
@@ -556,7 +569,8 @@ impl Tools {
     }
 
     #[tool(
-        description = "Search up to eight collections within a single tenant and merge their ranked results."
+        description = "Search up to eight collections within a single tenant and merge their ranked results.",
+        annotations(read_only_hint = true)
     )]
     async fn search_collections(
         &self,
@@ -595,7 +609,10 @@ impl Tools {
         response(result)
     }
 
-    #[tool(description = "Check a durable ingestion operation for progress and errors.")]
+    #[tool(
+        description = "Check a durable ingestion operation for progress and errors.",
+        annotations(read_only_hint = true)
+    )]
     async fn ingestion_status(&self, Parameters(args): Parameters<Operation>) -> CallToolResult {
         let result = async {
             let scope = args.scope.scope()?;
@@ -618,7 +635,8 @@ impl Tools {
     }
 
     #[tool(
-        description = "Read namespaced JSON metadata on a collection, current source, or chunk."
+        description = "Read namespaced JSON metadata on a collection, current source, or chunk.",
+        annotations(read_only_hint = true)
     )]
     async fn get_metadata(&self, Parameters(args): Parameters<Target>) -> CallToolResult {
         let result = async {

@@ -90,6 +90,19 @@ def child(command, **kwargs):
                 raise
 
 
+READ_ONLY_TOOLS = {
+    "list_collections", "ingestion_status", "search", "search_collections",
+    "scan_pending_text", "fetch_chunk", "fetch_context", "get_metadata",
+}
+WRITE_TOOLS = {"create_collection", "ingest_text", "mutate_metadata"}
+
+
+def check_tool_annotations(tools):
+    hints = {tool["name"]: tool.get("annotations", {}).get("readOnlyHint") for tool in tools}
+    assert hints.keys() == READ_ONLY_TOOLS | WRITE_TOOLS, hints
+    assert {name for name, hint in hints.items() if hint is True} == READ_ONLY_TOOLS, hints
+
+
 def check(bin_dir):
     suffix = ".exe" if os.name == "nt" else ""
     server_bin = bin_dir / f"sanctum-server{suffix}"
@@ -129,7 +142,7 @@ def check(bin_dir):
             http = Rpc(transport)
             http.initialize()
             tools = http.request("tools/list")["tools"]
-            assert "search_collections" in {tool["name"] for tool in tools}, tools
+            check_tool_annotations(tools)
             http.tool("create_collection", collection="notes")
             http.tool("create_collection", collection="reference")
             first = http.tool("list_collections", limit=1)
@@ -253,9 +266,7 @@ def check_hosted(bin_dir):
                 assert error.code == 403, (error.code, error.read())
         else:
             raise AssertionError("hosted MCP accepted a browser Origin")
-        tools = {tool["name"] for tool in rpc.request("tools/list")["tools"]}
-        assert tools == {"create_collection", "list_collections", "ingest_text", "ingestion_status",
-                         "search", "search_collections", "scan_pending_text", "fetch_chunk", "fetch_context", "get_metadata", "mutate_metadata"}, tools
+        check_tool_annotations(rpc.request("tools/list")["tools"])
         rpc.tool("create_collection", **scope)
         rpc.tool("create_collection", tenant=scope["tenant"], collection="reference")
         first_page = rpc.tool("list_collections", tenant=scope["tenant"], limit=1)
