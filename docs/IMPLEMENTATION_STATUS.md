@@ -8,7 +8,7 @@ which parts have working implementations and where to find the evidence.
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | End-to-end acceptance in an LLM client |
 | 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, platform packaging and verification |
 | 3. Object storage and publication | Shared storage contract, filesystem and MinIO-tested S3, native GCS adapter, and fenced SQLite snapshot publication for hosted catalog, source, and metadata operations | Live GCS verification and cloud recovery scenarios |
-| 4. Cloud Run and Cloud Tasks | Linux API and worker containers, durable staged uploads, dispatch and repair, scheduled maintenance, and hosted gRPC and MCP | Live IAM, Cloud Run ingress, Tasks and Scheduler delivery, and hosted job controls |
+| 4. Cloud Run and Cloud Tasks | Linux API and worker containers, durable staged uploads, dispatch and repair, scheduled maintenance, and hosted gRPC and MCP | Live IAM, Cloud Run ingress, and Tasks and Scheduler delivery |
 | 5. Capacity | [SQLite snapshot transfer and publication benchmark](CAPACITY.md) | Representative 200 MB sources, GB-scale collections and database snapshots, cold/warm cloud performance, measured optimization |
 
 ## Local text ingestion and retrieval
@@ -951,3 +951,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   that preserves the old revision and its metadata.
 - The live MinIO MCP smoke submits and reads chunk metadata after the
   hosted worker publishes the revision.
+- Delivered in [PR #64](https://github.com/ArcaneArts/Sanctum/pull/64).
+
+## Hosted job activity
+
+- Hosted gRPC and CLI page through retained job records by tenant or
+  collection. The storage cursor is scope-bound and listing work is
+  bounded per request. Deleted collections are excluded.
+- The gRPC test resumes on another instance and checks short and empty
+  pages, tenant isolation, and pending and canceled operation states.
+- Live MinIO and the CLI verify that a hosted continuation survives a
+  restart and returns pending and canceled records across collections.

@@ -14,11 +14,13 @@ use uuid::Uuid;
 
 use crate::{HostedCatalog, RevisionContent, TaskStage, TextUpload};
 
+mod activity;
 mod cancellation;
 mod embedding_tasks;
 mod indexing;
 mod orphan_cleanup;
 
+pub use activity::HostedActivityPage;
 pub use orphan_cleanup::UploadSweep;
 
 const FORMAT: u8 = 1;

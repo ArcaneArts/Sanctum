@@ -94,6 +94,7 @@ impl Sanctum for Grpc {
         let mut capabilities = vec![
             "catalog",
             "upload",
+            "ingestion_activity",
             "source_inspection",
             "retrieval",
             "pending_literal_scan",
@@ -718,22 +719,51 @@ impl Sanctum for Grpc {
             .map(str::parse)
             .transpose()
             .map_err(status)?;
-        let before = parse_optional_id(request.before_operation_id, "invalid activity cursor")?;
-        let service = self.local()?.clone();
-        work(move || {
-            let (jobs, next) = service.activity(
-                &tenant,
-                collection.as_ref(),
-                before,
-                request.limit.unwrap_or(25),
-            )?;
-            Ok(v1::ListIngestionJobsResponse {
-                jobs: jobs.into_iter().map(wire_job).collect(),
-                next_before_operation_id: next.map(|id| id.to_string()),
-            })
-        })
-        .await
-        .map(Response::new)
+        let limit = request.limit.unwrap_or(25);
+        let response = match &self.0 {
+            Backend::Hosted(catalog) => {
+                if request.before_operation_id.is_some() {
+                    return Err(Status::invalid_argument("hosted activity uses page_token"));
+                }
+                let page = catalog
+                    .ingestion_activity(
+                        &tenant,
+                        collection.as_ref(),
+                        request.page_token.as_deref(),
+                        limit,
+                    )
+                    .await
+                    .map_err(status)?;
+                v1::ListIngestionJobsResponse {
+                    jobs: page
+                        .jobs
+                        .into_iter()
+                        .map(|(scope, job)| wire_hosted_job(&scope, job))
+                        .collect(),
+                    next_page_token: page.next,
+                    ..Default::default()
+                }
+            }
+            Backend::Local(service) => {
+                if request.page_token.is_some() {
+                    return Err(Status::invalid_argument(
+                        "local activity uses before_operation_id",
+                    ));
+                }
+                let before =
+                    parse_optional_id(request.before_operation_id, "invalid activity cursor")?;
+                let service = service.clone();
+                let (jobs, next) =
+                    work(move || service.activity(&tenant, collection.as_ref(), before, limit))
+                        .await?;
+                v1::ListIngestionJobsResponse {
+                    jobs: jobs.into_iter().map(wire_job).collect(),
+                    next_before_operation_id: next.map(|id| id.to_string()),
+                    ..Default::default()
+                }
+            }
+        };
+        Ok(Response::new(response))
     }
 
     async fn get_embedding_status(

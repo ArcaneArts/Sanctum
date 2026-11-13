@@ -152,6 +152,16 @@ enum Command {
         collection: String,
         operation_id: String,
     },
+    /// List a page of ingestion activity in this tenant or a collection.
+    Jobs {
+        collection: Option<String>,
+        #[arg(long, default_value_t = 25)]
+        limit: u32,
+        #[arg(long, conflicts_with = "before")]
+        page_token: Option<String>,
+        #[arg(long)]
+        before: Option<String>,
+    },
     Cancel {
         collection: String,
         operation_id: String,
@@ -648,6 +658,34 @@ async fn main() -> anyhow::Result<()> {
                     .await?
                     .into_inner(),
             );
+        }
+        Command::Jobs {
+            collection,
+            limit,
+            page_token,
+            before,
+        } => {
+            let page = client
+                .list_ingestion_jobs(v1::ListIngestionJobsRequest {
+                    tenant: args.tenant.clone(),
+                    collection,
+                    limit: Some(limit),
+                    before_operation_id: before,
+                    page_token,
+                })
+                .await?
+                .into_inner();
+            for job in page.jobs {
+                let scope = job.scope.as_ref().context("server omitted job scope")?;
+                print!("{}/{} ", scope.tenant, scope.collection);
+                print_job(job);
+            }
+            if let Some(next) = page.next_page_token {
+                eprintln!("Next page: --page-token {next}");
+            }
+            if let Some(next) = page.next_before_operation_id {
+                eprintln!("Next page: --before {next}");
+            }
         }
         Command::Cancel {
             collection,
