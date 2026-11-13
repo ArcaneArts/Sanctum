@@ -102,7 +102,11 @@ cargo run --locked -p sanctum-cli -- retry notes OPERATION_ID
 
 Pause prevents new claims and lets active jobs finish. Cancellation can win
 until the worker starts publication. Retry applies to failures marked
-`retryable` and preserves the operation and revision IDs.
+`retryable` and preserves the operation and revision IDs. Local maintenance
+removes completed, canceled, and permanently failed job records 45 days
+after they finish. Pending and retryable jobs remain available. A cursor
+whose job has expired must restart from the newest page. Published source
+bytes and search results follow the independent revision lifecycle.
 
 `SearchText` defaults to lexical search. It matches the supplied words in a
 single chunk using SQLite FTS5 tokenization. Results include byte offsets as
