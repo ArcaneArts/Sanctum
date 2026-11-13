@@ -90,8 +90,8 @@ process. Cloud Run accounts for its writable filesystem in instance
 memory. [Cloud Run container filesystem](https://docs.cloud.google.com/run/docs/container-contract#file_system_access).
 
 The one-row result establishes the cost of full snapshot publication at
-the target size. The next workload should measure realistic source and
-embedding batches before choosing a mutation journal or database split.
+the target size. The multi-GiB source workload below measures real indexing and publication.
+Embedding batches still need separate measurements.
 
 ## Exact vector ranking in SQLite
 
@@ -176,3 +176,46 @@ The cluster usage API listed 4,052 objects totaling 209,418,168 bytes in
 The benchmark covers one process, small active databases, and four active
 writers submitting to a serial worker. It provides no estimate for many
 simultaneously active tenants, large vector queries, or Cloud Run ingress.
+
+## Small edit in a multi-GiB collection
+
+The release benchmark publishes twelve 200 MiB sources to one MinIO-backed
+collection. The files use independently seeded synthetic observations and
+unique search terms near EOF. After restarting the API, it measures the first
+search and three repeats, changes eight bytes near EOF in the final source,
+replaces that source, and verifies the resulting MCP range byte for byte. The
+current source data is 2,516,582,400 bytes (2.34 GiB). Embeddings are disabled.
+
+```sh
+cargo build --release --locked -p sanctum-server -p sanctum-cli
+python3 scripts/benchmark-large-collection.py
+```
+
+Supply a [standalone S3 configuration](STORAGE.md#hosted-server-configuration)
+with a dedicated empty prefix. `--sources` and `--mib` control the fixture.
+The script leaves the published data and snapshot generations in that prefix.
+
+| Measure | Apple M4 Max with loopback MinIO |
+| --- | ---: |
+| First / twelfth source from upload to text ready | 9.38 / 58.83 s |
+| First search after process restart | 4,199.15 ms |
+| Repeated searches | 23.43, 17.32, 34.07 ms |
+| Eight-byte edit from upload to acceptance / text ready | 5.15 / 69.73 s |
+| Canonical bytes returned by MCP fetch | 3,557 |
+| SQLite snapshot before replacement | 685,527,040 bytes |
+| SQLite snapshot after replacement | 743,645,184 bytes |
+| Additional object storage immediately after replacement | 1,638,888,451 bytes |
+
+A separate MinIO listing matched the reported 80 objects and 12,432,584,704
+bytes after replacement. It found 27 SQLite generations totaling
+9,706,274,816 bytes. The eight-byte edit used the ordinary whole-source upload
+and published two full SQLite snapshots for registration and lexical indexing.
+Both previous snapshots and prior source data were still within reader grace.
+The figures describe the storage retained during that window. They do not
+estimate steady-state storage after maintenance or cloud ingress latency.
+
+This workload exposes write amplification before vectors are added. The next
+publication optimization should reduce full-size writes for small changes while
+preserving ordered registration and conditional publication. A durable mutation
+journal remains a candidate and would require crash, replay, and compaction
+measurements at the same collection size.

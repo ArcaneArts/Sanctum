@@ -9,7 +9,7 @@ which parts have working implementations and where to find the evidence.
 | 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, Windows package and tray verification, distribution signing |
 | 3. Object storage and publication | Shared storage contract, filesystem and MinIO-tested S3, native GCS adapter, and fenced SQLite snapshot publication for hosted catalog, source, and metadata operations | Live GCS verification and cloud recovery scenarios |
 | 4. Cloud Run and Cloud Tasks | Linux API and worker containers, durable staged uploads, dispatch and repair, scheduled maintenance, and hosted gRPC and MCP | Live IAM, Cloud Run ingress, and Tasks and Scheduler delivery |
-| 5. Capacity | [200 MiB lexical ingestion and 1–2 GiB snapshot measurements](CAPACITY.md) | Representative GB-scale text and model recall, larger active workloads, cold/warm cloud performance, measured optimization |
+| 5. Capacity | [200 MiB lexical ingestion and 1–2 GiB snapshot measurements](CAPACITY.md) | Representative model recall, larger active workloads, cold/warm cloud performance, measured optimization |
 
 ## Local text ingestion and retrieval
 
@@ -1085,3 +1085,12 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   658.74 ms p50 and 860.10 ms p95. Source identity and tenant isolation held.
 - The measured cluster usage matched a separate MinIO listing across 4,052
   objects. [Method and results](CAPACITY.md#concurrent-collections-among-1000-tenants).
+
+## Multi-GiB collection replacement
+
+- Twelve 200 MiB sources published through the standalone MinIO server.
+  First search after restart took 4.20 s. Three warm searches took 17–34 ms.
+- Changing eight bytes in the final source preserved its ID, replaced the
+  old search hit, and returned the exact new MCP range. Text readiness took
+  69.73 s. Registration and indexing each wrote a complete SQLite snapshot.
+  [Method and measurements](CAPACITY.md#small-edit-in-a-multi-gib-collection).
