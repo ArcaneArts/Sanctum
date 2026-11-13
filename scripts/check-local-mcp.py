@@ -6,12 +6,14 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket
 import subprocess
 import threading
 import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 
 class Rpc:
@@ -51,8 +53,10 @@ class Http:
 
     def post(self, message, **extra_headers):
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        if message["method"] != "initialize":
+            headers["MCP-Protocol-Version"] = "2025-11-25"
         if self.session:
-            headers.update({"Mcp-Session-Id": self.session, "MCP-Protocol-Version": "2025-11-25"})
+            headers["Mcp-Session-Id"] = self.session
         request = urllib.request.Request(self.endpoint, json.dumps(message).encode(),
                                          headers=headers | extra_headers)
         return urllib.request.urlopen(request, timeout=10)
@@ -190,7 +194,113 @@ def check(bin_dir):
     print("MCP HTTP and stdio shared the gRPC data, with metadata, exact UTF-8 ranges, and tenant scope verified.")
 
 
-if __name__ == "__main__":
-    import sys
+@contextlib.contextmanager
+def hosted_process(server, config, cloud_role=None):
+    env = os.environ | {"SANCTUM_MANAGED_STDIO": "1", "NO_COLOR": "1"}
+    if cloud_role:
+        with socket.socket() as port:
+            port.bind(("127.0.0.1", 0))
+            env["PORT"] = str(port.getsockname()[1])
+        config = config | {"cloud_run_role": cloud_role}
+    env["SANCTUM_CONFIG_JSON"] = json.dumps(config)
+    with child([server], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as process:
+        try:
+            addresses = json.loads(process.stdout.readline())
+            yield {key: address.replace("0.0.0.0:", "127.0.0.1:") if address else None
+                   for key, address in addresses.items()}
+        finally:
+            process.stdin.close()
+            assert process.wait(timeout=15) == 0
 
-    check(Path(sys.argv[1] if len(sys.argv) > 1 else "target/debug").resolve())
+
+def check_hosted(bin_dir):
+    """Use a caller-supplied dedicated object storage prefix."""
+    suffix = ".exe" if os.name == "nt" else ""
+    server = bin_dir / f"sanctum-server{suffix}"
+    cli = bin_dir / f"sanctum-cli{suffix}"
+    config = json.loads(os.environ["SANCTUM_CONFIG_JSON"])
+    scope = {"tenant": "hosted-check", "collection": "notes"}
+    text = "Quartz and café notes near the ridge ❄️.\n"
+    request = str(uuid.uuid4())
+
+    with hosted_process(server, config, "worker") as worker, \
+            hosted_process(server, config, "api") as first, \
+            hosted_process(server, config, "api") as second:
+        assert first["grpc"] == first["mcp"] and first["worker"] is None
+        assert second["grpc"] == second["mcp"] and second["worker"] is None
+        assert worker["mcp"] is None and worker["grpc"] is None
+        api = f"http://{first['grpc']}"
+        first_http = Http(f"{api}/mcp")
+        second_http = Http(f"http://{second['mcp']}/mcp")
+        rpc = Rpc(first_http)
+        rpc.initialize()
+        assert first_http.session is None
+        initial = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+        try:
+            first_http.post(initial, Origin="https://untrusted.example")
+        except urllib.error.HTTPError as error:
+            with error:
+                assert error.code == 403, (error.code, error.read())
+        else:
+            raise AssertionError("hosted MCP accepted a browser Origin")
+        tools = {tool["name"] for tool in rpc.request("tools/list")["tools"]}
+        assert tools == {"create_collection", "list_collections", "ingest_text", "ingestion_status",
+                         "search", "search_collections", "fetch_chunk"}, tools
+        rpc.tool("create_collection", **scope)
+        rpc.tool("create_collection", tenant=scope["tenant"], collection="reference")
+        first_page = rpc.tool("list_collections", tenant=scope["tenant"], limit=1)
+        assert first_page["collections"] == ["notes"]
+        assert rpc.tool("list_collections", tenant=scope["tenant"],
+                        after=first_page["next_after"])["collections"] == ["reference"]
+        args = scope | {"name": "notes.md", "text": text, "request_id": request}
+        accepted = rpc.tool("ingest_text", **args)
+        assert accepted["state"] == "accepted" and accepted["operation_id"] == request
+        rpc.exchange = second_http
+        assert rpc.tool("ingest_text", **args) == accepted
+        conflict = rpc.request("tools/call", {"name": "ingest_text", "arguments": args | {"text": "other"}})
+        assert conflict["isError"], conflict
+        job = scope | {"operation_id": request}
+        for stage, state in [("register", "registered"), ("index", "text_ready")]:
+            delivery = urllib.request.Request(f"http://{worker['worker']}/internal/tasks/{stage}-upload",
+                                              json.dumps(job).encode(),
+                                              {"Content-Type": "application/json"})
+            with urllib.request.urlopen(delivery, timeout=30) as response:
+                assert response.status == 204
+            status = rpc.tool("ingestion_status", **job)
+            assert status["state"] == state, status
+
+        result = rpc.tool("search_collections", tenant=scope["tenant"], collections=["notes", "reference"],
+                          query="quartz")
+        assert result["mode"] == "lexical" and result["degraded_reason"] == "embedding_disabled"
+        hit, = result["hits"]
+        assert hit["database_generation"]
+        reference = {key: hit[key] for key in ("tenant", "collection", "source_id", "revision_id", "ordinal")}
+        exact = rpc.tool("fetch_chunk", **reference)
+        assert exact["excerpt"] == text.encode()[exact["start_byte"]:exact["end_byte"]].decode() == text
+        missing = rpc.request("tools/call", {"name": "fetch_chunk",
+                                             "arguments": reference | {"tenant": "other"}})
+        assert missing["isError"], missing
+        grpc = subprocess.run([cli, "--endpoint", api, "--tenant", scope["tenant"], "search", "notes", "quartz"],
+                              check=True, capture_output=True, text=True, timeout=10)
+        assert text.strip() in grpc.stdout, grpc.stdout
+
+        h2_request = {"jsonrpc": "2.0", "id": 8, "method": "tools/list"}
+        response = subprocess.run(
+            ["curl", "--http2-prior-knowledge", "--fail", "--silent", "--show-error", "--max-time", "10",
+             "-H", "Content-Type: application/json", "-H", "Accept: application/json, text/event-stream",
+             "-H", "MCP-Protocol-Version: 2025-11-25", "--data", json.dumps(h2_request), f"{api}/mcp"],
+            check=True, capture_output=True, text=True,
+        )
+        h2_result = json.loads(response.stdout)
+        assert h2_result["id"] == 8 and "tools" in h2_result["result"], h2_result
+    print("Hosted MCP used HTTP/1.1 and h2c on the gRPC port and continued across API processes.")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("bin_dir", default="target/debug", nargs="?", type=Path)
+    parser.add_argument("--hosted", action="store_true", help="read isolated object storage config from SANCTUM_CONFIG_JSON")
+    args = parser.parse_args()
+    (check_hosted if args.hosted else check)(args.bin_dir.resolve())

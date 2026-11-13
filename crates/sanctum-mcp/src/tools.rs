@@ -1,15 +1,17 @@
 use std::io::Write;
 
+use tokio::io::AsyncWriteExt;
+
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
 };
-use sanctum_core::{Error, ExternalSource, Result as SanctumResult, Scope};
+use sanctum_core::{Error, ExternalSource, Result as SanctumResult, Scope, ScopeId};
 use sanctum_service::{
-    ChunkRef, Hit, Job, JobState, MetadataEdit, MetadataEntry, MetadataMutation, Replacement,
-    RevisionTarget, SearchMode, Service, TextUpload,
+    ChunkRef, Hit, HostedCatalog, HostedJob, HostedJobState, Job, JobState, MetadataEdit,
+    MetadataEntry, MetadataMutation, Replacement, RevisionTarget, SearchMode, Service, TextUpload,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -20,29 +22,44 @@ use crate::filter::MetadataFilter;
 const INLINE_LIMIT: usize = 128 * 1024;
 
 #[derive(Clone)]
+enum Backend {
+    Local(Service),
+    Hosted(HostedCatalog),
+}
+
+#[derive(Clone)]
 pub(crate) struct Tools {
-    service: Service,
+    backend: Backend,
     tool_router: ToolRouter<Self>,
 }
 
 impl Tools {
     pub(crate) fn new(service: Service) -> Self {
         Self {
-            service,
+            backend: Backend::Local(service),
             tool_router: Self::tool_router(),
         }
     }
 
-    async fn execute(
-        &self,
-        work: impl FnOnce(Service) -> SanctumResult<Value> + Send + 'static,
-    ) -> CallToolResult {
-        let service = self.service.clone();
-        match tokio::task::spawn_blocking(move || work(service)).await {
-            Ok(result) => response(result),
-            Err(error) => response(Err(Error::Internal(Box::new(error)))),
+    pub(crate) fn hosted(catalog: HostedCatalog) -> Self {
+        let mut tool_router = Self::tool_router();
+        tool_router.remove_route("get_metadata");
+        tool_router.remove_route("mutate_metadata");
+        Self {
+            backend: Backend::Hosted(catalog),
+            tool_router,
         }
     }
+}
+
+async fn local<T: Send + 'static>(
+    service: &Service,
+    work: impl FnOnce(Service) -> SanctumResult<T> + Send + 'static,
+) -> SanctumResult<T> {
+    let service = service.clone();
+    tokio::task::spawn_blocking(move || work(service))
+        .await
+        .map_err(|error| Error::Internal(Box::new(error)))?
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -96,6 +113,8 @@ struct Ingest {
     replace_source_id: Option<String>,
     /// Reject the replacement if the current revision differs.
     expected_revision_id: Option<String>,
+    /// Optional hosted request UUID. Retry with the same UUID and identical input.
+    request_id: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -213,8 +232,8 @@ struct MetadataUpdate {
 impl Tools {
     #[tool(description = "List a page of collection IDs within a tenant.")]
     async fn list_collections(&self, Parameters(args): Parameters<Collections>) -> CallToolResult {
-        self.execute(move |service| {
-            let tenant = args.tenant.parse()?;
+        let result = async {
+            let tenant: ScopeId = args.tenant.parse()?;
             let after = args.after.as_deref().map(str::parse).transpose()?;
             let limit = args.limit.unwrap_or(25);
             if !(1..=99).contains(&limit) {
@@ -222,7 +241,22 @@ impl Tools {
                     "collection limit must be between 1 and 99".into(),
                 ));
             }
-            let mut ids = service.list_collections_page(&tenant, after.as_ref(), limit + 1)?;
+            let mut ids = match &self.backend {
+                Backend::Local(service) => {
+                    local(service, {
+                        let tenant = tenant.clone();
+                        move |service| {
+                            service.list_collections_page(&tenant, after.as_ref(), limit + 1)
+                        }
+                    })
+                    .await?
+                }
+                Backend::Hosted(catalog) => {
+                    catalog
+                        .list_collections(&tenant, after.as_ref(), limit + 1)
+                        .await?
+                }
+            };
             let next = if ids.len() > limit as usize {
                 ids.pop();
                 ids.last().cloned()
@@ -230,26 +264,40 @@ impl Tools {
                 None
             };
             Ok(json!({"tenant": tenant.as_str(), "collections": ids, "next_after": next}))
-        })
-        .await
+        }
+        .await;
+        response(result)
     }
 
     #[tool(description = "Create a collection to hold searchable text in a tenant.")]
     async fn create_collection(&self, Parameters(args): Parameters<Collection>) -> CallToolResult {
-        self.execute(move |service| {
+        let result = async {
             let scope = args.scope()?;
-            service.create_collection(&scope)?;
+            match &self.backend {
+                Backend::Local(service) => {
+                    local(service, {
+                        let scope = scope.clone();
+                        move |service| service.create_collection(&scope)
+                    })
+                    .await?
+                }
+                Backend::Hosted(catalog) => catalog.create_collection(&scope, None).await?,
+            }
             Ok(scope_value(&scope))
-        })
-        .await
+        }
+        .await;
+        response(result)
     }
 
     #[tool(description = "Queue inline UTF-8 text for indexing and return a durable operation ID.")]
     async fn ingest_text(&self, Parameters(args): Parameters<Ingest>) -> CallToolResult {
-        self.execute(move |service| {
+        let result = async {
             let scope = args.scope.scope()?;
-            if args.text.len() > INLINE_LIMIT || args.text.len() as u64 > service.max_source_bytes()
-            {
+            let max_source_bytes = match &self.backend {
+                Backend::Local(service) => service.max_source_bytes(),
+                Backend::Hosted(catalog) => catalog.max_source_bytes(),
+            };
+            if args.text.len() > INLINE_LIMIT || args.text.len() as u64 > max_source_bytes {
                 return Err(Error::Invalid(
                     "text exceeds the inline or configured source limit".into(),
                 ));
@@ -273,22 +321,41 @@ impl Tools {
                     })
                 })
                 .transpose()?;
-            let upload = service.stage_upload(
-                scope,
-                TextUpload {
-                    name: args.name,
-                    external: args.external.map(|external| ExternalSource {
-                        namespace: external.namespace,
-                        id: external.id,
-                    }),
-                    replacement,
-                    retain_original: false,
-                },
-            )?;
-            upload.reopen()?.write_all(args.text.as_bytes())?;
-            Ok(job_value(upload.enqueue()?))
-        })
-        .await
+            let upload = TextUpload {
+                name: args.name,
+                external: args.external.map(|external| ExternalSource {
+                    namespace: external.namespace,
+                    id: external.id,
+                }),
+                replacement,
+                retain_original: false,
+            };
+            let request = args.request_id.as_deref().map(id).transpose()?;
+            match &self.backend {
+                Backend::Local(service) => {
+                    if request.is_some() {
+                        return Err(Error::Invalid(
+                            "request ID is supported on hosted ingestion".into(),
+                        ));
+                    }
+                    local(service, move |service| {
+                        let upload = service.stage_upload(scope, upload)?;
+                        upload.reopen()?.write_all(args.text.as_bytes())?;
+                        Ok(job_value(upload.enqueue()?))
+                    })
+                    .await
+                }
+                Backend::Hosted(catalog) => {
+                    let staged = catalog.stage_upload(scope.clone(), upload, request).await?;
+                    let mut file = tokio::fs::File::from_std(staged.reopen()?);
+                    file.write_all(args.text.as_bytes()).await?;
+                    file.flush().await?;
+                    Ok(hosted_job_value(&scope, staged.enqueue().await?))
+                }
+            }
+        }
+        .await;
+        response(result)
     }
 
     #[tool(description = "Search one collection and return excerpts with exact source references.")]
@@ -300,7 +367,11 @@ impl Tools {
                 return Err(Error::Invalid("search limit must be between 1 and 10".into()));
             }
             let filter = args.metadata_filter.map(TryInto::try_into).transpose()?;
-            let result = self.service.retrieve(scope.clone(), args.query, limit, filter, args.mode.unwrap_or(Mode::Hybrid).into()).await?;
+            let mode = args.mode.unwrap_or(Mode::Hybrid).into();
+            let result = match &self.backend {
+                Backend::Local(service) => service.retrieve(scope.clone(), args.query, limit, filter, mode).await?,
+                Backend::Hosted(catalog) => catalog.retrieve(scope.clone(), args.query, limit, filter, mode).await?,
+            };
             let mode = match result.mode {
                 SearchMode::Lexical => "lexical",
                 SearchMode::Semantic => "semantic",
@@ -323,16 +394,27 @@ impl Tools {
 
     #[tool(description = "Read the exact canonical UTF-8 range for a chunk reference from search.")]
     async fn fetch_chunk(&self, Parameters(args): Parameters<Fetch>) -> CallToolResult {
-        self.execute(move |service| {
+        let result = async {
             let scope = args.scope.scope()?;
             let reference = ChunkRef {
                 source: id(&args.source_id)?,
                 revision: id(&args.revision_id)?,
                 ordinal: args.ordinal,
             };
-            Ok(hit_value(&scope, service.fetch(&scope, &reference)?))
-        })
-        .await
+            let hit = match &self.backend {
+                Backend::Local(service) => {
+                    local(service, {
+                        let scope = scope.clone();
+                        move |service| service.fetch(&scope, &reference)
+                    })
+                    .await?
+                }
+                Backend::Hosted(catalog) => catalog.fetch(&scope, reference).await?,
+            };
+            Ok(hit_value(&scope, hit))
+        }
+        .await;
+        response(result)
     }
 
     #[tool(
@@ -349,10 +431,12 @@ impl Tools {
             }
             let collections = args.collections.iter().map(|id| id.parse()).collect::<SanctumResult<_>>()?;
             let filter = args.metadata_filter.map(TryInto::try_into).transpose()?;
-            let result = self.service.retrieve_collections(
-                args.tenant.parse()?, collections, args.query, limit, filter,
-                args.mode.unwrap_or(Mode::Hybrid).into(),
-            ).await?;
+            let tenant: ScopeId = args.tenant.parse()?;
+            let mode = args.mode.unwrap_or(Mode::Hybrid).into();
+            let result = match &self.backend {
+                Backend::Local(service) => service.retrieve_collections(tenant, collections, args.query, limit, filter, mode).await?,
+                Backend::Hosted(catalog) => catalog.retrieve_collections(tenant, collections, args.query, limit, filter, mode).await?,
+            };
             let mode = match result.mode {
                 SearchMode::Lexical => "lexical",
                 SearchMode::Semantic => "semantic",
@@ -375,22 +459,42 @@ impl Tools {
 
     #[tool(description = "Check a durable ingestion operation for progress and errors.")]
     async fn ingestion_status(&self, Parameters(args): Parameters<Operation>) -> CallToolResult {
-        self.execute(move |service| {
+        let result = async {
             let scope = args.scope.scope()?;
-            Ok(job_value(service.job(&scope, id(&args.operation_id)?)?))
-        })
-        .await
+            let operation = id(&args.operation_id)?;
+            match &self.backend {
+                Backend::Local(service) => {
+                    local(service, move |service| {
+                        Ok(job_value(service.job(&scope, operation)?))
+                    })
+                    .await
+                }
+                Backend::Hosted(catalog) => Ok(hosted_job_value(
+                    &scope,
+                    catalog.ingestion_job(&scope, operation).await?,
+                )),
+            }
+        }
+        .await;
+        response(result)
     }
 
     #[tool(
         description = "Read namespaced JSON metadata on a collection, current source, or chunk."
     )]
     async fn get_metadata(&self, Parameters(args): Parameters<Target>) -> CallToolResult {
-        self.execute(move |service| {
-            let scope = args.scope.scope()?;
-            metadata_value(service.metadata(&scope, args.revision()?, None)?)
-        })
-        .await
+        let Backend::Local(service) = &self.backend else {
+            return response(Err(Error::Invalid(
+                "metadata tools require local storage".into(),
+            )));
+        };
+        response(
+            local(service, move |service| {
+                let scope = args.scope.scope()?;
+                metadata_value(service.metadata(&scope, args.revision()?, None)?)
+            })
+            .await,
+        )
     }
 
     #[tool(description = "Atomically set, merge-patch, or remove namespaced JSON metadata.")]
@@ -398,24 +502,31 @@ impl Tools {
         &self,
         Parameters(args): Parameters<MetadataUpdate>,
     ) -> CallToolResult {
-        self.execute(move |service| {
-            let scope = args.target.scope.scope()?;
-            let edits: Vec<_> = args
-                .edits
-                .into_iter()
-                .map(|edit| MetadataMutation {
-                    namespace: edit.namespace,
-                    key: edit.key,
-                    edit: match edit.edit {
-                        Edit::Set { value } => MetadataEdit::Set(value),
-                        Edit::Patch { value } => MetadataEdit::Patch(value),
-                        Edit::Remove => MetadataEdit::Remove,
-                    },
-                })
-                .collect();
-            metadata_value(service.metadata(&scope, args.target.revision()?, Some(&edits))?)
-        })
-        .await
+        let Backend::Local(service) = &self.backend else {
+            return response(Err(Error::Invalid(
+                "metadata tools require local storage".into(),
+            )));
+        };
+        response(
+            local(service, move |service| {
+                let scope = args.target.scope.scope()?;
+                let edits: Vec<_> = args
+                    .edits
+                    .into_iter()
+                    .map(|edit| MetadataMutation {
+                        namespace: edit.namespace,
+                        key: edit.key,
+                        edit: match edit.edit {
+                            Edit::Set { value } => MetadataEdit::Set(value),
+                            Edit::Patch { value } => MetadataEdit::Patch(value),
+                            Edit::Remove => MetadataEdit::Remove,
+                        },
+                    })
+                    .collect();
+                metadata_value(service.metadata(&scope, args.target.revision()?, Some(&edits))?)
+            })
+            .await,
+        )
     }
 }
 
@@ -459,9 +570,32 @@ fn job_value(job: Job) -> Value {
     })
 }
 
+fn hosted_job_value(scope: &Scope, job: HostedJob) -> Value {
+    let (state, failure) = match job.state {
+        HostedJobState::Accepted => ("accepted", None),
+        HostedJobState::Registered => ("registered", None),
+        HostedJobState::TextReady => ("text_ready", None),
+        HostedJobState::Failed { code, message } => {
+            ("failed", Some(json!({"code": code, "message": message})))
+        }
+    };
+    json!({
+        "scope": scope_value(scope),
+        "operation_id": job.operation.to_string(),
+        "source_id": job.source.map(|source| source.to_string()),
+        "revision_id": job.revision.to_string(),
+        "state": state,
+        "total_bytes": job.bytes,
+        "processed_bytes": if job.content.is_some() { job.bytes } else { 0 },
+        "update_sequence": job.update_sequence,
+        "created_at_unix_seconds": job.created_at,
+        "failure": failure,
+    })
+}
+
 fn hit_value(scope: &Scope, hit: Hit) -> Value {
     let chunk = hit.chunk;
-    json!({
+    let mut value = json!({
         "tenant": scope.tenant.as_str(),
         "collection": scope.collection.as_str(),
         "source_id": chunk.reference.source.to_string(),
@@ -474,7 +608,11 @@ fn hit_value(scope: &Scope, hit: Hit) -> Value {
         "external": chunk.external.map(|source| json!({"namespace": source.namespace, "id": source.id})),
         "excerpt": hit.excerpt,
         "score": hit.score,
-    })
+    });
+    if let Some(generation) = hit.database_generation {
+        value["database_generation"] = json!(generation);
+    }
+    value
 }
 
 fn metadata_value(entries: Vec<MetadataEntry>) -> SanctumResult<Value> {

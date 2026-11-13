@@ -173,13 +173,22 @@ cargo run --locked -p sanctum-cli -- --endpoint "$API_URL" \
   upload notes ./notes.md --background --request-id "$request_id"
 cargo run --locked -p sanctum-cli -- --endpoint "$API_URL" job notes "$request_id"
 cargo run --locked -p sanctum-cli -- --endpoint "$API_URL" search notes 'known term'
+curl --fail-with-body --http2 "$API_URL/mcp" \
+  -H "Authorization: Bearer $SANCTUM_GRPC_ID_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-11-25' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 unset SANCTUM_GRPC_ID_TOKEN
 ```
 
-The CLI adds the ID token only on HTTPS connections. This guide covers
-the hosted lexical path. Set the same embedding configuration on both
-roles to enable background embedding of new revisions. Hosted MCP
-remains open.
+The CLI adds the ID token only on HTTPS connections. The gRPC service
+and stateless MCP endpoint share the API listener. Cloud Run forwards
+requests to it over cleartext HTTP/2. Authorized callers can use the
+same token with an HTTPS MCP client. Set the same embedding configuration
+on both roles to enable background embedding of new revisions.
+[Cloud Run HTTP/2](https://docs.cloud.google.com/run/docs/configuring/http2),
+[MCP client setup](MCP.md#hosted-connection).
 The [storage guide](STORAGE.md) documents the worker stages, retry behavior,
 and MinIO configuration. Live Cloud Run, GCS, and IAM verification requires
 an authorized deployment environment.
