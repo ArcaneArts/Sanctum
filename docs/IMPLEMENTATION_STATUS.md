@@ -1009,3 +1009,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - The earlier macOS desktop smoke separately exercised the directory picker,
   persisted settings, the tray, and the managed sidecar. See
   [Codex CLI connection steps](MCP.md#codex-cli).
+
+## Standalone object-backed worker
+
+- Set `standalone_object_worker` to process durable object-backed uploads in
+  the same server as gRPC and MCP. The worker uses the existing publication
+  fences and stage receipts, runs embedding profile discovery and maintenance,
+  and resumes accepted jobs from persisted hints.
+- A hosted fixture restarted between registration and indexing and verified
+  that the accepted revision ID survived and the finished hint was removed.
+- A real MinIO and Ollama run recovered a previously accepted job, published a
+  synchronous upload, retrieved exact UTF-8 through MCP, and rebuilt embeddings
+  after the configured profile changed. Desktop backend selection is the next
+  integration step.

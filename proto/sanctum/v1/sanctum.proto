@@ -64,6 +64,7 @@ message RuntimeInfo {
   bool url_imports = 13;
   uint32 chunk_window_bytes = 14;
   uint32 chunk_overlap_bytes = 15;
+  bool standalone_object_worker = 16;
 }
 
 message DatabaseTarget {

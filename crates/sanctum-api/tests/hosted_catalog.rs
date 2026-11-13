@@ -2680,6 +2680,75 @@ async fn dispatch_reconciliation_recovers_a_failed_handoff_and_advances_its_curs
 }
 
 #[tokio::test]
+async fn standalone_worker_resumes_hosted_hints_without_an_external_dispatcher() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let first = catalog();
+    first.create_collection(&scope, None).await.unwrap();
+    let mut server = start(first).await;
+    let id = uuid::Uuid::from_u128(100);
+    let header = v1::UploadTextHeader {
+        scope: Some(v1::Scope {
+            tenant: "default".into(),
+            collection: "notes".into(),
+        }),
+        name: "resumed.txt".into(),
+        request_id: Some(id.to_string()),
+        ..Default::default()
+    };
+    let accepted = server
+        .client
+        .submit_text(upload_frames(&header, [b"resume me".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(accepted.state(), v1::IngestionState::Accepted);
+    server.stop().await;
+
+    let worker = catalog().with_standalone_worker(Arc::new(tokio::sync::Notify::new()));
+    let stopped = worker
+        .work_standalone_shard(0, None, || true)
+        .await
+        .unwrap();
+    assert_eq!((stopped.dispatched, stopped.failed), (0, 0));
+    let registered = worker
+        .work_standalone_shard(0, None, || false)
+        .await
+        .unwrap();
+    assert_eq!((registered.dispatched, registered.failed), (1, 0));
+    assert!(matches!(
+        worker.ingestion_job(&scope, id).await.unwrap().state,
+        sanctum_service::HostedJobState::Registered
+    ));
+    drop(worker);
+
+    let worker = catalog().with_standalone_worker(Arc::new(tokio::sync::Notify::new()));
+    let indexed = worker
+        .work_standalone_shard(0, None, || false)
+        .await
+        .unwrap();
+    assert_eq!((indexed.dispatched, indexed.failed), (1, 0));
+    let ready = worker.ingestion_job(&scope, id).await.unwrap();
+    assert!(matches!(
+        ready.state,
+        sanctum_service::HostedJobState::TextReady
+    ));
+    assert_eq!(ready.revision.to_string(), accepted.revision_id);
+    let idle = worker
+        .work_standalone_shard(0, None, || false)
+        .await
+        .unwrap();
+    assert_eq!((idle.dispatched, idle.failed), (0, 0));
+    let key = Key::parse(format!("_dispatch/00/pending/default/notes/{id}")).unwrap();
+    assert!(matches!(storage.head(&key).await, Err(Error::NotFound(_))));
+}
+
+#[tokio::test]
 async fn hosted_job_status_reports_a_persisted_embedding_delay() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());

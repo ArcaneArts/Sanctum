@@ -360,29 +360,11 @@ impl HostedCatalog {
         let Some((mut record, version)) = self.read_operation(&prefix, operation).await? else {
             return Ok(false);
         };
-        let (stage, not_before) = match record.stage {
-            Stage::PendingRegistration => (TaskStage::Register, None),
-            Stage::PendingIndexing { .. } => (TaskStage::Index, None),
-            Stage::TextReady {
-                embedding: Some(embedding),
-                ..
-            } => (
-                TaskStage::Embed {
-                    step: embedding.step,
-                },
-                embedding.not_before,
-            ),
-            Stage::TextReady {
-                embedding: None, ..
-            }
-            | Stage::Canceled { .. }
-            | Stage::Failed { .. } => {
-                if matches!(record.stage, Stage::Canceled { .. } | Stage::Failed { .. }) {
-                    self.discard_input(&prefix, &record).await?;
-                }
-                self.clear_dispatch_hint(scope, operation).await?;
-                return Ok(false);
-            }
+        let Some((stage, not_before)) = self
+            .pending_upload_task(scope, operation, &prefix, &record)
+            .await?
+        else {
+            return Ok(false);
         };
         let now = unix_seconds()?;
         let window =
@@ -413,6 +395,73 @@ impl HostedCatalog {
             Ok(_) | Err(Error::Conflict(_)) => Ok(true),
             Err(error) => Err(error),
         }
+    }
+
+    pub(crate) async fn work_standalone_upload(
+        &self,
+        scope: &Scope,
+        operation: Uuid,
+    ) -> Result<bool> {
+        let prefix = self.operation_prefix(scope, operation)?;
+        let Some((record, _)) = self.read_operation(&prefix, operation).await? else {
+            return Ok(false);
+        };
+        let Some((stage, not_before)) = self
+            .pending_upload_task(scope, operation, &prefix, &record)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if let Some(not_before) = not_before
+            && unix_seconds()? < not_before
+        {
+            return Ok(false);
+        }
+        match stage {
+            TaskStage::Register => {
+                self.register_upload(scope, operation).await?;
+            }
+            TaskStage::Index => {
+                self.index_upload(scope, operation).await?;
+            }
+            TaskStage::Embed { step } => self.embed_upload(scope, operation, step).await?,
+            TaskStage::Rebuild { .. } => unreachable!("rebuilds use separate records"),
+        }
+        Ok(true)
+    }
+
+    async fn pending_upload_task(
+        &self,
+        scope: &Scope,
+        operation: Uuid,
+        prefix: &Key,
+        record: &Operation,
+    ) -> Result<Option<(TaskStage, Option<u64>)>> {
+        let task = match record.stage {
+            Stage::PendingRegistration => (TaskStage::Register, None),
+            Stage::PendingIndexing { .. } => (TaskStage::Index, None),
+            Stage::TextReady {
+                embedding: Some(embedding),
+                ..
+            } => (
+                TaskStage::Embed {
+                    step: embedding.step,
+                },
+                embedding.not_before,
+            ),
+            Stage::TextReady {
+                embedding: None, ..
+            }
+            | Stage::Canceled { .. }
+            | Stage::Failed { .. } => {
+                if matches!(record.stage, Stage::Canceled { .. } | Stage::Failed { .. }) {
+                    self.discard_input(prefix, record).await?;
+                }
+                self.clear_dispatch_hint(scope, operation).await?;
+                return Ok(None);
+            }
+        };
+        Ok(Some(task))
     }
 
     async fn discard_input(&self, prefix: &Key, record: &Operation) -> Result<()> {
@@ -530,7 +579,7 @@ impl HostedUpload {
         let condition = match self.service.read_envelope(&prefix, self.operation).await? {
             Some((Envelope::Accepted(saved), _)) => {
                 let job = saved.replay(&candidate)?;
-                if self.service.dispatcher.is_some()
+                if (self.service.dispatcher.is_some() || self.service.standalone_wake.is_some())
                     && matches!(
                         job.state,
                         HostedJobState::Accepted | HostedJobState::Registered

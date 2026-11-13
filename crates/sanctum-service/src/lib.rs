@@ -48,7 +48,7 @@ pub use embedding::{CollectionSearchResult, SearchMode, run_embedding_worker};
 pub use git_import::{GitImportEvent, GitRepository};
 pub use hosted_catalog::{DEFAULT_SNAPSHOT_CACHE_BYTES, HostedCatalog};
 pub use hosted_database::HostedDatabaseSession;
-pub use hosted_dispatch::{Dispatch, ReconcilePage, Task, TaskStage};
+pub use hosted_dispatch::{DISPATCH_SHARDS, Dispatch, ReconcilePage, Task, TaskStage};
 pub use hosted_ingestion::{
     HostedActivityPage, HostedEmbeddingWork, HostedJob, HostedJobState, HostedUpload, UploadSweep,
 };

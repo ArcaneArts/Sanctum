@@ -37,7 +37,7 @@ impl HostedCatalog {
     /// Discover collections from their manifests. The worker resolves the active catalog
     /// and current collection snapshot only when it runs a batch.
     pub async fn discover_profile_rebuild(&self) -> Result<RebuildPage> {
-        if self.dispatcher.is_none() {
+        if self.dispatcher.is_none() && self.standalone_wake.is_none() {
             return Ok(RebuildPage {
                 discovered: 0,
                 complete: true,
@@ -176,6 +176,31 @@ impl HostedCatalog {
             Ok(_) | Err(Error::Conflict(_)) => Ok(true),
             Err(error) => Err(error),
         }
+    }
+
+    pub(crate) async fn work_standalone_rebuild(
+        &self,
+        scope: &Scope,
+        operation: Uuid,
+    ) -> Result<bool> {
+        if self.embedding.is_none() {
+            return Ok(false);
+        }
+        let Some((_, record, _)) = self.current_rebuild(scope, operation).await? else {
+            self.clear_hint(scope, operation, true).await?;
+            return Ok(false);
+        };
+        let Some(step) = record.step else {
+            self.clear_hint(scope, operation, true).await?;
+            return Ok(false);
+        };
+        if let Some(not_before) = record.not_before
+            && unix_seconds()? < not_before
+        {
+            return Ok(false);
+        }
+        self.run_profile_rebuild(scope, operation, step).await?;
+        Ok(true)
     }
 
     pub async fn run_profile_rebuild(

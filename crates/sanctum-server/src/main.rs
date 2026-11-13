@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 mod cloud_tasks;
 mod hosted;
 mod hosted_worker;
+mod standalone_worker;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

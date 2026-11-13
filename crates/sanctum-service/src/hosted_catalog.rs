@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use sanctum_core::{ChunkSettings, Error, Result, Scope, ScopeId, UsageMeasurement, UsageScope};
 use sanctum_db::{Command, Publication, SnapshotCache, Unit, collection_prefix, tenant_prefix};
 use sanctum_storage::{Key, Storage};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::{Dispatch, db};
@@ -18,6 +19,7 @@ pub struct HostedCatalog {
     pub(crate) publication: Publication,
     pub(crate) snapshots: Arc<SnapshotCache>,
     pub(crate) dispatcher: Option<Arc<dyn Dispatch>>,
+    pub(crate) standalone_wake: Option<Arc<Notify>>,
     pub(crate) embedding: Option<Arc<dyn sanctum_embedding::Provider>>,
 }
 
@@ -39,6 +41,7 @@ impl HostedCatalog {
             publication,
             snapshots: Arc::new(SnapshotCache::new(DEFAULT_SNAPSHOT_CACHE_BYTES)),
             dispatcher: None,
+            standalone_wake: None,
             embedding: None,
         })
     }
