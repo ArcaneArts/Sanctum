@@ -8,11 +8,14 @@ rust-version.workspace = true
 sanctum-api = { path = "../sanctum-api" }
 sanctum-config = { path = "../sanctum-config" }
 sanctum-embedding-ollama = { path = "../sanctum-embedding-ollama" }
+sanctum-mcp = { path = "../sanctum-mcp", features = ["http"] }
 sanctum-proto = { path = "../sanctum-proto" }
 sanctum-service = { path = "../sanctum-service" }
 anyhow = { workspace = true }
+axum.workspace = true
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util.workspace = true
 tonic = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing = { workspace = true }

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use sanctum_config::{Config, EmbeddingConfig};
 use sanctum_service::{Service, run_embedding_worker, run_local_maintenance, run_local_worker};
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -19,6 +20,16 @@ async fn main() -> anyhow::Result<()> {
     let service =
         Service::open_with_embedding(&config.storage_root, config.max_source_bytes, embedding)?;
     let listener = tokio::net::TcpListener::bind(config.grpc_listen).await?;
+    let mcp_listener = if let Some(address) = config.mcp_listen {
+        anyhow::ensure!(
+            address.ip().is_loopback(),
+            "the local MCP listener requires a loopback address"
+        );
+        Some(tokio::net::TcpListener::bind(address).await?)
+    } else {
+        None
+    };
+    let cancellation = CancellationToken::new();
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..config.local_worker_concurrency {
@@ -26,23 +37,60 @@ async fn main() -> anyhow::Result<()> {
     }
     workers.spawn(run_embedding_worker(service.clone(), shutdown.clone()));
     workers.spawn(run_local_maintenance(service.clone(), shutdown));
+
+    if let Some(listener) = &mcp_listener {
+        tracing::info!(address = %listener.local_addr()?, "Sanctum MCP listening");
+    }
+    let mcp = serve_mcp(mcp_listener, service.clone(), cancellation.child_token());
     tracing::info!(address = %listener.local_addr()?, "Sanctum gRPC listening");
-    let result = tonic::transport::Server::builder()
+    let grpc = tonic::transport::Server::builder()
         .add_service(sanctum_api::grpc(service))
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
-            async {
-                if let Err(error) = tokio::signal::ctrl_c().await {
-                    tracing::error!(%error, "cannot listen for Ctrl-C");
-                    std::future::pending::<()>().await;
-                }
-            },
-        )
-        .await;
-    let _ = stop.send(true);
+            cancellation.clone().cancelled_owned(),
+        );
+    tokio::pin!(grpc, mcp);
+    let result = tokio::select! {
+        result = &mut grpc => {
+            cancellation.cancel();
+            let _ = stop.send(true);
+            result.map_err(anyhow::Error::from).and(mcp.await)
+        }
+        result = &mut mcp => {
+            cancellation.cancel();
+            let _ = stop.send(true);
+            result.and(grpc.await.map_err(anyhow::Error::from))
+        }
+        signal = tokio::signal::ctrl_c() => {
+            cancellation.cancel();
+            let _ = stop.send(true);
+            let (grpc, mcp) = tokio::join!(grpc, mcp);
+            signal.map_err(anyhow::Error::from).and(grpc.map_err(anyhow::Error::from)).and(mcp)
+        }
+    };
     while let Some(result) = workers.join_next().await {
         result?;
     }
     result?;
+    Ok(())
+}
+
+async fn serve_mcp(
+    listener: Option<tokio::net::TcpListener>,
+    service: Service,
+    cancellation: CancellationToken,
+) -> anyhow::Result<()> {
+    if let Some(listener) = listener {
+        let router = sanctum_mcp::router(
+            service,
+            listener.local_addr()?.ip(),
+            cancellation.child_token(),
+        );
+        axum::serve(listener, router)
+            .with_graceful_shutdown(cancellation.cancelled_owned())
+            .await?;
+    } else {
+        cancellation.cancelled().await;
+    }
     Ok(())
 }

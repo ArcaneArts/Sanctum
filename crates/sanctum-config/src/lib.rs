@@ -12,6 +12,8 @@ pub struct Config {
     pub storage_root: PathBuf,
     #[serde(default = "default_grpc")]
     pub grpc_listen: SocketAddr,
+    #[serde(default = "default_mcp")]
+    pub mcp_listen: Option<SocketAddr>,
     #[serde(default = "default_max_source")]
     pub max_source_bytes: u64,
     #[serde(default = "default_worker_concurrency")]
@@ -54,6 +56,10 @@ impl Config {
 
 fn default_grpc() -> SocketAddr {
     ([127, 0, 0, 1], 47550).into()
+}
+
+fn default_mcp() -> Option<SocketAddr> {
+    Some(([127, 0, 0, 1], 47551).into())
 }
 
 fn default_max_source() -> u64 {

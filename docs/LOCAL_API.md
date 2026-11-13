@@ -14,6 +14,7 @@ SANCTUM_CONFIG_JSON='{"version":1,"storage_root":"./local-data"}' \
 `grpc_listen` defaults to `127.0.0.1:47550`. `max_source_bytes` defaults to
 1 GiB. This local service trusts callers. Keep it on loopback for local use.
 `local_worker_concurrency` defaults to one and accepts 1 to 32 workers.
+See [Local MCP](MCP.md) for the server's Streamable HTTP and stdio interfaces.
 
 In another terminal, create a collection, upload a UTF-8 or RTF file, and search:
 
