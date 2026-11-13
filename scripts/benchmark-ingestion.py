@@ -30,10 +30,10 @@ WORDS = (
 )
 
 
-def make_input(path, size):
-    rng = random.Random(20261113)
+def make_input(path, size, *, seed=20261113, tail=TAIL):
+    rng = random.Random(seed)
     with path.open("wb") as file:
-        remaining = size - len(TAIL)
+        remaining = size - len(tail)
         i = 0
         while remaining:
             lines = []
@@ -46,7 +46,7 @@ def make_input(path, size):
                 block = text + b" " * (remaining - len(text))
             file.write(block)
             remaining -= len(block)
-        file.write(TAIL)
+        file.write(tail)
     assert path.stat().st_size == size
 
 
