@@ -366,6 +366,8 @@ message UploadTextHeader {
   bool retain_original = 5;
   // Optional nonzero UUID for replaying hosted submissions within a collection.
   optional string request_id = 6;
+  // Namespaced JSON values attached to the new source revision on publication.
+  repeated MetadataEntry source_metadata = 7;
 }
 
 message Replacement {

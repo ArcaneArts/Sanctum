@@ -203,6 +203,7 @@ impl Service {
                     external: Some(external),
                     replacement: None,
                     retain_original,
+                    initial_metadata: Vec::new(),
                 },
             )?;
             let output = staged.reopen()?;

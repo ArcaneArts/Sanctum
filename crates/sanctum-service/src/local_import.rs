@@ -251,6 +251,7 @@ impl Service {
                 external: Some(external.clone()),
                 replacement: None,
                 retain_original,
+                initial_metadata: Vec::new(),
             },
         )?;
         let mut input = File::open(path)?;

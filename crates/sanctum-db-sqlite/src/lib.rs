@@ -525,6 +525,22 @@ impl<T: Deref<Target = Connection>> RevisionWrite<T> {
         Ok(())
     }
 
+    pub fn set_initial_metadata(
+        &self,
+        revision: &Revision,
+        edits: &[metadata::Mutation],
+    ) -> Result<()> {
+        if !edits.is_empty() {
+            let target = metadata::RevisionTarget {
+                source: revision.source,
+                revision: revision.revision,
+                ordinal: None,
+            };
+            metadata::revision_entries(&self.0, target, Some(edits))?;
+        }
+        Ok(())
+    }
+
     fn register_source(&self, data: &Revision) -> Result<()> {
         self.reject_deleted(data.source)?;
         let namespace = data.external.as_ref().map(|external| &external.namespace);

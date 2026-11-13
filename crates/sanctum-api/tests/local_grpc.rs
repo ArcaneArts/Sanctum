@@ -1951,6 +1951,7 @@ fn header(tenant: &str) -> v1::UploadTextFrame {
             replacement: None,
             retain_original: false,
             request_id: None,
+            source_metadata: Vec::new(),
         })),
     }
 }
@@ -3182,6 +3183,97 @@ fn rtf_header(retain_original: bool, external_id: &str) -> v1::UploadTextFrame {
         header.retain_original = retain_original;
     }
     request
+}
+
+#[tokio::test]
+async fn local_upload_metadata_publishes_with_replacement_after_restart() {
+    let dir = TempDir::new().unwrap();
+    let entry = |key: &str, value: &str| v1::MetadataEntry {
+        namespace: "integration".into(),
+        key: key.into(),
+        value_json: value.into(),
+    };
+    let with_metadata = |mut frame: v1::UploadTextFrame, metadata| {
+        if let Some(Frame::Header(header)) = &mut frame.frame {
+            header.source_metadata = metadata;
+        }
+        frame
+    };
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    let first = upload(
+        &mut running.client,
+        with_metadata(header("default"), vec![entry("old", "true")]),
+        b"old quartz",
+    )
+    .await;
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: true })
+        .await
+        .unwrap();
+    let replacement = with_metadata(
+        replacement(Some(&first.source_id), Some(&first.revision_id)),
+        vec![entry("new", "[1,null]")],
+    );
+    let accepted = running
+        .client
+        .submit_text(tokio_stream::iter([
+            replacement,
+            data(b"new quartz"),
+            end(),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    let target = v1::MetadataTarget {
+        scope: scope("default"),
+        source_id: Some(first.source_id.clone()),
+        revision_id: Some(first.revision_id.clone()),
+        ..Default::default()
+    };
+    assert_eq!(
+        running
+            .client
+            .get_metadata(target.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .entries,
+        vec![entry("old", "true")]
+    );
+    running.stop().await;
+    let mut running = Running::start(&dir).await;
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: false })
+        .await
+        .unwrap();
+    await_ready(&mut running.client, job_request(accepted.operation_id)).await;
+    let current = v1::MetadataTarget {
+        revision_id: Some(accepted.revision_id),
+        ..target.clone()
+    };
+    assert_eq!(
+        running
+            .client
+            .get_metadata(current)
+            .await
+            .unwrap()
+            .into_inner()
+            .entries,
+        vec![entry("new", "[1,null]")]
+    );
+    assert_eq!(
+        running
+            .client
+            .get_metadata(target)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    running.stop().await;
 }
 
 #[tokio::test]

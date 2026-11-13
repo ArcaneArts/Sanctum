@@ -1290,6 +1290,19 @@ async fn read_upload_header(
         }),
         replacement,
         retain_original: header.retain_original,
+        initial_metadata: header
+            .source_metadata
+            .into_iter()
+            .map(|entry| {
+                Ok(sanctum_service::MetadataMutation {
+                    namespace: entry.namespace,
+                    key: entry.key,
+                    edit: sanctum_service::MetadataEdit::Set(parse_metadata_json(
+                        &entry.value_json,
+                    )?),
+                })
+            })
+            .collect::<std::result::Result<_, Status>>()?,
     };
     let request_id = parse_optional_id(header.request_id, "invalid request ID")?;
     Ok((scope, upload, request_id))

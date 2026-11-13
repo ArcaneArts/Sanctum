@@ -259,7 +259,9 @@ def check_hosted(bin_dir):
         assert first_page["collections"] == ["notes"]
         assert rpc.tool("list_collections", tenant=scope["tenant"],
                         after=first_page["next_after"])["collections"] == ["reference"]
-        args = scope | {"name": "notes.md", "text": text, "request_id": request}
+        initial_metadata = {"namespace": "field", "key": "labels", "value": ["original", None]}
+        args = scope | {"name": "notes.md", "text": text, "request_id": request,
+                        "source_metadata": [initial_metadata]}
         accepted = rpc.tool("ingest_text", **args)
         assert accepted["state"] == "accepted" and accepted["operation_id"] == request
         rpc.exchange = second_http
@@ -296,6 +298,8 @@ def check_hosted(bin_dir):
         assert entry["level"] == "collection" and json.loads(entry["value_json"]) == edit["value"]
         assert hit["database_generation"] and not hit["metadata_omitted"]
         reference = {key: hit[key] for key in ("tenant", "collection", "source_id", "revision_id", "ordinal")}
+        source_ref = {key: value for key, value in reference.items() if key != "ordinal"}
+        assert rpc.tool("get_metadata", **source_ref)["entries"] == [initial_metadata]
         exact = rpc.tool("fetch_chunk", **reference)
         context = rpc.tool("fetch_context", **reference)
         assert context["text"] == text and context["hit"] == exact

@@ -928,3 +928,15 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   the gRPC stream cancels an in-flight range read in the storage fixture.
 - The hosted MCP smoke on live MinIO returns the exact UTF-8 byte range
   of a literal before any indexing task has run.
+- Delivered in [PR #62](https://github.com/ArcaneArts/Sanctum/pull/62).
+
+## Source metadata on upload
+
+- Upload headers and MCP deposits accept namespaced JSON source metadata.
+  Local queue records and hosted envelopes carry it through restart.
+  SQLite commits the metadata and lexical publication together.
+- Local integration verifies that the previous metadata stays visible
+  until replacement publication. Hosted integration verifies restart,
+  replay with reordered metadata, and rejection of changed replay values.
+- Live MinIO verifies that metadata submitted through one hosted MCP
+  process is visible after the worker publishes the revision.

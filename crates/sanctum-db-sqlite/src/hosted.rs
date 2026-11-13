@@ -183,11 +183,13 @@ pub fn publish_revision(
     objects: &RevisionObjects,
     replacement: bool,
     profile: Option<&str>,
+    initial_metadata: &[crate::metadata::Mutation],
     add_chunks: impl FnOnce(&crate::RevisionWrite<&rusqlite::Connection>) -> Result<()>,
 ) -> Result<()> {
     let writer = crate::RevisionWrite(&**tx);
     add_chunks(&writer)?;
     writer.register(revision, replacement, profile)?;
+    writer.set_initial_metadata(revision, initial_metadata)?;
     tx.execute(
         "INSERT INTO hosted_revision_objects (source_id, revision_id, text_key, original_key)
          VALUES (?1, ?2, ?3, ?4)",
