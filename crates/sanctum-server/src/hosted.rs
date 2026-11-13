@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) async fn serve(
     address: SocketAddr,
+    worker_address: Option<SocketAddr>,
     config: ObjectStorageConfig,
     max_source_bytes: u64,
 ) -> anyhow::Result<()> {
@@ -39,28 +40,66 @@ pub(crate) async fn serve(
     )?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
+    let worker = if let Some(worker_address) = worker_address {
+        Some(tokio::net::TcpListener::bind(worker_address).await?)
+    } else {
+        None
+    };
+    let worker_address = worker
+        .as_ref()
+        .map(tokio::net::TcpListener::local_addr)
+        .transpose()?;
     if crate::managed() {
-        println!("{}", serde_json::json!({"grpc": address, "mcp": null}));
+        println!(
+            "{}",
+            serde_json::json!({"grpc": address, "mcp": null, "worker": worker_address})
+        );
     }
     tracing::info!(%address, "Sanctum object-backed gRPC listening");
+    if let Some(worker_address) = worker_address {
+        tracing::info!(%worker_address, "Sanctum hosted worker listening");
+    }
+
     let cancellation = CancellationToken::new();
-    let shutdown = cancellation.clone();
-    tonic::transport::Server::builder()
-        .add_service(sanctum_api::hosted_grpc(catalog, cancellation))
+    let grpc = tonic::transport::Server::builder()
+        .add_service(sanctum_api::hosted_grpc(
+            catalog.clone(),
+            cancellation.child_token(),
+        ))
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
-            async move {
-                tokio::select! {
-                    result = tokio::signal::ctrl_c() => {
-                        if let Err(error) = result {
-                            tracing::warn!(%error, "could not listen for shutdown signal");
-                        }
-                    }
-                    _ = crate::host_shutdown() => {}
-                }
-                shutdown.cancel();
-            },
-        )
-        .await?;
-    Ok(())
+            cancellation.clone().cancelled_owned(),
+        );
+    let worker = async {
+        if let Some(worker) = worker {
+            axum::serve(worker, crate::hosted_worker::router(catalog))
+                .with_graceful_shutdown(cancellation.clone().cancelled_owned())
+                .await?;
+        } else {
+            cancellation.cancelled().await;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let shutdown = async {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = crate::host_shutdown() => Ok(()),
+        }
+    };
+    tokio::pin!(grpc, worker);
+    tokio::select! {
+        result = &mut grpc => {
+            cancellation.cancel();
+            result.map_err(anyhow::Error::from).and(worker.await)
+        }
+        result = &mut worker => {
+            cancellation.cancel();
+            result.and(grpc.await.map_err(anyhow::Error::from))
+        }
+        signal = shutdown => {
+            cancellation.cancel();
+            let (grpc, worker) = tokio::join!(grpc, worker);
+            signal.map_err(anyhow::Error::from).and(grpc.map_err(anyhow::Error::from)).and(worker)
+        }
+    }
 }

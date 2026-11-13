@@ -8,8 +8,8 @@ use sanctum_proto::v1::{
     upload_text_frame::Frame,
 };
 use sanctum_service::{
-    AcceptedUpload, ChunkRef, GitRepository, Hit, HostedCatalog, ImportEvent, ImportOptions,
-    ImportState, Job, JobState, Replacement, Service, TextUpload, WatchedFolder,
+    ChunkRef, GitRepository, Hit, HostedCatalog, HostedJob, HostedJobState, ImportEvent,
+    ImportOptions, ImportState, Job, JobState, Replacement, Service, TextUpload, WatchedFolder,
 };
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -568,7 +568,7 @@ impl Sanctum for Grpc {
                 .parse()
                 .map_err(|_| Status::invalid_argument("invalid operation ID"))?;
             let accepted = catalog.ingestion_job(&scope, id).await.map_err(status)?;
-            return Ok(Response::new(wire_accepted(&scope, accepted)));
+            return Ok(Response::new(wire_hosted_job(&scope, accepted)));
         }
         job_action(self.local()?, request, Service::job).await
     }
@@ -859,7 +859,7 @@ async fn submit_hosted(
     let file = staged.reopen().map_err(status)?;
     receive_upload(&mut stream, file, catalog.max_source_bytes()).await?;
     let accepted = staged.enqueue().await.map_err(status)?;
-    Ok(wire_accepted(&scope, accepted))
+    Ok(wire_hosted_job(&scope, accepted))
 }
 
 async fn read_upload_header(
@@ -975,7 +975,14 @@ fn text_revision(job: &Job) -> Option<v1::TextRevision> {
     })
 }
 
-fn wire_accepted(scope: &Scope, job: AcceptedUpload) -> v1::IngestionJob {
+fn wire_hosted_job(scope: &Scope, job: HostedJob) -> v1::IngestionJob {
+    let (state, error_code, error_message) = match job.state {
+        HostedJobState::Accepted => (v1::IngestionState::Accepted, None, None),
+        HostedJobState::Registered => (v1::IngestionState::Registered, None, None),
+        HostedJobState::Failed { code, message } => {
+            (v1::IngestionState::Failed, Some(code), Some(message))
+        }
+    };
     v1::IngestionJob {
         scope: Some(wire_scope(scope)),
         operation_id: job.operation.to_string(),
@@ -986,7 +993,10 @@ fn wire_accepted(scope: &Scope, job: AcceptedUpload) -> v1::IngestionJob {
         name: job.name,
         external: job.external.map(wire_external),
         total_bytes: job.bytes,
-        state: v1::IngestionState::Accepted.into(),
+        state: state.into(),
+        error_code,
+        error_message,
+        update_sequence: job.update_sequence,
         created_at_unix_seconds: job.created_at,
         ..Default::default()
     }

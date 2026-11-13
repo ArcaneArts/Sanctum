@@ -1,4 +1,4 @@
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use sanctum_core::{Error, ExternalSource, GitProvenance, Result};
 use uuid::Uuid;
 
@@ -72,45 +72,52 @@ impl CollectionDb {
     }
 }
 
+pub(super) fn find_source(
+    connection: &Connection,
+    id: Option<Uuid>,
+    external: Option<&ExternalSource>,
+) -> Result<SourceIdentity> {
+    let namespace = external.map(|value| value.namespace.as_str());
+    let external_id = external.map(|value| value.id.as_str());
+    let source = connection
+        .query_row(
+            "SELECT s.id, s.current_revision, s.external_namespace, s.external_id,
+                    COALESCE(r.original_hash, r.content_hash), r.retain_original, r.extractor IS NOT NULL, r.git_provenance
+         FROM sources s JOIN revisions r ON r.source_id = s.id AND r.id = s.current_revision
+         WHERE s.deleted = 0 AND
+            ((?1 IS NOT NULL AND s.id = ?1) OR
+             (?1 IS NULL AND s.external_namespace = ?2 AND s.external_id = ?3))",
+            params![id.map(|value| value.to_string()), namespace, external_id],
+            |row| {
+                let reference = key(row)?;
+                let external = match (row.get(2)?, row.get(3)?) {
+                    (Some(namespace), Some(id)) => Some(ExternalSource { namespace, id }),
+                    _ => None,
+                };
+                Ok(SourceIdentity {
+                    source: reference.source,
+                    revision: reference.revision,
+                    external,
+                    hash: row.get(4)?,
+                    retain_original: row.get(5)?,
+                    extracted: row.get(6)?,
+                    git: read_json(row, 7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(database_error)?
+        .ok_or_else(|| Error::NotFound("source was not found".into()))?;
+    Ok(source)
+}
+
 impl RevisionWriter<'_> {
     pub fn find_source(
         &self,
         id: Option<Uuid>,
         external: Option<&ExternalSource>,
     ) -> Result<SourceIdentity> {
-        let namespace = external.map(|value| value.namespace.as_str());
-        let external_id = external.map(|value| value.id.as_str());
-        let source = self
-            .0
-            .query_row(
-                "SELECT s.id, s.current_revision, s.external_namespace, s.external_id,
-                        COALESCE(r.original_hash, r.content_hash), r.retain_original, r.extractor IS NOT NULL, r.git_provenance
-             FROM sources s JOIN revisions r ON r.source_id = s.id AND r.id = s.current_revision
-             WHERE s.deleted = 0 AND
-                ((?1 IS NOT NULL AND s.id = ?1) OR
-                 (?1 IS NULL AND s.external_namespace = ?2 AND s.external_id = ?3))",
-                params![id.map(|value| value.to_string()), namespace, external_id],
-                |row| {
-                    let reference = key(row)?;
-                    let external = match (row.get(2)?, row.get(3)?) {
-                        (Some(namespace), Some(id)) => Some(ExternalSource { namespace, id }),
-                        _ => None,
-                    };
-                    Ok(SourceIdentity {
-                        source: reference.source,
-                        revision: reference.revision,
-                        external,
-                        hash: row.get(4)?,
-                        retain_original: row.get(5)?,
-                        extracted: row.get(6)?,
-                        git: read_json(row, 7)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(database_error)?
-            .ok_or_else(|| Error::NotFound("source was not found".into()))?;
-        Ok(source)
+        find_source(&self.0, id, external)
     }
 
     pub(super) fn replace_current(&self, data: &Revision) -> Result<()> {

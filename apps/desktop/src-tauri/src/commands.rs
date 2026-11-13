@@ -140,6 +140,7 @@ pub(crate) async fn overview(host: State<'_, Host>, collection: Option<String>) 
                 name: job.name,
                 state: match state {
                     v1::IngestionState::Accepted => "Queued",
+                    v1::IngestionState::Registered => "Registered",
                     v1::IngestionState::Extracting => "Extracting",
                     v1::IngestionState::Indexing => "Indexing",
                     v1::IngestionState::Publishing => "Publishing",

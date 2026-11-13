@@ -7,6 +7,7 @@ use sanctum_core::{ByteRange, Error, ExternalSource, GitProvenance, Result, UrlP
 use uuid::Uuid;
 
 pub mod embedding;
+pub mod hosted;
 mod lifecycle;
 pub mod metadata;
 pub mod metadata_filter;
@@ -27,6 +28,7 @@ const COLLECTION_MIGRATIONS: &[&str] = &[
     include_str!("collection_v5.sql"),
     include_str!("collection_v6.sql"),
     include_str!("collection_v7.sql"),
+    include_str!("collection_v8.sql"),
 ];
 
 #[derive(Debug)]

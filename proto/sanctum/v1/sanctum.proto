@@ -234,6 +234,8 @@ enum IngestionState {
   INGESTION_STATE_FAILED = 5;
   INGESTION_STATE_CANCELED = 6;
   INGESTION_STATE_EXTRACTING = 7;
+  // The hosted collection writer ordered the revision. Indexing is pending.
+  INGESTION_STATE_REGISTERED = 8;
 }
 
 message IngestionJobRequest {

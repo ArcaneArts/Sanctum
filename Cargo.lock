@@ -2551,6 +2551,7 @@ dependencies = [
  "axum",
  "sanctum-api",
  "sanctum-config",
+ "sanctum-core",
  "sanctum-embedding",
  "sanctum-embedding-google",
  "sanctum-embedding-ollama",
@@ -2561,6 +2562,7 @@ dependencies = [
  "sanctum-storage",
  "sanctum-storage-gcs",
  "sanctum-storage-s3",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-stream",
@@ -2568,6 +2570,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -12,6 +12,7 @@ pub struct Config {
     #[serde(default)]
     pub storage_root: PathBuf,
     pub object_storage: Option<ObjectStorageConfig>,
+    pub hosted_worker_listen: Option<SocketAddr>,
     #[serde(default = "default_grpc")]
     pub grpc_listen: SocketAddr,
     #[serde(default = "default_mcp")]
@@ -82,6 +83,11 @@ impl Config {
         if config.object_storage.is_none() && config.storage_root.as_os_str().is_empty() {
             return Err(Error::Invalid(
                 "storage_root is required for filesystem storage".into(),
+            ));
+        }
+        if config.hosted_worker_listen.is_some() && config.object_storage.is_none() {
+            return Err(Error::Invalid(
+                "hosted_worker_listen requires object storage".into(),
             ));
         }
         if !(1..=32).contains(&config.local_worker_concurrency) {

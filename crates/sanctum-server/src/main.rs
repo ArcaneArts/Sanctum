@@ -7,6 +7,7 @@ use sanctum_service::{
 use tokio_util::sync::CancellationToken;
 
 mod hosted;
+mod hosted_worker;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -15,7 +16,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let mut config = Config::from_env()?;
     if let Some(storage) = config.object_storage.take() {
-        return hosted::serve(config.grpc_listen, storage, config.max_source_bytes).await;
+        return hosted::serve(
+            config.grpc_listen,
+            config.hosted_worker_listen,
+            storage,
+            config.max_source_bytes,
+        )
+        .await;
     }
     let embedding: Option<Arc<dyn sanctum_embedding::Provider>> = config
         .embedding

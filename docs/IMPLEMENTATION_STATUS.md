@@ -443,6 +443,21 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   count. The debug server accepted the large upload in 47.45 seconds
   with a sampled peak RSS of 43.3 MiB on Apple Silicon. This measures
   acceptance through durable storage.
-- The next hosted cycle will register pending revisions with the collection
-  writer. Cloud Tasks, dispatch repair, lexical publication, and cleanup of
-  abandoned input attempts are still open.
+- Delivered in [PR #28](https://github.com/ArcaneArts/Sanctum/pull/28).
+
+## Hosted revision registration
+
+- The optional private worker listener accepts a scoped operation reference
+  and registers the revision under the collection writer lease. The update
+  sequence and receipt commit together in the collection snapshot. A
+  conditional envelope update checkpoints the result for ingestion status.
+- The hosted gRPC integration test interrupts that checkpoint, restarts the
+  API, and verifies receipt replay without publishing another snapshot. It
+  also verifies replacement ordering, an unchanged current revision, and
+  rejection of a stale expected revision.
+- A standalone server and CLI against MinIO exercised the private HTTP
+  endpoint with out-of-order deliveries and a conflicting external ID.
+  After restart, both deliveries replayed without changing the published
+  snapshot. The CLI reported registered and failed states.
+- The next hosted cycle will process registered input and publish searchable
+  text. Cloud Tasks, scheduled dispatch repair, and cleanup remain open.
