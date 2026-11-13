@@ -8,7 +8,7 @@ use tokio::sync::watch;
 use crate::{Chunk, ChunkRef, Hit, Service, metadata_filter::Filter};
 pub use sanctum_db_sqlite::embedding::Coverage;
 
-mod collections;
+pub(crate) mod collections;
 pub use collections::CollectionSearchResult;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -26,6 +26,7 @@ pub struct SearchResult {
     pub degraded: Option<&'static str>,
 }
 
+#[derive(Clone)]
 pub(crate) struct PreparedQuery {
     pub(crate) expression: String,
     pub(crate) profile: Option<String>,

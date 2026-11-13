@@ -1,12 +1,16 @@
 use std::sync::Arc;
 
-use sanctum_core::{Error, Result, Scope};
+use sanctum_core::{Error, Result, Scope, ScopeId};
 use sanctum_db::{Unit, collection_prefix};
 use sanctum_embedding::{Purpose, embed};
 use sanctum_storage::Key;
 use uuid::Uuid;
 
-use crate::embedding::{PreparedQuery, SearchResult, fuse, lexical_expression, limit_hits};
+use crate::embedding::{
+    CollectionSearchResult, Coverage, PreparedQuery, SearchResult,
+    collections::{Candidates, collection_scopes, merge, rank_collection},
+    fuse, lexical_expression, limit_hits,
+};
 use crate::{Chunk, ChunkRef, Hit, HostedCatalog, SearchMode, db, metadata_filter::Filter};
 
 impl HostedCatalog {
@@ -27,50 +31,17 @@ impl HostedCatalog {
         filter: Option<Filter>,
         mode: SearchMode,
     ) -> Result<SearchResult> {
-        let expression = lexical_expression(&query, limit)?;
-        if let Some(filter) = &filter {
-            filter.validate()?;
-        }
-        let mut prepared = PreparedQuery {
-            expression,
-            profile: self
-                .embedding
-                .as_ref()
-                .map(|provider| provider.profile_id().to_owned()),
-            vector: None,
-            degraded: None,
-        };
-        if mode != SearchMode::Lexical {
-            if let Some(provider) = &self.embedding {
-                let profile = provider.profile_id().to_owned();
-                let (available, _) = self
-                    .with_collection(&scope, move |db| db.has_embeddings(&profile))
-                    .await?;
-                if available {
-                    match embed(provider.as_ref(), Purpose::Query, &[query]).await {
-                        Ok(mut vectors) => prepared.vector = vectors.pop().map(Arc::from),
-                        Err(error) => {
-                            tracing::warn!(%error, "hosted query embedding unavailable");
-                            prepared.degraded = Some("embedding_provider_unavailable");
-                        }
-                    }
-                }
-            } else {
-                prepared.degraded = Some("embedding_disabled");
-            }
-        }
+        let prepared = self
+            .prepare_hosted_query(
+                std::slice::from_ref(&scope),
+                query,
+                limit,
+                filter.as_ref(),
+                mode,
+            )
+            .await?;
         let profile = prepared.profile.clone();
-        let metadata = if filter
-            .as_ref()
-            .is_some_and(Filter::uses_collection_metadata)
-        {
-            self.with_catalog(&scope, |path, collection| {
-                db::metadata::read_catalog_metadata(path, &collection)
-            })
-            .await?
-        } else {
-            Vec::new()
-        };
+        let metadata = self.search_metadata(&scope, filter.as_ref()).await?;
         let ((chunks, coverage, actual_mode, degraded), generation) = self
             .with_collection(&scope, move |database| {
                 let coverage = database.embedding_coverage(prepared.profile.as_deref())?;
@@ -128,6 +99,138 @@ impl HostedCatalog {
             mode: actual_mode,
             degraded,
         })
+    }
+
+    pub async fn retrieve_collections(
+        &self,
+        tenant: ScopeId,
+        collections: Vec<ScopeId>,
+        query: String,
+        limit: u32,
+        filter: Option<Filter>,
+        requested: SearchMode,
+    ) -> Result<CollectionSearchResult> {
+        let scopes = collection_scopes(tenant, collections)?;
+        let prepared = self
+            .prepare_hosted_query(&scopes, query, limit, filter.as_ref(), requested)
+            .await?;
+        let candidate_limit = (limit * 4).max(32);
+        let filter = filter.map(Arc::new);
+        let mut all = Vec::with_capacity(scopes.len());
+        let mut coverage = Coverage::default();
+        for scope in scopes {
+            let metadata = self.search_metadata(&scope, filter.as_deref()).await?;
+            let filter = filter.clone();
+            let query = prepared.clone();
+            let ((ranked, current), generation) = self
+                .with_collection(&scope, move |database| {
+                    let (ranked, current) = rank_collection(
+                        database,
+                        &query,
+                        candidate_limit,
+                        filter.as_deref(),
+                        &metadata,
+                        requested,
+                    )?;
+                    let located = ranked
+                        .into_iter()
+                        .map(|chunk| locate(database, chunk))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok((located, current))
+                })
+                .await?;
+            coverage.total += current.total;
+            coverage.embedded += current.embedded;
+            coverage.failed += current.failed;
+            all.push(Candidates {
+                scope,
+                coverage: current,
+                ranked: ranked
+                    .into_iter()
+                    .map(|(chunk, key)| (chunk, (key, generation)))
+                    .collect(),
+            });
+        }
+        let (mode, degraded) = prepared.strategy(requested, coverage)?;
+        let mut hits = Vec::with_capacity(limit as usize);
+        for (scope, chunk, (key, generation), score) in merge(all, limit) {
+            let mut hit = self.read_hit(&scope, chunk, key, generation).await?;
+            hit.score = Some(score);
+            hits.push((scope, hit));
+        }
+        Ok(CollectionSearchResult {
+            hits,
+            mode,
+            coverage,
+            profile: prepared.profile,
+            degraded,
+        })
+    }
+
+    async fn prepare_hosted_query(
+        &self,
+        scopes: &[Scope],
+        query: String,
+        limit: u32,
+        filter: Option<&Filter>,
+        mode: SearchMode,
+    ) -> Result<PreparedQuery> {
+        let expression = lexical_expression(&query, limit)?;
+        if let Some(filter) = filter {
+            filter.validate()?;
+        }
+        let mut prepared = PreparedQuery {
+            expression,
+            profile: self
+                .embedding
+                .as_ref()
+                .map(|provider| provider.profile_id().to_owned()),
+            vector: None,
+            degraded: None,
+        };
+        if mode != SearchMode::Lexical {
+            if let Some(provider) = &self.embedding {
+                let profile = provider.profile_id().to_owned();
+                let mut available = false;
+                for scope in scopes {
+                    let profile = profile.clone();
+                    let (has_embeddings, _) = self
+                        .with_collection(scope, move |db| db.has_embeddings(&profile))
+                        .await?;
+                    if has_embeddings {
+                        available = true;
+                        break;
+                    }
+                }
+                if available {
+                    match embed(provider.as_ref(), Purpose::Query, &[query]).await {
+                        Ok(mut vectors) => prepared.vector = vectors.pop().map(Arc::from),
+                        Err(error) => {
+                            tracing::warn!(%error, "hosted query embedding unavailable");
+                            prepared.degraded = Some("embedding_provider_unavailable");
+                        }
+                    }
+                }
+            } else {
+                prepared.degraded = Some("embedding_disabled");
+            }
+        }
+        Ok(prepared)
+    }
+
+    async fn search_metadata(
+        &self,
+        scope: &Scope,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<db::metadata::Entry>> {
+        if filter.is_some_and(Filter::uses_collection_metadata) {
+            self.with_catalog(scope, |path, collection| {
+                db::metadata::read_catalog_metadata(path, &collection)
+            })
+            .await
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     pub(crate) async fn with_collection<T: Send + 'static>(

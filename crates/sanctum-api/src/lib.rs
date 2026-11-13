@@ -743,18 +743,20 @@ impl Sanctum for Grpc {
             .map(metadata_filter::parse)
             .transpose()
             .map_err(status)?;
-        let result = self
-            .local()?
-            .retrieve_collections(
-                tenant,
-                collections,
-                request.query,
-                request.limit.unwrap_or(10),
-                filter,
-                mode,
-            )
-            .await
-            .map_err(status)?;
+        let limit = request.limit.unwrap_or(10);
+        let result = match &self.0 {
+            Backend::Local(service) => {
+                service
+                    .retrieve_collections(tenant, collections, request.query, limit, filter, mode)
+                    .await
+            }
+            Backend::Hosted(service) => {
+                service
+                    .retrieve_collections(tenant, collections, request.query, limit, filter, mode)
+                    .await
+            }
+        }
+        .map_err(status)?;
         Ok(Response::new(v1::SearchTextResponse {
             hits: result
                 .hits
