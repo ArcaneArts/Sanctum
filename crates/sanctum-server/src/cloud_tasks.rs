@@ -114,6 +114,7 @@ impl CloudTasks {
             TaskStage::Register => ("register-upload", None),
             TaskStage::Index => ("index-upload", None),
             TaskStage::Embed { step } => ("embed-upload", Some(step)),
+            TaskStage::Rebuild { step } => ("rebuild-collection", Some(step)),
         };
         let mut worker = self.worker.clone();
         worker.set_path(&format!("/internal/tasks/{stage}"));

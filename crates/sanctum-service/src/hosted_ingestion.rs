@@ -496,7 +496,7 @@ impl Operation {
     }
 }
 
-fn unix_seconds() -> Result<u64> {
+pub(crate) fn unix_seconds() -> Result<u64> {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())

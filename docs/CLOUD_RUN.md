@@ -124,7 +124,19 @@ for shard in $(seq 0 15); do
     --oidc-service-account-email "$SCHEDULER_SA" \
     --oidc-token-audience "$WORKER_URL" --attempt-deadline 300s
 done
+
+gcloud scheduler jobs create http sanctum-embedding-profile \
+  --project "$PROJECT" --location "$REGION" \
+  --schedule '*/5 * * * *' --time-zone Etc/UTC --http-method POST \
+  --uri "$WORKER_URL/internal/maintenance/embedding-profile" \
+  --oidc-service-account-email "$SCHEDULER_SA" \
+  --oidc-token-audience "$WORKER_URL" --attempt-deadline 300s
 ```
+
+The embedding profile job checks the worker's configured profile and
+resumes discovery after a change. It shares the existing dispatch
+shards. Point scheduled requests and task deliveries at the active
+worker revision when updating the embedding configuration.
 
 ## Verify a deployment
 

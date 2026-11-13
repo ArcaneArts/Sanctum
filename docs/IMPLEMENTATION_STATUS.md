@@ -578,5 +578,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - A standalone MinIO and Ollama run exercised hybrid search across an
   embedded collection and a collection awaiting vectors. Semantic search
   returned the embedded collection, and restart preserved both results.
-- Automatic rebuilds for idle collections after a profile change remain
-  open.
+- Delivered in [PR #36](https://github.com/ArcaneArts/Sanctum/pull/36).
+
+## Hosted embedding profile rebuilds
+
+- Scheduled discovery detects a changed server profile and scans object
+  manifests with a durable cursor. Each discovered collection gets
+  bounded rebuild tasks through the existing dispatch repair index.
+- The integration test covers an idle collection, a restart between
+  discovery pages, worker profile mismatch, duplicate delivery, and
+  rebuilt coverage for the new profile.
+- A standalone MinIO and real Ollama run changed the document prefix
+  of the configured profile. The API excluded the old vectors and
+  preserved hybrid fallback. The discovery route and manually delivered
+  worker steps restored semantic search for the idle collection.
+- Discovery lists object metadata across the deployment prefix. Its
+  scan cost and live Cloud Scheduler delivery remain to be measured.

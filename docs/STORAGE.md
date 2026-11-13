@@ -266,6 +266,9 @@ unavailable.
 With Cloud Tasks configured, lexical publication schedules bounded
 embedding steps automatically. The worker checkpoints each step and
 schedules retryable provider work at its recorded retry time. The
-reconciler can recover a missing delivery. For collections already idle
-when a profile changes, invoke the manual batch endpoint until coverage
-is complete.
+reconciler can recover a missing delivery. The scheduled embedding
+profile endpoint scans one page of object keys after a profile change
+and queues collections from their manifests. A persisted cursor resumes
+discovery on the next invocation. Workers rebuild each collection in
+bounded steps and ignore old run IDs. See the
+[Cloud Run schedule](CLOUD_RUN.md#schedule-dispatch-repair).
