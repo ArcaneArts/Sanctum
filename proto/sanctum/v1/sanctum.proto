@@ -288,6 +288,8 @@ message Scope {
 
 message CreateCollectionRequest {
   Scope scope = 1;
+  // Hosted storage replays a matching request ID after an ambiguous failure.
+  optional string request_id = 2;
 }
 
 message Collection {
@@ -296,10 +298,13 @@ message Collection {
 
 message ListCollectionsRequest {
   string tenant = 1;
+  optional string after = 2;
+  optional uint32 limit = 3;
 }
 
 message ListCollectionsResponse {
   repeated Collection collections = 1;
+  optional string next_after = 2;
 }
 
 message ExternalSource {

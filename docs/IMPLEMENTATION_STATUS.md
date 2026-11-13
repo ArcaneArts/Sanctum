@@ -7,7 +7,7 @@ which parts have working implementations and where to find the evidence.
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | End-to-end acceptance in an LLM client |
 | 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, platform packaging and verification |
-| 3. Object storage and publication | Shared object contract, filesystem and MinIO-tested S3 adapters, and a fenced SQLite snapshot executor, and a native GCS adapter | Live GCS verification, server integration, durable application operations, and deployment recovery |
+| 3. Object storage and publication | Shared object contract, filesystem and MinIO-tested S3 adapters, and a fenced SQLite snapshot executor, a native GCS adapter, and a hosted catalog | Live GCS verification, hosted source operations, and deployment recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
 | 5. Capacity | Pending | Representative 200 MB sources, GB-scale collections and database snapshots, cold/warm cloud performance, measured optimization |
 
@@ -400,6 +400,8 @@ Merged in [PR #25](https://github.com/ArcaneArts/Sanctum/pull/25).
 
 ## Native Google Cloud Storage adapter
 
+Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
+
 - The GCS adapter uses the JSON API, Google Application Default
   Credentials, generation preconditions, streaming downloads, bounded
   resumable upload parts, and paginated recursive listing.
@@ -408,4 +410,19 @@ Merged in [PR #25](https://github.com/ArcaneArts/Sanctum/pull/25).
   validation, and list continuation. They use a fixture credential.
 - The [storage guide](STORAGE.md) documents the live contract command.
   Actual GCS verification still requires an authorized test bucket and
-  ADC identity. The server does not yet select a remote backend.
+  ADC identity. Hosted catalog configuration now selects the adapter.
+
+## Hosted catalog
+
+- `SANCTUM_CONFIG_JSON.object_storage` selects S3 or GCS for the hosted
+  gRPC catalog. The server publishes the initial collection database
+  before activating it in the tenant catalog. An optional request ID
+  replays the recorded activation outcome.
+- The hosted gRPC test resumes an interrupted creation without rebuilding
+  the collection database. It also covers tenant isolation, pagination,
+  request ID replay, and usage.
+- A standalone server and CLI run against live MinIO created collections
+  for two tenants, restarted, replayed creation, and matched an independent
+  bucket listing at collection, tenant, and cluster scopes.
+- The hosted catalog currently supports collection creation, listing, and
+  storage usage. Hosted source operations and Cloud Tasks are still open.

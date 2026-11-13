@@ -74,13 +74,7 @@ pub fn create_collection(catalog_path: &Path, db_path: &Path, collection: &str) 
     let transaction = catalog
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
-    let inserted = transaction
-        .execute(
-            "INSERT OR IGNORE INTO collections (id) VALUES (?1)",
-            [collection],
-        )
-        .map_err(database_error)?;
-    if inserted == 0 {
+    if !activate_collection(&transaction, collection)? {
         return Err(Error::Conflict(format!(
             "collection {collection} already exists"
         )));
@@ -89,6 +83,24 @@ pub fn create_collection(catalog_path: &Path, db_path: &Path, collection: &str) 
     fs::create_dir_all(db_path.parent().expect("database has a parent"))?;
     migrate(&mut open(db_path, true)?, COLLECTION_MIGRATIONS)?;
     transaction.commit().map_err(database_error)
+}
+
+pub fn initialize_catalog(transaction: &Transaction<'_>) -> Result<()> {
+    apply_migrations(transaction, CATALOG_MIGRATIONS)
+}
+
+pub fn initialize_collection(transaction: &Transaction<'_>) -> Result<()> {
+    apply_migrations(transaction, COLLECTION_MIGRATIONS)
+}
+
+pub fn activate_collection(transaction: &Transaction<'_>, collection: &str) -> Result<bool> {
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO collections (id) VALUES (?1)",
+            [collection],
+        )
+        .map(|count| count == 1)
+        .map_err(database_error)
 }
 
 pub fn list_collections(path: &Path) -> Result<Vec<String>> {
@@ -407,7 +419,12 @@ fn migrate(connection: &mut Connection, schemas: &[&str]) -> Result<()> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
-    let version = schema_version(&transaction)?;
+    apply_migrations(&transaction, schemas)?;
+    transaction.commit().map_err(database_error)
+}
+
+fn apply_migrations(transaction: &Transaction<'_>, schemas: &[&str]) -> Result<()> {
+    let version = schema_version(transaction)?;
     if version > schemas.len() {
         return Err(Error::Invalid(format!(
             "unsupported database schema {version}"
@@ -419,7 +436,7 @@ fn migrate(connection: &mut Connection, schemas: &[&str]) -> Result<()> {
             .pragma_update(None, "user_version", (index + 1) as u32)
             .map_err(database_error)?;
     }
-    transaction.commit().map_err(database_error)
+    Ok(())
 }
 
 fn schema_version(connection: &Connection) -> Result<usize> {

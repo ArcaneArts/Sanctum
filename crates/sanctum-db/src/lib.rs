@@ -28,18 +28,15 @@ impl Unit {
     }
 
     pub fn collection(prefix: Option<&Key>, scope: &Scope) -> Result<Self> {
-        Self::new(
-            prefix,
-            &format!("{}/collections/{}", scope.tenant, scope.collection),
-            "meta.db",
-        )
+        Ok(Self {
+            prefix: collection_prefix(prefix, scope)?,
+            database: "meta.db",
+        })
     }
 
     fn new(prefix: Option<&Key>, unit: &str, database: &'static str) -> Result<Self> {
         Ok(Self {
-            prefix: Key::parse(
-                prefix.map_or_else(|| unit.to_owned(), |prefix| format!("{prefix}/{unit}")),
-            )?,
+            prefix: scoped_key(prefix, unit)?,
             database,
         })
     }
@@ -54,6 +51,21 @@ impl Unit {
             self.prefix, self.database
         ))
     }
+}
+
+pub fn collection_prefix(prefix: Option<&Key>, scope: &Scope) -> Result<Key> {
+    scoped_key(
+        prefix,
+        &format!("{}/collections/{}", scope.tenant, scope.collection),
+    )
+}
+
+pub fn tenant_prefix(prefix: Option<&Key>, tenant: &ScopeId) -> Result<Key> {
+    scoped_key(prefix, tenant.as_str())
+}
+
+fn scoped_key(prefix: Option<&Key>, path: &str) -> Result<Key> {
+    Key::parse(prefix.map_or_else(|| path.to_owned(), |prefix| format!("{prefix}/{path}")))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -203,6 +215,39 @@ impl Publication {
         let result = lease.reclaim(grace, cursor).await;
         let release = lease.release().await;
         result.and_then(|page| release.map(|()| page))
+    }
+
+    pub async fn receipt(&self, unit: &Unit, operation: Uuid) -> Result<Option<String>> {
+        let scratch = tempfile::tempdir()?;
+        let Some(database) = self.read(unit, scratch.path()).await? else {
+            return Ok(None);
+        };
+        tokio::task::spawn_blocking(move || {
+            use rusqlite::OptionalExtension;
+            let _scratch = scratch;
+            let connection = Connection::open_with_flags(
+                database.path(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(sql_error)?;
+            connection
+                .query_row(
+                    "SELECT outcome FROM applied_commands WHERE id = ?1",
+                    [operation.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)
+        })
+        .await
+        .map_err(|error| Error::Internal(Box::new(error)))?
+    }
+
+    pub async fn generation(&self, unit: &Unit) -> Result<Option<Generation>> {
+        Ok(self
+            .read_head(unit)
+            .await?
+            .and_then(|(head, _)| head.generation))
     }
 
     pub async fn read(&self, unit: &Unit, directory: &Path) -> Result<Option<Materialized>> {

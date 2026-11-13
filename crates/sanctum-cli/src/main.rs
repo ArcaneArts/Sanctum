@@ -27,6 +27,8 @@ enum Command {
     },
     Create {
         collection: String,
+        #[arg(long)]
+        request_id: Option<String>,
     },
     List,
     Usage {
@@ -393,29 +395,42 @@ async fn main() -> anyhow::Result<()> {
                 return Err(anyhow!("{failures} import entries failed"));
             }
         }
-        Command::Create { collection } => {
+        Command::Create {
+            collection,
+            request_id,
+        } => {
             client
                 .create_collection(v1::CreateCollectionRequest {
                     scope: scope(collection.clone()),
+                    request_id,
                 })
                 .await?;
             println!("{collection}");
         }
         Command::List => {
-            let response = client
-                .list_collections(v1::ListCollectionsRequest {
-                    tenant: args.tenant,
-                })
-                .await?
-                .into_inner();
-            for collection in response.collections {
-                println!(
-                    "{}",
-                    collection
-                        .scope
-                        .context("server omitted collection scope")?
-                        .collection
-                );
+            let mut after = None;
+            loop {
+                let response = client
+                    .list_collections(v1::ListCollectionsRequest {
+                        tenant: args.tenant.clone(),
+                        after,
+                        limit: Some(50),
+                    })
+                    .await?
+                    .into_inner();
+                for collection in response.collections {
+                    println!(
+                        "{}",
+                        collection
+                            .scope
+                            .context("server omitted collection scope")?
+                            .collection
+                    );
+                }
+                let Some(next) = response.next_after else {
+                    break;
+                };
+                after = Some(next);
             }
         }
         Command::Upload {

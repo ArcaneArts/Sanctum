@@ -22,3 +22,7 @@ async-trait.workspace = true
 rusqlite.workspace = true
 sanctum-embedding = { path = "../sanctum-embedding" }
 tempfile.workspace = true
+sanctum-storage = { path = "../sanctum-storage" }
+sanctum-storage-fs = { path = "../sanctum-storage-fs" }
+sanctum-db = { path = "../sanctum-db" }
+sanctum-db-sqlite = { path = "../sanctum-db-sqlite" }
