@@ -19,6 +19,7 @@ mod embedding;
 mod local_import;
 mod local_jobs;
 mod maintenance;
+mod url_import;
 mod watched_folders;
 mod worker;
 pub use embedding::{CollectionSearchResult, SearchMode, run_embedding_worker};
@@ -35,6 +36,7 @@ pub struct Service {
     files: Arc<LocalFiles>,
     queue: LocalQueue,
     max_source_bytes: u64,
+    url_importer: url_import::UrlImporter,
     retrieval: Arc<RwLock<()>>,
     embedding: Option<Arc<dyn sanctum_embedding::Provider>>,
 }
@@ -150,6 +152,7 @@ impl Service {
             files,
             queue,
             max_source_bytes,
+            url_importer: url_import::UrlImporter::new()?,
             retrieval: Arc::new(RwLock::new(())),
             embedding,
         };

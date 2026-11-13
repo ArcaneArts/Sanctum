@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -39,6 +40,10 @@ impl Running {
         workers: bool,
     ) -> Self {
         let service = Service::open_with_embedding(dir.path(), 32_768, provider).unwrap();
+        Self::with_service(service, workers).await
+    }
+
+    async fn with_service(service: Service, workers: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let (stop, shutdown) = oneshot::channel();
@@ -86,6 +91,305 @@ impl Running {
         self.stop.send(()).unwrap();
         self.server.await.unwrap().unwrap();
     }
+}
+
+#[tokio::test]
+async fn url_import_tracks_provenance_and_reconciles_content() {
+    use axum::{Router, http::header, response::Redirect, routing::get};
+
+    let variant = Arc::new(AtomicUsize::new(0));
+    let document = {
+        let variant = variant.clone();
+        move || {
+            let variant = variant.clone();
+            async move {
+                let (text, etag) = match variant.load(Ordering::Relaxed) {
+                    0 => ("A café keeps chrysanthemum notes.", r#""v1""#),
+                    1 => ("A café keeps chrysanthemum notes.", r#""v2""#),
+                    _ => ("A café keeps magnolia notes.", r#""v3""#),
+                };
+                (
+                    [
+                        (header::CONTENT_TYPE, "text/plain; charset=UTF-8"),
+                        (header::ETAG, etag),
+                        (header::LAST_MODIFIED, "Sun, 06 Nov 1994 08:49:37 GMT"),
+                    ],
+                    text,
+                )
+            }
+        }
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let http = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/notes", get(|| async { Redirect::temporary("/raw.txt") }))
+                .route("/raw.txt", get(document))
+                .route(
+                    "/report",
+                    get(|| async {
+                        (
+                            [(header::CONTENT_TYPE, "application/rtf")],
+                            r"{\rtf1\ansi A beryllium note.}",
+                        )
+                    }),
+                ),
+        )
+        .await
+        .unwrap();
+    });
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    create(&mut running.client, "other").await;
+    let mut request = v1::ImportUrlRequest {
+        scope: scope("default"),
+        url: format!("{origin}/notes#ignored"),
+        retain_original: false,
+    };
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: true })
+        .await
+        .unwrap();
+    let first = running
+        .client
+        .import_url(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.state(), v1::ImportState::Queued);
+    let provenance = first.url.clone().unwrap();
+    assert_eq!(provenance.requested_url, format!("{origin}/notes"));
+    assert_eq!(provenance.final_url, format!("{origin}/raw.txt"));
+    assert_eq!(provenance.etag.as_deref(), Some(r#""v1""#));
+    assert_eq!(
+        provenance.last_modified.as_deref(),
+        Some("Sun, 06 Nov 1994 08:49:37 GMT")
+    );
+    let pending = running
+        .client
+        .import_url(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(pending.state(), v1::ImportState::Pending);
+    assert_eq!(pending.operation_id, first.operation_id);
+    let job = job_request(first.operation_id.unwrap());
+    running.stop().await;
+
+    let mut running = Running::start(&dir).await;
+    let accepted = running
+        .client
+        .get_ingestion_job(job.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(accepted.state(), v1::IngestionState::Accepted);
+    assert_eq!(accepted.url, Some(provenance.clone()));
+    let mut other = job.clone();
+    other.scope = scope("other");
+    assert_eq!(
+        running
+            .client
+            .get_ingestion_job(other)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: false })
+        .await
+        .unwrap();
+    let revision = await_ready(&mut running.client, job)
+        .await
+        .text_revision
+        .unwrap();
+    assert_eq!(revision.url, Some(provenance.clone()));
+    assert_eq!(
+        search(&mut running.client, "default", "chrysanthemum").await[0].excerpt,
+        "A café keeps chrysanthemum notes."
+    );
+    assert!(
+        search(&mut running.client, "other", "chrysanthemum")
+            .await
+            .is_empty()
+    );
+
+    let db = rusqlite::Connection::open(dir.path().join("default/notes/meta.db")).unwrap();
+    let saved: String = db
+        .query_row(
+            "SELECT url_provenance FROM revisions WHERE id = ?1",
+            [&first.revision_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let saved: sanctum_core::UrlProvenance = serde_json::from_str(&saved).unwrap();
+    assert_eq!(saved.final_url, provenance.final_url);
+    assert_eq!(saved.etag, provenance.etag);
+
+    variant.store(1, Ordering::Relaxed);
+    let same = running
+        .client
+        .import_url(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(same.state(), v1::ImportState::Unchanged);
+    assert_eq!(same.revision_id, first.revision_id);
+    assert_eq!(same.url.unwrap().etag.as_deref(), Some(r#""v2""#));
+
+    variant.store(2, Ordering::Relaxed);
+    let updated = running
+        .client
+        .import_url(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(updated.state(), v1::ImportState::Queued);
+    assert_eq!(updated.source_id, first.source_id);
+    assert_ne!(updated.revision_id, first.revision_id);
+    await_ready(
+        &mut running.client,
+        job_request(updated.operation_id.unwrap()),
+    )
+    .await;
+    assert!(
+        search(&mut running.client, "default", "chrysanthemum")
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        search(&mut running.client, "default", "magnolia")
+            .await
+            .len(),
+        1
+    );
+
+    request.url = format!("{origin}/report");
+    request.retain_original = true;
+    let rtf = running
+        .client
+        .import_url(request)
+        .await
+        .unwrap()
+        .into_inner();
+    let revision = await_ready(&mut running.client, job_request(rtf.operation_id.unwrap()))
+        .await
+        .text_revision
+        .unwrap();
+    assert!(revision.extractor.is_some());
+    assert!(revision.retain_original);
+    assert_eq!(
+        search(&mut running.client, "default", "beryllium").await[0].excerpt,
+        "A beryllium note."
+    );
+    running.stop().await;
+    http.abort();
+}
+
+#[tokio::test]
+async fn url_import_exposes_http_failures_and_enforces_size_and_origin_policy() {
+    use axum::{
+        Router,
+        body::{Body, Bytes},
+        http::{StatusCode, header},
+        response::Redirect,
+        routing::get,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let origin = format!("http://{address}");
+    // The hostname differs, but the address would reach this same server.
+    let denied = format!("http://localhost:{}/target", address.port());
+    let count = Arc::new(AtomicUsize::new(0));
+    let hits = count.clone();
+    let http = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route(
+                    "/server-error",
+                    get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+                )
+                .route(
+                    "/binary",
+                    get(|| async { ([(header::CONTENT_TYPE, "image/png")], "binary") }),
+                )
+                .route(
+                    "/oversize",
+                    get(|| async {
+                        let chunks = tokio_stream::iter(
+                            (0..3)
+                                .map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![b'a'; 16_384]))),
+                        );
+                        (
+                            [(header::CONTENT_TYPE, "text/plain")],
+                            Body::from_stream(chunks),
+                        )
+                    }),
+                )
+                .route(
+                    "/redirect",
+                    get(move || async move { Redirect::temporary(&denied) }),
+                )
+                .route(
+                    "/target",
+                    get(move || async move {
+                        hits.fetch_add(1, Ordering::Relaxed);
+                        "private"
+                    }),
+                ),
+        )
+        .await
+        .unwrap();
+    });
+    let dir = TempDir::new().unwrap();
+    let service = Service::open(dir.path(), 32_768)
+        .unwrap()
+        .with_url_origins(Some(HashMap::from([(origin.clone(), None)])))
+        .unwrap();
+    let mut running = Running::with_service(service, true).await;
+    create(&mut running.client, "default").await;
+    for (path, code, message) in [
+        ("/missing", Code::InvalidArgument, "HTTP 404"),
+        ("/server-error", Code::Unavailable, "HTTP 503"),
+        ("/binary", Code::InvalidArgument, "content type"),
+        ("/oversize", Code::InvalidArgument, "upload limit"),
+        ("/redirect", Code::InvalidArgument, "origin is not allowed"),
+    ] {
+        let error = running
+            .client
+            .import_url(v1::ImportUrlRequest {
+                scope: scope("default"),
+                url: format!("{origin}{path}"),
+                retain_original: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), code, "{error}");
+        assert!(error.message().contains(message), "{error}");
+    }
+    assert_eq!(count.load(Ordering::Relaxed), 0);
+    assert!(
+        running
+            .client
+            .list_ingestion_jobs(v1::ListIngestionJobsRequest {
+                tenant: "default".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .jobs
+            .is_empty()
+    );
+    running.stop().await;
+    http.abort();
 }
 
 struct EmbeddingFixture {

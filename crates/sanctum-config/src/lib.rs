@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
 use sanctum_core::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,7 @@ pub struct Config {
     #[serde(default = "default_worker_concurrency")]
     pub local_worker_concurrency: usize,
     pub embedding: Option<EmbeddingConfig>,
+    pub url_import_origins: Option<HashMap<String, Option<String>>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

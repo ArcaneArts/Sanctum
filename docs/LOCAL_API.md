@@ -356,3 +356,48 @@ cargo run --locked -p sanctum-cli -- usage notes
 cargo run --locked -p sanctum-cli -- --tenant default usage
 cargo run --locked -p sanctum-cli -- usage --cluster
 ```
+
+## URL imports
+
+```sh
+cargo run --locked -p sanctum-cli -- import-url notes https://example.org/notes.md
+cargo run --locked -p sanctum-cli -- job notes OPERATION_ID
+```
+
+`ImportUrl` fetches a complete HTTP(S) response on the server, streams it to
+local staging within `max_source_bytes`, and submits it to the same durable
+queue as uploads. It accepts UTF-8 text, common textual media types, and RTF.
+HTML is indexed as UTF-8 source. `--retain-original` keeps fetched RTF beside
+its extracted text. Real HTTP failures surface with the upstream status.
+Transport errors and upstream 429 or 5xx responses return `UNAVAILABLE`.
+An oversized or failed download never enters the ingestion queue.
+
+The normalized requested URL, excluding its fragment, is the source's
+external ID in the `url` namespace. Re-importing the same URL compares the
+body's BLAKE3 digest. An unchanged body reuses the current revision or
+pending operation. A changed body keeps the source ID and queues a new
+revision. The response records the final URL, ETag, Last-Modified, and
+Content-Type observed during the fetch when present. The accepted
+operation and published revision retain the provenance of the fetch that
+produced them. Each import performs a complete GET. URLs are stored as
+provenance, so keep secrets out of their query strings.
+
+Set `url_import_origins` in `SANCTUM_CONFIG_JSON` to restrict requests to
+exact scheme, host, and port combinations. A null value permits that origin
+without credentials. For an HTTPS origin, a string names a server environment
+variable holding a bearer token. The server looks up a credential separately
+for each destination, including redirects. An empty object disables URL
+imports. An omitted field allows HTTP(S) destinations for the trusted local
+operator. Use network egress controls as well when an origin's DNS or service
+is outside the operator's control.
+
+```json
+{
+  "version": 1,
+  "storage_root": "./local-data",
+  "url_import_origins": {
+    "https://example.org": null,
+    "https://docs.example.org": "SANCTUM_DOCS_TOKEN"
+  }
+}
+```

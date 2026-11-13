@@ -5,11 +5,11 @@ use std::{
 };
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use sanctum_core::{Error, ExternalSource, Result, Scope};
+use sanctum_core::{Error, ExternalSource, Result, Scope, UrlProvenance, is_rtf};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-use crate::{Service, TextUpload, local_jobs::new_job};
+use crate::{Service, StagedUpload, TextUpload, local_jobs::new_job};
 
 #[derive(Default, serde::Deserialize, serde::Serialize)]
 pub struct ImportOptions {
@@ -285,15 +285,35 @@ impl Service {
             ));
         }
         drop(output);
-        let hash = hasher.finalize().to_hex().to_string();
-        let mut database = self.database(scope)?;
+        staged.enqueue_import(bytes, hasher.finalize().to_hex().to_string(), None)
+    }
+}
+
+impl StagedUpload {
+    pub(crate) fn enqueue_import(
+        self,
+        bytes: u64,
+        hash: String,
+        url: Option<UrlProvenance>,
+    ) -> Result<ImportEvent> {
+        let service = self.service.clone();
+        let scope = &self.scope;
+        let external = self
+            .upload
+            .external
+            .clone()
+            .expect("imports have an external ID");
+        let id = external.id.clone();
+        let retain_original = self.upload.retain_original;
+        let extract_rtf = is_rtf(&self.upload.name);
+        let mut database = service.database(scope)?;
         let writer = database.write()?;
         let current = match writer.find_source(None, Some(&external)) {
             Ok(current) => Some(current),
             Err(Error::NotFound(_)) => None,
             Err(error) => return Err(error),
         };
-        let pending = self
+        let pending = service
             .queue
             .pending_external(scope, &external)?
             .filter(|job| {
@@ -304,25 +324,29 @@ impl Service {
                     }
             });
         if let Some(pending) = pending.as_ref().filter(|job| {
-            job.import_hash.as_ref() == Some(&hash) && job.retain_original == retain_original
+            job.import_hash.as_ref() == Some(&hash)
+                && job.retain_original == retain_original
+                && job.extract_rtf == extract_rtf
         }) {
             return Ok(ImportEvent {
                 source: Some(pending.source),
                 revision: Some(pending.revision),
                 operation: Some(pending.id),
-                ..ImportEvent::new(id, ImportState::Pending)
+                ..ImportEvent::new(&id, ImportState::Pending)
             });
         }
         if let Some(current) = current.as_ref().filter(|source| {
-            source.hash == hash && (!source.extracted || source.retain_original == retain_original)
+            source.hash == hash
+                && source.extracted == extract_rtf
+                && (!extract_rtf || source.retain_original == retain_original)
         }) {
             if let Some(pending) = &pending {
-                self.queue.supersede_import(scope, pending)?;
+                service.queue.supersede_import(scope, pending)?;
             }
             return Ok(ImportEvent {
                 source: Some(current.source),
                 revision: Some(current.revision),
-                ..ImportEvent::new(id, ImportState::Unchanged)
+                ..ImportEvent::new(&id, ImportState::Unchanged)
             });
         }
         let source = current
@@ -330,7 +354,7 @@ impl Service {
             .map(|source| source.source)
             .or_else(|| pending.map(|job| job.source))
             .unwrap_or_else(Uuid::new_v4);
-        let name = staged.upload.name.clone();
+        let name = self.upload.name.clone();
         let mut job = new_job(
             scope.clone(),
             name,
@@ -340,16 +364,19 @@ impl Service {
             current.is_some(),
         );
         job.import_hash = Some(hash);
-        let job = staged.publish_job(job)?;
+        job.url = url;
+        let job = self.publish_job(job)?;
         drop(writer);
         Ok(ImportEvent {
             source: Some(job.source),
             revision: Some(job.revision),
             operation: Some(job.id),
-            ..ImportEvent::new(id, ImportState::Queued)
+            ..ImportEvent::new(&id, ImportState::Queued)
         })
     }
+}
 
+impl Service {
     fn reconcile_import(
         &self,
         scope: &Scope,
@@ -490,7 +517,7 @@ fn globs(patterns: &[String]) -> Result<GlobSet> {
         .map_err(|error| Error::Invalid(format!("invalid import globs: {error}")))
 }
 
-fn default_text(path: &Path) -> bool {
+pub(crate) fn default_text(path: &Path) -> bool {
     if path.file_name().is_some_and(|name| {
         matches!(
             name.to_str(),

@@ -99,6 +99,15 @@ pub struct ExternalSource {
     pub id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct UrlProvenance {
+    pub requested_url: String,
+    pub final_url: String,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub content_type: Option<String>,
+}
+
 pub const UPLOAD_FRAME_BYTES: usize = 256 * 1024;
 
 pub fn is_rtf(name: &str) -> bool {

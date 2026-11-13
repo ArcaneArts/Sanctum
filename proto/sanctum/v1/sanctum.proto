@@ -19,6 +19,7 @@ service Sanctum {
   rpc FetchChunk(FetchChunkRequest) returns (TextHit);
   rpc DeleteSource(DeleteSourceRequest) returns (DeletedSource);
   rpc ImportLocal(ImportLocalRequest) returns (stream ImportLocalEvent);
+  rpc ImportUrl(ImportUrlRequest) returns (ImportUrlResponse);
   rpc WatchFolder(WatchFolderRequest) returns (WatchedFolder);
   rpc ListWatchedFolders(ListWatchedFoldersRequest) returns (ListWatchedFoldersResponse);
   rpc UnwatchFolder(UnwatchFolderRequest) returns (Empty);
@@ -144,6 +145,7 @@ message IngestionJob {
   optional TextRevision text_revision = 13;
   uint64 update_sequence = 14;
   uint64 created_at_unix_seconds = 15;
+  UrlProvenance url = 16;
 }
 
 message LocalQueueStatus {
@@ -214,6 +216,29 @@ message ImportLocalRequest {
   repeated string exclude = 4;
   bool prune_missing = 5;
   bool retain_original = 6;
+}
+
+message ImportUrlRequest {
+  Scope scope = 1;
+  string url = 2;
+  bool retain_original = 3;
+}
+
+message UrlProvenance {
+  string requested_url = 1;
+  string final_url = 2;
+  optional string etag = 3;
+  optional string last_modified = 4;
+  optional string content_type = 5;
+}
+
+message ImportUrlResponse {
+  ImportState state = 1;
+  string source_id = 2;
+  string revision_id = 3;
+  optional string operation_id = 4;
+  // Observed during this request, including when the bytes were unchanged.
+  UrlProvenance url = 5;
 }
 
 message WatchFolderRequest {
@@ -297,6 +322,7 @@ message TextRevision {
   string source_encoding = 10;
   optional string extractor = 11;
   bool retain_original = 12;
+  UrlProvenance url = 13;
 }
 
 message SearchTextRequest {
