@@ -703,3 +703,17 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   RTF text across restart. The local object-store test verifies deletion
   using controlled object ages.
 - Inputs with no acceptance envelope still require a durable fence.
+- Delivered in [PR #44](https://github.com/ArcaneArts/Sanctum/pull/44).
+
+## Hosted synchronous uploads
+
+- Hosted `UploadText` uses the same durable admission as `SubmitText`.
+  It waits up to 30 seconds after acceptance for worker publication.
+  A wait failure reports the operation UUID for polling or replay.
+- The gRPC test confirms the call waits through registration, returns
+  the committed revision, and reports a terminal validation failure
+  with the accepted operation ID. Both outcomes replay with the same
+  request UUID.
+- The live MinIO check exercised a worker-driven synchronous upload,
+  a matching replay, and a timeout that left the operation available
+  for subsequent worker delivery and status polling.

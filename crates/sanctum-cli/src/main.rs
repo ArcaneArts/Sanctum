@@ -112,7 +112,7 @@ enum Command {
         #[arg(long)]
         background: bool,
         /// Replay an accepted hosted submission with the same UUID and input.
-        #[arg(long, requires = "background")]
+        #[arg(long)]
         request_id: Option<String>,
         #[arg(long)]
         retain_original: bool,

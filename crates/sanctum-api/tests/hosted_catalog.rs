@@ -168,6 +168,91 @@ async fn hosted_catalog_recovers_across_server_restart_and_stays_in_scope() {
 }
 
 #[tokio::test]
+async fn hosted_synchronous_upload_waits_for_worker_and_replays() {
+    use std::time::Duration;
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let service = HostedCatalog::new(storage, None, 1024).unwrap();
+    let mut server = start(service.clone()).await;
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    service.create_collection(&scope, None).await.unwrap();
+
+    for (name, content) in [
+        ("notes.txt", b"quartz note".as_slice()),
+        ("invalid.txt", &[0xff][..]),
+    ] {
+        let operation = uuid::Uuid::new_v4();
+        let header = v1::UploadTextHeader {
+            scope: Some(v1::Scope {
+                tenant: "default".into(),
+                collection: "notes".into(),
+            }),
+            name: name.into(),
+            request_id: Some(operation.to_string()),
+            ..Default::default()
+        };
+        let mut upload_client = server.client.clone();
+        let upload_header = header.clone();
+        let upload = tokio::spawn(async move {
+            upload_client
+                .upload_text(upload_frames(&upload_header, [content]))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match service.ingestion_job(&scope, operation).await {
+                    Ok(job) => {
+                        assert!(matches!(
+                            job.state,
+                            sanctum_service::HostedJobState::Accepted
+                        ));
+                        break;
+                    }
+                    Err(Error::NotFound(_)) => tokio::time::sleep(Duration::from_millis(20)).await,
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!upload.is_finished());
+        service.register_upload(&scope, operation).await.unwrap();
+        assert!(!upload.is_finished());
+        service.index_upload(&scope, operation).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), upload)
+            .await
+            .unwrap()
+            .unwrap();
+        let replay = server
+            .client
+            .upload_text(upload_frames(&header, [content]))
+            .await;
+        if name == "notes.txt" {
+            let revision = response.unwrap().into_inner();
+            assert_eq!(revision.bytes, content.len() as u64);
+            assert_eq!(revision, replay.unwrap().into_inner());
+        } else {
+            for result in [response, replay] {
+                let failure = result.unwrap_err();
+                assert_eq!(failure.code(), Code::InvalidArgument);
+                let stored = failure
+                    .metadata()
+                    .get_bin("sanctum-operation-id-bin")
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap();
+                assert_eq!(stored.as_ref(), operation.as_bytes());
+            }
+        }
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_submissions_store_exact_bytes_and_replay_after_restart() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
