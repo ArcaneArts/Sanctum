@@ -1,0 +1,24 @@
+[package]
+name = "sanctum-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake3.workspace = true
+bytes.workspace = true
+rusqlite.workspace = true
+sanctum-core = { path = "../sanctum-core" }
+sanctum-db-sqlite = { path = "../sanctum-db-sqlite" }
+sanctum-storage = { path = "../sanctum-storage" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+async-trait.workspace = true
+sanctum-storage-fs = { path = "../sanctum-storage-fs" }
+sanctum-storage-s3 = { path = "../sanctum-storage-s3" }
