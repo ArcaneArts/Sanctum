@@ -6,7 +6,7 @@ which parts have working implementations and where to find the evidence.
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | Personal workflow verified on macOS. Cross-platform packaging and tray verification are tracked in milestone 2. |
-| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, platform packaging and verification |
+| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, Windows package and tray verification, distribution signing |
 | 3. Object storage and publication | Shared storage contract, filesystem and MinIO-tested S3, native GCS adapter, and fenced SQLite snapshot publication for hosted catalog, source, and metadata operations | Live GCS verification and cloud recovery scenarios |
 | 4. Cloud Run and Cloud Tasks | Linux API and worker containers, durable staged uploads, dispatch and repair, scheduled maintenance, and hosted gRPC and MCP | Live IAM, Cloud Run ingress, and Tasks and Scheduler delivery |
 | 5. Capacity | [200 MiB lexical ingestion and 1–2 GiB snapshot measurements](CAPACITY.md) | Representative GB-scale text and vector workloads, many-tenant concurrency, cold/warm cloud performance, measured optimization |
@@ -1056,3 +1056,23 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   both 768 and 1,536 dimensions matched all 240 returned top-ten neighbors.
   The scalar extension did not improve median latency. Representative model
   recall and concurrent collections remain open. [Method and results](CAPACITY.md#exact-vector-ranking-in-sqlite).
+
+## Native desktop package verification
+
+- Tauri built the Apple Silicon `Sanctum.app` release bundle with the desktop
+  executable and both ARM64 sidecars. The bundled server started with an
+  isolated application data directory, and the bundled CLI saw a collection
+  created before the app restart. The build used local ad-hoc signing.
+- The macOS tray and native file picker were exercised in the earlier debug
+  builds. Distribution signing and notarization remain open.
+- The ARM64 Debian package built and installed on Ubuntu 24.04.5 with
+  WebKitGTK 4.1. In an isolated X11 session with Openbox and the Xfce 4.18
+  tray host, the installed app registered its tray menu and displayed
+  running status. Closing the window hid it while the bundled server still
+  accepted gRPC and MCP connections. **Open Sanctum** restored the window,
+  a second launch kept one server child, and **Quit Sanctum** released both
+  listeners. The collection survived relaunch. The tray actions were
+  exercised through the session's D-Bus menu.
+- The Linux package evidence covers Ubuntu ARM64 and this X11 tray host.
+  Windows, other Linux desktop environments, and signed distribution remain
+  open. [Native package commands](DESKTOP.md#native-packages).
