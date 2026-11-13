@@ -97,6 +97,42 @@ impl Running {
 }
 
 #[tokio::test]
+async fn local_upload_keeps_accepted_chunk_settings_across_restart() {
+    let dir = TempDir::new().unwrap();
+    let configured = Service::open(dir.path(), 32_768)
+        .unwrap()
+        .with_chunking(sanctum_core::ChunkSettings {
+            window_bytes: 256,
+            overlap_bytes: 32,
+        })
+        .unwrap();
+    let mut api = Running::with_service(configured, false).await;
+    create(&mut api.client, "default").await;
+    let accepted = api
+        .client
+        .submit_text(tokio_stream::iter(vec![
+            header("default"),
+            v1::UploadTextFrame {
+                frame: Some(Frame::Data(vec![b'x'; 1024])),
+            },
+            v1::UploadTextFrame {
+                frame: Some(Frame::End(v1::UploadTextEnd {})),
+            },
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    api.stop().await;
+
+    let mut api = Running::start(&dir).await;
+    let result = await_ready(&mut api.client, job_request(accepted.operation_id)).await;
+    let revision = result.text_revision.unwrap();
+    assert_eq!(revision.chunker, "utf8-overlap-v1/256/32");
+    assert!(revision.chunks > 1);
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn local_collection_deletion_purges_jobs_and_recovers_from_a_tombstone() {
     let dir = TempDir::new().unwrap();
     let mut api = Running::start(&dir).await;

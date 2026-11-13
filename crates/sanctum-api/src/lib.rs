@@ -1273,6 +1273,7 @@ fn text_revision(job: &Job) -> Option<v1::TextRevision> {
         retain_original: job.retain_original,
         url: job.url.clone().map(wire_url),
         git: job.git.clone().map(wire_git),
+        chunker: job.chunking.identifier(),
     })
 }
 
@@ -1293,6 +1294,7 @@ fn wire_revision(scope: &Scope, revision: sanctum_service::Revision) -> v1::Text
         retain_original: content.retain_original,
         url: content.url.map(wire_url),
         git: content.git.map(wire_git),
+        chunker: content.chunker,
     }
 }
 
@@ -1326,6 +1328,7 @@ fn wire_hosted_job(scope: &Scope, job: HostedJob) -> v1::IngestionJob {
         retain_original: content.retain_original,
         url: content.url.map(wire_url),
         git: content.git.map(wire_git),
+        chunker: content.chunker,
     });
     v1::IngestionJob {
         scope: Some(scope),

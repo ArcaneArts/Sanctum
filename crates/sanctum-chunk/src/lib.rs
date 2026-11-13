@@ -1,9 +1,6 @@
 use std::{io::Read, str};
 
-use sanctum_core::{ByteRange, Error, Result};
-
-pub const WINDOW_BYTES: usize = 4096;
-pub const OVERLAP_BYTES: usize = 400;
+use sanctum_core::{ByteRange, ChunkSettings, Error, Result};
 
 #[derive(Debug)]
 pub struct TextIndex {
@@ -14,10 +11,21 @@ pub struct TextIndex {
 
 /// Consumes a UTF-8 stream and emits overlapping ranges into the original bytes.
 pub fn index_utf8(
+    source: impl Read,
+    emit: impl FnMut(ByteRange, &str) -> Result<()>,
+) -> Result<TextIndex> {
+    index_utf8_with_settings(source, ChunkSettings::default(), emit)
+}
+
+pub fn index_utf8_with_settings(
     mut source: impl Read,
+    settings: ChunkSettings,
     mut emit: impl FnMut(ByteRange, &str) -> Result<()>,
 ) -> Result<TextIndex> {
-    let mut window = Vec::with_capacity(WINDOW_BYTES + 1);
+    settings.validate()?;
+    let capacity = settings.window_bytes as usize;
+    let overlap = settings.overlap_bytes as usize;
+    let mut window = Vec::with_capacity(capacity + 1);
     let mut offset = 0;
     let mut chunks = 0;
     let mut total_bytes = 0;
@@ -26,7 +34,7 @@ pub fn index_utf8(
     loop {
         let old_len = window.len();
         (&mut source)
-            .take((WINDOW_BYTES + 1 - old_len) as u64)
+            .take((capacity + 1 - old_len) as u64)
             .read_to_end(&mut window)?;
         hash.update(&window[old_len..]);
         total_bytes += (window.len() - old_len) as u64;
@@ -34,8 +42,8 @@ pub fn index_utf8(
             break;
         }
 
-        let eof = window.len() <= WINDOW_BYTES;
-        let candidate = &window[..window.len().min(WINDOW_BYTES)];
+        let eof = window.len() <= capacity;
+        let candidate = &window[..window.len().min(capacity)];
         let text = match str::from_utf8(candidate) {
             Ok(text) => text,
             Err(error) if !eof && error.error_len().is_none() => {
@@ -53,7 +61,7 @@ pub fn index_utf8(
         } else {
             text.rmatch_indices('\n')
                 .map(|(index, _)| index + 1)
-                .find(|&index| index >= WINDOW_BYTES * 3 / 4)
+                .find(|&index| index >= capacity * 3 / 4)
                 .unwrap_or(text.len())
         };
         emit(
@@ -68,7 +76,7 @@ pub fn index_utf8(
             break;
         }
 
-        let mut advance = end - OVERLAP_BYTES;
+        let mut advance = end - overlap;
         while !text.is_char_boundary(advance) {
             advance += 1;
         }
@@ -86,6 +94,8 @@ pub fn index_utf8(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const WINDOW_BYTES: usize = 4096;
 
     #[test]
     fn preserves_ranges_and_hash_across_split_utf8_and_long_lines() {

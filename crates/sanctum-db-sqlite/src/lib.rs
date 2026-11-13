@@ -53,6 +53,8 @@ pub struct Revision {
 pub struct RevisionContent {
     pub bytes: u64,
     pub chunks: u64,
+    #[serde(default = "default_chunker")]
+    pub chunker: String,
     pub hash: String,
     pub original_hash: String,
     pub encoding: String,
@@ -60,6 +62,10 @@ pub struct RevisionContent {
     pub retain_original: bool,
     pub url: Option<UrlProvenance>,
     pub git: Option<GitProvenance>,
+}
+
+fn default_chunker() -> String {
+    sanctum_core::ChunkSettings::default().identifier()
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -341,7 +347,7 @@ impl CollectionDb {
         self.0
             .query_row(
                 "SELECT content_hash, chunk_count, bytes, COALESCE(original_hash, content_hash),
-                    source_encoding, extractor, retain_original, url_provenance, git_provenance
+                    source_encoding, extractor, retain_original, url_provenance, git_provenance, chunker
                  FROM revisions WHERE source_id = ?1 AND id = ?2",
                 params![source.to_string(), revision.to_string()],
                 |row| row_revision_content(row, 0),
@@ -496,7 +502,7 @@ impl<T: Deref<Target = Connection>> RevisionWrite<T> {
             .execute(
                 "INSERT INTO revisions (source_id, id, content_hash, bytes, chunk_count, chunker,
                     original_hash, source_encoding, extractor, retain_original, url_provenance, git_provenance)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'utf8-overlap-v1', ?6, ?7, ?8, ?9, ?10, ?11)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?12, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     data.source.to_string(),
                     data.revision.to_string(),
@@ -508,7 +514,8 @@ impl<T: Deref<Target = Connection>> RevisionWrite<T> {
                     data.content.extractor,
                     data.content.retain_original,
                     write_json(data.content.url.as_ref())?,
-                    write_json(data.content.git.as_ref())?
+                    write_json(data.content.git.as_ref())?,
+                    data.content.chunker
                 ],
             )
             .map_err(database_error)?;
@@ -642,6 +649,7 @@ fn row_revision_content(row: &Row<'_>, offset: usize) -> rusqlite::Result<Revisi
         retain_original: row.get(offset + 6)?,
         url: read_json(row, offset + 7)?,
         git: read_json(row, offset + 8)?,
+        chunker: row.get(offset + 9)?,
     })
 }
 

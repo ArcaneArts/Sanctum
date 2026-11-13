@@ -117,6 +117,46 @@ pub struct GitProvenance {
     pub blob: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChunkSettings {
+    pub window_bytes: u32,
+    pub overlap_bytes: u32,
+}
+
+impl Default for ChunkSettings {
+    fn default() -> Self {
+        Self {
+            window_bytes: 4096,
+            overlap_bytes: 400,
+        }
+    }
+}
+
+impl ChunkSettings {
+    pub fn validate(self) -> Result<()> {
+        if !(256..=16_384).contains(&self.window_bytes)
+            || self.overlap_bytes > self.window_bytes / 2
+        {
+            return Err(Error::Invalid(
+                "chunk window must be 256 to 16384 bytes, with overlap at most half the window"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn identifier(self) -> String {
+        if self == Self::default() {
+            return "utf8-overlap-v1".into();
+        }
+        format!(
+            "utf8-overlap-v1/{}/{}",
+            self.window_bytes, self.overlap_bytes
+        )
+    }
+}
+
 pub const UPLOAD_FRAME_BYTES: usize = 256 * 1024;
 
 pub fn is_rtf(name: &str) -> bool {

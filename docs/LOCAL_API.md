@@ -124,6 +124,20 @@ points at either outer boundary. The returned half-open range identifies
 the context. The nested hit still describes the exact cited chunk and
 its verified content hash.
 
+## Chunk configuration
+
+Set `chunking.window_bytes` and `chunking.overlap_bytes` in
+`SANCTUM_CONFIG_JSON` to change the streaming UTF-8 window. The
+defaults are 4096 and 400 bytes. Windows can be 256 to 16384 bytes.
+Overlap can be zero through half the window. Boundaries follow UTF-8
+code points and prefer nearby newlines.
+
+Accepted uploads retain their chunk settings through retries and
+worker restarts. Existing published revisions keep their byte ranges.
+A replacement uses the settings effective at its acceptance. Revision
+inspection reports the algorithm identifier with custom byte settings
+when applicable. `GetRuntimeInfo` reports the current defaults.
+
 ## Runtime information
 
 `GetRuntimeInfo` reports the serving state and version of the API process,

@@ -444,6 +444,10 @@ async fn main() -> anyhow::Result<()> {
             println!("Sanctum {} ({}, {})", info.version, info.status, info.role);
             println!("Storage: {}", info.storage);
             println!("Source limit: {} bytes", info.max_source_bytes);
+            println!(
+                "Chunk window: {} bytes, {} bytes overlap",
+                info.chunk_window_bytes, info.chunk_overlap_bytes
+            );
             if let Some(concurrency) = info.local_worker_concurrency {
                 println!("Local workers: {concurrency}");
             }

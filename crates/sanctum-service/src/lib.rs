@@ -11,7 +11,9 @@ pub use db::metadata::{
 };
 pub use db::{metadata_filter, metadata_query, snapshot as database_snapshot};
 pub use hit_metadata::{HitMetadata, HitMetadataEntry};
-use sanctum_core::{Error, ExternalSource, Result, Scope, ScopeId, UsageMeasurement, UsageScope};
+use sanctum_core::{
+    ChunkSettings, Error, ExternalSource, Result, Scope, ScopeId, UsageMeasurement, UsageScope,
+};
 use sanctum_db_sqlite::{self as db, CollectionDb};
 pub use sanctum_db_sqlite::{Chunk, ChunkRef, CollectionDetails, Revision, RevisionContent};
 use sanctum_storage_fs::LocalFiles;
@@ -70,6 +72,7 @@ pub struct Service {
     files: Arc<LocalFiles>,
     queue: LocalQueue,
     max_source_bytes: u64,
+    chunking: ChunkSettings,
     url_importer: url_import::UrlImporter,
     git_imports: git_import::ActiveImports,
     database_sessions: database_sessions::DatabaseSessions,
@@ -249,6 +252,7 @@ impl Service {
             files,
             queue,
             max_source_bytes,
+            chunking: ChunkSettings::default(),
             url_importer: url_import::UrlImporter::new()?,
             git_imports: Default::default(),
             database_sessions,
@@ -262,6 +266,12 @@ impl Service {
             tracing::warn!(%error, "could not reclaim all unreferenced local uploads");
         }
         Ok(service)
+    }
+
+    pub fn with_chunking(mut self, settings: ChunkSettings) -> Result<Self> {
+        settings.validate()?;
+        self.chunking = settings;
+        Ok(self)
     }
 
     pub fn max_source_bytes(&self) -> u64 {

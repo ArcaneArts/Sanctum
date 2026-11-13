@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use sanctum_core::{Error, Result, Scope, ScopeId, UsageMeasurement, UsageScope};
+use sanctum_core::{ChunkSettings, Error, Result, Scope, ScopeId, UsageMeasurement, UsageScope};
 use sanctum_db::{Command, Publication, SnapshotCache, Unit, collection_prefix, tenant_prefix};
 use sanctum_storage::{Key, Storage};
 use uuid::Uuid;
@@ -14,6 +14,7 @@ pub struct HostedCatalog {
     pub(crate) storage: Arc<dyn Storage>,
     pub(crate) prefix: Option<Key>,
     pub(crate) max_source_bytes: u64,
+    pub(crate) chunking: ChunkSettings,
     pub(crate) publication: Publication,
     pub(crate) snapshots: Arc<SnapshotCache>,
     pub(crate) dispatcher: Option<Arc<dyn Dispatch>>,
@@ -34,11 +35,18 @@ impl HostedCatalog {
             storage,
             prefix,
             max_source_bytes,
+            chunking: ChunkSettings::default(),
             publication,
             snapshots: Arc::new(SnapshotCache::new(DEFAULT_SNAPSHOT_CACHE_BYTES)),
             dispatcher: None,
             embedding: None,
         })
+    }
+
+    pub fn with_chunking(mut self, settings: ChunkSettings) -> Result<Self> {
+        settings.validate()?;
+        self.chunking = settings;
+        Ok(self)
     }
 
     pub fn with_embedding(

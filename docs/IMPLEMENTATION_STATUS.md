@@ -845,3 +845,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - Local and hosted integration checks verify the stable scope. A
   CLI and generated Python MinIO check verifies Unicode display names
   and an unchanged creation time after restart.
+- Delivered in [PR #55](https://github.com/ArcaneArts/Sanctum/pull/55).
+
+## Configurable chunking
+
+- Server JSON controls the bounded streaming UTF-8 window and overlap.
+  Local jobs and hosted envelopes persist the settings at acceptance.
+  Legacy jobs retain the original defaults, and revision inspection
+  records the chunking strategy used.
+- Integration checks reopen the filesystem executor and deliver hosted
+  work through a worker with different settings. Both preserve the
+  accepted window. The hosted test verifies the resulting UTF-8 range.
+- A generated Python client verified the configured chunker identifier
+  on a published RTF revision in live MinIO.
