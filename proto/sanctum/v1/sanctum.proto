@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package sanctum.v1;
+
+service Sanctum {
+  rpc CreateCollection(CreateCollectionRequest) returns (Collection);
+  rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
+  rpc UploadText(stream UploadTextFrame) returns (TextRevision);
+  rpc SearchText(SearchTextRequest) returns (SearchTextResponse);
+  rpc FetchChunk(FetchChunkRequest) returns (TextHit);
+}
+
+message Scope {
+  string tenant = 1;
+  string collection = 2;
+}
+
+message CreateCollectionRequest {
+  Scope scope = 1;
+}
+
+message Collection {
+  Scope scope = 1;
+}
+
+message ListCollectionsRequest {
+  string tenant = 1;
+}
+
+message ListCollectionsResponse {
+  repeated Collection collections = 1;
+}
+
+message ExternalSource {
+  string namespace = 1;
+  string id = 2;
+}
+
+message UploadTextHeader {
+  Scope scope = 1;
+  string name = 2;
+  ExternalSource external = 3;
+}
+
+message UploadTextEnd {}
+
+// Send a header, data frames of at most 256 KiB, then one end frame and EOF.
+message UploadTextFrame {
+  oneof frame {
+    UploadTextHeader header = 1;
+    bytes data = 2;
+    UploadTextEnd end = 3;
+  }
+}
+
+// Successful UploadText responses describe a committed lexical revision.
+message TextRevision {
+  Scope scope = 1;
+  string source_id = 2;
+  string revision_id = 3;
+  string name = 4;
+  ExternalSource external = 5;
+  uint64 bytes = 6;
+  uint64 chunks = 7;
+  string content_blake3 = 8;
+}
+
+message SearchTextRequest {
+  Scope scope = 1;
+  string query = 2;
+  optional uint32 limit = 3;
+}
+
+message SearchTextResponse {
+  repeated TextHit hits = 1;
+}
+
+message ChunkRef {
+  Scope scope = 1;
+  string source_id = 2;
+  string revision_id = 3;
+  uint64 ordinal = 4;
+}
+
+message FetchChunkRequest {
+  ChunkRef chunk = 1;
+}
+
+message TextHit {
+  ChunkRef chunk = 1;
+  string name = 2;
+  ExternalSource external = 3;
+  uint64 start_byte = 4;
+  uint64 end_byte = 5; // Exclusive.
+  string excerpt = 6;
+  string content_blake3 = 7;
+}

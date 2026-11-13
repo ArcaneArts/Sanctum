@@ -1,0 +1,13 @@
+[package]
+name = "sanctum-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sanctum-core = { path = "../sanctum-core" }
+sanctum-proto = { path = "../sanctum-proto" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }

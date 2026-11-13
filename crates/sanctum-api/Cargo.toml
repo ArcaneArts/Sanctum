@@ -1,0 +1,17 @@
+[package]
+name = "sanctum-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sanctum-core = { path = "../sanctum-core" }
+sanctum-proto = { path = "../sanctum-proto" }
+sanctum-service = { path = "../sanctum-service" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio-stream.workspace = true

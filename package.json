@@ -1,0 +1,8 @@
+{
+  "name": "sanctum",
+  "private": true,
+  "packageManager": "pnpm@11.15.1",
+  "scripts": {
+    "check": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked"
+  }
+}
