@@ -20,7 +20,8 @@ impl Service {
 
     pub fn reclaim_retired(&self, scope: &Scope) -> Result<()> {
         let mut database = self.database(scope)?;
-        if !database.has_retirement_work()? {
+        let profile = self.embedding_profile();
+        if !database.has_retirement_work(profile)? {
             return Ok(());
         }
         let _exclusive = self
@@ -28,12 +29,14 @@ impl Service {
             .write()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         let writer = database.write()?;
-        for candidate in writer.retirement_candidates()? {
+        writer.release_retirements(profile)?;
+        for candidate in writer.retirement_candidates(profile)? {
             if !self.queue.retains_input(scope, candidate)? {
                 writer.retire(candidate)?;
             }
         }
         writer.expire_deletion_receipts()?;
+        writer.prune_unreferenced_embeddings()?;
         writer.commit()?;
 
         for garbage in database.garbage()? {
@@ -75,7 +78,7 @@ impl Service {
         }
     }
 
-    fn local_scopes(&self) -> Result<Vec<Scope>> {
+    pub(crate) fn local_scopes(&self) -> Result<Vec<Scope>> {
         let mut scopes = Vec::new();
         for tenant in self.files.tenants()? {
             for collection in self.list_collections(&tenant)? {

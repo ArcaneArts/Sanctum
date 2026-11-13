@@ -5,7 +5,7 @@ which parts have working implementations and where to find the evidence.
 
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
-| 1. Local desktop and MCP | Local Rust service and gRPC CLI with streamed UTF-8 and RTF ingestion, original retention, directory imports, SQLite FTS5, byte-range fetch, restartable lexical jobs, source lifecycle, metadata CRUD and filters, and filesystem storage usage | Embedding reuse and readiness, Ollama and vector search, MCP, tray app, desktop acceptance |
+| 1. Local desktop and MCP | Local Rust service and gRPC CLI with streamed UTF-8 and RTF ingestion, directory imports, byte-range fetch, source lifecycle, metadata and filters, filesystem usage, and Ollama-backed semantic and hybrid search | MCP, tray app, per-source embedding progress, desktop acceptance |
 | 2. Providers and local integrations | Pending | Hosted provider adapters, rebuilds, watchers, URL and Git imports, metadata queries and cursors, SQL access, multi-collection retrieval, platform packaging and verification |
 | 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
@@ -61,8 +61,8 @@ Merged in [PR #4](https://github.com/ArcaneArts/Sanctum/pull/4).
 - The local gRPC tests cover both replacement targets, stale expected revisions,
   competing queued replacements, deletion during queued work, and retirement
   of old index rows and files. A v1 fixture verifies migration and orphan cleanup.
-- Retirement currently follows lexical readiness. Adding embeddings must link
-  retirement to the configured embedding profile's readiness.
+- Retirement now also waits for the configured embedding profile's readiness
+  when embeddings are enabled.
 
 ## Local file and directory imports
 
@@ -118,9 +118,11 @@ Merged in [PR #8](https://github.com/ArcaneArts/Sanctum/pull/8).
 - The gRPC test demonstrates a matching lower-ranked candidate under a
   one-hit limit. It also covers literal path segments, large integer
   comparisons, JSON null versus missing, and tenant scope.
-- Semantic and hybrid search must reuse the candidate filtering semantics.
+- Semantic and hybrid search reuse these candidate filtering semantics.
 
 ## Local storage usage
+
+Merged in [PR #9](https://github.com/ArcaneArts/Sanctum/pull/9).
 
 - `GetStorageUsage` and `sanctum-cli usage` measure real filesystem lengths
   at the collection, tenant, and cluster scopes. The response includes file
@@ -129,4 +131,24 @@ Merged in [PR #8](https://github.com/ArcaneArts/Sanctum/pull/8).
   filesystem walk and verifies staging, retained originals, symbolic links,
   and refresh after removal.
 - Object storage usage remains part of the object storage milestone.
-  Next, add Ollama profile configuration, embedding persistence, and retrieval.
+
+## Local embeddings and retrieval
+
+- The server can use an existing Ollama endpoint with a configured model
+  revision, dimensions, and separate document and query prefixes. The
+  background worker reuses matching inputs within a collection, tracks
+  failures and retry times in SQLite, and keeps provider calls outside
+  SQLite transactions.
+- Single-collection search supports lexical, semantic, and hybrid modes.
+  Vector ranking uses exact cosine similarity. A profile change excludes
+  previous vectors immediately, and hybrid search reports lexical fallback
+  or partial coverage during a rebuild.
+- The gRPC integration test exercises search, filtering before ranking,
+  lexical fallback, vector reuse, failed replacement retention, restart,
+  and profile isolation. It uses a deterministic test provider.
+- A standalone server and CLI smoke test used the installed Ollama
+  `embeddinggemma-2:740m` model, verified two persisted 768-dimensional
+  vectors, and ranked a relevant source for a query with no lexical match.
+  It also exercised hybrid search.
+- Per-source embedding progress, explicit retry of permanent failures,
+  cross-collection ranking, and capacity measurement remain open.

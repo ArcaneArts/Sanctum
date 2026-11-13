@@ -86,6 +86,8 @@ enum Command {
         query: String,
         #[arg(long, default_value_t = 10)]
         limit: u32,
+        #[arg(long, value_parser = ["lexical", "semantic", "hybrid"], default_value = "lexical")]
+        mode: String,
     },
     Fetch {
         collection: String,
@@ -328,6 +330,7 @@ async fn main() -> anyhow::Result<()> {
             collection,
             query,
             limit,
+            mode,
         } => {
             let response = client
                 .search_text(v1::SearchTextRequest {
@@ -335,9 +338,18 @@ async fn main() -> anyhow::Result<()> {
                     query,
                     limit: Some(limit),
                     metadata_filter: None,
+                    mode: match mode.as_str() {
+                        "semantic" => v1::SearchMode::Semantic,
+                        "hybrid" => v1::SearchMode::Hybrid,
+                        _ => v1::SearchMode::Lexical,
+                    }
+                    .into(),
                 })
                 .await?
                 .into_inner();
+            if let Some(reason) = response.degraded_reason {
+                eprintln!("Search coverage: {reason}");
+            }
             for hit in response.hits {
                 let chunk = hit.chunk.context("server omitted chunk reference")?;
                 println!(

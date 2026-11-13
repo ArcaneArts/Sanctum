@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 sanctum-api = { path = "../sanctum-api" }
 sanctum-config = { path = "../sanctum-config" }
+sanctum-embedding-ollama = { path = "../sanctum-embedding-ollama" }
 sanctum-proto = { path = "../sanctum-proto" }
 sanctum-service = { path = "../sanctum-service" }
 anyhow = { workspace = true }

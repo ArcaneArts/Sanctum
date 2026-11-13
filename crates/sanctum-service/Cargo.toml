@@ -10,6 +10,7 @@ sanctum-storage-fs = { path = "../sanctum-storage-fs" }
 sanctum-db-sqlite = { path = "../sanctum-db-sqlite" }
 sanctum-chunk = { path = "../sanctum-chunk" }
 sanctum-extract = { path = "../sanctum-extract" }
+sanctum-embedding = { path = "../sanctum-embedding" }
 blake3 = { workspace = true }
 globset.workspace = true
 tempfile = { workspace = true }

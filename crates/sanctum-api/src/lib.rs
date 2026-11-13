@@ -289,26 +289,50 @@ impl Sanctum for Grpc {
     ) -> Reply<v1::SearchTextResponse> {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
-        let service = self.0.clone();
-        work(move || {
-            let hits = service
-                .search(
-                    &scope,
-                    &request.query,
-                    request.limit.unwrap_or(10),
-                    request
-                        .metadata_filter
-                        .map(metadata_filter::parse)
-                        .transpose()?
-                        .as_ref(),
-                )?
+        let mode = match v1::SearchMode::try_from(request.mode) {
+            Ok(v1::SearchMode::Unspecified | v1::SearchMode::Lexical) => {
+                sanctum_service::SearchMode::Lexical
+            }
+            Ok(v1::SearchMode::Semantic) => sanctum_service::SearchMode::Semantic,
+            Ok(v1::SearchMode::Hybrid) => sanctum_service::SearchMode::Hybrid,
+            Err(_) => return Err(Status::invalid_argument("unknown search mode")),
+        };
+        let filter = request
+            .metadata_filter
+            .map(metadata_filter::parse)
+            .transpose()
+            .map_err(status)?;
+        let result = self
+            .0
+            .retrieve(
+                scope.clone(),
+                request.query,
+                request.limit.unwrap_or(10),
+                filter,
+                mode,
+            )
+            .await
+            .map_err(status)?;
+        let mode = match result.mode {
+            sanctum_service::SearchMode::Lexical => v1::SearchMode::Lexical,
+            sanctum_service::SearchMode::Semantic => v1::SearchMode::Semantic,
+            sanctum_service::SearchMode::Hybrid => v1::SearchMode::Hybrid,
+        };
+        Ok(Response::new(v1::SearchTextResponse {
+            hits: result
+                .hits
                 .into_iter()
                 .map(|hit| wire_hit(&scope, hit))
-                .collect();
-            Ok(v1::SearchTextResponse { hits })
-        })
-        .await
-        .map(Response::new)
+                .collect(),
+            mode: mode.into(),
+            embedding_coverage: Some(v1::EmbeddingCoverage {
+                profile_id: result.profile,
+                total_chunks: result.coverage.total,
+                embedded_chunks: result.coverage.embedded,
+                failed_chunks: result.coverage.failed,
+            }),
+            degraded_reason: result.degraded.map(str::to_owned),
+        }))
     }
 
     async fn fetch_chunk(&self, request: Request<v1::FetchChunkRequest>) -> Reply<v1::TextHit> {
@@ -592,6 +616,7 @@ fn wire_hit(scope: &Scope, hit: Hit) -> v1::TextHit {
         end_byte: chunk.range.end,
         excerpt: hit.excerpt,
         content_blake3: chunk.hash,
+        score: hit.score,
     }
 }
 

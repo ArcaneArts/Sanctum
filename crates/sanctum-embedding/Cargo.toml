@@ -1,0 +1,11 @@
+[package]
+name = "sanctum-embedding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+serde.workspace = true
+thiserror.workspace = true

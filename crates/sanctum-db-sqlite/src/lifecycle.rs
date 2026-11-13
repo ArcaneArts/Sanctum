@@ -48,14 +48,23 @@ impl CollectionDb {
             .is_some())
     }
 
-    pub fn has_retirement_work(&self) -> Result<bool> {
+    pub fn has_retirement_work(&self, profile: Option<&str>) -> Result<bool> {
         self.0
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM revisions WHERE retire_at <= unixepoch())
+                 OR EXISTS (
+                    SELECT 1 FROM revisions r JOIN sources s ON s.id = r.source_id
+                    WHERE s.deleted = 0 AND s.current_revision <> r.id AND r.retire_at IS NULL
+                      AND (?1 IS NULL OR NOT EXISTS (
+                        SELECT 1 FROM chunks c LEFT JOIN embedding_cache e
+                          ON e.profile = ?1 AND e.input_hash = c.content_hash AND e.vector IS NOT NULL
+                        WHERE c.source_id = s.id AND c.revision_id = s.current_revision AND e.input_hash IS NULL
+                      ))
+                 )
                  OR EXISTS(SELECT 1 FROM revision_garbage)
                  OR EXISTS(SELECT 1 FROM deleted_sources d WHERE d.expires_at <= unixepoch()
                      AND NOT EXISTS(SELECT 1 FROM sources WHERE id = d.id))",
-                [],
+                [profile],
                 |row| row.get(0),
             )
             .map_err(database_error)
@@ -136,17 +145,10 @@ impl RevisionWriter<'_> {
                 ],
             )
             .map_err(database_error)?;
-        // Only the lexical stage is configured so far. Embedding readiness will
-        // own this transition when an embedding profile is active.
         self.0
             .execute(
-                "UPDATE revisions SET retire_at = unixepoch() + ?3
-             WHERE source_id = ?1 AND id = ?2",
-                params![
-                    previous.source.to_string(),
-                    previous.revision.to_string(),
-                    RETIRE_GRACE_SECONDS
-                ],
+                "UPDATE revisions SET retire_at = NULL WHERE source_id = ?1",
+                [previous.source.to_string()],
             )
             .map_err(database_error)?;
         Ok(())
@@ -201,14 +203,18 @@ impl RevisionWriter<'_> {
         Ok(current)
     }
 
-    pub fn retirement_candidates(&self) -> Result<Vec<RevisionKey>> {
+    pub fn retirement_candidates(&self, profile: Option<&str>) -> Result<Vec<RevisionKey>> {
         query_all(
             &self.0,
             "SELECT r.source_id, r.id FROM revisions r
             JOIN sources s ON s.id = r.source_id
-            WHERE r.retire_at <= unixepoch()
+            WHERE r.retire_at <= unixepoch() AND (s.deleted = 1 OR ?1 IS NULL OR NOT EXISTS (
+              SELECT 1 FROM chunks c LEFT JOIN embedding_cache e
+                ON e.profile = ?1 AND e.input_hash = c.content_hash AND e.vector IS NOT NULL
+              WHERE c.source_id = s.id AND c.revision_id = s.current_revision AND e.input_hash IS NULL
+            ))
             ORDER BY (r.id = s.current_revision), r.retire_at LIMIT 256",
-            [],
+            [profile],
             key,
         )
     }

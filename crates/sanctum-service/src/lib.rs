@@ -15,10 +15,12 @@ use sanctum_storage_fs::LocalFiles;
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+mod embedding;
 mod local_import;
 mod local_jobs;
 mod maintenance;
 mod worker;
+pub use embedding::{SearchMode, run_embedding_worker};
 pub use local_import::{ImportEvent, ImportOptions, ImportState};
 pub use worker::{run_local_maintenance, run_local_worker};
 
@@ -31,6 +33,7 @@ pub struct Service {
     queue: LocalQueue,
     max_source_bytes: u64,
     retrieval: Arc<RwLock<()>>,
+    embedding: Option<Arc<dyn sanctum_embedding::Provider>>,
 }
 
 pub struct TextUpload {
@@ -56,6 +59,7 @@ pub struct StagedUpload {
 pub struct Hit {
     pub chunk: Chunk,
     pub excerpt: String,
+    pub score: Option<f64>,
 }
 
 impl Service {
@@ -93,6 +97,14 @@ impl Service {
         self.database(scope)?.changes(after, limit)
     }
     pub fn open(root: &Path, max_source_bytes: u64) -> Result<Self> {
+        Self::open_with_embedding(root, max_source_bytes, None)
+    }
+
+    pub fn open_with_embedding(
+        root: &Path,
+        max_source_bytes: u64,
+        embedding: Option<Arc<dyn sanctum_embedding::Provider>>,
+    ) -> Result<Self> {
         if !(1..=i64::MAX as u64).contains(&max_source_bytes) {
             return Err(Error::Invalid(
                 "max_source_bytes is outside the supported range".into(),
@@ -105,6 +117,7 @@ impl Service {
             queue,
             max_source_bytes,
             retrieval: Arc::new(RwLock::new(())),
+            embedding,
         };
         if let Err(error) = service.reclaim_startup_orphans() {
             tracing::warn!(%error, "could not reclaim all unreferenced local uploads");
@@ -162,45 +175,6 @@ impl Service {
         })
     }
 
-    pub fn search(
-        &self,
-        scope: &Scope,
-        query: &str,
-        limit: u32,
-        filter: Option<&metadata_filter::Filter>,
-    ) -> Result<Vec<Hit>> {
-        if query.trim().is_empty() || query.len() > 4096 || query.as_bytes().contains(&0) {
-            return Err(Error::Invalid(
-                "search requires a text query of at most 4096 bytes".into(),
-            ));
-        }
-        if !(1..=100).contains(&limit) {
-            return Err(Error::Invalid(
-                "search limit must be between 1 and 100".into(),
-            ));
-        }
-        let expression = query
-            .split_whitespace()
-            .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let collection_metadata = match filter {
-            Some(filter) if filter.uses_collection_metadata() => {
-                self.metadata(scope, None, None)?
-            }
-            _ => Vec::new(),
-        };
-        let _reader = self
-            .retrieval
-            .read()
-            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
-        self.database(scope)?
-            .search(&expression, limit, filter, &collection_metadata)?
-            .into_iter()
-            .map(|chunk| self.hit(scope, chunk))
-            .collect()
-    }
-
     pub fn fetch(&self, scope: &Scope, reference: &ChunkRef) -> Result<Hit> {
         let _reader = self
             .retrieval
@@ -235,7 +209,11 @@ impl Service {
             )));
         }
         let excerpt = String::from_utf8(bytes).map_err(|error| Error::Internal(Box::new(error)))?;
-        Ok(Hit { chunk, excerpt })
+        Ok(Hit {
+            chunk,
+            excerpt,
+            score: None,
+        })
     }
 }
 

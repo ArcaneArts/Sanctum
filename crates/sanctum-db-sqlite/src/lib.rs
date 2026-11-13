@@ -6,6 +6,7 @@ use rusqlite::{
 use sanctum_core::{ByteRange, Error, ExternalSource, Result};
 use uuid::Uuid;
 
+pub mod embedding;
 mod lifecycle;
 pub mod metadata;
 pub mod metadata_filter;
@@ -20,6 +21,7 @@ const COLLECTION_MIGRATIONS: &[&str] = &[
     include_str!("collection_v2.sql"),
     include_str!("collection_v3.sql"),
     include_str!("collection_v4.sql"),
+    include_str!("collection_v5.sql"),
 ];
 
 #[derive(Debug)]
@@ -42,7 +44,7 @@ pub struct RevisionContent {
     pub retain_original: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ChunkRef {
     pub source: Uuid,
     pub revision: Uuid,
@@ -168,6 +170,13 @@ impl CollectionDb {
         ))
     }
 
+    pub fn read_snapshot<T>(&self, read: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        let transaction = self.0.unchecked_transaction().map_err(database_error)?;
+        let result = read(self)?;
+        transaction.commit().map_err(database_error)?;
+        Ok(result)
+    }
+
     pub fn search(
         &self,
         phrase: &str,
@@ -268,7 +277,12 @@ impl RevisionWriter<'_> {
         Ok(())
     }
 
-    pub fn register(&self, data: &Revision, replacement: bool) -> Result<()> {
+    pub fn register(
+        &self,
+        data: &Revision,
+        replacement: bool,
+        profile: Option<&str>,
+    ) -> Result<()> {
         if replacement {
             self.replace_current(data)?;
         } else {
@@ -300,6 +314,9 @@ impl RevisionWriter<'_> {
                 ],
             )
             .map_err(database_error)?;
+        if replacement {
+            self.release_retirements(profile)?;
+        }
         Ok(())
     }
 
