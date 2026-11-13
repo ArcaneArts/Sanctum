@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Sanctum",
+  "version": "0.1.0",
+  "identifier": "com.arcanearts.sanctum",
+  "build": {
+    "beforeDevCommand": "node ../../scripts/desktop-sidecars.mjs && pnpm dev",
+    "beforeBuildCommand": "node ../../scripts/desktop-sidecars.mjs --release && pnpm build",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Sanctum",
+        "width": 1040,
+        "height": 720,
+        "minWidth": 610,
+        "minHeight": 560,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'",
+      "devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:1420; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "externalBin": ["binaries/sanctum-server", "binaries/sanctum-cli"],
+    "icon": ["icons/icon.png", "icons/icon.icns", "icons/icon.ico"]
+  }
+}

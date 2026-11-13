@@ -1,11 +1,11 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use sanctum_core::{Error, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const CONFIG_ENV: &str = "SANCTUM_CONFIG_JSON";
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
@@ -21,7 +21,7 @@ pub struct Config {
     pub embedding: Option<EmbeddingConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "provider", rename_all = "snake_case")]
 pub enum EmbeddingConfig {
     Ollama(sanctum_embedding_ollama::OllamaConfig),
