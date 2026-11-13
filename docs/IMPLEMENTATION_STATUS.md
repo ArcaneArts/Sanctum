@@ -6,7 +6,7 @@ which parts have working implementations and where to find the evidence.
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | End-to-end acceptance in an LLM client |
-| 2. Providers and local integrations | Local profile rebuilds and multi-collection retrieval | Hosted provider adapters, watchers, URL and Git imports, advanced metadata queries and cursors, SQL access, platform packaging and verification |
+| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, and watched folders | Live hosted provider checks, URL and Git imports, advanced metadata queries and cursors, SQL access, platform packaging and verification |
 | 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
 | 5. Capacity | Pending | Representative 200 MB sources, GB-scale collections and database snapshots, cold/warm cloud performance, measured optimization |
@@ -247,8 +247,21 @@ Merged in [PR #16](https://github.com/ArcaneArts/Sanctum/pull/16).
 
 ## Desktop embedding settings
 
+Merged in [PR #17](https://github.com/ArcaneArts/Sanctum/pull/17).
+
 - The desktop supports Ollama, OpenAI-compatible endpoints, and Google
   Cloud using the headless server's provider configuration. Earlier
   desktop Ollama settings load with their saved profile intact.
 - The Rust settings test covers old settings, provider round trips, and
   credential references. Hosted provider verification remains open.
+
+## Watched folders
+
+- Watch definitions persist in the local queue and reconcile with the
+  existing directory importer after restart and at configurable intervals.
+  Watches preserve source IDs on edits and support explicit removal
+  handling.
+- The gRPC integration test verifies queue pause, tenant scoping, filters,
+  and edits and removals made while the server was offline. A standalone
+  CLI smoke test also detected an edit while running and verified that the
+  source ID stayed the same.

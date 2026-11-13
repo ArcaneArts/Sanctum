@@ -2338,6 +2338,8 @@ dependencies = [
  "sanctum-embedding",
  "sanctum-extract",
  "sanctum-storage-fs",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

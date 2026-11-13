@@ -8,7 +8,7 @@ use std::{
 
 use sanctum_embedding::{EmbedError, Provider, Purpose};
 use sanctum_proto::v1::{self, sanctum_client::SanctumClient, upload_text_frame::Frame};
-use sanctum_service::{Service, run_embedding_worker, run_local_worker};
+use sanctum_service::{Service, run_embedding_worker, run_local_worker, run_watched_folders};
 use tempfile::TempDir;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -50,9 +50,13 @@ impl Running {
                     server_service.clone(),
                     worker_stop.clone(),
                 ));
-                let embedding =
-                    tokio::spawn(run_embedding_worker(server_service.clone(), worker_stop));
-                (worker, embedding)
+                let embedding = tokio::spawn(run_embedding_worker(
+                    server_service.clone(),
+                    worker_stop.clone(),
+                ));
+                let watcher =
+                    tokio::spawn(run_watched_folders(server_service.clone(), worker_stop));
+                (worker, embedding, watcher)
             });
             let result = Server::builder()
                 .add_service(sanctum_api::grpc(server_service))
@@ -61,9 +65,10 @@ impl Running {
                 })
                 .await;
             let _ = stop_worker.send(true);
-            if let Some((worker, embedding)) = workers {
+            if let Some((worker, embedding, watcher)) = workers {
                 worker.await.unwrap();
                 embedding.await.unwrap();
+                watcher.await.unwrap();
             }
             result
         });
@@ -1435,6 +1440,148 @@ fn expire_and_reclaim(dir: &TempDir, service: &Service) {
             collection: "notes".parse().unwrap(),
         })
         .unwrap();
+}
+
+#[tokio::test]
+async fn folder_watch_reconciles_offline_edits_and_prunes_explicitly() {
+    let dir = TempDir::new().unwrap();
+    let files = TempDir::new().unwrap();
+    let first = files.path().join("first.md");
+    let removed = files.path().join("removed.md");
+    std::fs::write(&first, "zircon").unwrap();
+    std::fs::write(&removed, "spinel").unwrap();
+    std::fs::write(files.path().join("skip.txt"), "invisible").unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    create(&mut running.client, "other").await;
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: true })
+        .await
+        .unwrap();
+    let request = v1::WatchFolderRequest {
+        scope: scope("default"),
+        path: files.path().to_str().unwrap().into(),
+        include: vec!["**/*.md".into()],
+        prune_missing: true,
+        interval_seconds: Some(3600),
+        ..Default::default()
+    };
+    let watch = running
+        .client
+        .watch_folder(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(watch.last_scan_at_unix_seconds.is_none());
+    assert_eq!(
+        running
+            .client
+            .watch_folder(request)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    let list = |tenant| v1::ListWatchedFoldersRequest {
+        scope: scope(tenant),
+        ..Default::default()
+    };
+    assert!(
+        running
+            .client
+            .list_watched_folders(list("other"))
+            .await
+            .unwrap()
+            .into_inner()
+            .folders
+            .is_empty()
+    );
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: false })
+        .await
+        .unwrap();
+    let initial = await_watch_hit(&mut running.client, "zircon").await;
+    await_watch_hit(&mut running.client, "spinel").await;
+    running.stop().await;
+
+    std::fs::write(&first, "andalusite").unwrap();
+    std::fs::remove_file(&removed).unwrap();
+    let mut running = Running::start(&dir).await;
+    let updated = await_watch_hit(&mut running.client, "andalusite").await;
+    assert_eq!(initial.source_id, updated.source_id);
+    assert_ne!(initial.revision_id, updated.revision_id);
+    assert!(
+        search(&mut running.client, "default", "spinel")
+            .await
+            .is_empty()
+    );
+    assert!(
+        search(&mut running.client, "default", "invisible")
+            .await
+            .is_empty()
+    );
+    let response = running
+        .client
+        .list_watched_folders(list("default"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.folders.len(), 1);
+    assert_eq!(response.folders[0].id, watch.id);
+    assert_eq!(response.folders[0].last_deleted, 1);
+    let request = v1::UnwatchFolderRequest {
+        scope: scope("other"),
+        id: watch.id,
+    };
+    assert_eq!(
+        running
+            .client
+            .unwatch_folder(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    running
+        .client
+        .unwatch_folder(v1::UnwatchFolderRequest {
+            scope: scope("default"),
+            ..request
+        })
+        .await
+        .unwrap();
+    assert!(
+        running
+            .client
+            .list_watched_folders(list("default"))
+            .await
+            .unwrap()
+            .into_inner()
+            .folders
+            .is_empty()
+    );
+    assert_eq!(
+        search(&mut running.client, "default", "andalusite")
+            .await
+            .len(),
+        1
+    );
+    running.stop().await;
+}
+
+async fn await_watch_hit(client: &mut SanctumClient<Channel>, query: &str) -> v1::ChunkRef {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Some(hit) = search(client, "default", query).await.pop() {
+                return hit.chunk.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap()
 }
 
 #[tokio::test]

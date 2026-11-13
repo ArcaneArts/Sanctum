@@ -13,6 +13,8 @@ sanctum-extract = { path = "../sanctum-extract" }
 sanctum-embedding = { path = "../sanctum-embedding" }
 blake3 = { workspace = true }
 globset.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

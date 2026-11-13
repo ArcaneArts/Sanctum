@@ -11,7 +11,7 @@ use walkdir::WalkDir;
 
 use crate::{Service, TextUpload, local_jobs::new_job};
 
-#[derive(Default)]
+#[derive(Default, serde::Deserialize, serde::Serialize)]
 pub struct ImportOptions {
     pub include: Vec<String>,
     pub exclude: Vec<String>,
@@ -61,6 +61,7 @@ impl ImportEvent {
 struct Selection {
     include: GlobSet,
     exclude: GlobSet,
+    prune_missing: bool,
 }
 
 impl Selection {
@@ -68,6 +69,7 @@ impl Selection {
         Ok(Self {
             include: globs(&options.include)?,
             exclude: globs(&options.exclude)?,
+            prune_missing: options.prune_missing,
         })
     }
 
@@ -93,12 +95,43 @@ impl Selection {
 }
 
 impl Service {
+    pub(crate) fn validate_watch(
+        &self,
+        scope: &Scope,
+        path: &Path,
+        options: &ImportOptions,
+    ) -> Result<PathBuf> {
+        self.require_collection(scope)?;
+        if !fs::symlink_metadata(path)?.file_type().is_dir() {
+            return Err(Error::Invalid("watch path must be a directory".into()));
+        }
+        let root = fs::canonicalize(path)?;
+        if root.starts_with(self.files.root()) {
+            return Err(Error::Invalid(
+                "cannot watch Sanctum's managed storage".into(),
+            ));
+        }
+        Selection::new(options)?;
+        Ok(root)
+    }
+
     /// Import a path on the local server's filesystem. Returning false stops the scan.
     pub fn import_local(
         &self,
         scope: &Scope,
         path: &Path,
         options: &ImportOptions,
+        emit: impl FnMut(ImportEvent) -> bool,
+    ) -> Result<()> {
+        self.import_local_until(scope, path, options, || false, emit)
+    }
+
+    pub(crate) fn import_local_until(
+        &self,
+        scope: &Scope,
+        path: &Path,
+        options: &ImportOptions,
+        stopped: impl Fn() -> bool,
         mut emit: impl FnMut(ImportEvent) -> bool,
     ) -> Result<()> {
         self.require_collection(scope)?;
@@ -142,6 +175,9 @@ impl Service {
             });
         let mut had_errors = false;
         for entry in walk {
+            if stopped() {
+                return Ok(());
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -176,6 +212,7 @@ impl Service {
                 &namespace,
                 &id,
                 options.retain_original,
+                &stopped,
             ) {
                 Ok(event) => event,
                 Err(error) => {
@@ -187,15 +224,8 @@ impl Service {
                 return Ok(());
             }
         }
-        if file_type.is_dir() && !had_errors {
-            self.reconcile_import(
-                scope,
-                &root,
-                &namespace,
-                &select,
-                options.prune_missing,
-                emit,
-            )?;
+        if file_type.is_dir() && !had_errors && !stopped() {
+            self.reconcile_import(scope, &root, &namespace, &select, &stopped, emit)?;
         }
         Ok(())
     }
@@ -207,6 +237,7 @@ impl Service {
         namespace: &str,
         id: &str,
         retain_original: bool,
+        stopped: impl Fn() -> bool,
     ) -> Result<ImportEvent> {
         let external = ExternalSource {
             namespace: namespace.into(),
@@ -222,11 +253,15 @@ impl Service {
             },
         )?;
         let mut input = File::open(path)?;
+        let before = input.metadata()?;
         let mut output = staged.reopen()?;
         let mut buffer = [0; 64 * 1024];
         let mut hasher = blake3::Hasher::new();
         let mut bytes = 0;
         loop {
+            if stopped() {
+                return Err(Error::Busy("import scan stopped".into()));
+            }
             let read = input.read(&mut buffer)?;
             if read == 0 {
                 break;
@@ -239,6 +274,15 @@ impl Service {
             }
             hasher.update(&buffer[..read]);
             output.write_all(&buffer[..read])?;
+        }
+        let after = input.metadata()?;
+        if bytes != before.len()
+            || bytes != after.len()
+            || before.modified().ok() != after.modified().ok()
+        {
+            return Err(Error::Busy(
+                "source changed while it was being imported".into(),
+            ));
         }
         drop(output);
         let hash = hasher.finalize().to_hex().to_string();
@@ -312,7 +356,7 @@ impl Service {
         root: &Path,
         namespace: &str,
         select: &Selection,
-        prune: bool,
+        stopped: &impl Fn() -> bool,
         mut emit: impl FnMut(ImportEvent) -> bool,
     ) -> Result<()> {
         let mut cursor = String::new();
@@ -327,6 +371,9 @@ impl Service {
                 return Ok(());
             }
             for id in paths {
+                if stopped() {
+                    return Ok(());
+                }
                 let relative = PathBuf::from(&id);
                 if relative_id(&relative).is_ok_and(|valid| valid == id)
                     && select.file_selected(&relative)
@@ -334,7 +381,12 @@ impl Service {
                     match fs::symlink_metadata(root.join(&relative)) {
                         Ok(_) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            let event = match self.missing_import(scope, namespace, &id, prune) {
+                            let event = match self.missing_import(
+                                scope,
+                                namespace,
+                                &id,
+                                select.prune_missing,
+                            ) {
                                 Ok(event) => event,
                                 Err(error) => Some(ImportEvent::failed(&id, &error)),
                             };
