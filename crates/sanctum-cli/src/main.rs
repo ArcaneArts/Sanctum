@@ -33,6 +33,18 @@ enum Command {
         external_id: Option<String>,
         #[arg(long)]
         background: bool,
+        #[arg(long)]
+        replace_source: Option<String>,
+        #[arg(long, requires = "namespace")]
+        replace_external: bool,
+        #[arg(long)]
+        expected_revision: Option<String>,
+    },
+    Delete {
+        collection: String,
+        source_id: String,
+        #[arg(long)]
+        expected_revision: Option<String>,
     },
     Job {
         collection: String,
@@ -106,6 +118,9 @@ async fn main() -> anyhow::Result<()> {
             namespace,
             external_id,
             background,
+            replace_source,
+            replace_external,
+            expected_revision,
         } => {
             let file = tokio::fs::File::open(&path)
                 .await
@@ -115,12 +130,23 @@ async fn main() -> anyhow::Result<()> {
                 .context("upload path must name a file")?
                 .to_string_lossy()
                 .into_owned();
+            let replacement = if replace_source.is_some() || replace_external {
+                Some(v1::Replacement {
+                    source_id: replace_source,
+                    expected_revision_id: expected_revision,
+                })
+            } else if expected_revision.is_some() {
+                return Err(anyhow!("--expected-revision requires a replacement target"));
+            } else {
+                None
+            };
             let header = v1::UploadTextHeader {
                 scope: scope(collection),
                 name,
                 external: namespace
                     .zip(external_id)
                     .map(|(namespace, id)| v1::ExternalSource { namespace, id }),
+                replacement,
             };
             let (sender, receiver) = tokio::sync::mpsc::channel(2);
             if background {
@@ -141,6 +167,21 @@ async fn main() -> anyhow::Result<()> {
                 "{} {} ({} chunks, {} bytes)",
                 revision.source_id, revision.revision_id, revision.chunks, revision.bytes
             );
+        }
+        Command::Delete {
+            collection,
+            source_id,
+            expected_revision,
+        } => {
+            let deleted = client
+                .delete_source(v1::DeleteSourceRequest {
+                    scope: scope(collection),
+                    source_id,
+                    expected_revision_id: expected_revision,
+                })
+                .await?
+                .into_inner();
+            println!("{} {}", deleted.source_id, deleted.revision_id);
         }
         Command::Job {
             collection,

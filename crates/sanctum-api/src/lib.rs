@@ -4,7 +4,7 @@ use sanctum_proto::v1::{
     sanctum_server::{Sanctum, SanctumServer},
     upload_text_frame::Frame,
 };
-use sanctum_service::{ChunkRef, Hit, Job, JobState, Service, TextUpload};
+use sanctum_service::{ChunkRef, Hit, Job, JobState, Replacement, Service, TextUpload};
 use tokio::io::AsyncWriteExt;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -195,6 +195,30 @@ impl Sanctum for Grpc {
             .await
             .map(Response::new)
     }
+
+    async fn delete_source(
+        &self,
+        request: Request<v1::DeleteSourceRequest>,
+    ) -> Reply<v1::DeletedSource> {
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        let source = request
+            .source_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("invalid source ID"))?;
+        let expected =
+            parse_optional_id(request.expected_revision_id, "invalid expected revision ID")?;
+        let service = self.0.clone();
+        work(move || {
+            let revision = service.delete_source(&scope, source, expected)?;
+            Ok(v1::DeletedSource {
+                source_id: source.to_string(),
+                revision_id: revision.to_string(),
+            })
+        })
+        .await
+        .map(Response::new)
+    }
 }
 
 async fn submit(
@@ -210,6 +234,17 @@ async fn submit(
         }
     };
     let scope = parse_scope(header.scope)?;
+    let replacement = if let Some(replacement) = header.replacement {
+        Some(Replacement {
+            source: parse_optional_id(replacement.source_id, "invalid source ID")?,
+            expected_revision: parse_optional_id(
+                replacement.expected_revision_id,
+                "invalid expected revision ID",
+            )?,
+        })
+    } else {
+        None
+    };
     let service = service.clone();
     let max_bytes = service.max_source_bytes();
     let (staged, file) = work(move || {
@@ -221,6 +256,7 @@ async fn submit(
                     namespace: value.namespace,
                     id: value.id,
                 }),
+                replacement,
             },
         )?;
         let file = staged.reopen()?;
@@ -322,6 +358,7 @@ fn wire_job(job: Job) -> v1::IngestionJob {
         error_code,
         error_message,
         text_revision,
+        update_sequence: job.update_sequence,
     }
 }
 
@@ -385,10 +422,21 @@ fn status(error: Error) -> Status {
         Error::Invalid(message) => Status::invalid_argument(message),
         Error::NotFound(message) => Status::not_found(message),
         Error::Conflict(message) => Status::already_exists(message),
+        Error::StaleRevision(message) => Status::failed_precondition(message),
         Error::Busy(message) => Status::unavailable(message),
         Error::Io(_) | Error::Internal(_) => {
             tracing::error!(%error, "application operation failed");
             Status::internal("storage or database operation failed")
         }
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_optional_id(
+    value: Option<String>,
+    error: &'static str,
+) -> std::result::Result<Option<uuid::Uuid>, Status> {
+    value
+        .map(|id| id.parse().map_err(|_| Status::invalid_argument(error)))
+        .transpose()
 }

@@ -3,7 +3,7 @@ use std::{
     str::FromStr,
 };
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use sanctum_core::{Error, ExternalSource, Result, Scope, ScopeId};
 use uuid::Uuid;
 
@@ -54,6 +54,8 @@ pub struct Job {
     pub failure: Option<JobFailure>,
     pub hash: Option<String>,
     pub chunks: Option<u64>,
+    pub replacement: bool,
+    pub update_sequence: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -61,13 +63,17 @@ pub struct LocalQueue(PathBuf);
 
 const COLUMNS: &str = "operation_id, tenant, collection, source_id, revision_id,
     name, external_namespace, external_id, total_bytes, processed_bytes,
-    attempts, status, error_code, error_message, content_hash, chunks";
+    attempts, status, error_code, error_message, content_hash, chunks,
+    replacement, update_sequence";
 
 impl LocalQueue {
     /// The caller holds the storage owner's exclusive lock for this queue.
     pub fn open(path: PathBuf) -> Result<Self> {
         let mut connection = open(&path, true)?;
-        migrate(&mut connection, include_str!("runtime.sql"))?;
+        migrate(
+            &mut connection,
+            &[include_str!("runtime.sql"), include_str!("runtime_v2.sql")],
+        )?;
         connection
             .execute(
                 "UPDATE ingestion_jobs
@@ -79,14 +85,35 @@ impl LocalQueue {
         Ok(Self(path))
     }
 
-    pub fn insert(&self, job: &Job) -> Result<()> {
+    pub fn insert(&self, job: &mut Job) -> Result<()> {
         let namespace = job.external.as_ref().map(|external| &external.namespace);
         let external_id = job.external.as_ref().map(|external| &external.id);
-        self.connect()?
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        if job.replacement {
+            job.update_sequence = transaction
+                .query_row(
+                    "INSERT INTO replacement_sequences (tenant, collection, source_id, sequence)
+                 VALUES (?1, ?2, ?3, 1)
+                 ON CONFLICT (tenant, collection, source_id)
+                 DO UPDATE SET sequence = sequence + 1 RETURNING sequence",
+                    params![
+                        job.scope.tenant.as_str(),
+                        job.scope.collection.as_str(),
+                        job.source.to_string()
+                    ],
+                    |row| unsigned_column(row, 0),
+                )
+                .map_err(database_error)?;
+        }
+        transaction
             .execute(
                 "INSERT INTO ingestion_jobs (operation_id, tenant, collection, source_id,
-                revision_id, name, external_namespace, external_id, total_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                revision_id, name, external_namespace, external_id, total_bytes,
+                replacement, update_sequence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     job.id.to_string(),
                     job.scope.tenant.as_str(),
@@ -96,11 +123,50 @@ impl LocalQueue {
                     job.name,
                     namespace,
                     external_id,
-                    sql_integer(job.bytes)?
+                    sql_integer(job.bytes)?,
+                    job.replacement,
+                    sql_integer(job.update_sequence)?
                 ],
             )
             .map_err(database_error)?;
-        Ok(())
+        transaction.commit().map_err(database_error)
+    }
+
+    pub fn is_latest_replacement(&self, job: &Job) -> Result<bool> {
+        if !job.replacement {
+            return Ok(true);
+        }
+        self.connect()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM replacement_sequences
+             WHERE tenant = ?1 AND collection = ?2 AND source_id = ?3 AND sequence = ?4)",
+                params![
+                    job.scope.tenant.as_str(),
+                    job.scope.collection.as_str(),
+                    job.source.to_string(),
+                    sql_integer(job.update_sequence)?
+                ],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
+    }
+
+    pub fn retains_input(&self, scope: &Scope, revision: super::RevisionKey) -> Result<bool> {
+        self.connect()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ingestion_jobs
+             WHERE tenant = ?1 AND collection = ?2 AND source_id = ?3 AND revision_id = ?4
+               AND (status IN ('accepted', 'indexing', 'publishing')
+                    OR (status = 'failed' AND error_code = 'retryable')))",
+                params![
+                    scope.tenant.as_str(),
+                    scope.collection.as_str(),
+                    revision.source.to_string(),
+                    revision.revision.to_string()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
     }
 
     pub fn get(&self, scope: &Scope, id: Uuid) -> Result<Job> {
@@ -307,6 +373,8 @@ fn map_job(row: &Row<'_>) -> rusqlite::Result<Job> {
                     .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(15, value))
             })
             .transpose()?,
+        replacement: row.get(16)?,
+        update_sequence: unsigned_column(row, 17)?,
     })
 }
 

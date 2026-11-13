@@ -9,6 +9,7 @@ use tonic::{
 };
 
 struct Running {
+    service: Service,
     client: SanctumClient<Channel>,
     stop: oneshot::Sender<()>,
     server: JoinHandle<Result<(), tonic::transport::Error>>,
@@ -20,11 +21,12 @@ impl Running {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let (stop, shutdown) = oneshot::channel();
+        let server_service = service.clone();
         let server = tokio::spawn(async move {
             let (stop_worker, worker_stop) = tokio::sync::watch::channel(false);
-            let worker = tokio::spawn(run_local_worker(service.clone(), worker_stop));
+            let worker = tokio::spawn(run_local_worker(server_service.clone(), worker_stop));
             let result = Server::builder()
-                .add_service(sanctum_api::grpc(service))
+                .add_service(sanctum_api::grpc(server_service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                     let _ = shutdown.await;
                 })
@@ -35,6 +37,7 @@ impl Running {
         });
         let client = SanctumClient::connect(endpoint).await.unwrap();
         Self {
+            service,
             client,
             stop,
             server,
@@ -64,6 +67,7 @@ fn header(tenant: &str) -> v1::UploadTextFrame {
                 namespace: "notes-app".into(),
                 id: "entry:42".into(),
             }),
+            replacement: None,
         })),
     }
 }
@@ -493,4 +497,317 @@ async fn retry_preserves_the_operation_and_revision_after_a_storage_failure() {
         1
     );
     running.stop().await;
+}
+
+#[tokio::test]
+async fn replacement_preserves_identity_and_the_latest_intent_wins() {
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    let original = upload(&mut running.client, header("default"), b"original agate").await;
+    let old_chunk = search(&mut running.client, "default", "agate")
+        .await
+        .remove(0)
+        .chunk
+        .unwrap();
+
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: true })
+        .await
+        .unwrap();
+    let old_candidate = running
+        .client
+        .submit_text(tokio_stream::iter([
+            replacement(Some(&original.source_id), Some(&original.revision_id)),
+            data(b"superseded pyrite"),
+            end(),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    let latest = running
+        .client
+        .submit_text(tokio_stream::iter([
+            replacement(None, Some(&original.revision_id)),
+            data(b"latest beryl"),
+            end(),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(old_candidate.source_id, original.source_id);
+    assert_eq!(latest.source_id, original.source_id);
+    assert!(latest.update_sequence > old_candidate.update_sequence);
+    assert_eq!(
+        search(&mut running.client, "default", "agate").await.len(),
+        1
+    );
+    assert!(
+        search(&mut running.client, "default", "beryl")
+            .await
+            .is_empty()
+    );
+
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: false })
+        .await
+        .unwrap();
+    let latest = await_ready(&mut running.client, job_request(latest.operation_id)).await;
+    let superseded =
+        await_failure(&mut running.client, job_request(old_candidate.operation_id)).await;
+    assert_eq!(superseded.error_code.as_deref(), Some("conflict"));
+    assert!(
+        search(&mut running.client, "default", "pyrite")
+            .await
+            .is_empty()
+    );
+    assert!(
+        search(&mut running.client, "default", "agate")
+            .await
+            .is_empty()
+    );
+    let hits = search(&mut running.client, "default", "beryl").await;
+    assert_eq!(
+        hits[0].chunk.as_ref().unwrap().revision_id,
+        latest.revision_id
+    );
+    assert_eq!(hits[0].external.as_ref().unwrap().id, "entry:42");
+    assert_eq!(
+        running
+            .client
+            .fetch_chunk(v1::FetchChunkRequest {
+                chunk: Some(old_chunk.clone())
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .excerpt,
+        "original agate"
+    );
+
+    let stale = running
+        .client
+        .submit_text(tokio_stream::iter([
+            replacement(Some(&original.source_id), Some(&original.revision_id)),
+            data(b"stale"),
+            end(),
+        ]))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), Code::FailedPrecondition);
+
+    expire_and_reclaim(&dir, &running.service);
+    assert!(!text_path(&dir, &original.source_id, &original.revision_id).exists());
+    assert_eq!(
+        running
+            .client
+            .fetch_chunk(v1::FetchChunkRequest {
+                chunk: Some(old_chunk)
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        search(&mut running.client, "default", "beryl").await.len(),
+        1
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn deletion_blocks_queued_replacement_and_reclaims_all_revisions() {
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    let first = upload(&mut running.client, header("default"), b"first opal").await;
+    let current = upload(
+        &mut running.client,
+        replacement(Some(&first.source_id), None),
+        b"second topaz",
+    )
+    .await;
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: true })
+        .await
+        .unwrap();
+    let late = running
+        .client
+        .submit_text(tokio_stream::iter([
+            replacement(Some(&first.source_id), None),
+            data(b"late chalcedony"),
+            end(),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut delete = v1::DeleteSourceRequest {
+        scope: scope("default"),
+        source_id: current.source_id.clone(),
+        expected_revision_id: Some(first.revision_id.clone()),
+    };
+    assert_eq!(
+        running
+            .client
+            .delete_source(delete.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    delete.expected_revision_id = Some(current.revision_id.clone());
+    running.client.delete_source(delete).await.unwrap();
+    assert!(
+        search(&mut running.client, "default", "topaz")
+            .await
+            .is_empty()
+    );
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: false })
+        .await
+        .unwrap();
+    let failed = await_failure(&mut running.client, job_request(late.operation_id)).await;
+    assert_eq!(failed.error_code.as_deref(), Some("conflict"));
+    expire_and_reclaim(&dir, &running.service);
+    assert!(!text_path(&dir, &first.source_id, &first.revision_id).exists());
+    assert!(!text_path(&dir, &current.source_id, &current.revision_id).exists());
+    assert!(!text_path(&dir, &late.source_id, &late.revision_id).exists());
+    let imported = upload(
+        &mut running.client,
+        header("default"),
+        b"new source malachite",
+    )
+    .await;
+    assert_ne!(imported.source_id, first.source_id);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn startup_migrates_v1_and_reclaims_files_left_before_acceptance() {
+    let dir = TempDir::new().unwrap();
+    let store = dir.path().join("default/notes");
+    std::fs::create_dir_all(store.join("staging")).unwrap();
+    std::fs::write(store.join("staging/.tmp-leftover"), b"truncated upload").unwrap();
+    let catalog = rusqlite::Connection::open(dir.path().join("default/root.db")).unwrap();
+    catalog
+        .execute_batch(
+            "PRAGMA user_version = 1;
+         CREATE TABLE collections (id TEXT PRIMARY KEY NOT NULL);
+         INSERT INTO collections VALUES ('notes');",
+        )
+        .unwrap();
+    drop(catalog);
+    let collection = rusqlite::Connection::open(store.join("meta.db")).unwrap();
+    collection
+        .execute_batch(include_str!("../../sanctum-db-sqlite/src/collection.sql"))
+        .unwrap();
+    collection.pragma_update(None, "user_version", 1).unwrap();
+    drop(collection);
+    let runtime = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
+    runtime
+        .execute_batch(include_str!("../../sanctum-db-sqlite/src/runtime.sql"))
+        .unwrap();
+    runtime.pragma_update(None, "user_version", 1).unwrap();
+    drop(runtime);
+
+    let orphan = text_path(
+        &dir,
+        &uuid::Uuid::new_v4().to_string(),
+        &uuid::Uuid::new_v4().to_string(),
+    );
+    std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    std::fs::write(&orphan, b"persisted before the queue commit").unwrap();
+    let mut running = Running::start(&dir).await;
+    assert!(!orphan.exists());
+    assert!(!store.join("staging/.tmp-leftover").exists());
+    let revision = upload(&mut running.client, header("default"), b"migrated obsidian").await;
+    assert_eq!(
+        search(&mut running.client, "default", "obsidian")
+            .await
+            .len(),
+        1
+    );
+    assert!(text_path(&dir, &revision.source_id, &revision.revision_id).exists());
+    running.stop().await;
+}
+
+fn replacement(source: Option<&str>, expected: Option<&str>) -> v1::UploadTextFrame {
+    let mut request = header("default");
+    if let Some(Frame::Header(header)) = &mut request.frame {
+        header.replacement = Some(v1::Replacement {
+            source_id: source.map(str::to_string),
+            expected_revision_id: expected.map(str::to_string),
+        });
+    }
+    request
+}
+
+fn job_request(operation_id: String) -> v1::IngestionJobRequest {
+    v1::IngestionJobRequest {
+        scope: scope("default"),
+        operation_id,
+    }
+}
+
+async fn upload(
+    client: &mut SanctumClient<Channel>,
+    header: v1::UploadTextFrame,
+    bytes: &[u8],
+) -> v1::TextRevision {
+    client
+        .upload_text(tokio_stream::iter([header, data(bytes), end()]))
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+async fn await_failure(
+    client: &mut SanctumClient<Channel>,
+    request: v1::IngestionJobRequest,
+) -> v1::IngestionJob {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let job = client
+                .get_ingestion_job(request.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            match job.state() {
+                v1::IngestionState::Failed => return job,
+                v1::IngestionState::TextReady | v1::IngestionState::Canceled => panic!("{job:?}"),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+fn text_path(dir: &TempDir, source: &str, revision: &str) -> std::path::PathBuf {
+    dir.path()
+        .join("default/notes/sources")
+        .join(source)
+        .join(revision)
+        .join("text.utf8")
+}
+
+fn expire_and_reclaim(dir: &TempDir, service: &Service) {
+    let db = rusqlite::Connection::open(dir.path().join("default/notes/meta.db")).unwrap();
+    db.execute(
+        "UPDATE revisions SET retire_at = 0 WHERE retire_at IS NOT NULL",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    service
+        .reclaim_retired(&sanctum_core::Scope {
+            tenant: "default".parse().unwrap(),
+            collection: "notes".parse().unwrap(),
+        })
+        .unwrap();
 }

@@ -9,6 +9,8 @@ pub enum Error {
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
+    StaleRevision(String),
+    #[error("{0}")]
     Busy(String),
     #[error("storage I/O failed: {0}")]
     Io(#[from] io::Error),

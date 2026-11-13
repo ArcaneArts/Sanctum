@@ -14,6 +14,7 @@ service Sanctum {
   rpc SetLocalQueue(SetLocalQueueRequest) returns (LocalQueueStatus);
   rpc SearchText(SearchTextRequest) returns (SearchTextResponse);
   rpc FetchChunk(FetchChunkRequest) returns (TextHit);
+  rpc DeleteSource(DeleteSourceRequest) returns (DeletedSource);
 }
 
 message Empty {}
@@ -47,6 +48,7 @@ message IngestionJob {
   optional string error_code = 11;
   optional string error_message = 12;
   optional TextRevision text_revision = 13;
+  uint64 update_sequence = 14;
 }
 
 message LocalQueueStatus {
@@ -87,6 +89,24 @@ message UploadTextHeader {
   Scope scope = 1;
   string name = 2;
   ExternalSource external = 3;
+  Replacement replacement = 4;
+}
+
+message Replacement {
+  // When absent, resolve the target using UploadTextHeader.external.
+  optional string source_id = 1;
+  optional string expected_revision_id = 2;
+}
+
+message DeleteSourceRequest {
+  Scope scope = 1;
+  string source_id = 2;
+  optional string expected_revision_id = 3;
+}
+
+message DeletedSource {
+  string source_id = 1;
+  string revision_id = 2;
 }
 
 message UploadTextEnd {}

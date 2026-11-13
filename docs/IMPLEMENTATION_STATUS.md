@@ -5,7 +5,7 @@ which parts have working implementations and where to find the evidence.
 
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
-| 1. Local desktop and MCP | Local Rust service and gRPC CLI with a tenant catalog, streamed UTF-8 uploads, SQLite FTS5, byte-range fetch, and restartable lexical jobs | RTF extraction, local imports, metadata, replacement and cleanup, usage, Ollama and vector search, MCP, tray app, desktop acceptance |
+| 1. Local desktop and MCP | Local Rust service and gRPC CLI with a tenant catalog, streamed UTF-8 uploads, SQLite FTS5, byte-range fetch, restartable lexical jobs, source replacement, deletion, and local cleanup | RTF extraction, local imports, metadata and reset events, embedding reuse and readiness, usage, Ollama and vector search, MCP, tray app, desktop acceptance |
 | 2. Providers and local integrations | Pending | Hosted provider adapters, rebuilds, watchers, URL and Git imports, metadata queries and cursors, SQL access, multi-collection retrieval, platform packaging and verification |
 | 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
@@ -33,6 +33,8 @@ Merged in [PR #2](https://github.com/ArcaneArts/Sanctum/pull/2).
 
 ## Durable local lexical work
 
+Merged in [PR #3](https://github.com/ArcaneArts/Sanctum/pull/3).
+
 - `SubmitText` acknowledges after persisting the input and the queue record in
   `runtime.db`. Configurable workers claim jobs atomically. The queue records
   progress, failures, attempts, and pause state. gRPC and the CLI expose status,
@@ -42,6 +44,24 @@ Merged in [PR #2](https://github.com/ArcaneArts/Sanctum/pull/2).
   recorded, the next attempt recovers that receipt without indexing twice.
 - The gRPC tests cover persisted pause and acceptance, tenant-scoped cancellation,
   recovery from a missing receipt, and retry after a storage read failure.
-- Reclamation of orphan files from before acceptance and caller-provided request
-  idempotency remain open. The next cycle adds source replacement and deletion,
-  then uses that lifecycle for RTF and directory imports.
+- Caller-provided request idempotency remains open.
+
+## Local source lifecycle
+
+- gRPC and the CLI can replace a source by its ID or external reference, with
+  an optional expected revision. The collection writer serializes registration
+  and publication, and the queue persists the registered replacement sequence.
+- Deletion hides the source immediately. The worker rejects pending writes to
+  deleted or superseded sources. A short grace period protects old fetch handles
+  during lexical replacement, and the cleanup queue persists across restarts.
+- Startup reclaims abandoned uploads while preserving committed revisions and
+  queued or retryable inputs. Existing v1 databases migrate in place.
+- The local gRPC tests cover both replacement targets, stale expected revisions,
+  competing queued replacements, deletion during queued work, and retirement
+  of old index rows and files. A v1 fixture verifies migration and orphan cleanup.
+- Retirement currently follows lexical readiness. Adding embeddings must link
+  retirement to the configured embedding profile's readiness. Metadata reset
+  events remain pending with the metadata and changes API.
+
+Next, add streaming RTF extraction, original retention, and local imports using
+the same upload, replacement, and recovery pipeline.
