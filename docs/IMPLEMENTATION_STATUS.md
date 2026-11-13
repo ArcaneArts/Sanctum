@@ -5,7 +5,7 @@ which parts have working implementations and where to find the evidence.
 
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
-| 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | End-to-end acceptance in an LLM client |
+| 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | Personal workflow verified on macOS. Cross-platform packaging and tray verification are tracked in milestone 2. |
 | 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, platform packaging and verification |
 | 3. Object storage and publication | Shared storage contract, filesystem and MinIO-tested S3, native GCS adapter, and fenced SQLite snapshot publication for hosted catalog, source, and metadata operations | Live GCS verification and cloud recovery scenarios |
 | 4. Cloud Run and Cloud Tasks | Linux API and worker containers, durable staged uploads, dispatch and repair, scheduled maintenance, and hosted gRPC and MCP | Live IAM, Cloud Run ingress, and Tasks and Scheduler delivery |
@@ -994,3 +994,18 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - A real MinIO and Ollama smoke observed batch 0 before embedding and batch 1
   after worker progress, then checked completion, semantic and hybrid search,
   and semantic retrieval after restart.
+
+## Codex MCP retrieval
+
+- Read-only MCP tools declare their behavior in `tools/list`. HTTP and stdio
+  report the same annotations. A live MinIO smoke verified hosted discovery and
+  retrieval across separate API processes.
+- Codex CLI 0.160.1 used Streamable HTTP and an existing ChatGPT login in two
+  ephemeral sessions. A filesystem-backed server with real 768-dimensional
+  Ollama embeddings imported a test directory, then reimported it after an edit.
+  The model used hybrid search and `fetch_chunk`. Both excerpts, source and
+  revision IDs, ordinals, and byte ranges matched the gRPC result. The second
+  lookup ran after server restart, with the same source ID and a new revision.
+- The earlier macOS desktop smoke separately exercised the directory picker,
+  persisted settings, the tray, and the managed sidecar. See
+  [Codex CLI connection steps](MCP.md#codex-cli).
