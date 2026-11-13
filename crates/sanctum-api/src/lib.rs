@@ -1506,6 +1506,10 @@ fn wire_hosted_job(scope: &Scope, job: HostedJob) -> v1::IngestionJob {
         text_revision,
         update_sequence: job.update_sequence,
         created_at_unix_seconds: job.created_at,
+        embedding_work: job.embedding_work.map(|work| v1::HostedEmbeddingWork {
+            next_batch: work.next_batch,
+            not_before_unix_seconds: work.not_before,
+        }),
         ..Default::default()
     }
 }
@@ -1541,6 +1545,7 @@ fn wire_job(job: Job) -> v1::IngestionJob {
         text_revision,
         update_sequence: job.update_sequence,
         created_at_unix_seconds: job.created_at,
+        embedding_work: None,
         url: job.url.map(wire_url),
         git: job.git.map(wire_git),
     }

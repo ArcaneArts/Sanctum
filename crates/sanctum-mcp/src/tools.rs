@@ -737,6 +737,10 @@ fn hosted_job_value(scope: &Scope, job: HostedJob) -> Value {
         "update_sequence": job.update_sequence,
         "created_at_unix_seconds": job.created_at,
         "failure": failure,
+        "embedding_work": job.embedding_work.map(|work| json!({
+            "next_batch": work.next_batch,
+            "not_before_unix_seconds": work.not_before,
+        })),
     })
 }
 

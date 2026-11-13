@@ -2680,6 +2680,74 @@ async fn dispatch_reconciliation_recovers_a_failed_handoff_and_advances_its_curs
 }
 
 #[tokio::test]
+async fn hosted_job_status_reports_a_persisted_embedding_delay() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let provider = Arc::new(HostedEmbeddingFixture {
+        profile: "fixture-v1",
+        fail: AtomicU8::new(1),
+        queries: AtomicUsize::new(0),
+    });
+    let make_catalog = || {
+        HostedCatalog::new(storage.clone(), None, 1024)
+            .unwrap()
+            .with_embedding(Some(provider.clone()))
+    };
+    let catalog = make_catalog();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    catalog.create_collection(&scope, None).await.unwrap();
+    let mut server = start(catalog.clone()).await;
+    let header = v1::UploadTextHeader {
+        scope: Some(v1::Scope {
+            tenant: "default".into(),
+            collection: "notes".into(),
+        }),
+        name: "notes.txt".into(),
+        ..Default::default()
+    };
+    let accepted = server
+        .client
+        .submit_text(upload_frames(&header, [b"retry me".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let id = accepted.operation_id.parse().unwrap();
+    catalog.register_upload(&scope, id).await.unwrap();
+    catalog.index_upload(&scope, id).await.unwrap();
+    catalog.embed_upload(&scope, id, 0).await.unwrap();
+    catalog.embed_upload(&scope, id, 1).await.unwrap();
+    let delay = catalog
+        .embedding_status(&scope, None)
+        .await
+        .unwrap()
+        .next_retry
+        .unwrap();
+    server.stop().await;
+    let mut server = start(make_catalog()).await;
+    let job = server
+        .client
+        .get_ingestion_job(v1::IngestionJobRequest {
+            scope: header.scope,
+            operation_id: accepted.operation_id,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(job.state(), v1::IngestionState::TextReady);
+    assert_eq!(
+        job.embedding_work,
+        Some(v1::HostedEmbeddingWork {
+            next_batch: 2,
+            not_before_unix_seconds: Some(delay)
+        })
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishing() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance {
@@ -2722,6 +2790,24 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
         .unwrap();
     service.register_upload(&scope, operation).await.unwrap();
     service.index_upload(&scope, operation).await.unwrap();
+    let request = v1::IngestionJobRequest {
+        scope: header.scope.clone(),
+        operation_id: operation.to_string(),
+    };
+    let status = server
+        .client
+        .get_ingestion_job(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status.state(), v1::IngestionState::TextReady);
+    assert_eq!(
+        status.embedding_work,
+        Some(v1::HostedEmbeddingWork {
+            next_batch: 0,
+            not_before_unix_seconds: None
+        })
+    );
     service.try_dispatch(&scope, operation).await;
     assert_eq!(
         dispatch.delivered.lock().unwrap().last(),
@@ -2758,6 +2844,14 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
         .with_dispatch(dispatch.clone())
         .with_embedding(Some(provider));
     restarted.embed_upload(&scope, operation, 0).await.unwrap();
+    let mut server = start(restarted.clone()).await;
+    let resumed = server
+        .client
+        .get_ingestion_job(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resumed.embedding_work.unwrap().next_batch, 1);
     assert_eq!(executor.generation(&unit).await.unwrap(), snapshot);
     restarted.reconcile_shard(0).await.unwrap();
     assert_eq!(
@@ -2769,6 +2863,14 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
     restarted.try_dispatch(&scope, operation).await;
     let key = Key::parse(format!("_dispatch/00/pending/default/notes/{operation}")).unwrap();
     assert!(matches!(storage.head(&key).await, Err(Error::NotFound(_))));
+    let finished = server
+        .client
+        .get_ingestion_job(request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(finished.embedding_work.is_none());
+    server.stop().await;
 }
 
 #[tokio::test]

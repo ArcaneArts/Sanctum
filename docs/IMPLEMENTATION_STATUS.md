@@ -983,3 +983,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - The Apple Silicon `pnpm devtop` smoke edited a server log string,
   verified the new binary and child PID, and checked that a collection
   survived both rebuilds. Ctrl+C released the frontend and API ports.
+- Delivered in [PR #67](https://github.com/ArcaneArts/Sanctum/pull/67).
+
+## Hosted embedding job progress
+
+- Job status and activity expose the durable embedding batch checkpoint
+  and retry time through gRPC. MCP and the CLI show the same checkpoint.
+- Hosted integration checks the checkpoint before embedding, after replay
+  of an interrupted batch, during a persisted retry delay, and after work ends.
+- A real MinIO and Ollama smoke observed batch 0 before embedding and batch 1
+  after worker progress, then checked completion, semantic and hybrid search,
+  and semantic retrieval after restart.

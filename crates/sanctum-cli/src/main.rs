@@ -937,6 +937,12 @@ fn print_job(job: v1::IngestionJob) {
         job.total_bytes,
         job.attempts,
     );
+    if let Some(work) = job.embedding_work {
+        println!("Next embedding batch: {}", work.next_batch);
+        if let Some(when) = work.not_before_unix_seconds {
+            println!("Embedding retry at Unix second: {when}");
+        }
+    }
     if let Some(git) = job.git {
         println!("Git commit: {}", git.commit);
         println!("Git blob: {}", git.blob);
