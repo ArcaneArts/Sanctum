@@ -6,7 +6,7 @@ which parts have working implementations and where to find the evidence.
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | End-to-end acceptance in an LLM client |
-| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, advanced metadata queries, SQL access, platform packaging and verification |
+| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, SQL access, platform packaging and verification |
 | 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
 | 5. Capacity | Pending | Representative 200 MB sources, GB-scale collections and database snapshots, cold/warm cloud performance, measured optimization |
@@ -105,7 +105,7 @@ Merged in [PR #7](https://github.com/ArcaneArts/Sanctum/pull/7).
   expired cursors. Collection metadata stays independent of source changes.
 - The gRPC integration test covers JSON null and merge behavior, transaction
   rollback, tenant scope, cursor pages, and stale writes after replacement.
-- Metadata sorting and aggregation remain open.
+- Metadata sorting and aggregation use the structured query API described below.
 
 ## Lexical candidate filtering
 
@@ -305,6 +305,8 @@ Merged in [PR #20](https://github.com/ArcaneArts/Sanctum/pull/20).
 
 ## Resumable changes and Python gRPC client
 
+Merged in [PR #21](https://github.com/ArcaneArts/Sanctum/pull/21).
+
 - `WatchChanges` streams the same retained records as `ListChanges`.
   A bounded channel applies backpressure and an idle heartbeat preserves
   the resume cursor. `GetChangeCursor` captures the position to resume
@@ -323,3 +325,18 @@ Merged in [PR #20](https://github.com/ArcaneArts/Sanctum/pull/20).
 - The watched-folder regression test waits for the scan's deletion
   count before checking that the removed source is absent. Publishing
   an edited source can finish before the same scan reconciles removals.
+
+## Structured metadata queries
+
+- `QueryMetadata` lists current collections, sources, and chunks with
+  typed filters, optional sorting, and bounded result pages. Counts can
+  be grouped by a field on the target or an ancestor.
+- The SQLite query reuses the retrieval filter compiler and preserves
+  numeric precision and the distinction between JSON null and missing
+  values. Each page observes current committed data.
+- The gRPC test covers nested literal paths, pagination, large integers,
+  grouping numerically equal values, null and missing values, ancestor
+  metadata, and tenant scope.
+- Local storage explicitly releases its ownership lock when the final
+  owner drops. A regression test exercises restart with a duplicate
+  descriptor still open, as can happen during a concurrent process launch.

@@ -85,6 +85,61 @@ impl Sanctum for Grpc {
             .map(Response::new)
     }
 
+    async fn query_metadata(
+        &self,
+        request: Request<v1::QueryMetadataRequest>,
+    ) -> Reply<v1::QueryMetadataResponse> {
+        use sanctum_service::metadata_query::Results;
+        let request = request.into_inner();
+        let tenant = request.tenant.parse().map_err(status)?;
+        let collection = request
+            .collection
+            .as_ref()
+            .map(|id| id.parse())
+            .transpose()
+            .map_err(status)?;
+        let query = metadata_filter::parse_query(request).map_err(status)?;
+        let service = self.0.clone();
+        work(move || {
+            let page = service.query_metadata(&tenant, collection, query)?;
+            let mut reply = v1::QueryMetadataResponse {
+                next_offset: page.next_offset,
+                ..Default::default()
+            };
+            match page.results {
+                Results::Matches(matches) => {
+                    reply.matches = matches
+                        .into_iter()
+                        .map(|row| v1::MetadataMatch {
+                            target: Some(v1::MetadataTarget {
+                                scope: Some(v1::Scope {
+                                    tenant: tenant.to_string(),
+                                    collection: row.collection,
+                                }),
+                                source_id: row.source,
+                                revision_id: row.revision,
+                                chunk_ordinal: row.ordinal,
+                            }),
+                            value_json: row.value_json,
+                        })
+                        .collect();
+                }
+                Results::Counts(groups) => {
+                    reply.groups = groups
+                        .into_iter()
+                        .map(|group| v1::MetadataGroup {
+                            count: group.count,
+                            value_json: group.value_json,
+                        })
+                        .collect();
+                }
+            }
+            Ok(reply)
+        })
+        .await
+        .map(Response::new)
+    }
+
     async fn list_changes(
         &self,
         request: Request<v1::ListChangesRequest>,

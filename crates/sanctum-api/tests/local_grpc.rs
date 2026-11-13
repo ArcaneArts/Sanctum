@@ -2861,6 +2861,250 @@ async fn write_metadata(
 }
 
 #[tokio::test]
+async fn metadata_queries_filter_sort_and_count_without_coercing_json() {
+    use v1::{
+        MetadataLevel as Level, MetadataOperator as Operator, metadata_filter::Expression,
+        metadata_mutation::Edit, metadata_path_segment::Segment, query_metadata_request::View,
+    };
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    let client = &mut running.client;
+    create(client, "default").await;
+    create(client, "other").await;
+    let edit = |target, key: &str, value: &str| v1::MutateMetadataRequest {
+        target: Some(target),
+        edits: vec![v1::MetadataMutation {
+            namespace: "integration".into(),
+            key: key.into(),
+            edit: Some(Edit::SetJson(value.into())),
+        }],
+    };
+    for (tenant, enabled) in [("default", "true"), ("other", "false")] {
+        client
+            .mutate_metadata(edit(
+                v1::MetadataTarget {
+                    scope: scope(tenant),
+                    ..Default::default()
+                },
+                "enabled",
+                enabled,
+            ))
+            .await
+            .unwrap();
+    }
+    let mut revisions = Vec::new();
+    for (index, value) in [
+        Some(r#"{"a.b":9007199254740993}"#),
+        Some(r#"{"a.b":9007199254740992}"#),
+        Some(r#"{"a.b":null}"#),
+        Some(r#"{"a.b":1}"#),
+        Some(r#"{"a.b":1.0}"#),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let header = v1::UploadTextFrame {
+            frame: Some(Frame::Header(v1::UploadTextHeader {
+                scope: scope("default"),
+                name: format!("{index}.md"),
+                ..Default::default()
+            })),
+        };
+        let revision = upload(client, header, b"searchable example").await;
+        if let Some(value) = value {
+            client
+                .mutate_metadata(edit(
+                    v1::MetadataTarget {
+                        scope: scope("default"),
+                        source_id: Some(revision.source_id.clone()),
+                        revision_id: Some(revision.revision_id.clone()),
+                        chunk_ordinal: None,
+                    },
+                    "priority",
+                    value,
+                ))
+                .await
+                .unwrap();
+        }
+        revisions.push(revision);
+    }
+
+    let field = v1::MetadataField {
+        level: Level::Source.into(),
+        namespace: "integration".into(),
+        key: "priority".into(),
+        path: vec![v1::MetadataPathSegment {
+            segment: Some(Segment::Property("a.b".into())),
+        }],
+    };
+    let filter = v1::MetadataFilter {
+        expression: Some(Expression::Test(v1::MetadataPredicate {
+            level: Level::Collection.into(),
+            namespace: "integration".into(),
+            key: "enabled".into(),
+            operator: Operator::Equal.into(),
+            operand_json: Some("true".into()),
+            ..Default::default()
+        })),
+    };
+    let mut request = v1::QueryMetadataRequest {
+        tenant: "default".into(),
+        collection: Some("notes".into()),
+        level: Level::Source.into(),
+        filter: Some(filter.clone()),
+        view: Some(View::List(v1::MetadataList {
+            sort_by: Some(field.clone()),
+            descending: true,
+        })),
+        limit: Some(2),
+        ..Default::default()
+    };
+    let first = client
+        .query_metadata(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let values: Vec<_> = first
+        .matches
+        .iter()
+        .map(|row| row.value_json.as_deref())
+        .collect();
+    assert_eq!(
+        values,
+        vec![Some("9007199254740993"), Some("9007199254740992")]
+    );
+    assert_eq!(
+        first.matches[0]
+            .target
+            .as_ref()
+            .unwrap()
+            .source_id
+            .as_deref(),
+        Some(revisions[0].source_id.as_str())
+    );
+    request.offset = first.next_offset.unwrap();
+    let second = client
+        .query_metadata(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second.matches.len(), 2);
+    assert_eq!(second.next_offset, Some(4));
+    request.offset = second.next_offset.unwrap();
+    let third = client
+        .query_metadata(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(third.matches[0].value_json.as_deref(), Some("null"));
+    assert_eq!(third.matches[1].value_json, None);
+    assert!(third.next_offset.is_none());
+
+    request.offset = 0;
+    request.limit = None;
+    request.level = Level::Chunk.into();
+    request.view = Some(View::Count(v1::MetadataCount {
+        group_by: Some(field.clone()),
+    }));
+    let groups = client
+        .query_metadata(request.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .groups;
+    assert_eq!(groups.len(), 5);
+    assert_eq!(groups[0].count, 2);
+    assert_eq!(
+        groups[0]
+            .value_json
+            .as_deref()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap(),
+        1.0
+    );
+    assert!(
+        groups
+            .iter()
+            .any(|group| group.value_json.as_deref() == Some("null") && group.count == 1)
+    );
+    assert!(
+        groups
+            .iter()
+            .any(|group| group.value_json.is_none() && group.count == 1)
+    );
+
+    request.view = Some(View::Count(v1::MetadataCount::default()));
+    let count = client
+        .query_metadata(request.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .groups[0]
+        .count;
+    assert_eq!(count, 6);
+    request.tenant = "other".into();
+    assert_eq!(
+        client
+            .query_metadata(request.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .groups[0]
+            .count,
+        0
+    );
+
+    let mut catalog = v1::QueryMetadataRequest {
+        tenant: "default".into(),
+        level: Level::Collection.into(),
+        filter: Some(filter),
+        ..Default::default()
+    };
+    let listed = client
+        .query_metadata(catalog.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        listed.matches[0].target.as_ref().unwrap().scope,
+        scope("default")
+    );
+    catalog.tenant = "other".into();
+    assert!(
+        client
+            .query_metadata(catalog.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .matches
+            .is_empty()
+    );
+    catalog.tenant = "missing".into();
+    catalog.view = Some(View::Count(v1::MetadataCount::default()));
+    assert_eq!(
+        client
+            .query_metadata(catalog.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .groups[0]
+            .count,
+        0
+    );
+    catalog.view = Some(View::List(v1::MetadataList {
+        sort_by: Some(field),
+        descending: false,
+    }));
+    assert_eq!(
+        client.query_metadata(catalog).await.unwrap_err().code(),
+        Code::InvalidArgument
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn metadata_filters_apply_to_candidates_before_limit_and_preserve_json_types() {
     use v1::{
         MetadataLevel as Level, MetadataOperator as Op, metadata_filter::Expression,

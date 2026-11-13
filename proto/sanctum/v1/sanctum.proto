@@ -26,6 +26,7 @@ service Sanctum {
   rpc UnwatchFolder(UnwatchFolderRequest) returns (Empty);
   rpc GetMetadata(MetadataTarget) returns (MetadataResponse);
   rpc MutateMetadata(MutateMetadataRequest) returns (MetadataResponse);
+  rpc QueryMetadata(QueryMetadataRequest) returns (QueryMetadataResponse);
   rpc ListChanges(ListChangesRequest) returns (ListChangesResponse);
   rpc WatchChanges(ListChangesRequest) returns (stream ListChangesResponse);
   rpc GetChangeCursor(ChangeCursorRequest) returns (ChangeCursor);
@@ -82,6 +83,54 @@ message MutateMetadataRequest {
 
 message MetadataResponse {
   repeated MetadataEntry entries = 1;
+}
+
+message MetadataField {
+  MetadataLevel level = 1;
+  string namespace = 2;
+  string key = 3;
+  repeated MetadataPathSegment path = 4;
+}
+
+message MetadataList {
+  MetadataField sort_by = 1;
+  bool descending = 2;
+}
+
+message MetadataCount {
+  MetadataField group_by = 1;
+}
+
+message QueryMetadataRequest {
+  string tenant = 1;
+  // Set for source or chunk targets. Collection targets query the tenant catalog.
+  optional string collection = 2;
+  MetadataLevel level = 3;
+  MetadataFilter filter = 4;
+  oneof view {
+    MetadataList list = 5;
+    MetadataCount count = 6;
+  }
+  uint32 offset = 7;
+  optional uint32 limit = 8;
+}
+
+message MetadataMatch {
+  MetadataTarget target = 1;
+  // Absent for missing values or lists without a sort field.
+  optional string value_json = 2;
+}
+
+message MetadataGroup {
+  // Absent for the missing-value group or a count without grouping.
+  optional string value_json = 1;
+  uint64 count = 2;
+}
+
+message QueryMetadataResponse {
+  repeated MetadataMatch matches = 1;
+  repeated MetadataGroup groups = 2;
+  optional uint32 next_offset = 3;
 }
 
 message ListChangesRequest {

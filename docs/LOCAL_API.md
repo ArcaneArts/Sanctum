@@ -450,3 +450,31 @@ An import reports selected paths missing from the new commit. Use
 `--prune-missing` to delete them and supersede their pending operations. Pruning
 runs after the tree is read successfully and all selected blobs are accepted.
 Includes and excludes use the same globs as local directory imports.
+
+### Structured metadata queries
+
+`QueryMetadata` lists or counts entities without a text search. Set `tenant`
+and `level`. For `SOURCE` or `CHUNK`, also set `collection`. A `COLLECTION`
+query reads the tenant catalog. Queries include only current, non-deleted
+source revisions and their chunks. Fields and filters can refer to an
+entity's own level or an ancestor. For example, group chunks by a
+source-level tag and filter them by a collection-level flag.
+
+Use the same namespaced keys and literal path segments as search filters.
+`list.sort_by` returns the selected JSON value with each target. The
+ascending order is null, booleans, numbers, strings, arrays, and objects.
+Numbers use numeric comparison and arrays and objects compare
+lexicographically by their elements or sorted keys and values. Missing
+values sort last in both directions. Equal values break ties by collection,
+source, and chunk ordinal.
+
+`count` returns the total number of matches. Set `count.group_by` for
+counts per JSON value, ordered by descending count with ties in ascending
+value order. An absent `value_json` identifies a missing value. The JSON
+string `null` identifies an explicitly stored null. Numerically equivalent
+values such as `1` and `1.0` share a group.
+
+Pages default to 16 rows with a maximum of 32. Pass `next_offset` with the
+same request to get the next page. Each page reads current committed data.
+An integration that needs repeatable pages across concurrent edits can
+query an exported database snapshot once that API is available.

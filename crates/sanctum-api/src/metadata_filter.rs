@@ -1,6 +1,9 @@
 use sanctum_core::{Error, Result};
 use sanctum_proto::v1::{self, metadata_filter::Expression, metadata_path_segment::Segment};
-use sanctum_service::metadata_filter::{Filter, Level, Operator, PathSegment, Predicate};
+use sanctum_service::{
+    metadata_filter::{Filter, Level, Operator, PathSegment, Predicate},
+    metadata_query::{Field, Query, View},
+};
 
 pub(super) fn parse(filter: v1::MetadataFilter) -> Result<Filter> {
     parse_node(filter, 1, &mut 0)
@@ -36,12 +39,7 @@ fn parse_node(filter: v1::MetadataFilter, depth: usize, nodes: &mut usize) -> Re
 }
 
 fn parse_predicate(test: v1::MetadataPredicate) -> Result<Predicate> {
-    let level = match test.level() {
-        v1::MetadataLevel::Collection => Level::Collection,
-        v1::MetadataLevel::Source => Level::Source,
-        v1::MetadataLevel::Chunk => Level::Chunk,
-        _ => return Err(Error::Invalid("metadata level is required".into())),
-    };
+    let level = parse_level(test.level())?;
     let operator = match test.operator() {
         v1::MetadataOperator::Equal => Operator::Equal,
         v1::MetadataOperator::Less => Operator::Less,
@@ -57,15 +55,7 @@ fn parse_predicate(test: v1::MetadataPredicate) -> Result<Predicate> {
             ));
         }
     };
-    let path = test
-        .path
-        .into_iter()
-        .map(|value| match value.segment {
-            Some(Segment::Property(property)) => Ok(PathSegment::Property(property)),
-            Some(Segment::Index(index)) => Ok(PathSegment::Index(index)),
-            None => Err(Error::Invalid("metadata path segment is required".into())),
-        })
-        .collect::<Result<_>>()?;
+    let path = parse_path(test.path)?;
     let operand = test
         .operand_json
         .map(|json| {
@@ -84,4 +74,57 @@ fn parse_predicate(test: v1::MetadataPredicate) -> Result<Predicate> {
         path,
         operand,
     })
+}
+
+pub(super) fn parse_query(request: v1::QueryMetadataRequest) -> Result<Query> {
+    use v1::query_metadata_request::View as WireView;
+    let level = parse_level(request.level())?;
+    let view = match request.view {
+        Some(WireView::List(view)) => View::List {
+            sort: view.sort_by.map(parse_field).transpose()?,
+            descending: view.descending,
+        },
+        Some(WireView::Count(view)) => View::Count {
+            group_by: view.group_by.map(parse_field).transpose()?,
+        },
+        None => View::List {
+            sort: None,
+            descending: false,
+        },
+    };
+    Ok(Query {
+        level,
+        view,
+        filter: request.filter.map(parse).transpose()?,
+        limit: request.limit.unwrap_or(16),
+        offset: request.offset,
+    })
+}
+
+fn parse_field(field: v1::MetadataField) -> Result<Field> {
+    Ok(Field {
+        level: parse_level(field.level())?,
+        namespace: field.namespace,
+        key: field.key,
+        path: parse_path(field.path)?,
+    })
+}
+
+fn parse_level(level: v1::MetadataLevel) -> Result<Level> {
+    match level {
+        v1::MetadataLevel::Collection => Ok(Level::Collection),
+        v1::MetadataLevel::Source => Ok(Level::Source),
+        v1::MetadataLevel::Chunk => Ok(Level::Chunk),
+        _ => Err(Error::Invalid("metadata level is required".into())),
+    }
+}
+
+fn parse_path(path: Vec<v1::MetadataPathSegment>) -> Result<Vec<PathSegment>> {
+    path.into_iter()
+        .map(|value| match value.segment {
+            Some(Segment::Property(property)) => Ok(PathSegment::Property(property)),
+            Some(Segment::Index(index)) => Ok(PathSegment::Index(index)),
+            None => Err(Error::Invalid("metadata path segment is required".into())),
+        })
+        .collect()
 }
