@@ -245,7 +245,7 @@ def check_hosted(bin_dir):
             raise AssertionError("hosted MCP accepted a browser Origin")
         tools = {tool["name"] for tool in rpc.request("tools/list")["tools"]}
         assert tools == {"create_collection", "list_collections", "ingest_text", "ingestion_status",
-                         "search", "search_collections", "fetch_chunk"}, tools
+                         "search", "search_collections", "fetch_chunk", "get_metadata", "mutate_metadata"}, tools
         rpc.tool("create_collection", **scope)
         rpc.tool("create_collection", tenant=scope["tenant"], collection="reference")
         first_page = rpc.tool("list_collections", tenant=scope["tenant"], limit=1)
@@ -269,13 +269,24 @@ def check_hosted(bin_dir):
             status = rpc.tool("ingestion_status", **job)
             assert status["state"] == state, status
 
+        edit = {"namespace": "field", "key": "classification", "operation": "set",
+                "value": {"tags": ["sample", None]}}
+        rpc.tool("mutate_metadata", **scope, edits=[edit])
+        rpc.exchange = first_http
+        assert rpc.tool("get_metadata", **scope)["entries"][0]["value"] == edit["value"]
+        predicate = {"kind": "test", "level": "collection", "namespace": "field",
+                     "key": "classification", "path": ["tags"], "operator": "contains",
+                     "operand_json": "null"}
         result = rpc.tool("search_collections", tenant=scope["tenant"], collections=["notes", "reference"],
-                          query="quartz")
+                          query="quartz", metadata_filter=predicate)
         assert result["mode"] == "lexical" and result["degraded_reason"] == "embedding_disabled"
         hit, = result["hits"]
         assert hit["database_generation"]
         reference = {key: hit[key] for key in ("tenant", "collection", "source_id", "revision_id", "ordinal")}
         exact = rpc.tool("fetch_chunk", **reference)
+        rpc.tool("mutate_metadata", **reference, edits=[edit])
+        rpc.exchange = second_http
+        assert rpc.tool("get_metadata", **reference)["entries"][0]["value"] == edit["value"]
         assert exact["excerpt"] == text.encode()[exact["start_byte"]:exact["end_byte"]].decode() == text
         missing = rpc.request("tools/call", {"name": "fetch_chunk",
                                              "arguments": reference | {"tenant": "other"}})

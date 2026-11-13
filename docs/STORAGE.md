@@ -300,3 +300,20 @@ that are no longer current. Deletion is eligible after 15 minutes from
 that observation, including for uploaded snapshots that never committed.
 Busy units are revisited on the next pass. The sweep preserves the
 published HEAD generation and leaves already downloaded reader files usable.
+
+### Hosted metadata
+
+MCP and gRPC can read or edit namespaced JSON on collections, current
+sources, and chunks. A collection edit commits to the tenant catalog.
+A source or chunk edit commits to its collection database and records
+a metadata change in the same transaction. Each write publishes through
+that database's existing writer lease. An overlapping writer can
+return a retryable busy error. Mutations check revision identity inside
+the transaction and stale revision targets require a fresh reference.
+
+gRPC `QueryMetadata` filters, sorts, and counts against published
+snapshots with the same JSON type rules as the local API. Search uses
+these fields when evaluating metadata predicates. Source and chunk
+metadata reset on replacement. Collection metadata remains attached
+to the collection.
+[Metadata and changes](LOCAL_API.md#metadata-and-changes).

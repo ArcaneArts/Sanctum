@@ -74,27 +74,50 @@ pub fn catalog(path: &Path, query: Query) -> Result<Page> {
     }
     let field = validate(&query)?;
     if !path.try_exists()? {
-        let results = match query.view {
-            View::List { .. } => Results::Matches(Vec::new()),
-            View::Count { group_by: Some(_) } => Results::Counts(Vec::new()),
-            View::Count { group_by: None } => Results::Counts(
-                (query.offset == 0)
-                    .then_some(Group {
-                        value_json: None,
-                        count: 0,
-                    })
-                    .into_iter()
-                    .collect(),
-            ),
-        };
-        return Ok(Page {
-            results,
-            next_offset: None,
-        });
+        return Ok(empty_catalog_page(&query));
     }
     let mut connection = open(path, false)?;
     migrate(&mut connection, CATALOG_MIGRATIONS)?;
     execute(connection, &query, field, CollectionValues::Catalog, None)
+}
+
+pub fn read_catalog(path: Option<&Path>, query: Query) -> Result<Page> {
+    if query.level != Level::Collection {
+        return Err(Error::Invalid(
+            "catalog metadata queries require collection targets".into(),
+        ));
+    }
+    let field = validate(&query)?;
+    let Some(path) = path else {
+        return Ok(empty_catalog_page(&query));
+    };
+    execute(
+        crate::open_read_only(path)?,
+        &query,
+        field,
+        CollectionValues::Catalog,
+        None,
+    )
+}
+
+fn empty_catalog_page(query: &Query) -> Page {
+    let results = match &query.view {
+        View::List { .. } => Results::Matches(Vec::new()),
+        View::Count { group_by: Some(_) } => Results::Counts(Vec::new()),
+        View::Count { group_by: None } => Results::Counts(
+            (query.offset == 0)
+                .then_some(Group {
+                    value_json: None,
+                    count: 0,
+                })
+                .into_iter()
+                .collect(),
+        ),
+    };
+    Page {
+        results,
+        next_offset: None,
+    }
 }
 
 impl CollectionDb {
