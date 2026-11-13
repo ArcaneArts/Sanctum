@@ -248,6 +248,14 @@ message SearchTextRequest {
   string query = 2;
   optional uint32 limit = 3;
   MetadataFilter metadata_filter = 4;
+  SearchMode mode = 5;
+}
+
+enum SearchMode {
+  SEARCH_MODE_UNSPECIFIED = 0;
+  SEARCH_MODE_LEXICAL = 1;
+  SEARCH_MODE_SEMANTIC = 2;
+  SEARCH_MODE_HYBRID = 3;
 }
 
 message MetadataFilter {
@@ -300,6 +308,16 @@ message MetadataPredicate {
 
 message SearchTextResponse {
   repeated TextHit hits = 1;
+  SearchMode mode = 2;
+  EmbeddingCoverage embedding_coverage = 3;
+  optional string degraded_reason = 4;
+}
+
+message EmbeddingCoverage {
+  optional string profile_id = 1;
+  uint64 total_chunks = 2;
+  uint64 embedded_chunks = 3;
+  uint64 failed_chunks = 4;
 }
 
 message ChunkRef {
@@ -321,4 +339,5 @@ message TextHit {
   uint64 end_byte = 5; // Exclusive.
   string excerpt = 6;
   string content_blake3 = 7;
+  optional double score = 8;
 }

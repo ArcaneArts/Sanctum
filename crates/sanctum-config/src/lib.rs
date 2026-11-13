@@ -16,6 +16,13 @@ pub struct Config {
     pub max_source_bytes: u64,
     #[serde(default = "default_worker_concurrency")]
     pub local_worker_concurrency: usize,
+    pub embedding: Option<EmbeddingConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum EmbeddingConfig {
+    Ollama(sanctum_embedding_ollama::OllamaConfig),
 }
 
 impl Config {

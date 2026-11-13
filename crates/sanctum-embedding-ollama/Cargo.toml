@@ -1,0 +1,12 @@
+[package]
+name = "sanctum-embedding-ollama"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+reqwest.workspace = true
+sanctum-embedding = { path = "../sanctum-embedding" }
+serde.workspace = true
+serde_json.workspace = true

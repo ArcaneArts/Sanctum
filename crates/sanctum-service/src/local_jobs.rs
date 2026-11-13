@@ -150,7 +150,7 @@ impl Service {
             retain_original: job.retain_original,
         };
         let revision = revision_for(job, content);
-        writer.register(&revision, job.replacement)?;
+        writer.register(&revision, job.replacement, self.embedding_profile())?;
         if !self.queue.begin_publish(job.id)? {
             return Err(Error::Conflict("indexing canceled".into()));
         }

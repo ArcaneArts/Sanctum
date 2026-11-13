@@ -1,5 +1,14 @@
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+use sanctum_embedding::{EmbedError, Provider, Purpose};
 use sanctum_proto::v1::{self, sanctum_client::SanctumClient, upload_text_frame::Frame};
-use sanctum_service::{Service, run_local_worker};
+use sanctum_service::{Service, run_embedding_worker, run_local_worker};
 use tempfile::TempDir;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -17,22 +26,31 @@ struct Running {
 
 impl Running {
     async fn start(dir: &TempDir) -> Self {
-        let service = Service::open(dir.path(), 32_768).unwrap();
+        Self::with_embedding(dir, None).await
+    }
+
+    async fn with_embedding(dir: &TempDir, provider: Option<Arc<dyn Provider>>) -> Self {
+        let service = Service::open_with_embedding(dir.path(), 32_768, provider).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let (stop, shutdown) = oneshot::channel();
         let server_service = service.clone();
         let server = tokio::spawn(async move {
             let (stop_worker, worker_stop) = tokio::sync::watch::channel(false);
-            let worker = tokio::spawn(run_local_worker(server_service.clone(), worker_stop));
+            let worker = tokio::spawn(run_local_worker(
+                server_service.clone(),
+                worker_stop.clone(),
+            ));
+            let embedding = tokio::spawn(run_embedding_worker(server_service.clone(), worker_stop));
             let result = Server::builder()
                 .add_service(sanctum_api::grpc(server_service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                     let _ = shutdown.await;
                 })
                 .await;
-            stop_worker.send(true).unwrap();
+            let _ = stop_worker.send(true);
             worker.await.unwrap();
+            embedding.await.unwrap();
             result
         });
         let client = SanctumClient::connect(endpoint).await.unwrap();
@@ -49,6 +67,266 @@ impl Running {
         self.stop.send(()).unwrap();
         self.server.await.unwrap().unwrap();
     }
+}
+
+struct EmbeddingFixture {
+    profile: &'static str,
+    fail_queries: AtomicBool,
+    reject_input: bool,
+    document_inputs: AtomicUsize,
+}
+
+impl EmbeddingFixture {
+    fn new(profile: &'static str, reject_input: bool) -> Arc<Self> {
+        Arc::new(Self {
+            profile,
+            fail_queries: AtomicBool::new(false),
+            reject_input,
+            document_inputs: AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for EmbeddingFixture {
+    fn profile_id(&self) -> &str {
+        self.profile
+    }
+
+    fn dimensions(&self) -> usize {
+        2
+    }
+
+    async fn embed(&self, purpose: Purpose, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if matches!(purpose, Purpose::Query) && self.fail_queries.load(Ordering::SeqCst) {
+            return Err(EmbedError::Transient("simulated provider outage".into()));
+        }
+        if matches!(purpose, Purpose::Document) {
+            if self.reject_input && texts.iter().any(|text| text.contains("reject input")) {
+                return Err(EmbedError::Input("simulated context limit".into()));
+            }
+            self.document_inputs
+                .fetch_add(texts.len(), Ordering::SeqCst);
+        }
+        Ok(texts
+            .iter()
+            .map(|text| {
+                if text.contains("quartz") || text.contains("minerals") {
+                    vec![2.0, 0.0]
+                } else {
+                    vec![0.0, 2.0]
+                }
+            })
+            .collect())
+    }
+}
+
+fn vector_search(query: &str, mode: v1::SearchMode) -> v1::SearchTextRequest {
+    v1::SearchTextRequest {
+        scope: scope("default"),
+        query: query.into(),
+        limit: Some(1),
+        metadata_filter: None,
+        mode: mode.into(),
+    }
+}
+
+async fn await_coverage(client: &mut SanctumClient<Channel>, embedded: u64, failed: u64) {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let coverage = client
+                .search_text(vector_search("quartz", v1::SearchMode::Lexical))
+                .await
+                .unwrap()
+                .into_inner()
+                .embedding_coverage
+                .unwrap();
+            if coverage.embedded_chunks == embedded && coverage.failed_chunks == failed {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn embedding_search_reuses_vectors_and_isolates_profiles() {
+    let dir = TempDir::new().unwrap();
+    let provider = EmbeddingFixture::new("profile-a", true);
+    let mut running = Running::with_embedding(&dir, Some(provider.clone())).await;
+    create(&mut running.client, "default").await;
+    let quartz = upload(&mut running.client, header("default"), b"quartz specimens").await;
+    let mut alternate = header("default");
+    if let Some(Frame::Header(header)) = &mut alternate.frame {
+        header.external = None;
+    }
+    let forecast = upload(&mut running.client, alternate, b"tomorrow's forecast").await;
+    await_coverage(&mut running.client, 2, 0).await;
+    assert_eq!(provider.document_inputs.load(Ordering::SeqCst), 2);
+    let request = vector_search("minerals", v1::SearchMode::Semantic);
+    let response = running
+        .client
+        .search_text(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.mode(), v1::SearchMode::Semantic);
+    assert_eq!(
+        response.hits[0].chunk.as_ref().unwrap().source_id,
+        quartz.source_id
+    );
+    assert_eq!(response.hits[0].score, Some(1.0));
+
+    write_metadata(
+        &mut running.client,
+        v1::MetadataTarget {
+            scope: scope("default"),
+            source_id: Some(forecast.source_id.clone()),
+            revision_id: Some(forecast.revision_id),
+            chunk_ordinal: None,
+        },
+        vec![metadata_edit(
+            "eligible",
+            v1::metadata_mutation::Edit::SetJson("true".into()),
+        )],
+    )
+    .await
+    .unwrap();
+    let mut filtered = request.clone();
+    filtered.metadata_filter = Some(v1::MetadataFilter {
+        expression: Some(v1::metadata_filter::Expression::Test(
+            v1::MetadataPredicate {
+                level: v1::MetadataLevel::Source.into(),
+                namespace: "demo.integration".into(),
+                key: "eligible".into(),
+                operator: v1::MetadataOperator::Exists.into(),
+                ..Default::default()
+            },
+        )),
+    });
+    let filtered = running
+        .client
+        .search_text(filtered)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        filtered.hits[0].chunk.as_ref().unwrap().source_id,
+        forecast.source_id
+    );
+
+    provider.fail_queries.store(true, Ordering::SeqCst);
+    let response = running
+        .client
+        .search_text(vector_search("quartz", v1::SearchMode::Hybrid))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.mode(), v1::SearchMode::Lexical);
+    assert_eq!(
+        response.degraded_reason.as_deref(),
+        Some("embedding_provider_unavailable")
+    );
+    assert_eq!(response.hits.len(), 1);
+    assert_eq!(
+        running
+            .client
+            .search_text(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable
+    );
+    provider.fail_queries.store(false, Ordering::SeqCst);
+    let same = upload(
+        &mut running.client,
+        replacement(Some(&quartz.source_id), Some(&quartz.revision_id)),
+        b"quartz specimens",
+    )
+    .await;
+    await_coverage(&mut running.client, 2, 0).await;
+    assert_eq!(provider.document_inputs.load(Ordering::SeqCst), 2);
+    expire_and_reclaim(&dir, &running.service);
+    assert!(!text_path(&dir, &quartz.source_id, &quartz.revision_id).exists());
+
+    let changed = upload(
+        &mut running.client,
+        replacement(Some(&quartz.source_id), Some(&same.revision_id)),
+        b"quartz reject input",
+    )
+    .await;
+    await_coverage(&mut running.client, 1, 1).await;
+    expire_and_reclaim(&dir, &running.service);
+    assert!(text_path(&dir, &same.source_id, &same.revision_id).exists());
+    assert_eq!(
+        search(&mut running.client, "default", "quartz").await[0].excerpt,
+        "quartz reject input"
+    );
+    let partial = running
+        .client
+        .search_text(vector_search("quartz", v1::SearchMode::Hybrid))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(partial.mode(), v1::SearchMode::Hybrid);
+    assert_eq!(
+        partial.degraded_reason.as_deref(),
+        Some("embedding_coverage_partial")
+    );
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: true })
+        .await
+        .unwrap();
+    running.stop().await;
+
+    let corrected = EmbeddingFixture::new("profile-b", false);
+    let mut restarted = Running::with_embedding(&dir, Some(corrected.clone())).await;
+    assert_eq!(
+        restarted
+            .client
+            .search_text(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable
+    );
+    let fallback = restarted
+        .client
+        .search_text(vector_search("quartz", v1::SearchMode::Hybrid))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fallback.mode(), v1::SearchMode::Lexical);
+    assert_eq!(
+        fallback.degraded_reason.as_deref(),
+        Some("embeddings_unavailable")
+    );
+    let coverage = fallback.embedding_coverage.unwrap();
+    assert_eq!(coverage.profile_id.as_deref(), Some("profile-b"));
+    assert_eq!((coverage.embedded_chunks, coverage.total_chunks), (0, 2));
+    restarted
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: false })
+        .await
+        .unwrap();
+    await_coverage(&mut restarted.client, 2, 0).await;
+    assert_eq!(corrected.document_inputs.load(Ordering::SeqCst), 2);
+    let response = restarted
+        .client
+        .search_text(request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response.hits[0].chunk.as_ref().unwrap().revision_id,
+        changed.revision_id
+    );
+    expire_and_reclaim(&dir, &restarted.service);
+    assert!(!text_path(&dir, &same.source_id, &same.revision_id).exists());
+    restarted.stop().await;
 }
 
 fn scope(tenant: &str) -> Option<v1::Scope> {
@@ -105,6 +383,7 @@ async fn search(
             query: query.into(),
             limit: None,
             metadata_filter: None,
+            mode: v1::SearchMode::Lexical.into(),
         })
         .await
         .unwrap()
@@ -1526,6 +1805,7 @@ async fn metadata_filters_apply_to_candidates_before_limit_and_preserve_json_typ
         query: "quartz".into(),
         limit: Some(1),
         metadata_filter: Some(eligible),
+        mode: v1::SearchMode::Lexical.into(),
     };
     let hits = running
         .client

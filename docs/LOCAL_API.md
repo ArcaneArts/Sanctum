@@ -71,8 +71,9 @@ cargo run --locked -p sanctum-cli -- delete notes SOURCE_ID --expected-revision 
 
 For an external target, pass `--replace-external --namespace NAME --external-id ID`.
 Deletion immediately removes the source from search and prevents queued
-replacements from publishing. The local lexical service retains replaced
-bytes for five minutes before reclaiming them. Fetching a reclaimed revision
+replacements from publishing. For replacement, a five-minute grace period
+starts after the new revision is ready for lexical search and all of its
+chunks have embeddings for the configured profile, if enabled. Fetching a reclaimed revision
 returns `FAILED_PRECONDITION` while the source or its deletion receipt is known.
 
 Use `SubmitText` for background ingestion. It returns a durable operation
@@ -94,10 +95,70 @@ Pause prevents new claims and lets active jobs finish. Cancellation can win
 until the worker starts publication. Retry applies to failures marked
 `retryable` and preserves the operation and revision IDs.
 
-`SearchText` matches the supplied words in a single chunk, using SQLite FTS5
-tokenization. Results include byte offsets as `[start_byte, end_byte)` into
+`SearchText` defaults to lexical search. It matches the supplied words in a
+single chunk using SQLite FTS5 tokenization. Results include byte offsets as
+`[start_byte, end_byte)` into
 the canonical UTF-8 representation. Pass the result's `ChunkRef` unchanged
 to `FetchChunk` to retrieve that range.
+
+## Ollama and search modes
+
+Add an `embedding` block to the JSON configuration to enable background
+embedding for every collection on the server. Run the model in Ollama before
+requesting semantic search. For example, this configuration uses a local
+installation of `embeddinggemma-2:740m` with 768 dimensions.
+
+```json
+{
+  "version": 1,
+  "storage_root": "./local-data",
+  "embedding": {
+    "provider": "ollama",
+    "endpoint": "http://127.0.0.1:11434",
+    "timeout_seconds": 30,
+    "profile": {
+      "model": "embeddinggemma-2:740m",
+      "revision": "eaff2253e2ba",
+      "dimensions": 768
+    }
+  }
+}
+```
+
+Set `revision` to identify the exact model installed on your Ollama instance
+and change it when the contents of the model tag change. The example uses
+the digest abbreviation reported by `ollama list` on the development machine.
+Optional `document_prefix` and `query_prefix` apply model-specific prefixes
+and are part of profile identity. Restart the server to apply profile changes.
+
+```sh
+cargo run --locked -p sanctum-cli -- search notes 'how crystals form' --mode semantic
+cargo run --locked -p sanctum-cli -- search notes 'quartz formation' --mode hybrid
+```
+
+- `lexical` uses FTS5 independently of the provider.
+- `semantic` orders compatible chunks by exact cosine similarity. It
+  returns `UNAVAILABLE` if query embedding fails or the collection has no
+  compatible vectors.
+- `hybrid` combines lexical and semantic ranks with reciprocal rank fusion
+  (constant 60). It falls back to lexical when the provider or compatible
+  vectors are unavailable. Semantic and hybrid modes collapse overlapping
+  byte ranges from the same source revision within the retrieved candidates.
+
+The response includes the mode used, optional scores, and coverage for the
+active profile across current chunks in the collection, before any metadata
+filter. A partial coverage message indicates that semantic ranking covered
+only the chunks that already have compatible vectors. Failed counts include
+chunks awaiting retry and permanently rejected inputs. Ingestion and lexical
+publication proceed while embedding is pending.
+
+Vectors are reused within a collection when both the chunk's bytes and
+profile match, even when its offset or revision changes. After a profile
+change, background work resumes from persisted results for the new profile.
+Ollama requests disable truncation. A rejected input is recorded separately
+so other chunks can proceed. Transient failures back off and retry. Correct
+a permanently rejected input with a new source revision or use a corrected
+embedding profile.
 
 ## Local file and directory imports
 
@@ -165,7 +226,7 @@ tests for an element in an array. `exists` includes JSON null and `missing`
 matches an absent entry or path. Use the JSON string `null` as the operand
 to match an explicit null. Existence tests omit the operand.
 
-SQLite applies the predicates to lexical candidates before returning the
+SQLite applies the predicates to lexical and semantic candidates before returning the
 requested number of ranked hits. The filter allows 64 expression nodes,
 eight expression levels, and 16 segments per path.
 
