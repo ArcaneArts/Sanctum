@@ -307,6 +307,7 @@ async fn main() -> anyhow::Result<()> {
                     scope: scope(collection),
                     query,
                     limit: Some(limit),
+                    metadata_filter: None,
                 })
                 .await?
                 .into_inner();

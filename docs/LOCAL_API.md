@@ -151,3 +151,20 @@ changes. Replacement records a `source_replaced` event followed by a
 `metadata_reset` event in the same commit. The change log keeps the most
 recent 10,000 events. An expired cursor returns `FAILED_PRECONDITION` and
 requires a rescan.
+
+`SearchText.metadata_filter` accepts a tree of `test`, `all`, `any`, and
+`not` expressions. A test selects a namespace and key at the collection,
+source, or chunk level. An optional path selects object properties and
+zero-based array indices. Property names are literal, including dots and
+quotes. A source or chunk test reads metadata on the candidate's revision.
+
+Equality compares JSON values by type and structure, with numeric comparison
+across integer and floating-point values. Ordered comparisons accept numbers
+with numbers or strings with strings. Strings sort lexically. `contains`
+tests for an element in an array. `exists` includes JSON null and `missing`
+matches an absent entry or path. Use the JSON string `null` as the operand
+to match an explicit null. Existence tests omit the operand.
+
+SQLite applies the predicates to lexical candidates before returning the
+requested number of ranked hits. The filter allows 64 expression nodes,
+eight expression levels, and 16 segments per path.

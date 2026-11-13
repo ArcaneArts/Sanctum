@@ -230,6 +230,55 @@ message SearchTextRequest {
   Scope scope = 1;
   string query = 2;
   optional uint32 limit = 3;
+  MetadataFilter metadata_filter = 4;
+}
+
+message MetadataFilter {
+  oneof expression {
+    MetadataPredicate test = 1;
+    MetadataFilterGroup all = 2;
+    MetadataFilterGroup any = 3;
+    MetadataFilter not = 4;
+  }
+}
+
+message MetadataFilterGroup {
+  repeated MetadataFilter filters = 1;
+}
+
+message MetadataPathSegment {
+  oneof segment {
+    string property = 1;
+    uint32 index = 2;
+  }
+}
+
+enum MetadataLevel {
+  METADATA_LEVEL_UNSPECIFIED = 0;
+  METADATA_LEVEL_COLLECTION = 1;
+  METADATA_LEVEL_SOURCE = 2;
+  METADATA_LEVEL_CHUNK = 3;
+}
+
+enum MetadataOperator {
+  METADATA_OPERATOR_UNSPECIFIED = 0;
+  METADATA_OPERATOR_EQUAL = 1;
+  METADATA_OPERATOR_LESS = 2;
+  METADATA_OPERATOR_LESS_OR_EQUAL = 3;
+  METADATA_OPERATOR_GREATER = 4;
+  METADATA_OPERATOR_GREATER_OR_EQUAL = 5;
+  METADATA_OPERATOR_CONTAINS = 6;
+  METADATA_OPERATOR_EXISTS = 7;
+  METADATA_OPERATOR_MISSING = 8;
+}
+
+message MetadataPredicate {
+  MetadataLevel level = 1;
+  string namespace = 2;
+  string key = 3;
+  repeated MetadataPathSegment path = 4;
+  MetadataOperator operator = 5;
+  optional string operand_json = 6;
 }
 
 message SearchTextResponse {

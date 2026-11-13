@@ -295,7 +295,7 @@ fn apply(
     Ok(entries)
 }
 
-fn valid_name(name: &str) -> bool {
+pub(super) fn valid_name(name: &str) -> bool {
     !name.trim().is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
 }
 
