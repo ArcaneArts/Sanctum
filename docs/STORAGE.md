@@ -367,6 +367,21 @@ and source bytes in bounded pages. It retains the small manifest fence.
 An already materialized snapshot remains readable for the life of its
 local reader.
 
+### Hosted upload cancellation
+
+Use `CancelIngestionJob` or `sanctum-cli cancel COLLECTION OPERATION` for
+an accepted or registered upload. Cancellation and indexing compete for
+one SQLite receipt under the collection writer lease. Once text has been
+published, cancellation fails and the revision remains available.
+
+A successful cancellation releases any reserved external ID for a new
+source, discards the staged upload, and returns `CANCELED`. Repeating the
+request returns the same canceled status. If the worker or API stops
+between committing the receipt and updating the operation envelope,
+repeating the request or delivering the next worker task recovers the
+receipt and finishes cancellation. Late tasks cannot publish canceled
+input. Cancellation uses the same 30-day window as indexing.
+
 ### Hosted operation retention
 
 The upload sweep compacts terminal envelopes after 45 days without an

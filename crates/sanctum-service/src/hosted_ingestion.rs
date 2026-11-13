@@ -4,7 +4,7 @@ use std::{
 };
 
 use sanctum_core::{ChunkSettings, Error, ExternalSource, Result, Scope};
-use sanctum_db::{Command, Unit, collection_prefix};
+use sanctum_db::{Command, Unit, collection_prefix, command_receipt};
 use sanctum_db_sqlite::hosted::{Registration, RevisionIntent, Target, register_revision};
 use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES, Version};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::{HostedCatalog, RevisionContent, TaskStage, TextUpload};
 
+mod cancellation;
 mod embedding_tasks;
 mod indexing;
 mod orphan_cleanup;
@@ -49,6 +50,7 @@ pub enum HostedJobState {
     Accepted,
     Registered,
     TextReady,
+    Canceled,
     Failed { code: String, message: String },
 }
 
@@ -64,6 +66,10 @@ enum Stage {
         content: Box<RevisionContent>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         embedding: Option<EmbeddingStep>,
+    },
+    Canceled {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        registration: Option<Registration>,
     },
     Failed {
         code: String,
@@ -83,6 +89,7 @@ struct EmbeddingStep {
 #[serde(rename_all = "snake_case")]
 enum RegistrationOutcome {
     Registered(Registration),
+    Canceled,
     Failed { code: String, message: String },
 }
 
@@ -180,7 +187,10 @@ impl HostedCatalog {
                     payload: intent,
                 }],
                 move |tx, intent| {
-                    let outcome = if unix_seconds()? >= expires_at {
+                    let canceled = command_receipt(tx, operation, indexing::INDEX_STAGE)?;
+                    let outcome = if cancellation::index_was_canceled(canceled.as_deref())? {
+                        RegistrationOutcome::Canceled
+                    } else if unix_seconds()? >= expires_at {
                         RegistrationOutcome::Failed {
                             code: "expired".into(),
                             message: "registration window expired".into(),
@@ -196,12 +206,16 @@ impl HostedCatalog {
         let released = writer.release().await;
         let (_, receipts) = result?;
         released?;
-        let outcome: RegistrationOutcome = serde_json::from_str(&receipts[0].outcome)
-            .map_err(|error| Error::Internal(Box::new(error)))?;
+        let outcome = decode_registration(&receipts[0].outcome)?;
         record.dispatched_at = None;
         record.stage = match outcome {
             RegistrationOutcome::Registered(registration) => {
                 Stage::PendingIndexing { registration }
+            }
+            RegistrationOutcome::Canceled => {
+                return self
+                    .checkpoint_canceled(scope, &prefix, record, version, None)
+                    .await;
             }
             RegistrationOutcome::Failed { code, message } => Stage::Failed {
                 code,
@@ -266,12 +280,10 @@ impl HostedCatalog {
             Stage::TextReady {
                 embedding: None, ..
             }
+            | Stage::Canceled { .. }
             | Stage::Failed { .. } => {
-                if matches!(record.stage, Stage::Failed { .. }) {
-                    match self.storage.delete(&record.input_key(&prefix)?).await {
-                        Ok(()) | Err(Error::NotFound(_)) => {}
-                        Err(error) => return Err(error),
-                    }
+                if matches!(record.stage, Stage::Canceled { .. } | Stage::Failed { .. }) {
+                    self.discard_input(&prefix, &record).await?;
                 }
                 self.clear_dispatch_hint(scope, operation).await?;
                 return Ok(false);
@@ -303,6 +315,13 @@ impl HostedCatalog {
             .await
         {
             Ok(_) | Err(Error::Conflict(_)) => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn discard_input(&self, prefix: &Key, record: &Operation) -> Result<()> {
+        match self.storage.delete(&record.input_key(prefix)?).await {
+            Ok(()) | Err(Error::NotFound(_)) => Ok(()),
             Err(error) => Err(error),
         }
     }
@@ -522,6 +541,7 @@ impl Operation {
                 Some(registration),
                 Some(*content),
             ),
+            Stage::Canceled { registration } => (HostedJobState::Canceled, registration, None),
             Stage::Failed {
                 code,
                 message,
@@ -568,6 +588,10 @@ pub(crate) fn unix_seconds() -> Result<u64> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .map_err(|error| Error::Internal(Box::new(error)))
+}
+
+fn decode_registration(receipt: &str) -> Result<RegistrationOutcome> {
+    serde_json::from_str(receipt).map_err(|error| Error::Internal(Box::new(error)))
 }
 
 impl RegistrationOutcome {

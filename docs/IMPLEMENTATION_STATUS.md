@@ -883,3 +883,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - The local MCP HTTP and stdio check verifies disabled status. Live
   MinIO and Ollama verify pending, ready, and pending after a profile
   change over MCP HTTP, including status on fetched context.
+- Delivered in [PR #58](https://github.com/ArcaneArts/Sanctum/pull/58).
+
+## Hosted upload cancellation
+
+- Hosted gRPC and CLI cancel accepted or registered uploads. Cancellation
+  and indexing share a fenced SQLite receipt, and worker replay completes
+  cleanup if the operation envelope update was interrupted. MCP status
+  reports canceled operations.
+- Integration checks cover lost checkpoints on either side of publication,
+  duplicate cancellation, tenant isolation, and reuse of an external ID
+  after canceling a registered upload.
+- Live MinIO verified cancellation before and after registration, duplicate
+  delivery across restart, input reclamation, and refusal after commit.

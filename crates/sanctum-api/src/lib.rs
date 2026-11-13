@@ -697,11 +697,7 @@ impl Sanctum for Grpc {
     ) -> Reply<v1::IngestionJob> {
         let request = request.into_inner();
         if let Backend::Hosted(catalog) = &self.0 {
-            let scope = parse_scope(request.scope)?;
-            let id = request
-                .operation_id
-                .parse()
-                .map_err(|_| Status::invalid_argument("invalid operation ID"))?;
+            let (scope, id) = job_target(request)?;
             let accepted = catalog.ingestion_job(&scope, id).await.map_err(status)?;
             return Ok(Response::new(wire_hosted_job(&scope, accepted)));
         }
@@ -782,7 +778,13 @@ impl Sanctum for Grpc {
         &self,
         request: Request<v1::IngestionJobRequest>,
     ) -> Reply<v1::IngestionJob> {
-        job_action(self.local()?, request.into_inner(), Service::cancel_job).await
+        let request = request.into_inner();
+        if let Backend::Hosted(catalog) = &self.0 {
+            let (scope, id) = job_target(request)?;
+            let job = catalog.cancel_upload(&scope, id).await.map_err(status)?;
+            return Ok(Response::new(wire_hosted_job(&scope, job)));
+        }
+        job_action(self.local()?, request, Service::cancel_job).await
     }
 
     async fn retry_ingestion_job(
@@ -1134,6 +1136,12 @@ async fn wait_hosted_upload(
                 };
                 return Err(with_operation_id(failure, operation));
             }
+            HostedJobState::Canceled => {
+                return Err(with_operation_id(
+                    Status::cancelled("upload was canceled"),
+                    operation,
+                ));
+            }
             HostedJobState::Accepted | HostedJobState::Registered => {}
         }
         let pending = async {
@@ -1242,16 +1250,24 @@ async fn job_action(
     request: v1::IngestionJobRequest,
     action: fn(&Service, &Scope, uuid::Uuid) -> Result<Job>,
 ) -> Reply<v1::IngestionJob> {
-    let scope = parse_scope(request.scope)?;
-    let id = request
-        .operation_id
-        .parse()
-        .map_err(|_| Status::invalid_argument("invalid operation ID"))?;
+    let (scope, id) = job_target(request)?;
     let service = service.clone();
     work(move || action(&service, &scope, id))
         .await
         .map(wire_job)
         .map(Response::new)
+}
+
+#[allow(clippy::result_large_err)]
+fn job_target(
+    request: v1::IngestionJobRequest,
+) -> std::result::Result<(Scope, uuid::Uuid), Status> {
+    let scope = parse_scope(request.scope)?;
+    let id = request
+        .operation_id
+        .parse()
+        .map_err(|_| Status::invalid_argument("invalid operation ID"))?;
+    Ok((scope, id))
 }
 
 fn text_revision(job: &Job) -> Option<v1::TextRevision> {
@@ -1303,6 +1319,7 @@ fn wire_hosted_job(scope: &Scope, job: HostedJob) -> v1::IngestionJob {
         HostedJobState::Accepted => (v1::IngestionState::Accepted, None, None),
         HostedJobState::Registered => (v1::IngestionState::Registered, None, None),
         HostedJobState::TextReady => (v1::IngestionState::TextReady, None, None),
+        HostedJobState::Canceled => (v1::IngestionState::Canceled, None, None),
         HostedJobState::Failed { code, message } => {
             (v1::IngestionState::Failed, Some(code), Some(message))
         }

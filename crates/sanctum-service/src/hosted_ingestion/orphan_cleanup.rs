@@ -159,7 +159,7 @@ impl HostedCatalog {
                 embedding: None, ..
             } => (!is_rtf(&record.upload.name) || record.upload.retain_original)
                 .then_some(record.attempt),
-            Stage::Failed { .. } => None,
+            Stage::Canceled { .. } | Stage::Failed { .. } => None,
             _ => return Ok(false),
         };
         self.clear_dispatch_hint(scope, operation).await?;

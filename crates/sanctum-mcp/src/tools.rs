@@ -628,6 +628,7 @@ fn hosted_job_value(scope: &Scope, job: HostedJob) -> Value {
         HostedJobState::Accepted => ("accepted", None),
         HostedJobState::Registered => ("registered", None),
         HostedJobState::TextReady => ("text_ready", None),
+        HostedJobState::Canceled => ("canceled", None),
         HostedJobState::Failed { code, message } => {
             ("failed", Some(json!({"code": code, "message": message})))
         }

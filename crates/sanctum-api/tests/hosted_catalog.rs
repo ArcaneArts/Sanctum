@@ -1014,6 +1014,180 @@ async fn hosted_submissions_store_exact_bytes_and_replay_after_restart() {
 }
 
 #[tokio::test]
+async fn hosted_cancellation_recovers_from_lost_checkpoints_without_publishing() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        interrupt: AtomicU8::new(0),
+    });
+    let catalog = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let wire_scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    for tenant in ["default", "other"] {
+        catalog
+            .create_collection(
+                &sanctum_core::Scope {
+                    tenant: tenant.parse().unwrap(),
+                    ..scope.clone()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let mut server = start(catalog.clone()).await;
+    let header = v1::UploadTextHeader {
+        scope: Some(wire_scope.clone()),
+        name: "notes.txt".into(),
+        external: Some(v1::ExternalSource {
+            namespace: "fixture".into(),
+            id: "document".into(),
+        }),
+        ..Default::default()
+    };
+    let payload = [b"quartz".as_slice()];
+    for registered in [false, true] {
+        let accepted = server
+            .client
+            .submit_text(upload_frames(&header, payload))
+            .await
+            .unwrap()
+            .into_inner();
+        let id = accepted.operation_id.parse().unwrap();
+        let request = v1::IngestionJobRequest {
+            scope: Some(wire_scope.clone()),
+            operation_id: accepted.operation_id,
+        };
+        let wrong_tenant = v1::IngestionJobRequest {
+            scope: Some(v1::Scope {
+                tenant: "other".into(),
+                ..wire_scope.clone()
+            }),
+            ..request.clone()
+        };
+        assert_eq!(
+            server
+                .client
+                .cancel_ingestion_job(wrong_tenant)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::NotFound
+        );
+        if registered {
+            assert_eq!(
+                catalog
+                    .register_upload(&scope, id)
+                    .await
+                    .unwrap()
+                    .update_sequence,
+                1
+            );
+        }
+        storage.interrupt.store(1, Ordering::Relaxed);
+        assert_eq!(
+            server
+                .client
+                .cancel_ingestion_job(request.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
+        server.stop().await;
+        let recovered = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+        if registered {
+            assert!(matches!(
+                recovered.index_upload(&scope, id).await.unwrap().state,
+                sanctum_service::HostedJobState::Canceled
+            ));
+        } else {
+            assert!(matches!(
+                recovered.register_upload(&scope, id).await.unwrap().state,
+                sanctum_service::HostedJobState::Canceled
+            ));
+        }
+        server = start(recovered.clone()).await;
+        let canceled = server
+            .client
+            .cancel_ingestion_job(request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(canceled.state(), v1::IngestionState::Canceled);
+        assert_eq!(canceled.update_sequence, u64::from(registered));
+        assert!(matches!(
+            recovered.index_upload(&scope, id).await.unwrap().state,
+            sanctum_service::HostedJobState::Canceled
+        ));
+        let input_prefix =
+            Key::parse(format!("default/collections/notes/operations/{id}/inputs")).unwrap();
+        assert!(
+            storage
+                .list(Some(&input_prefix), None, 10)
+                .await
+                .unwrap()
+                .objects
+                .is_empty()
+        );
+        assert!(
+            server
+                .client
+                .search_text(v1::SearchTextRequest {
+                    scope: Some(wire_scope.clone()),
+                    query: "quartz".into(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .hits
+                .is_empty()
+        );
+    }
+
+    // The external ID was released. Once the next upload's text is committed,
+    // cancellation must refuse it even if the envelope still says registered.
+    let published = server
+        .client
+        .submit_text(upload_frames(&header, payload))
+        .await
+        .unwrap()
+        .into_inner();
+    let id = published.operation_id.parse().unwrap();
+    catalog.register_upload(&scope, id).await.unwrap();
+    storage.interrupt.store(1, Ordering::Relaxed);
+    assert!(matches!(
+        catalog.index_upload(&scope, id).await,
+        Err(Error::Busy(_))
+    ));
+    let request = v1::IngestionJobRequest {
+        scope: Some(wire_scope),
+        operation_id: published.operation_id,
+    };
+    assert_eq!(
+        server
+            .client
+            .cancel_ingestion_job(request)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    assert!(matches!(
+        catalog.index_upload(&scope, id).await.unwrap().state,
+        sanctum_service::HostedJobState::TextReady
+    ));
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_registration_replays_after_checkpoint_failure_and_orders_replacements() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance {
