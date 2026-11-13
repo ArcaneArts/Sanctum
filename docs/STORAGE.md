@@ -269,6 +269,14 @@ disable reuse. Oversized snapshots and files still in use can add to
 active temporary storage. Hosted gRPC search and fetch hits report the
 database generation that supplied their chunk ranges.
 
+Receipt reads and writers can use the same verified snapshot cache. A
+writer resolves the generation from its acquired lease, copies a retained
+snapshot to a private working file, and publishes a SQLite backup. Only
+successful conditional publication makes the new backup eligible for the
+cache. Reads continue to resolve HEAD, including after another instance
+publishes or a collection is deleted. Each write still uploads a complete
+snapshot.
+
 ### Hosted embedding batches
 
 Set the same server-level `embedding` configuration on the API and

@@ -219,3 +219,18 @@ publication optimization should reduce full-size writes for small changes while
 preserving ordered registration and conditional publication. A durable mutation
 journal remains a candidate and would require crash, replay, and compaction
 measurements at the same collection size.
+
+### Reusing verified snapshots during publication
+
+A second release run used the same fixture and loopback MinIO with receipt
+lookups and writers sharing the verified snapshot cache. The twelfth
+source reached text readiness in 30.83 s, and the eight-byte replacement
+in 29.56 s, compared with 58.83 s and 69.73 s in the baseline run. Cold
+search took 3.27 s and the three repeated searches took 11.56, 12.15, and
+14.57 ms. These are single runs and include varying upload latency.
+
+The replacement still published two full snapshots. The final snapshot was
+745,369,600 bytes, and the 27 retained generations occupied 9,728,929,792
+bytes. This change saves repeated downloads within an instance. It leaves
+full-size writes and temporary storage for private writer copies in the
+publication path.

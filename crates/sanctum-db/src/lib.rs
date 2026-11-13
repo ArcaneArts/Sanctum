@@ -105,6 +105,7 @@ struct Head {
 pub struct Publication {
     storage: Arc<dyn Storage>,
     ttl: Duration,
+    snapshots: Option<Arc<SnapshotCache>>,
 }
 
 pub struct Lease {
@@ -154,7 +155,16 @@ impl Publication {
                 "database lease must last from 100 milliseconds to one hour".into(),
             ));
         }
-        Ok(Self { storage, ttl })
+        Ok(Self {
+            storage,
+            ttl,
+            snapshots: None,
+        })
+    }
+
+    pub fn with_snapshot_cache(mut self, snapshots: Arc<SnapshotCache>) -> Self {
+        self.snapshots = Some(snapshots);
+        self
     }
 
     pub async fn acquire(&self, unit: &Unit) -> Result<Lease> {
@@ -295,12 +305,14 @@ impl Publication {
         stage: &str,
     ) -> Result<Option<String>> {
         let id = receipt_id(operation, stage);
-        let scratch = tempfile::tempdir()?;
-        let Some(database) = self.read(unit, scratch.path()).await? else {
+        let database = match &self.snapshots {
+            Some(snapshots) => snapshots.read(self, unit).await?,
+            None => self.read(unit, &std::env::temp_dir()).await?.map(Arc::new),
+        };
+        let Some(database) = database else {
             return Ok(None);
         };
         tokio::task::spawn_blocking(move || {
-            let _scratch = scratch;
             let connection = Connection::open_with_flags(
                 database.path(),
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -459,16 +471,27 @@ impl Lease {
         }
         self.renew().await?;
         let directory = tempfile::tempdir()?;
-        let source = match self.head.generation.clone() {
-            Some(generation) => Some(
-                self.publication
-                    .materialize(&self.unit, generation, directory.path())
-                    .await?,
+        let (source, shared) = match (self.head.generation.clone(), &self.publication.snapshots) {
+            (Some(generation), Some(snapshots)) if snapshots.retains(&generation) => (
+                Some(
+                    snapshots
+                        .read_generation(&self.publication, &self.unit, generation)
+                        .await?,
+                ),
+                true,
             ),
-            None => None,
+            (Some(generation), _) => (
+                Some(Arc::new(
+                    self.publication
+                        .materialize(&self.unit, generation, directory.path())
+                        .await?,
+                )),
+                false,
+            ),
+            (None, _) => (None, false),
         };
         let prepared = tokio::task::spawn_blocking(move || {
-            apply_snapshot(directory, source, stage, commands, apply)
+            apply_snapshot(directory, source, shared, stage, commands, apply)
         })
         .await
         .map_err(|error| Error::Internal(Box::new(error)))??;
@@ -495,6 +518,17 @@ impl Lease {
         let mut head = self.head.clone();
         head.generation = Some(generation.clone());
         self.write(head).await?;
+        if let Some(snapshots) = &self.publication.snapshots {
+            snapshots
+                .remember(
+                    &self.unit,
+                    Materialized {
+                        generation: generation.clone(),
+                        file: staged,
+                    },
+                )
+                .await;
+        }
         tracing::debug!(
             epoch = self.head.epoch,
             snapshot_bytes = generation.bytes,
@@ -724,14 +758,24 @@ fn read_receipt(connection: &Connection, id: &str) -> Result<Option<String>> {
 
 fn apply_snapshot<T>(
     directory: TempDir,
-    source: Option<Materialized>,
+    source: Option<Arc<Materialized>>,
+    shared: bool,
     stage: &str,
     commands: Vec<Command<T>>,
     mut apply: impl FnMut(&Transaction<'_>, T) -> Result<String>,
 ) -> Result<Prepared> {
     use rusqlite::params;
-    let empty = directory.path().join("initial.sqlite");
-    let path = source.as_ref().map_or(empty.as_path(), Materialized::path);
+    let working = directory.path().join("working.sqlite");
+    let path = match source.as_deref() {
+        Some(source) if shared => {
+            // A cached file may still serve readers. Copy the closed, published
+            // snapshot before opening it for a write transaction.
+            std::fs::copy(source.path(), &working)?;
+            working.as_path()
+        }
+        Some(source) => source.path(),
+        None => working.as_path(),
+    };
     let mut db = Connection::open(path).map_err(sql_error)?;
     db.pragma_update(None, "foreign_keys", true)
         .map_err(sql_error)?;

@@ -47,7 +47,7 @@ impl SnapshotCache {
         unit: &Unit,
         generation: Generation,
     ) -> Result<Arc<Materialized>> {
-        if self.max_bytes == 0 || generation.bytes > self.max_bytes {
+        if !self.retains(&generation) {
             let file = publication
                 .materialize(unit, generation, &std::env::temp_dir())
                 .await?;
@@ -70,6 +70,18 @@ impl SnapshotCache {
             "resolved hosted snapshot"
         );
         Ok(file.clone())
+    }
+
+    pub(crate) fn retains(&self, generation: &Generation) -> bool {
+        self.max_bytes != 0 && generation.bytes <= self.max_bytes
+    }
+
+    pub(crate) async fn remember(&self, unit: &Unit, snapshot: Materialized) {
+        if !self.retains(&snapshot.generation) {
+            return;
+        }
+        let slot = self.slot(unit, &snapshot.generation).await;
+        let _ = slot.set(Arc::new(snapshot));
     }
 
     async fn slot(&self, unit: &Unit, generation: &Generation) -> Arc<OnceCell<Arc<Materialized>>> {

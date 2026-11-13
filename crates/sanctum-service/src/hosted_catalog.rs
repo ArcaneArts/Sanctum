@@ -32,14 +32,16 @@ impl HostedCatalog {
         if max_source_bytes == 0 {
             return Err(Error::Invalid("max_source_bytes must be positive".into()));
         }
-        let publication = Publication::new(storage.clone(), Duration::from_secs(300))?;
+        let snapshots = Arc::new(SnapshotCache::new(DEFAULT_SNAPSHOT_CACHE_BYTES));
+        let publication = Publication::new(storage.clone(), Duration::from_secs(300))?
+            .with_snapshot_cache(snapshots.clone());
         Ok(Self {
             storage,
             prefix,
             max_source_bytes,
             chunking: ChunkSettings::default(),
             publication,
-            snapshots: Arc::new(SnapshotCache::new(DEFAULT_SNAPSHOT_CACHE_BYTES)),
+            snapshots,
             dispatcher: None,
             standalone_wake: None,
             embedding: None,
@@ -62,6 +64,7 @@ impl HostedCatalog {
 
     pub fn with_snapshot_cache_bytes(mut self, max_bytes: u64) -> Self {
         self.snapshots = Arc::new(SnapshotCache::new(max_bytes));
+        self.publication = self.publication.with_snapshot_cache(self.snapshots.clone());
         self
     }
 
