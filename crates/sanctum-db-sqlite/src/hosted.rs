@@ -160,6 +160,23 @@ pub fn release_intent(tx: &Transaction<'_>, source: Uuid) -> Result<()> {
     Ok(())
 }
 
+pub fn release_canceled_intent(
+    tx: &Transaction<'_>,
+    operation: Uuid,
+    revision: Uuid,
+    source: Uuid,
+) -> Result<()> {
+    initialize_collection(tx)?;
+    // Keep the sequence, and leave any newer intent or unrelated source alone.
+    tx.execute(
+        "UPDATE hosted_revision_intents SET creating = 0, external_namespace = NULL,
+         external_id = NULL WHERE source_id = ?1 AND operation_id = ?2 AND revision_id = ?3 AND creating = 1",
+        params![source.to_string(), operation.to_string(), revision.to_string()],
+    )
+    .map_err(database_error)?;
+    Ok(())
+}
+
 pub fn publish_revision(
     tx: &Transaction<'_>,
     revision: &crate::Revision,

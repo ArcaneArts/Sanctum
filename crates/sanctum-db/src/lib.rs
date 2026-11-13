@@ -300,21 +300,13 @@ impl Publication {
             return Ok(None);
         };
         tokio::task::spawn_blocking(move || {
-            use rusqlite::OptionalExtension;
             let _scratch = scratch;
             let connection = Connection::open_with_flags(
                 database.path(),
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )
             .map_err(sql_error)?;
-            connection
-                .query_row(
-                    "SELECT outcome FROM applied_commands WHERE id = ?1",
-                    [id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(sql_error)
+            read_receipt(&connection, &id)
         })
         .await
         .map_err(|error| Error::Internal(Box::new(error)))?
@@ -709,6 +701,27 @@ fn receipt_id(operation: Uuid, stage: &str) -> String {
     }
 }
 
+/// Looks up a stage outcome inside the same transaction as a dependent command.
+pub fn command_receipt(
+    transaction: &Transaction<'_>,
+    operation: Uuid,
+    stage: &str,
+) -> Result<Option<String>> {
+    read_receipt(transaction, &receipt_id(operation, stage))
+}
+
+fn read_receipt(connection: &Connection, id: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    connection
+        .query_row(
+            "SELECT outcome FROM applied_commands WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)
+}
+
 fn apply_snapshot<T>(
     directory: TempDir,
     source: Option<Materialized>,
@@ -716,7 +729,7 @@ fn apply_snapshot<T>(
     commands: Vec<Command<T>>,
     mut apply: impl FnMut(&Transaction<'_>, T) -> Result<String>,
 ) -> Result<Prepared> {
-    use rusqlite::{OptionalExtension, params};
+    use rusqlite::params;
     let empty = directory.path().join("initial.sqlite");
     let path = source.as_ref().map_or(empty.as_path(), Materialized::path);
     let mut db = Connection::open(path).map_err(sql_error)?;
@@ -736,14 +749,7 @@ fn apply_snapshot<T>(
     let now = (unix_ms()? / 1000) as i64;
     for command in commands {
         let id = receipt_id(command.operation, stage);
-        let previous: Option<String> = tx
-            .query_row(
-                "SELECT outcome FROM applied_commands WHERE id = ?1",
-                [&id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql_error)?;
+        let previous = read_receipt(&tx, &id)?;
         let outcome = match previous {
             Some(outcome) => outcome,
             None => {

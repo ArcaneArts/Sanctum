@@ -18,12 +18,13 @@ use super::{
 };
 use crate::{ChunkRef, Revision, RevisionContent};
 
-const INDEX_STAGE: &str = "index";
+pub(super) const INDEX_STAGE: &str = "index";
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Outcome {
+pub(super) enum Outcome {
     Ready(Box<RevisionContent>),
+    Canceled(Option<Registration>),
     Failed { code: String, message: String },
 }
 
@@ -68,6 +69,11 @@ impl HostedCatalog {
                 Err(error) => return Err(error),
             },
         };
+        if let Outcome::Canceled(registration) = outcome {
+            return self
+                .checkpoint_canceled(scope, &prefix, record, version, registration)
+                .await;
+        }
         let Stage::PendingIndexing { registration } = record.stage else {
             unreachable!("stage was checked above");
         };
@@ -86,20 +92,17 @@ impl HostedCatalog {
                     }),
                 }
             }
+            Outcome::Canceled(_) => unreachable!("cancellation was handled above"),
             Outcome::Failed { code, message } => Stage::Failed {
                 code,
                 message,
                 registration: Some(registration),
             },
         };
-        let input_key = record.input_key(&prefix)?;
         let discard_input = matches!(&record.stage, Stage::Failed { .. })
             || (is_rtf(&record.upload.name) && !record.upload.retain_original);
         if discard_input {
-            match self.storage.delete(&input_key).await {
-                Ok(()) | Err(Error::NotFound(_)) => {}
-                Err(error) => return Err(error),
-            }
+            self.discard_input(&prefix, &record).await?;
         }
         self.checkpoint(&prefix, record, version, |stage| {
             matches!(stage, Stage::PendingIndexing { .. })
@@ -335,6 +338,6 @@ fn invalid_input() -> Error {
     .into()
 }
 
-fn decode(receipt: &str) -> Result<Outcome> {
+pub(super) fn decode(receipt: &str) -> Result<Outcome> {
     serde_json::from_str(receipt).map_err(|error| Error::Internal(Box::new(error)))
 }
