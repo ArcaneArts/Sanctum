@@ -77,6 +77,10 @@ pub trait Provider: Send + Sync {
     fn profile_id(&self) -> &str;
     fn dimensions(&self) -> usize;
 
+    fn max_batch_size(&self) -> u32 {
+        16
+    }
+
     async fn embed(&self, purpose: Purpose, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError>;
 }
 

@@ -27,6 +27,7 @@ pub enum EmbeddingConfig {
     Ollama(sanctum_embedding_ollama::OllamaConfig),
     #[serde(rename = "openai")]
     OpenAi(sanctum_embedding_openai::OpenAiConfig),
+    Google(sanctum_embedding_google::GoogleConfig),
 }
 
 impl Config {

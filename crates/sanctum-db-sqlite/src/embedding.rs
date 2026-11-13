@@ -125,7 +125,7 @@ impl CollectionDb {
         ).map_err(database_error)
     }
 
-    pub fn pending_embeddings(&self, profile: &str) -> Result<Vec<Chunk>> {
+    pub fn pending_embeddings(&self, profile: &str, limit: u32) -> Result<Vec<Chunk>> {
         query_all(
             &self.0,
             "SELECT c.source_id, c.revision_id, c.ordinal, s.name, s.external_namespace,
@@ -133,8 +133,8 @@ impl CollectionDb {
              FROM chunks c JOIN sources s ON s.id = c.source_id AND s.current_revision = c.revision_id
              LEFT JOIN embedding_cache e ON e.profile = ?1 AND e.input_hash = c.content_hash
              WHERE s.deleted = 0 AND (e.input_hash IS NULL OR e.retry_at <= unixepoch())
-             GROUP BY c.content_hash ORDER BY min(c.id) LIMIT 16",
-            [profile], row_chunk,
+             GROUP BY c.content_hash ORDER BY min(c.id) LIMIT ?2",
+            params![profile, limit], row_chunk,
         )
     }
 
