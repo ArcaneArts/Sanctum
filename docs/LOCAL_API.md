@@ -128,6 +128,21 @@ points at either outer boundary. The returned half-open range identifies
 the context. The nested hit still describes the exact cited chunk and
 its verified content hash.
 
+## Metadata on upload
+
+`SubmitText` and `UploadText` accept `source_metadata` on the upload header.
+Each entry contains `namespace`, `key`, and `value_json`. Use up to 32 unique
+namespace/key pairs, 64 KiB per JSON value, and 512 KiB of values in total.
+The queue stores the entries at acceptance. The same transaction that makes
+text searchable attaches them to the new revision. On replacement, readers
+see the previous revision and its metadata until the replacement commits.
+The new revision starts with the metadata supplied for that upload.
+
+The CLI reads a JSON array from `--source-metadata FILE`. For example,
+`[{"namespace":"editor","key":"tags","value":["sample",null]}]` attaches one
+array value. Hosted replay with the same request UUID requires the same
+metadata values and accepts a different entry order.
+
 ## Literal scan of pending text
 
 `ScanPendingText` searches a single pending operation from the same tenant

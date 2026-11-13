@@ -149,7 +149,7 @@ impl HostedCatalog {
     pub async fn stage_upload(
         &self,
         scope: Scope,
-        upload: TextUpload,
+        mut upload: TextUpload,
         operation: Option<Uuid>,
     ) -> Result<HostedUpload> {
         upload.validate()?;

@@ -158,6 +158,7 @@ impl Service {
         };
         let revision = revision_for(job, content);
         writer.register(&revision, job.replacement, self.embedding_profile())?;
+        writer.set_initial_metadata(&revision, &job.initial_metadata)?;
         if !self.queue.begin_publish(job.id)? {
             return Err(Error::Conflict("indexing canceled".into()));
         }
@@ -269,6 +270,7 @@ impl StagedUpload {
         service.require_collection(&job.scope)?;
         job.retain_original = self.upload.retain_original;
         job.chunking = self.service.chunking;
+        job.initial_metadata = self.upload.initial_metadata;
         if job.extract_rtf {
             self.service
                 .files
@@ -320,6 +322,7 @@ pub(crate) fn new_job(
         url: None,
         git: None,
         chunking: Default::default(),
+        initial_metadata: Vec::new(),
     }
 }
 

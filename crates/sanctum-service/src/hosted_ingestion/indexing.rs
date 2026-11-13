@@ -147,6 +147,7 @@ impl HostedCatalog {
         let operation = record.operation;
         let revision = record.revision;
         let chunking = record.chunking;
+        let initial_metadata = record.upload.initial_metadata.clone();
         let registration = Registration {
             source: registration.source,
             external: registration.external.clone(),
@@ -185,6 +186,7 @@ impl HostedCatalog {
                                     &prepared.objects,
                                     replacement,
                                     profile.as_deref(),
+                                    &initial_metadata,
                                     |writer| {
                                         let mut ordinal = 0;
                                         index_utf8_with_settings(

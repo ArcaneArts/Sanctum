@@ -125,6 +125,9 @@ enum Command {
         /// Replay an accepted hosted submission with the same UUID and input.
         #[arg(long)]
         request_id: Option<String>,
+        /// JSON array of namespaced metadata entries to attach to the revision.
+        #[arg(long)]
+        source_metadata: Option<PathBuf>,
         #[arg(long)]
         retain_original: bool,
         #[arg(long)]
@@ -538,6 +541,7 @@ async fn main() -> anyhow::Result<()> {
             external_id,
             background,
             request_id,
+            source_metadata,
             retain_original,
             replace_source,
             replace_external,
@@ -570,6 +574,10 @@ async fn main() -> anyhow::Result<()> {
                 replacement,
                 retain_original,
                 request_id,
+                source_metadata: match source_metadata {
+                    Some(path) => read_source_metadata(path).await?,
+                    None => Vec::new(),
+                },
             };
             let (sender, receiver) = tokio::sync::mpsc::channel(2);
             if background {
@@ -786,6 +794,39 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct SourceMetadata {
+    namespace: String,
+    key: String,
+    value: serde_json::Value,
+}
+
+async fn read_source_metadata(path: PathBuf) -> anyhow::Result<Vec<v1::MetadataEntry>> {
+    const MAX_FILE_BYTES: u64 = 1024 * 1024;
+    let file = tokio::fs::File::open(&path)
+        .await
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut input = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut input)
+        .await?;
+    if input.len() as u64 > MAX_FILE_BYTES {
+        return Err(anyhow!("source metadata file exceeds 1 MiB"));
+    }
+    let metadata: Vec<SourceMetadata> = serde_json::from_slice(&input)
+        .with_context(|| format!("parse metadata from {}", path.display()))?;
+    metadata
+        .into_iter()
+        .map(|entry| {
+            Ok(v1::MetadataEntry {
+                namespace: entry.namespace,
+                key: entry.key,
+                value_json: serde_json::to_string(&entry.value)?,
+            })
+        })
+        .collect()
 }
 
 async fn send_upload(

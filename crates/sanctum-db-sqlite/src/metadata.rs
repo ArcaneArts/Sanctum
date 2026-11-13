@@ -23,12 +23,15 @@ pub struct RevisionTarget {
     pub ordinal: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Edit {
     Set(Value),
     Patch(Value),
     Remove,
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Mutation {
     pub namespace: String,
     pub key: String,
@@ -48,6 +51,40 @@ pub struct Change {
     pub revision: String,
     pub previous_revision: Option<String>,
     pub ordinal: Option<u64>,
+}
+
+pub fn validate_initial_metadata(edits: &[Mutation]) -> Result<()> {
+    if edits.len() > 32 {
+        return Err(Error::Invalid(
+            "initial metadata allows at most 32 entries".into(),
+        ));
+    }
+    let mut keys = std::collections::HashSet::new();
+    let mut bytes = 0;
+    for edit in edits {
+        if !valid_name(&edit.namespace) || !valid_name(&edit.key) {
+            return Err(Error::Invalid(
+                "metadata namespace and key must be 1 to 128 non-control UTF-8 bytes".into(),
+            ));
+        }
+        if !keys.insert((&edit.namespace, &edit.key)) {
+            return Err(Error::Invalid(
+                "initial metadata keys must be unique per namespace".into(),
+            ));
+        }
+        let Edit::Set(value) = &edit.edit else {
+            return Err(Error::Invalid("initial metadata requires set edits".into()));
+        };
+        let length = serde_json::to_vec(value).map_err(json_error)?.len();
+        if length > VALUE_LIMIT {
+            return Err(Error::Invalid("metadata value exceeds 64 KiB".into()));
+        }
+        bytes += length;
+    }
+    if bytes > 512 * 1024 {
+        return Err(Error::Invalid("initial metadata exceeds 512 KiB".into()));
+    }
+    Ok(())
 }
 
 pub fn catalog_metadata(
@@ -215,7 +252,7 @@ pub fn mutate_revision_metadata(
     revision_entries(transaction, target, Some(edits))
 }
 
-fn revision_entries(
+pub(crate) fn revision_entries(
     connection: &Connection,
     target: RevisionTarget,
     edits: Option<&[Mutation]>,

@@ -88,6 +88,8 @@ pub struct TextUpload {
     pub external: Option<ExternalSource>,
     pub replacement: Option<Replacement>,
     pub retain_original: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub initial_metadata: Vec<MetadataMutation>,
 }
 
 #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -97,7 +99,11 @@ pub struct Replacement {
 }
 
 impl TextUpload {
-    fn validate(&self) -> Result<()> {
+    fn validate(&mut self) -> Result<()> {
+        db::metadata::validate_initial_metadata(&self.initial_metadata)?;
+        self.initial_metadata.sort_unstable_by(|left, right| {
+            (&left.namespace, &left.key).cmp(&(&right.namespace, &right.key))
+        });
         if self.name.trim().is_empty() || self.name.len() > 1024 {
             return Err(Error::Invalid(
                 "source name must contain 1 to 1024 bytes".into(),
@@ -315,7 +321,7 @@ impl Service {
         )
     }
 
-    pub fn stage_upload(&self, scope: Scope, upload: TextUpload) -> Result<StagedUpload> {
+    pub fn stage_upload(&self, scope: Scope, mut upload: TextUpload) -> Result<StagedUpload> {
         let _reader = self
             .retrieval
             .read()

@@ -13,6 +13,111 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Code, transport::Server};
 
 #[tokio::test]
+async fn hosted_upload_metadata_survives_restart_and_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let service = || HostedCatalog::new(store.clone(), None, 1024).unwrap();
+    let catalog = service();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let wire_scope = Some(v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    });
+    catalog.create_collection(&scope, None).await.unwrap();
+    let mut server = start(catalog).await;
+    let entry = |key: &str, value: &str| v1::MetadataEntry {
+        namespace: "integration".into(),
+        key: key.into(),
+        value_json: value.into(),
+    };
+    let mut header = v1::UploadTextHeader {
+        scope: wire_scope.clone(),
+        name: "notes.txt".into(),
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+        source_metadata: vec![entry("list", "[null,2]"), entry("active", "true")],
+        ..Default::default()
+    };
+    let body = [b"published metadata quartz".as_slice()];
+    let invalid = v1::UploadTextHeader {
+        source_metadata: vec![entry("list", "null"), entry("list", "true")],
+        ..header.clone()
+    };
+    assert_eq!(
+        server
+            .client
+            .submit_text(upload_frames(&invalid, body))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let accepted = server
+        .client
+        .submit_text(upload_frames(&header, body))
+        .await
+        .unwrap()
+        .into_inner();
+    let target = v1::MetadataTarget {
+        scope: wire_scope,
+        source_id: Some(accepted.source_id.clone()),
+        revision_id: Some(accepted.revision_id.clone()),
+        ..Default::default()
+    };
+    assert_eq!(
+        server
+            .client
+            .get_metadata(target.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    server.stop().await;
+    let restarted = service();
+    let mut server = start(restarted.clone()).await;
+    header.source_metadata.reverse();
+    let replayed = server
+        .client
+        .submit_text(upload_frames(&header, body))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(replayed.operation_id, accepted.operation_id);
+    assert_eq!(replayed.revision_id, accepted.revision_id);
+    let conflicting = v1::UploadTextHeader {
+        source_metadata: vec![entry("active", "false")],
+        ..header
+    };
+    assert_eq!(
+        server
+            .client
+            .submit_text(upload_frames(&conflicting, body))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    let operation = accepted.operation_id.parse().unwrap();
+    restarted.register_upload(&scope, operation).await.unwrap();
+    restarted.index_upload(&scope, operation).await.unwrap();
+    restarted.index_upload(&scope, operation).await.unwrap();
+    let metadata = server
+        .client
+        .get_metadata(target)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        metadata.entries,
+        vec![entry("active", "true"), entry("list", "[null,2]")]
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_pending_literal_scan_reports_exact_ranges_and_partial_coverage() {
     use v1::{PendingTextScanStop as Stop, pending_text_scan_event::Event};
 
@@ -543,6 +648,7 @@ async fn hosted_collection_reclamation_keeps_open_snapshots_and_resumes() {
                 external: None,
                 replacement: None,
                 retain_original: false,
+                initial_metadata: Vec::new(),
             },
             None,
         )
@@ -739,6 +845,7 @@ async fn hosted_upload_keeps_accepted_chunk_settings_across_worker_restart() {
                 external: None,
                 replacement: None,
                 retain_original: false,
+                initial_metadata: Vec::new(),
             },
             None,
         )
@@ -3497,6 +3604,7 @@ async fn upload_sweep_reclaims_only_unreferenced_candidates_and_resumes() {
                 external: None,
                 replacement: None,
                 retain_original: true,
+                initial_metadata: Vec::new(),
             },
             Some(operation),
         )
@@ -3634,6 +3742,7 @@ async fn hosted_upload_retention_rejects_old_work_and_preserves_published_bytes(
         external: None,
         replacement: None,
         retain_original: false,
+        initial_metadata: Vec::new(),
     };
     let age = |path: &std::path::Path| {
         std::fs::OpenOptions::new()
@@ -3748,6 +3857,7 @@ async fn upload_sweep_fences_an_in_flight_acceptance_before_reclaiming() {
         external: None,
         replacement: None,
         retain_original: false,
+        initial_metadata: Vec::new(),
     };
     let upload = catalog
         .stage_upload(scope.clone(), input(), Some(operation))

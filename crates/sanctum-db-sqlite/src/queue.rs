@@ -72,6 +72,7 @@ pub struct Job {
     pub url: Option<UrlProvenance>,
     pub git: Option<GitProvenance>,
     pub chunking: ChunkSettings,
+    pub initial_metadata: Vec<crate::metadata::Mutation>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,7 +82,7 @@ const COLUMNS: &str = "operation_id, tenant, collection, source_id, revision_id,
     name, external_namespace, external_id, total_bytes, processed_bytes,
     attempts, status, error_code, error_message, content_hash, chunks,
     replacement, update_sequence, import_hash, extract_rtf, retain_original, extracting,
-    canonical_bytes, original_hash, source_encoding, extractor, created_at, url_provenance, git_provenance, chunk_window_bytes, chunk_overlap_bytes";
+    canonical_bytes, original_hash, source_encoding, extractor, created_at, url_provenance, git_provenance, chunk_window_bytes, chunk_overlap_bytes, initial_metadata";
 
 impl LocalQueue {
     /// The caller holds the storage owner's exclusive lock for this queue.
@@ -100,6 +101,7 @@ impl LocalQueue {
                 include_str!("runtime_v8.sql"),
                 include_str!("runtime_v9.sql"),
                 include_str!("runtime_v10.sql"),
+                include_str!("runtime_v11.sql"),
             ],
         )?;
         connection
@@ -178,8 +180,8 @@ impl LocalQueue {
             .query_row(
                 "INSERT INTO ingestion_jobs (operation_id, tenant, collection, source_id,
                 revision_id, name, external_namespace, external_id, total_bytes,
-                replacement, update_sequence, import_hash, extract_rtf, retain_original, url_provenance, git_provenance, chunk_window_bytes, chunk_overlap_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                replacement, update_sequence, import_hash, extract_rtf, retain_original, url_provenance, git_provenance, chunk_window_bytes, chunk_overlap_bytes, initial_metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
              RETURNING created_at",
                 params![
                     job.id.to_string(),
@@ -200,6 +202,7 @@ impl LocalQueue {
                     write_json(job.git.as_ref())?,
                     job.chunking.window_bytes,
                     job.chunking.overlap_bytes,
+                    write_json((!job.initial_metadata.is_empty()).then_some(&job.initial_metadata))?,
                 ],
                 |row| unsigned_column(row, 0),
             )
@@ -437,7 +440,7 @@ impl LocalQueue {
              SET status = 'text_ready', content_hash = ?2, chunks = ?3, extracting = 0,
                  canonical_bytes = ?4, original_hash = ?5, source_encoding = ?6, extractor = ?7,
                  processed_bytes = total_bytes, error_code = NULL, error_message = NULL,
-                 finished_at = unixepoch()
+                 finished_at = unixepoch(), initial_metadata = NULL
              WHERE operation_id = ?1 AND status IN ('indexing', 'publishing')",
                 params![
                     id.to_string(),
@@ -460,6 +463,8 @@ impl LocalQueue {
                  status = CASE WHEN cancel_requested = 1 THEN 'canceled' ELSE 'failed' END,
                  error_code = CASE WHEN cancel_requested = 0 THEN ?2 END,
                  error_message = CASE WHEN cancel_requested = 0 THEN ?3 END,
+                 initial_metadata = CASE WHEN cancel_requested = 0 AND ?2 = 'retryable'
+                                         THEN initial_metadata END,
                  finished_at = unixepoch()
              WHERE operation_id = ?1 AND status IN ('indexing', 'publishing')",
                 params![id.to_string(), code, message],
@@ -474,7 +479,8 @@ impl LocalQueue {
             id,
             "SET cancel_requested = 1,
                  status = CASE WHEN status = 'accepted' THEN 'canceled' ELSE status END,
-                 finished_at = CASE WHEN status = 'accepted' THEN unixepoch() END",
+                 finished_at = CASE WHEN status = 'accepted' THEN unixepoch() END,
+                 initial_metadata = CASE WHEN status = 'indexing' THEN initial_metadata END",
             "status IN ('accepted', 'indexing') AND publication_started = 0",
             "only queued or indexing operations can be canceled",
         )
@@ -605,6 +611,7 @@ fn map_job(row: &Row<'_>) -> rusqlite::Result<Job> {
             window_bytes: row.get(29)?,
             overlap_bytes: row.get(30)?,
         },
+        initial_metadata: read_json(row, 31)?.unwrap_or_default(),
     })
 }
 

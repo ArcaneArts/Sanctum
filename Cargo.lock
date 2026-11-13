@@ -2404,6 +2404,8 @@ dependencies = [
  "sanctum-core",
  "sanctum-mcp",
  "sanctum-proto",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",

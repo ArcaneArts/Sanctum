@@ -113,6 +113,16 @@ struct Ingest {
     expected_revision_id: Option<String>,
     /// Optional hosted request UUID. Retry with the same UUID and identical input.
     request_id: Option<String>,
+    /// Namespaced JSON values attached to the new revision on publication.
+    #[serde(default)]
+    source_metadata: Vec<InitialMetadata>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct InitialMetadata {
+    namespace: String,
+    key: String,
+    value: Value,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -359,6 +369,15 @@ impl Tools {
                 }),
                 replacement,
                 retain_original: false,
+                initial_metadata: args
+                    .source_metadata
+                    .into_iter()
+                    .map(|entry| MetadataMutation {
+                        namespace: entry.namespace,
+                        key: entry.key,
+                        edit: MetadataEdit::Set(entry.value),
+                    })
+                    .collect(),
             };
             let request = args.request_id.as_deref().map(id).transpose()?;
             match &self.backend {
