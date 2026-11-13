@@ -9,7 +9,7 @@ which parts have working implementations and where to find the evidence.
 | 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, platform packaging and verification |
 | 3. Object storage and publication | Shared storage contract, filesystem and MinIO-tested S3, native GCS adapter, and fenced SQLite snapshot publication for hosted catalog, source, and metadata operations | Live GCS verification and cloud recovery scenarios |
 | 4. Cloud Run and Cloud Tasks | Linux API and worker containers, durable staged uploads, dispatch and repair, scheduled maintenance, and hosted gRPC and MCP | Live IAM, Cloud Run ingress, and Tasks and Scheduler delivery |
-| 5. Capacity | [SQLite snapshot transfer and publication benchmark](CAPACITY.md) | Representative 200 MB sources, GB-scale collections and database snapshots, cold/warm cloud performance, measured optimization |
+| 5. Capacity | [200 MiB lexical ingestion and 1–2 GiB snapshot measurements](CAPACITY.md) | Representative GB-scale text and vector workloads, many-tenant concurrency, cold/warm cloud performance, measured optimization |
 
 ## Local text ingestion and retrieval
 
@@ -1036,3 +1036,12 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   tests. Live GCS remains open.
 - `pnpm check` and `pnpm desktop:check` passed. The desktop settings tests
   cover prior filesystem configuration and both object backend configurations.
+
+## Large text ingestion measurements
+
+- A release benchmark streamed and indexed a deterministic 200 MiB UTF-8
+  source through the production filesystem and standalone MinIO servers.
+  Exact MCP range reads matched the final 2,631 bytes on both backends.
+- Local publication took 6.018 s at a sampled peak server RSS of 29,392,896
+  bytes. MinIO took 9.130 s at 46,415,872 bytes. The workload used lexical
+  indexing with embeddings disabled. [Reproduction and results](CAPACITY.md).
