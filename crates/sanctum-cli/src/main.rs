@@ -110,6 +110,9 @@ enum Command {
         external_id: Option<String>,
         #[arg(long)]
         background: bool,
+        /// Replay an accepted hosted submission with the same UUID and input.
+        #[arg(long, requires = "background")]
+        request_id: Option<String>,
         #[arg(long)]
         retain_original: bool,
         #[arg(long)]
@@ -439,6 +442,7 @@ async fn main() -> anyhow::Result<()> {
             namespace,
             external_id,
             background,
+            request_id,
             retain_original,
             replace_source,
             replace_external,
@@ -470,6 +474,7 @@ async fn main() -> anyhow::Result<()> {
                     .map(|(namespace, id)| v1::ExternalSource { namespace, id }),
                 replacement,
                 retain_original,
+                request_id,
             };
             let (sender, receiver) = tokio::sync::mpsc::channel(2);
             if background {

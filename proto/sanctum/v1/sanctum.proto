@@ -256,6 +256,7 @@ message ListIngestionJobsResponse {
 message IngestionJob {
   Scope scope = 1;
   string operation_id = 2;
+  // Empty while a hosted replacement by external reference awaits registration.
   string source_id = 3;
   string revision_id = 4;
   string name = 5;
@@ -319,6 +320,8 @@ message UploadTextHeader {
   Replacement replacement = 4;
   // Retain the original after extraction. UTF-8 input shares its canonical file.
   bool retain_original = 5;
+  // Optional nonzero UUID for replaying hosted submissions within a collection.
+  optional string request_id = 6;
 }
 
 message Replacement {

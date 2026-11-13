@@ -9,17 +9,26 @@ use crate::db;
 
 #[derive(Clone)]
 pub struct HostedCatalog {
-    storage: Arc<dyn Storage>,
-    prefix: Option<Key>,
+    pub(crate) storage: Arc<dyn Storage>,
+    pub(crate) prefix: Option<Key>,
+    pub(crate) max_source_bytes: u64,
     publication: Publication,
 }
 
 impl HostedCatalog {
-    pub fn new(storage: Arc<dyn Storage>, prefix: Option<Key>) -> Result<Self> {
+    pub fn new(
+        storage: Arc<dyn Storage>,
+        prefix: Option<Key>,
+        max_source_bytes: u64,
+    ) -> Result<Self> {
+        if max_source_bytes == 0 {
+            return Err(Error::Invalid("max_source_bytes must be positive".into()));
+        }
         let publication = Publication::new(storage.clone(), Duration::from_secs(300))?;
         Ok(Self {
             storage,
             prefix,
+            max_source_bytes,
             publication,
         })
     }
@@ -109,24 +118,28 @@ impl HostedCatalog {
             UsageScope::Cluster => self.prefix.clone(),
             UsageScope::Tenant(tenant) => Some(tenant_prefix(self.prefix.as_ref(), tenant)?),
             UsageScope::Collection(scope) => {
-                let scratch = tempfile::tempdir()?;
-                let unit = Unit::catalog(self.prefix.as_ref(), &scope.tenant)?;
-                let database = self
-                    .publication
-                    .read(&unit, scratch.path())
-                    .await?
-                    .ok_or_else(|| Error::NotFound("tenant catalog was not found".into()))?;
-                let collection = scope.collection.to_string();
-                tokio::task::spawn_blocking(move || {
-                    let _scratch = scratch;
-                    db::require_collection(database.path(), &collection)
-                })
-                .await
-                .map_err(|error| Error::Internal(Box::new(error)))??;
+                self.require_collection(scope).await?;
                 Some(collection_prefix(self.prefix.as_ref(), scope)?)
             }
         };
         sanctum_storage::usage(self.storage.as_ref(), prefix.as_ref()).await
+    }
+
+    pub(crate) async fn require_collection(&self, scope: &Scope) -> Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let unit = Unit::catalog(self.prefix.as_ref(), &scope.tenant)?;
+        let database = self
+            .publication
+            .read(&unit, scratch.path())
+            .await?
+            .ok_or_else(|| Error::NotFound("tenant catalog was not found".into()))?;
+        let collection = scope.collection.to_string();
+        tokio::task::spawn_blocking(move || {
+            let _scratch = scratch;
+            db::require_collection(database.path(), &collection)
+        })
+        .await
+        .map_err(|error| Error::Internal(Box::new(error)))?
     }
 }
 

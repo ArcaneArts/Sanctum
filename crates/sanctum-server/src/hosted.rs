@@ -7,7 +7,11 @@ use sanctum_storage_gcs::GcsStorage;
 use sanctum_storage_s3::{S3Config, S3Storage};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) async fn serve(address: SocketAddr, config: ObjectStorageConfig) -> anyhow::Result<()> {
+pub(crate) async fn serve(
+    address: SocketAddr,
+    config: ObjectStorageConfig,
+    max_source_bytes: u64,
+) -> anyhow::Result<()> {
     let (storage, prefix): (Arc<dyn Storage>, _) = match config {
         ObjectStorageConfig::S3 {
             bucket,
@@ -28,7 +32,11 @@ pub(crate) async fn serve(address: SocketAddr, config: ObjectStorageConfig) -> a
         ),
         ObjectStorageConfig::Gcs { bucket, prefix } => (Arc::new(GcsStorage::new(bucket)?), prefix),
     };
-    let catalog = HostedCatalog::new(storage, prefix.map(Key::parse).transpose()?)?;
+    let catalog = HostedCatalog::new(
+        storage,
+        prefix.map(Key::parse).transpose()?,
+        max_source_bytes,
+    )?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
     if crate::managed() {
