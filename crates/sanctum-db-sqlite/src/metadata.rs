@@ -64,16 +64,29 @@ pub fn catalog_metadata(
             TransactionBehavior::Deferred
         })
         .map_err(database_error)?;
-    let entries = apply(
-        &transaction,
+    let entries = catalog_entries(&transaction, collection, edits)?;
+    transaction.commit().map_err(database_error)?;
+    Ok(entries)
+}
+
+pub fn read_catalog_metadata(path: &Path, collection: &str) -> Result<Vec<Entry>> {
+    let connection = super::open_read_only(path)?;
+    catalog_entries(&connection, collection, None)
+}
+
+fn catalog_entries(
+    connection: &Connection,
+    collection: &str,
+    edits: Option<&[Mutation]>,
+) -> Result<Vec<Entry>> {
+    apply(
+        connection,
         "collection_metadata",
         "collection = ?1",
         "collection",
         vec![collection.to_owned().into()],
         edits,
-    )?;
-    transaction.commit().map_err(database_error)?;
-    Ok(entries)
+    )
 }
 
 impl CollectionDb {

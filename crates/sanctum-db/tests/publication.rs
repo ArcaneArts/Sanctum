@@ -58,6 +58,59 @@ async fn recovering_from_a_lost_publish_response_reuses_its_receipt() {
     retry.release().await.unwrap();
 }
 
+#[tokio::test]
+async fn snapshot_cache_reuses_verified_files_and_preserves_active_readers() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let publication = Publication::new(storage, Duration::from_secs(15)).unwrap();
+    let unit = Unit::catalog(None, &"first".parse().unwrap()).unwrap();
+    let other = Unit::catalog(None, &"second".parse().unwrap()).unwrap();
+
+    let mut writer = publication.acquire(&unit).await.unwrap();
+    let (first, _) = writer
+        .apply(vec![command(Uuid::new_v4(), 1)], apply_value)
+        .await
+        .unwrap();
+    writer.release().await.unwrap();
+    let cache = sanctum_db::SnapshotCache::new(first.bytes);
+    let (one, same) = tokio::join!(
+        cache.read(&publication, &unit),
+        cache.read(&publication, &unit)
+    );
+    let one = one.unwrap().unwrap();
+    let same = same.unwrap().unwrap();
+    assert!(Arc::ptr_eq(&one, &same));
+    assert_eq!(value(one.path()), 1);
+
+    let mut writer = publication.acquire(&unit).await.unwrap();
+    let (second, _) = writer
+        .apply(vec![command(Uuid::new_v4(), 2)], apply_value)
+        .await
+        .unwrap();
+    writer.release().await.unwrap();
+    let two = cache.read(&publication, &unit).await.unwrap().unwrap();
+    assert_eq!(two.generation, second);
+    assert_eq!(value(two.path()), 3);
+    assert_eq!(value(one.path()), 1);
+
+    let mut writer = publication.acquire(&other).await.unwrap();
+    writer
+        .apply(vec![command(Uuid::new_v4(), 9)], apply_value)
+        .await
+        .unwrap();
+    writer.release().await.unwrap();
+    let other = cache.read(&publication, &other).await.unwrap().unwrap();
+    assert_eq!(value(other.path()), 9);
+    let again = cache.read(&publication, &unit).await.unwrap().unwrap();
+    assert_eq!(value(again.path()), 3);
+    assert!(!Arc::ptr_eq(&two, &again));
+
+    let disabled = sanctum_db::SnapshotCache::new(0);
+    let a = disabled.read(&publication, &unit).await.unwrap().unwrap();
+    let b = disabled.read(&publication, &unit).await.unwrap().unwrap();
+    assert!(!Arc::ptr_eq(&a, &b));
+}
+
 struct LosePublishResponse {
     inner: sanctum_storage_fs::FileStorage,
     lose: std::sync::atomic::AtomicBool,
@@ -155,6 +208,10 @@ async fn verify(storage: Arc<dyn Storage>, prefix: &str, local_root: Option<&std
     let read = long.read(&unit, scratch.path()).await.unwrap().unwrap();
     assert_eq!(read.generation, first);
     assert_eq!(value(read.path()), 7);
+    let cache = sanctum_db::SnapshotCache::new(first.bytes);
+    let cached = cache.read(&long, &unit).await.unwrap().unwrap();
+    let warm = cache.read(&long, &unit).await.unwrap().unwrap();
+    assert!(Arc::ptr_eq(&cached, &warm));
     assert!(long.read(&catalog, scratch.path()).await.unwrap().is_none());
 
     let mut abandoned = short.acquire(&unit).await.unwrap();

@@ -678,6 +678,11 @@ async fn hosted_indexing_publishes_searchable_text_and_fences_old_replacements()
     assert_eq!(hits.degraded_reason.as_deref(), Some("embedding_disabled"));
     assert!(hits.hits.len() > 1);
     let hit = hits.hits.iter().find(|hit| hit.start_byte > 0).unwrap();
+    let first_generation = generation.unwrap().id.to_string();
+    assert_eq!(
+        hit.database_generation.as_deref(),
+        Some(first_generation.as_str())
+    );
     assert_eq!(
         hit.excerpt,
         body[hit.start_byte as usize..hit.end_byte as usize]
@@ -743,6 +748,12 @@ async fn hosted_indexing_publishes_searchable_text_and_fences_old_replacements()
         .hits;
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].excerpt, "replacement café\nnext");
+    let current = executor.generation(&unit).await.unwrap().unwrap();
+    assert_ne!(current.id.to_string(), first_generation);
+    assert_eq!(
+        hits[0].database_generation.as_deref(),
+        Some(current.id.to_string().as_str())
+    );
     assert!(
         server
             .client

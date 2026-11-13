@@ -516,3 +516,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   indexing, and gRPC search against MinIO. The Dockerfile static check
   passed.
 - Live Cloud Run and GCS verification are still open.
+
+- Delivered in [PR #32](https://github.com/ArcaneArts/Sanctum/pull/32).
+
+## Hosted snapshot reuse
+
+- Hosted catalog reads and lexical retrieval resolve the current HEAD on
+  each request and reuse its verified immutable SQLite file. Cache limits
+  bound retained files by size and count. Active readers can finish after
+  eviction, and an oversized snapshot is read without caching.
+- Hosted search and fetch hits report the generation that supplied their
+  byte offsets. SQLite opens cached collection snapshots read-only.
+- Tests verify a shared cold download, warm file reuse, refresh after
+  publication, eviction, and an active reader surviving refresh. The
+  MinIO publication contract also checks warm reuse.
+- Hosted reads currently reopen SQLite connections on the warm file.
+  Capacity measurements and the hosted vector path remain open.

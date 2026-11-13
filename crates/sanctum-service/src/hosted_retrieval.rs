@@ -1,18 +1,19 @@
 use sanctum_core::{Error, Result, Scope};
 use sanctum_db::{Unit, collection_prefix};
 use sanctum_storage::Key;
+use uuid::Uuid;
 
 use crate::embedding::{SearchResult, lexical_expression};
 use crate::{Chunk, ChunkRef, Hit, HostedCatalog, SearchMode, db, metadata_filter::Filter};
 
 impl HostedCatalog {
     pub async fn fetch(&self, scope: &Scope, reference: ChunkRef) -> Result<Hit> {
-        let (chunk, key) = self
+        let ((chunk, key), generation) = self
             .with_collection(scope, move |database| {
                 locate(database, database.fetch(&reference)?)
             })
             .await?;
-        self.read_hit(scope, chunk, key).await
+        self.read_hit(scope, chunk, key, generation).await
     }
 
     pub async fn retrieve(
@@ -35,13 +36,13 @@ impl HostedCatalog {
             .is_some_and(Filter::uses_collection_metadata)
         {
             self.with_catalog(&scope, |path, collection| {
-                db::metadata::catalog_metadata(path, &collection, None)
+                db::metadata::read_catalog_metadata(path, &collection)
             })
             .await?
         } else {
             Vec::new()
         };
-        let (chunks, coverage) = self
+        let ((chunks, coverage), generation) = self
             .with_collection(&scope, move |database| {
                 let coverage = database.embedding_coverage(None)?;
                 let chunks = database
@@ -54,7 +55,7 @@ impl HostedCatalog {
             .await?;
         let mut hits = Vec::with_capacity(chunks.len());
         for (chunk, key) in chunks {
-            hits.push(self.read_hit(&scope, chunk, key).await?);
+            hits.push(self.read_hit(&scope, chunk, key, generation).await?);
         }
         Ok(SearchResult {
             hits,
@@ -69,24 +70,29 @@ impl HostedCatalog {
         &self,
         scope: &Scope,
         read: impl FnOnce(&db::CollectionDb) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
+    ) -> Result<(T, Uuid)> {
         self.require_collection(scope).await?;
-        let directory = tempfile::tempdir()?;
         let unit = Unit::collection(self.prefix.as_ref(), scope)?;
         let database = self
-            .publication
-            .read(&unit, directory.path())
+            .snapshots
+            .read(&self.publication, &unit)
             .await?
             .ok_or_else(|| Error::NotFound("collection database was not found".into()))?;
         tokio::task::spawn_blocking(move || {
-            let _directory = directory;
-            read(&db::CollectionDb::open(database.path())?)
+            let value = read(&db::CollectionDb::open_read_only(database.path())?)?;
+            Ok((value, database.generation.id))
         })
         .await
         .map_err(|error| Error::Internal(Box::new(error)))?
     }
 
-    async fn read_hit(&self, scope: &Scope, chunk: Chunk, key: String) -> Result<Hit> {
+    async fn read_hit(
+        &self,
+        scope: &Scope,
+        chunk: Chunk,
+        key: String,
+        generation: Uuid,
+    ) -> Result<Hit> {
         let collection = collection_prefix(self.prefix.as_ref(), scope)?;
         let key = Key::parse(key)?;
         if !key
@@ -99,7 +105,9 @@ impl HostedCatalog {
             ));
         }
         let bytes = self.storage.read_range(&key, chunk.range).await?;
-        Hit::from_bytes(chunk, &bytes)
+        let mut hit = Hit::from_bytes(chunk, &bytes)?;
+        hit.database_generation = Some(generation);
+        Ok(hit)
     }
 }
 

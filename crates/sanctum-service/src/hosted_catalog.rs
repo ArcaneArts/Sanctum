@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use sanctum_core::{Error, Result, Scope, ScopeId, UsageMeasurement, UsageScope};
-use sanctum_db::{Command, Publication, Unit, collection_prefix, tenant_prefix};
+use sanctum_db::{Command, Publication, SnapshotCache, Unit, collection_prefix, tenant_prefix};
 use sanctum_storage::{Key, Storage};
 use uuid::Uuid;
 
@@ -13,6 +13,7 @@ pub struct HostedCatalog {
     pub(crate) prefix: Option<Key>,
     pub(crate) max_source_bytes: u64,
     pub(crate) publication: Publication,
+    pub(crate) snapshots: Arc<SnapshotCache>,
     pub(crate) dispatcher: Option<Arc<dyn Dispatch>>,
 }
 
@@ -31,8 +32,14 @@ impl HostedCatalog {
             prefix,
             max_source_bytes,
             publication,
+            snapshots: Arc::new(SnapshotCache::new(2 * 1024 * 1024 * 1024)),
             dispatcher: None,
         })
+    }
+
+    pub fn with_snapshot_cache_bytes(mut self, max_bytes: u64) -> Self {
+        self.snapshots = Arc::new(SnapshotCache::new(max_bytes));
+        self
     }
 
     pub async fn create_collection(&self, scope: &Scope, operation: Option<Uuid>) -> Result<()> {
@@ -101,14 +108,12 @@ impl HostedCatalog {
                 "collection page limit must be between 1 and 100".into(),
             ));
         }
-        let scratch = tempfile::tempdir()?;
         let catalog = Unit::catalog(self.prefix.as_ref(), tenant)?;
-        let Some(database) = self.publication.read(&catalog, scratch.path()).await? else {
+        let Some(database) = self.snapshots.read(&self.publication, &catalog).await? else {
             return Ok(Vec::new());
         };
         let after = after.map(ToString::to_string);
         tokio::task::spawn_blocking(move || {
-            let _scratch = scratch;
             db::list_collections_page(database.path(), after.as_deref(), limit)
         })
         .await
@@ -139,20 +144,16 @@ impl HostedCatalog {
         scope: &Scope,
         read: impl FnOnce(&std::path::Path, String) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let scratch = tempfile::tempdir()?;
         let unit = Unit::catalog(self.prefix.as_ref(), &scope.tenant)?;
         let database = self
-            .publication
-            .read(&unit, scratch.path())
+            .snapshots
+            .read(&self.publication, &unit)
             .await?
             .ok_or_else(|| Error::NotFound("tenant catalog was not found".into()))?;
         let collection = scope.collection.to_string();
-        tokio::task::spawn_blocking(move || {
-            let _scratch = scratch;
-            read(database.path(), collection)
-        })
-        .await
-        .map_err(|error| Error::Internal(Box::new(error)))?
+        tokio::task::spawn_blocking(move || read(database.path(), collection))
+            .await
+            .map_err(|error| Error::Internal(Box::new(error)))?
     }
 }
 

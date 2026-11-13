@@ -44,6 +44,9 @@ pub(crate) async fn serve(config: Config, storage: ObjectStorageConfig) -> anyho
         prefix.map(Key::parse).transpose()?,
         config.max_source_bytes,
     )?;
+    if let Some(max_bytes) = config.hosted_snapshot_cache_bytes {
+        catalog = catalog.with_snapshot_cache_bytes(max_bytes);
+    }
     if let Some(config) = config.cloud_tasks {
         catalog = catalog.with_dispatch(Arc::new(crate::cloud_tasks::CloudTasks::new(config)?));
     }

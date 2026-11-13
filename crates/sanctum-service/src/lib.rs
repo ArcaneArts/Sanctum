@@ -109,6 +109,7 @@ pub struct Hit {
     pub chunk: Chunk,
     pub excerpt: String,
     pub score: Option<f64>,
+    pub database_generation: Option<Uuid>,
 }
 
 impl Service {
@@ -331,6 +332,7 @@ impl Hit {
             chunk,
             excerpt,
             score: None,
+            database_generation: None,
         })
     }
 }

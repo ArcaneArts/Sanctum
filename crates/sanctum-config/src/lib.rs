@@ -15,6 +15,7 @@ pub struct Config {
     pub hosted_worker_listen: Option<SocketAddr>,
     pub cloud_tasks: Option<CloudTasksConfig>,
     pub cloud_run_role: Option<CloudRunRole>,
+    pub hosted_snapshot_cache_bytes: Option<u64>,
     #[serde(default = "default_grpc")]
     pub grpc_listen: SocketAddr,
     #[serde(default = "default_mcp")]
@@ -105,7 +106,8 @@ impl Config {
         if config.object_storage.is_none()
             && (config.hosted_worker_listen.is_some()
                 || config.cloud_tasks.is_some()
-                || config.cloud_run_role.is_some())
+                || config.cloud_run_role.is_some()
+                || config.hosted_snapshot_cache_bytes.is_some())
         {
             return Err(Error::Invalid(
                 "hosted runtime settings require object storage".into(),

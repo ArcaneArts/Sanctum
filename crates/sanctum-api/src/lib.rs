@@ -1279,6 +1279,7 @@ fn wire_hit(scope: &Scope, hit: Hit) -> v1::TextHit {
         excerpt: hit.excerpt,
         content_blake3: chunk.hash,
         score: hit.score,
+        database_generation: hit.database_generation.map(|id| id.to_string()),
     }
 }
 

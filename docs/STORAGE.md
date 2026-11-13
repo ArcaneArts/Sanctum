@@ -232,3 +232,13 @@ Manual registration and indexing remain available with the private listener
 when `cloud_tasks` is omitted. Operations accepted before dispatch hints were
 introduced can be resubmitted with the same request ID and input to record
 a hint. Live Google Cloud deployment verification remains open.
+
+### Hosted snapshot reuse
+
+The API resolves the current HEAD for each catalog or collection read.
+It reuses a downloaded snapshot when the generation and digest match,
+with at most 16 retained files and a 2 GiB default byte budget. Set
+`hosted_snapshot_cache_bytes` to change the budget or set it to zero to
+disable reuse. Oversized snapshots and files still in use can add to
+active temporary storage. Hosted gRPC search and fetch hits report the
+database generation that supplied their chunk ranges.
