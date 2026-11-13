@@ -424,5 +424,25 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - A standalone server and CLI run against live MinIO created collections
   for two tenants, restarted, replayed creation, and matched an independent
   bucket listing at collection, tenant, and cluster scopes.
-- The hosted catalog currently supports collection creation, listing, and
-  storage usage. Hosted source operations and Cloud Tasks are still open.
+- Delivered in [PR #27](https://github.com/ArcaneArts/Sanctum/pull/27).
+
+## Hosted upload acceptance
+
+- Hosted `SubmitText` uses the same framed stream reader as local uploads.
+  It spools and hashes the exact input on disk, uploads it under a unique
+  key, and creates a scoped operation envelope with the pending registration
+  stage. `GetIngestionJob` reads that envelope after an API restart.
+- The filesystem-backed gRPC test checks malformed streams, configured size
+  limits, exact Unicode bytes, concurrent submission replay, different input
+  or options under the same request ID, tenant isolation, and replacement
+  by external reference. A second test interrupts the write before and
+  after envelope creation and verifies recovery after restart.
+- A standalone server and CLI against MinIO replayed a Unicode upload
+  after restart. An independent S3 client verified a byte range, the
+  complete SHA-256 of a 201 MiB multipart input, and the envelope's byte
+  count. The debug server accepted the large upload in 47.45 seconds
+  with a sampled peak RSS of 43.3 MiB on Apple Silicon. This measures
+  acceptance through durable storage.
+- The next hosted cycle will register pending revisions with the collection
+  writer. Cloud Tasks, dispatch repair, lexical publication, and cleanup of
+  abandoned input attempts are still open.

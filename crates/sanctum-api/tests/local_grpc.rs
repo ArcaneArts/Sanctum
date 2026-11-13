@@ -1605,6 +1605,7 @@ fn header(tenant: &str) -> v1::UploadTextFrame {
             }),
             replacement: None,
             retain_original: false,
+            request_id: None,
         })),
     }
 }

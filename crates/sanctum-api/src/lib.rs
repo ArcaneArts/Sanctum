@@ -8,8 +8,8 @@ use sanctum_proto::v1::{
     upload_text_frame::Frame,
 };
 use sanctum_service::{
-    ChunkRef, GitRepository, Hit, HostedCatalog, ImportEvent, ImportOptions, ImportState, Job,
-    JobState, Replacement, Service, TextUpload, WatchedFolder,
+    AcceptedUpload, ChunkRef, GitRepository, Hit, HostedCatalog, ImportEvent, ImportOptions,
+    ImportState, Job, JobState, Replacement, Service, TextUpload, WatchedFolder,
 };
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -510,7 +510,7 @@ impl Sanctum for Grpc {
         &self,
         request: Request<Streaming<v1::UploadTextFrame>>,
     ) -> Reply<v1::TextRevision> {
-        let mut job = submit(self.local()?, request.into_inner()).await?;
+        let mut job = submit_local(self.local()?, request.into_inner()).await?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             match job.state {
@@ -548,17 +548,29 @@ impl Sanctum for Grpc {
         &self,
         request: Request<Streaming<v1::UploadTextFrame>>,
     ) -> Reply<v1::IngestionJob> {
-        submit(self.local()?, request.into_inner())
-            .await
-            .map(wire_job)
-            .map(Response::new)
+        let stream = request.into_inner();
+        let job = match &self.0 {
+            Backend::Local(service) => wire_job(submit_local(service, stream).await?),
+            Backend::Hosted(catalog) => submit_hosted(catalog, stream).await?,
+        };
+        Ok(Response::new(job))
     }
 
     async fn get_ingestion_job(
         &self,
         request: Request<v1::IngestionJobRequest>,
     ) -> Reply<v1::IngestionJob> {
-        job_action(self.local()?, request.into_inner(), Service::job).await
+        let request = request.into_inner();
+        if let Backend::Hosted(catalog) = &self.0 {
+            let scope = parse_scope(request.scope)?;
+            let id = request
+                .operation_id
+                .parse()
+                .map_err(|_| Status::invalid_argument("invalid operation ID"))?;
+            let accepted = catalog.ingestion_job(&scope, id).await.map_err(status)?;
+            return Ok(Response::new(wire_accepted(&scope, accepted)));
+        }
+        job_action(self.local()?, request, Service::job).await
     }
 
     async fn list_ingestion_jobs(
@@ -813,10 +825,46 @@ fn unix_ms(time: std::time::SystemTime) -> Result<u64> {
     u64::try_from(elapsed.as_millis()).map_err(|error| Error::Internal(Box::new(error)))
 }
 
-async fn submit(
+async fn submit_local(
     service: &Service,
     mut stream: Streaming<v1::UploadTextFrame>,
 ) -> std::result::Result<Job, Status> {
+    let (scope, upload, request_id) = read_upload_header(&mut stream).await?;
+    if request_id.is_some() {
+        return Err(Status::invalid_argument(
+            "upload request IDs are supported for hosted submissions",
+        ));
+    }
+    let service = service.clone();
+    let max_bytes = service.max_source_bytes();
+    let (staged, file) = work(move || {
+        let staged = service.stage_upload(scope, upload)?;
+        let file = staged.reopen()?;
+        Ok((staged, file))
+    })
+    .await?;
+    receive_upload(&mut stream, file, max_bytes).await?;
+    work(move || staged.enqueue()).await
+}
+
+async fn submit_hosted(
+    catalog: &HostedCatalog,
+    mut stream: Streaming<v1::UploadTextFrame>,
+) -> std::result::Result<v1::IngestionJob, Status> {
+    let (scope, upload, operation) = read_upload_header(&mut stream).await?;
+    let staged = catalog
+        .stage_upload(scope.clone(), upload, operation)
+        .await
+        .map_err(status)?;
+    let file = staged.reopen().map_err(status)?;
+    receive_upload(&mut stream, file, catalog.max_source_bytes()).await?;
+    let accepted = staged.enqueue().await.map_err(status)?;
+    Ok(wire_accepted(&scope, accepted))
+}
+
+async fn read_upload_header(
+    stream: &mut Streaming<v1::UploadTextFrame>,
+) -> std::result::Result<(Scope, TextUpload, Option<uuid::Uuid>), Status> {
     let header = match stream.message().await?.and_then(|message| message.frame) {
         Some(Frame::Header(header)) => header,
         _ => {
@@ -837,28 +885,26 @@ async fn submit(
     } else {
         None
     };
-    let service = service.clone();
-    let max_bytes = service.max_source_bytes();
-    let (staged, file) = work(move || {
-        let staged = service.stage_upload(
-            scope,
-            TextUpload {
-                name: header.name,
-                external: header.external.map(|value| ExternalSource {
-                    namespace: value.namespace,
-                    id: value.id,
-                }),
-                replacement,
-                retain_original: header.retain_original,
-            },
-        )?;
-        let file = staged.reopen()?;
-        Ok((staged, file))
-    })
-    .await?;
+    let upload = TextUpload {
+        name: header.name,
+        external: header.external.map(|value| ExternalSource {
+            namespace: value.namespace,
+            id: value.id,
+        }),
+        replacement,
+        retain_original: header.retain_original,
+    };
+    let request_id = parse_optional_id(header.request_id, "invalid request ID")?;
+    Ok((scope, upload, request_id))
+}
 
+async fn receive_upload(
+    stream: &mut Streaming<v1::UploadTextFrame>,
+    file: std::fs::File,
+    max_bytes: u64,
+) -> std::result::Result<(), Status> {
     let mut file = tokio::fs::File::from_std(file);
-    let mut written = 0;
+    let mut written = 0u64;
     loop {
         let data = match stream.message().await?.and_then(|message| message.frame) {
             Some(Frame::Data(data)) => data,
@@ -872,12 +918,12 @@ async fn submit(
         if data.len() > UPLOAD_FRAME_BYTES {
             return Err(Status::invalid_argument("upload frame exceeds 256 KiB"));
         }
-        written += data.len() as u64;
-        if written > max_bytes {
-            return Err(Status::resource_exhausted(
-                "source exceeds the configured upload limit",
-            ));
-        }
+        written = written
+            .checked_add(data.len() as u64)
+            .filter(|&bytes| bytes <= max_bytes)
+            .ok_or_else(|| {
+                Status::resource_exhausted("source exceeds the configured upload limit")
+            })?;
         file.write_all(&data)
             .await
             .map_err(|error| status(error.into()))?;
@@ -887,10 +933,7 @@ async fn submit(
             "unexpected frame after upload end",
         ));
     }
-    file.flush().await.map_err(|error| status(error.into()))?;
-    drop(file);
-
-    work(move || staged.enqueue()).await
+    file.flush().await.map_err(|error| status(error.into()))
 }
 
 async fn job_action(
@@ -930,6 +973,23 @@ fn text_revision(job: &Job) -> Option<v1::TextRevision> {
         url: job.url.clone().map(wire_url),
         git: job.git.clone().map(wire_git),
     })
+}
+
+fn wire_accepted(scope: &Scope, job: AcceptedUpload) -> v1::IngestionJob {
+    v1::IngestionJob {
+        scope: Some(wire_scope(scope)),
+        operation_id: job.operation.to_string(),
+        source_id: job
+            .source
+            .map_or_else(String::new, |source| source.to_string()),
+        revision_id: job.revision.to_string(),
+        name: job.name,
+        external: job.external.map(wire_external),
+        total_bytes: job.bytes,
+        state: v1::IngestionState::Accepted.into(),
+        created_at_unix_seconds: job.created_at,
+        ..Default::default()
+    }
 }
 
 fn wire_job(job: Job) -> v1::IngestionJob {

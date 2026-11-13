@@ -15,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let mut config = Config::from_env()?;
     if let Some(storage) = config.object_storage.take() {
-        return hosted::serve(config.grpc_listen, storage).await;
+        return hosted::serve(config.grpc_listen, storage, config.max_source_bytes).await;
     }
     let embedding: Option<Arc<dyn sanctum_embedding::Provider>> = config
         .embedding

@@ -93,7 +93,7 @@ impl ByteRange {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ExternalSource {
     pub namespace: String,
     pub id: String,

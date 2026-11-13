@@ -1,8 +1,13 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
 
-use sanctum_proto::v1::{self, sanctum_client::SanctumClient};
+use sanctum_core::{ByteRange, Error, Result as StorageResult};
+use sanctum_proto::v1::{self, sanctum_client::SanctumClient, upload_text_frame::Frame};
 use sanctum_service::HostedCatalog;
-use tokio::net::TcpListener;
+use sanctum_storage::{Condition, Download, Key, ListPage, Object, Reader, Storage, Version};
+use tokio::{io::AsyncReadExt, net::TcpListener};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, transport::Server};
@@ -11,7 +16,7 @@ use tonic::{Code, transport::Server};
 async fn hosted_catalog_recovers_across_server_restart_and_stays_in_scope() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
-    let mut state = start(HostedCatalog::new(store.clone(), None).unwrap()).await;
+    let mut state = start(HostedCatalog::new(store.clone(), None, 1024 * 1024).unwrap()).await;
     let request_id = uuid::Uuid::new_v4().to_string();
     let create =
         |tenant: &str, collection: &str, request_id: Option<String>| v1::CreateCollectionRequest {
@@ -70,7 +75,7 @@ async fn hosted_catalog_recovers_across_server_restart_and_stays_in_scope() {
         .unwrap();
     state.stop().await;
 
-    let mut state = start(HostedCatalog::new(store.clone(), None).unwrap()).await;
+    let mut state = start(HostedCatalog::new(store.clone(), None, 1024 * 1024).unwrap()).await;
     state.client.create_collection(first).await.unwrap();
     assert_eq!(
         state
@@ -160,6 +165,397 @@ async fn hosted_catalog_recovers_across_server_restart_and_stays_in_scope() {
         Code::Unimplemented
     );
     state.stop().await;
+}
+
+#[tokio::test]
+async fn hosted_submissions_store_exact_bytes_and_replay_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let prefix = Key::parse("workspace").unwrap();
+    let catalog = HostedCatalog::new(store.clone(), Some(prefix), 1024 * 1024).unwrap();
+    let mut state = start(catalog.clone()).await;
+    let scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    let operation = uuid::Uuid::new_v4().to_string();
+    let header = v1::UploadTextHeader {
+        scope: Some(scope.clone()),
+        name: "field-notes.md".into(),
+        external: Some(v1::ExternalSource {
+            namespace: "editor".into(),
+            id: "note:42".into(),
+        }),
+        request_id: Some(operation.clone()),
+        ..Default::default()
+    };
+    let bytes = "café 🦀
+"
+    .as_bytes();
+    assert_eq!(
+        state
+            .client
+            .submit_text(upload_frames(&header, [bytes]))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    state
+        .client
+        .create_collection(v1::CreateCollectionRequest {
+            scope: Some(scope.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut no_end = frames(&header, [bytes]);
+    no_end.pop();
+    assert_eq!(
+        state
+            .client
+            .submit_text(tokio_stream::iter(no_end))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let mut extra = frames(&header, [bytes]);
+    extra.push(v1::UploadTextFrame {
+        frame: Some(Frame::Data(vec![0])),
+    });
+    assert_eq!(
+        state
+            .client
+            .submit_text(tokio_stream::iter(extra))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let max_frame = vec![b'a'; sanctum_core::UPLOAD_FRAME_BYTES];
+    assert_eq!(
+        state
+            .client
+            .submit_text(upload_frames(
+                &header,
+                std::iter::repeat_n(max_frame.as_slice(), 5)
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::ResourceExhausted
+    );
+    let oversized_frame = vec![0; max_frame.len() + 1];
+    assert_eq!(
+        state
+            .client
+            .submit_text(upload_frames(&header, [oversized_frame.as_slice()]))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let operation_prefix = Key::parse(format!(
+        "workspace/default/collections/notes/operations/{operation}"
+    ))
+    .unwrap();
+    assert!(
+        store
+            .list(Some(&operation_prefix), None, 10)
+            .await
+            .unwrap()
+            .objects
+            .is_empty()
+    );
+
+    let mut duplicate = state.client.clone();
+    let (left, right) = tokio::join!(
+        state
+            .client
+            .submit_text(upload_frames(&header, bytes.chunks(2))),
+        duplicate.submit_text(upload_frames(&header, [bytes]))
+    );
+    let accepted = left.unwrap().into_inner();
+    assert_eq!(accepted, right.unwrap().into_inner());
+    assert_eq!(accepted.operation_id, operation);
+    assert_eq!(accepted.state(), v1::IngestionState::Accepted);
+    assert_eq!(accepted.total_bytes, bytes.len() as u64);
+    assert_eq!(accepted.update_sequence, 0);
+    assert_eq!(accepted.processed_bytes, 0);
+    assert!(accepted.text_revision.is_none());
+    assert!(uuid::Uuid::parse_str(&accepted.source_id).is_ok());
+    assert!(uuid::Uuid::parse_str(&accepted.revision_id).is_ok());
+    assert_eq!(accepted.external, header.external);
+
+    let page = store.list(Some(&operation_prefix), None, 10).await.unwrap();
+    assert_eq!(page.objects.len(), 2);
+    let envelope = Key::parse(format!("{operation_prefix}/operation.json")).unwrap();
+    let mut envelope_body = Vec::new();
+    store
+        .get(&envelope)
+        .await
+        .unwrap()
+        .reader
+        .read_to_end(&mut envelope_body)
+        .await
+        .unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&envelope_body).unwrap();
+    assert_eq!(envelope["stage"], "pending_registration");
+    let input_key = Key::parse(format!(
+        "{operation_prefix}/inputs/{}",
+        envelope["attempt"].as_str().unwrap()
+    ))
+    .unwrap();
+    let mut stored = Vec::new();
+    store
+        .get(&input_key)
+        .await
+        .unwrap()
+        .reader
+        .read_to_end(&mut stored)
+        .await
+        .unwrap();
+    assert_eq!(stored, bytes);
+    state.stop().await;
+
+    let mut state = start(catalog).await;
+    let job = |scope| v1::IngestionJobRequest {
+        scope: Some(scope),
+        operation_id: operation.clone(),
+    };
+    assert_eq!(
+        state
+            .client
+            .get_ingestion_job(job(scope.clone()))
+            .await
+            .unwrap()
+            .into_inner(),
+        accepted
+    );
+    let other = v1::Scope {
+        tenant: "other".into(),
+        ..scope.clone()
+    };
+    assert_eq!(
+        state
+            .client
+            .get_ingestion_job(job(other))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    assert_eq!(
+        state
+            .client
+            .submit_text(upload_frames(&header, [bytes]))
+            .await
+            .unwrap()
+            .into_inner(),
+        accepted
+    );
+    assert_eq!(
+        state
+            .client
+            .submit_text(upload_frames(&header, [b"different!".as_slice()]))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    let mut changed = header.clone();
+    changed.retain_original = true;
+    assert_eq!(
+        state
+            .client
+            .submit_text(upload_frames(&changed, [bytes]))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+
+    let replacement = v1::UploadTextHeader {
+        request_id: None,
+        replacement: Some(v1::Replacement {
+            source_id: None,
+            expected_revision_id: Some(accepted.revision_id),
+        }),
+        ..header
+    };
+    let job = state
+        .client
+        .submit_text(upload_frames(&replacement, [bytes]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(job.state(), v1::IngestionState::Accepted);
+    assert!(job.source_id.is_empty());
+    assert_ne!(job.operation_id, operation);
+    state.stop().await;
+}
+
+#[tokio::test]
+async fn hosted_submissions_recover_from_interrupted_acceptance() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        interrupt: AtomicU8::new(0),
+    });
+    let catalog = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let mut server = start(catalog.clone()).await;
+    let scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    server
+        .client
+        .create_collection(v1::CreateCollectionRequest {
+            scope: Some(scope.clone()),
+            request_id: None,
+        })
+        .await
+        .unwrap();
+    for mode in [1, 2] {
+        let operation = uuid::Uuid::new_v4().to_string();
+        let header = v1::UploadTextHeader {
+            scope: Some(scope.clone()),
+            name: "notes.txt".into(),
+            request_id: Some(operation.clone()),
+            ..Default::default()
+        };
+        let request = v1::IngestionJobRequest {
+            scope: Some(scope.clone()),
+            operation_id: operation.clone(),
+        };
+        let input = [b"durable".as_slice()];
+        storage.interrupt.store(mode, Ordering::Relaxed);
+        assert_eq!(
+            server
+                .client
+                .submit_text(upload_frames(&header, input))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
+        server.stop().await;
+        server = start(catalog.clone()).await;
+        let initial = server.client.get_ingestion_job(request.clone()).await;
+        let prefix =
+            Key::parse(format!("default/collections/notes/operations/{operation}")).unwrap();
+        let before = storage.list(Some(&prefix), None, 10).await.unwrap().objects;
+        assert_eq!(before.len(), usize::from(mode));
+        let accepted = server
+            .client
+            .submit_text(upload_frames(&header, input))
+            .await
+            .unwrap()
+            .into_inner();
+        if mode == 1 {
+            assert_eq!(initial.unwrap_err().code(), Code::NotFound);
+        } else {
+            assert_eq!(initial.unwrap().into_inner(), accepted);
+        }
+        assert_eq!(
+            server
+                .client
+                .get_ingestion_job(request)
+                .await
+                .unwrap()
+                .into_inner(),
+            accepted
+        );
+        let after = storage.list(Some(&prefix), None, 10).await.unwrap().objects;
+        assert_eq!(after.len(), if mode == 1 { 3 } else { 2 });
+        assert!(
+            before
+                .iter()
+                .all(|item| after.iter().any(|saved| saved.key == item.key))
+        );
+    }
+    server.stop().await;
+}
+
+struct InterruptAcceptance {
+    inner: sanctum_storage_fs::FileStorage,
+    interrupt: AtomicU8,
+}
+
+#[async_trait::async_trait]
+impl Storage for InterruptAcceptance {
+    async fn head(&self, key: &Key) -> StorageResult<Object> {
+        self.inner.head(key).await
+    }
+
+    async fn get(&self, key: &Key) -> StorageResult<Download> {
+        self.inner.get(key).await
+    }
+
+    async fn read_range(&self, key: &Key, range: ByteRange) -> StorageResult<axum::body::Bytes> {
+        self.inner.read_range(key, range).await
+    }
+
+    async fn put_stream(&self, key: &Key, reader: Reader, length: u64) -> StorageResult<Version> {
+        self.inner.put_stream(key, reader, length).await
+    }
+
+    async fn put_control(
+        &self,
+        key: &Key,
+        bytes: axum::body::Bytes,
+        condition: Condition,
+    ) -> StorageResult<Version> {
+        let interrupt = if key.as_str().ends_with("/operation.json") {
+            self.interrupt.swap(0, Ordering::Relaxed)
+        } else {
+            0
+        };
+        if interrupt == 1 {
+            return Err(Error::Busy("interrupted before envelope write".into()));
+        }
+        let version = self.inner.put_control(key, bytes, condition).await?;
+        if interrupt == 2 {
+            return Err(Error::Busy("envelope write response lost".into()));
+        }
+        Ok(version)
+    }
+
+    async fn list(
+        &self,
+        prefix: Option<&Key>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> StorageResult<ListPage> {
+        self.inner.list(prefix, cursor, limit).await
+    }
+
+    async fn delete(&self, key: &Key) -> StorageResult<()> {
+        self.inner.delete(key).await
+    }
+}
+
+fn upload_frames<'a>(
+    header: &v1::UploadTextHeader,
+    parts: impl IntoIterator<Item = &'a [u8]>,
+) -> tokio_stream::Iter<std::vec::IntoIter<v1::UploadTextFrame>> {
+    tokio_stream::iter(frames(header, parts))
+}
+
+fn frames<'a>(
+    header: &v1::UploadTextHeader,
+    parts: impl IntoIterator<Item = &'a [u8]>,
+) -> Vec<v1::UploadTextFrame> {
+    let header = Frame::Header(header.clone());
+    let data = parts.into_iter().map(|part| Frame::Data(part.to_vec()));
+    let end = Frame::End(v1::UploadTextEnd {});
+    std::iter::once(header)
+        .chain(data)
+        .chain(std::iter::once(end))
+        .map(|frame| v1::UploadTextFrame { frame: Some(frame) })
+        .collect()
 }
 
 struct Running {

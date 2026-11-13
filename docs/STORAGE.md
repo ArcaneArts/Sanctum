@@ -33,7 +33,7 @@ cargo test --locked -p sanctum-storage-s3 --test minio -- --ignored
 ```
 
 The server can select S3 for its hosted catalog. See the
-[configuration example](#hosted-catalog-configuration).
+[configuration example](#hosted-server-configuration).
 
 ## Object-backed database publication
 
@@ -88,7 +88,7 @@ cargo test --locked -p sanctum-storage-gcs --test live -- --ignored
 The regular test suite checks the JSON API contract with a loopback HTTP
 fixture. Live bucket verification remains open.
 
-## Hosted catalog configuration
+## Hosted server configuration
 
 Set `object_storage` in `SANCTUM_CONFIG_JSON` to select the backend.
 For a local MinIO bucket, start the server with a configuration such as
@@ -113,10 +113,9 @@ For GCS, set `object_storage` to
 `{"backend":"gcs","bucket":"your-bucket","prefix":"sanctum"}`.
 The prefix is optional. Use a dedicated bucket or prefix for each deployment.
 Omit `object_storage` and provide `storage_root` for the local filesystem
-service. The hosted catalog listens on gRPC and supports collection
-creation, listing, and scoped storage usage. Hosted ingestion, retrieval,
-and MCP are still in progress. Keep this listener within the controlling
-application's trusted network.
+service. The hosted server listens on gRPC and supports collection
+creation, listing, scoped storage usage, and durable upload acceptance.
+Keep this listener within the controlling application's trusted network.
 
 The hosted create operation initializes the collection database before
 activating its catalog record. If a request is interrupted between those
@@ -125,3 +124,32 @@ steps, repeat it to activate the existing database. Pass a UUID through
 to replay a successful activation after an ambiguous response. The
 request ID applies within the tenant catalog. Hosted lists default to
 50 items. Pass `next_after` as `after` to continue the same tenant's list.
+
+### Hosted uploads
+
+Use `SubmitText` with the [upload frame protocol](LOCAL_API.md), or submit
+from the CLI in background mode. Supply a nonzero UUID to recover from an
+ambiguous response. Repeat the same header and source bytes with that UUID
+within the same tenant and collection. The server returns the same operation
+and revision IDs. Reusing the UUID with different input or options returns
+`ALREADY_EXISTS`.
+
+```sh
+cargo run --locked -p sanctum-cli -- upload notes /path/to/notes.md \
+  --background --request-id "$(uuidgen)"
+cargo run --locked -p sanctum-cli -- job notes OPERATION_ID
+```
+
+The server spools the stream to a temporary file and honors
+`max_source_bytes`. It streams the original bytes to a unique input key under
+`<tenant>/collections/<collection>/operations/<operation>/inputs/`.
+The sibling `operation.json` is published with a create-only precondition.
+It records the input's length and BLAKE3 digest, ingestion options, and
+pending registration stage. A failed conditional write with an uncertain
+outcome preserves its input for recovery. Concurrent requests with the same
+ID adopt the winning operation and discard their losing input when possible.
+
+The `ACCEPTED` status can be queried after restart through `GetIngestionJob`.
+A replacement targeting an external reference has an empty `source_id` until
+registration resolves it. Hosted indexing, repair of abandoned input attempts,
+synchronous `UploadText`, retrieval, and MCP remain open.

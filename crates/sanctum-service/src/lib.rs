@@ -20,6 +20,7 @@ mod database_sessions;
 mod embedding;
 mod git_import;
 mod hosted_catalog;
+mod hosted_ingestion;
 mod local_import;
 mod local_jobs;
 mod maintenance;
@@ -29,6 +30,7 @@ mod worker;
 pub use embedding::{CollectionSearchResult, SearchMode, run_embedding_worker};
 pub use git_import::{GitImportEvent, GitRepository};
 pub use hosted_catalog::HostedCatalog;
+pub use hosted_ingestion::{AcceptedUpload, HostedUpload};
 pub use local_import::{ImportEvent, ImportOptions, ImportState};
 pub use sanctum_db_sqlite::embedding::EmbeddingStatus;
 pub use watched_folders::{WatchedFolder, run_watched_folders};
@@ -49,6 +51,7 @@ pub struct Service {
     embedding: Option<Arc<dyn sanctum_embedding::Provider>>,
 }
 
+#[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct TextUpload {
     pub name: String,
     pub external: Option<ExternalSource>,
@@ -56,9 +59,39 @@ pub struct TextUpload {
     pub retain_original: bool,
 }
 
+#[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Replacement {
     pub source: Option<Uuid>,
     pub expected_revision: Option<Uuid>,
+}
+
+impl TextUpload {
+    fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() || self.name.len() > 1024 {
+            return Err(Error::Invalid(
+                "source name must contain 1 to 1024 bytes".into(),
+            ));
+        }
+        if let Some(external) = &self.external
+            && (external.namespace.trim().is_empty()
+                || external.namespace.len() > 256
+                || external.id.trim().is_empty()
+                || external.id.len() > 4096)
+        {
+            return Err(Error::Invalid(
+                "external source requires a namespace and ID within their size limits".into(),
+            ));
+        }
+        if let Some(replacement) = &self.replacement
+            && replacement.source.is_none()
+            && self.external.is_none()
+        {
+            return Err(Error::Invalid(
+                "replacement requires a source ID or external reference".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub struct StagedUpload {
@@ -238,29 +271,7 @@ impl Service {
     }
 
     pub fn stage_upload(&self, scope: Scope, upload: TextUpload) -> Result<StagedUpload> {
-        if upload.name.trim().is_empty() || upload.name.len() > 1024 {
-            return Err(Error::Invalid(
-                "source name must contain 1 to 1024 bytes".into(),
-            ));
-        }
-        if let Some(external) = &upload.external
-            && (external.namespace.trim().is_empty()
-                || external.namespace.len() > 256
-                || external.id.trim().is_empty()
-                || external.id.len() > 4096)
-        {
-            return Err(Error::Invalid(
-                "external source requires a namespace and ID within their size limits".into(),
-            ));
-        }
-        if let Some(replacement) = &upload.replacement
-            && replacement.source.is_none()
-            && upload.external.is_none()
-        {
-            return Err(Error::Invalid(
-                "replacement requires a source ID or external reference".into(),
-            ));
-        }
+        upload.validate()?;
         self.require_collection(&scope)?;
         let file = self.files.stage(&scope)?;
         Ok(StagedUpload {
