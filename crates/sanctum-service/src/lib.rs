@@ -20,7 +20,7 @@ mod local_import;
 mod local_jobs;
 mod maintenance;
 mod worker;
-pub use embedding::{SearchMode, run_embedding_worker};
+pub use embedding::{CollectionSearchResult, SearchMode, run_embedding_worker};
 pub use local_import::{ImportEvent, ImportOptions, ImportState};
 pub use sanctum_db_sqlite::embedding::EmbeddingStatus;
 pub use worker::{run_local_maintenance, run_local_worker};

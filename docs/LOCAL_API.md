@@ -167,6 +167,20 @@ so other chunks can proceed. Transient failures back off and retry. Correct
 a permanently rejected input with a new source revision or use a corrected
 embedding profile.
 
+`SearchCollections` accepts one tenant and up to eight distinct collection
+IDs. It defaults to hybrid, reports aggregate coverage across the requested
+collections, and embeds the query at most once. Each collection applies the
+metadata filter and ranks its candidates before results are combined.
+Combined scores use reciprocal rank, `1 / (60 + rank)`, with one-based
+rank within the collection. Equal ranks sort by collection ID. Semantic
+and hybrid searches use only the active profile for vector ranking.
+Overlapping hits from the same revision are collapsed. Each reference
+carries the collection it came from.
+
+```sh
+cargo run --locked -p sanctum-cli -- search notes quartz --also reference --mode hybrid
+```
+
 `GetEmbeddingStatus` reports total, embedded, failed, and retrying chunks,
 the earliest retry time, and a sample error without invoking Ollama. Pass
 only the scope for collection coverage, or add a source ID and its current

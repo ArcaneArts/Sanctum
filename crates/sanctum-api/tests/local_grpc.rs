@@ -75,6 +75,7 @@ struct EmbeddingFixture {
     fail_documents: AtomicBool,
     reject_input: bool,
     document_inputs: AtomicUsize,
+    query_inputs: AtomicUsize,
 }
 
 impl EmbeddingFixture {
@@ -85,6 +86,7 @@ impl EmbeddingFixture {
             fail_documents: AtomicBool::new(false),
             reject_input,
             document_inputs: AtomicUsize::new(0),
+            query_inputs: AtomicUsize::new(0),
         })
     }
 }
@@ -100,6 +102,9 @@ impl Provider for EmbeddingFixture {
     }
 
     async fn embed(&self, purpose: Purpose, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if matches!(purpose, Purpose::Query) {
+            self.query_inputs.fetch_add(texts.len(), Ordering::SeqCst);
+        }
         if matches!(purpose, Purpose::Query) && self.fail_queries.load(Ordering::SeqCst) {
             return Err(EmbedError::Transient("simulated provider outage".into()));
         }
@@ -157,6 +162,167 @@ async fn await_coverage(client: &mut SanctumClient<Channel>, embedded: u64, fail
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn search_collections_ranks_scoped_matches_with_one_query_embedding() {
+    let dir = TempDir::new().unwrap();
+    let provider = EmbeddingFixture::new("multi-profile", true);
+    let mut running = Running::with_embedding(&dir, Some(provider.clone())).await;
+    create(&mut running.client, "default").await;
+    create(&mut running.client, "other").await;
+    let reference_scope = Some(v1::Scope {
+        tenant: "default".into(),
+        collection: "reference".into(),
+    });
+    running
+        .client
+        .create_collection(v1::CreateCollectionRequest {
+            scope: reference_scope.clone(),
+        })
+        .await
+        .unwrap();
+    let a = upload(&mut running.client, header("default"), b"quartz notes").await;
+    let mut second = header("default");
+    if let Some(Frame::Header(header)) = &mut second.frame {
+        header.scope = reference_scope.clone();
+    }
+    let b = upload(&mut running.client, second, b"quartz reject input").await;
+    upload(&mut running.client, header("other"), b"quartz private").await;
+    await_coverage(&mut running.client, 1, 0).await;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let status = running
+                .client
+                .get_embedding_status(v1::EmbeddingStatusRequest {
+                    scope: reference_scope.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            if status.coverage.unwrap().failed_chunks == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let mut request = v1::SearchCollectionsRequest {
+        tenant: "default".into(),
+        collections: vec!["reference".into(), "notes".into()],
+        query: "quartz".into(),
+        limit: Some(2),
+        mode: v1::SearchMode::Hybrid.into(),
+        metadata_filter: None,
+    };
+    let result = running
+        .client
+        .search_collections(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(provider.query_inputs.load(Ordering::SeqCst), 1);
+    assert_eq!(result.mode(), v1::SearchMode::Hybrid);
+    assert_eq!(
+        result.degraded_reason.as_deref(),
+        Some("embedding_coverage_partial")
+    );
+    let coverage = result.embedding_coverage.unwrap();
+    assert_eq!(
+        (
+            coverage.total_chunks,
+            coverage.embedded_chunks,
+            coverage.failed_chunks
+        ),
+        (2, 1, 1)
+    );
+    let ids: Vec<_> = result
+        .hits
+        .iter()
+        .map(|hit| hit.chunk.as_ref().unwrap().source_id.as_str())
+        .collect();
+    assert_eq!(ids, [&a.source_id, &b.source_id]);
+    request.collections.reverse();
+    request.mode = v1::SearchMode::Lexical.into();
+    let lexical = running
+        .client
+        .search_collections(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(lexical.mode(), v1::SearchMode::Lexical);
+    assert_eq!(lexical.hits, result.hits);
+    assert_eq!(provider.query_inputs.load(Ordering::SeqCst), 1);
+    request.mode = v1::SearchMode::Semantic.into();
+    let semantic = running
+        .client
+        .search_collections(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(semantic.mode(), v1::SearchMode::Semantic);
+    assert_eq!(semantic.hits.len(), 1);
+    assert_eq!(
+        semantic.hits[0].chunk.as_ref().unwrap().source_id,
+        a.source_id
+    );
+    assert_eq!(provider.query_inputs.load(Ordering::SeqCst), 2);
+
+    write_metadata(
+        &mut running.client,
+        v1::MetadataTarget {
+            scope: reference_scope,
+            ..Default::default()
+        },
+        vec![metadata_edit(
+            "visible",
+            v1::metadata_mutation::Edit::SetJson("true".into()),
+        )],
+    )
+    .await
+    .unwrap();
+    request.mode = v1::SearchMode::Hybrid.into();
+    request.limit = Some(1);
+    request.metadata_filter = Some(v1::MetadataFilter {
+        expression: Some(v1::metadata_filter::Expression::Test(
+            v1::MetadataPredicate {
+                level: v1::MetadataLevel::Collection.into(),
+                namespace: "demo.integration".into(),
+                key: "visible".into(),
+                operator: v1::MetadataOperator::Exists.into(),
+                ..Default::default()
+            },
+        )),
+    });
+    let filtered = running
+        .client
+        .search_collections(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        filtered.hits[0].chunk.as_ref().unwrap().source_id,
+        b.source_id
+    );
+
+    request.tenant = "other".into();
+    let missing = running
+        .client
+        .search_collections(request.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), Code::NotFound);
+    request.collections = vec!["notes".into(), "notes".into()];
+    let duplicate = running
+        .client
+        .search_collections(request)
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate.code(), Code::InvalidArgument);
+    running.stop().await;
 }
 
 #[tokio::test]

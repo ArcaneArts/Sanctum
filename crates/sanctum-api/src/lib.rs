@@ -355,14 +355,7 @@ impl Sanctum for Grpc {
     ) -> Reply<v1::SearchTextResponse> {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
-        let mode = match v1::SearchMode::try_from(request.mode) {
-            Ok(v1::SearchMode::Unspecified | v1::SearchMode::Lexical) => {
-                sanctum_service::SearchMode::Lexical
-            }
-            Ok(v1::SearchMode::Semantic) => sanctum_service::SearchMode::Semantic,
-            Ok(v1::SearchMode::Hybrid) => sanctum_service::SearchMode::Hybrid,
-            Err(_) => return Err(Status::invalid_argument("unknown search mode")),
-        };
+        let mode = search_mode(request.mode, sanctum_service::SearchMode::Lexical)?;
         let filter = request
             .metadata_filter
             .map(metadata_filter::parse)
@@ -379,18 +372,60 @@ impl Sanctum for Grpc {
             )
             .await
             .map_err(status)?;
-        let mode = match result.mode {
-            sanctum_service::SearchMode::Lexical => v1::SearchMode::Lexical,
-            sanctum_service::SearchMode::Semantic => v1::SearchMode::Semantic,
-            sanctum_service::SearchMode::Hybrid => v1::SearchMode::Hybrid,
-        };
         Ok(Response::new(v1::SearchTextResponse {
             hits: result
                 .hits
                 .into_iter()
                 .map(|hit| wire_hit(&scope, hit))
                 .collect(),
-            mode: mode.into(),
+            mode: wire_search_mode(result.mode).into(),
+            embedding_coverage: Some(v1::EmbeddingCoverage {
+                profile_id: result.profile,
+                total_chunks: result.coverage.total,
+                embedded_chunks: result.coverage.embedded,
+                failed_chunks: result.coverage.failed,
+            }),
+            degraded_reason: result.degraded.map(str::to_owned),
+        }))
+    }
+
+    async fn search_collections(
+        &self,
+        request: Request<v1::SearchCollectionsRequest>,
+    ) -> Reply<v1::SearchTextResponse> {
+        let request = request.into_inner();
+        let tenant = request.tenant.parse().map_err(status)?;
+        let collections = request
+            .collections
+            .iter()
+            .map(|id| id.parse())
+            .collect::<Result<Vec<_>>>()
+            .map_err(status)?;
+        let mode = search_mode(request.mode, sanctum_service::SearchMode::Hybrid)?;
+        let filter = request
+            .metadata_filter
+            .map(metadata_filter::parse)
+            .transpose()
+            .map_err(status)?;
+        let result = self
+            .0
+            .retrieve_collections(
+                tenant,
+                collections,
+                request.query,
+                request.limit.unwrap_or(10),
+                filter,
+                mode,
+            )
+            .await
+            .map_err(status)?;
+        Ok(Response::new(v1::SearchTextResponse {
+            hits: result
+                .hits
+                .into_iter()
+                .map(|(scope, hit)| wire_hit(&scope, hit))
+                .collect(),
+            mode: wire_search_mode(result.mode).into(),
             embedding_coverage: Some(v1::EmbeddingCoverage {
                 profile_id: result.profile,
                 total_chunks: result.coverage.total,
@@ -613,6 +648,29 @@ fn wire_job(job: Job) -> v1::IngestionJob {
 }
 
 type Reply<T> = std::result::Result<Response<T>, Status>;
+
+#[allow(clippy::result_large_err)]
+fn search_mode(
+    raw: i32,
+    default: sanctum_service::SearchMode,
+) -> std::result::Result<sanctum_service::SearchMode, Status> {
+    use sanctum_service::SearchMode;
+    match v1::SearchMode::try_from(raw) {
+        Ok(v1::SearchMode::Unspecified) => Ok(default),
+        Ok(v1::SearchMode::Lexical) => Ok(SearchMode::Lexical),
+        Ok(v1::SearchMode::Semantic) => Ok(SearchMode::Semantic),
+        Ok(v1::SearchMode::Hybrid) => Ok(SearchMode::Hybrid),
+        Err(_) => Err(Status::invalid_argument("unknown search mode")),
+    }
+}
+
+fn wire_search_mode(mode: sanctum_service::SearchMode) -> v1::SearchMode {
+    match mode {
+        sanctum_service::SearchMode::Lexical => v1::SearchMode::Lexical,
+        sanctum_service::SearchMode::Semantic => v1::SearchMode::Semantic,
+        sanctum_service::SearchMode::Hybrid => v1::SearchMode::Hybrid,
+    }
+}
 
 fn wire_import(event: ImportEvent) -> v1::ImportLocalEvent {
     let state = match event.state {

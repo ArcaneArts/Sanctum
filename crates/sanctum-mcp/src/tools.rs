@@ -130,6 +130,20 @@ struct Search {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct SearchCollections {
+    #[serde(default = "default_tenant")]
+    tenant: String,
+    /// One to eight distinct collection IDs in the tenant.
+    collections: Vec<String>,
+    query: String,
+    /// Maximum hits. Defaults to 5 and allows 1 to 10.
+    limit: Option<u32>,
+    /// Defaults to hybrid.
+    mode: Option<Mode>,
+    metadata_filter: Option<MetadataFilter>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct Fetch {
     #[serde(flatten)]
     scope: Collection,
@@ -319,6 +333,44 @@ impl Tools {
             Ok(hit_value(&scope, service.fetch(&scope, &reference)?))
         })
         .await
+    }
+
+    #[tool(
+        description = "Search up to eight collections within a single tenant and merge their ranked results."
+    )]
+    async fn search_collections(
+        &self,
+        Parameters(args): Parameters<SearchCollections>,
+    ) -> CallToolResult {
+        let result = async {
+            let limit = args.limit.unwrap_or(5);
+            if !(1..=10).contains(&limit) {
+                return Err(Error::Invalid("search limit must be between 1 and 10".into()));
+            }
+            let collections = args.collections.iter().map(|id| id.parse()).collect::<SanctumResult<_>>()?;
+            let filter = args.metadata_filter.map(TryInto::try_into).transpose()?;
+            let result = self.service.retrieve_collections(
+                args.tenant.parse()?, collections, args.query, limit, filter,
+                args.mode.unwrap_or(Mode::Hybrid).into(),
+            ).await?;
+            let mode = match result.mode {
+                SearchMode::Lexical => "lexical",
+                SearchMode::Semantic => "semantic",
+                SearchMode::Hybrid => "hybrid",
+            };
+            Ok(json!({
+                "mode": mode,
+                "degraded_reason": result.degraded,
+                "embedding_coverage": {
+                    "profile_id": result.profile,
+                    "total_chunks": result.coverage.total,
+                    "embedded_chunks": result.coverage.embedded,
+                    "failed_chunks": result.coverage.failed,
+                },
+                "hits": result.hits.into_iter().map(|(scope, hit)| hit_value(&scope, hit)).collect::<Vec<_>>(),
+            }))
+        }.await;
+        response(result)
     }
 
     #[tool(description = "Check a durable ingestion operation for progress and errors.")]

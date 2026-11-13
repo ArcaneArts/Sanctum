@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use sanctum_core::{ByteRange, Error, Result, Scope};
 use sanctum_db_sqlite::embedding::ScoredChunk;
@@ -7,6 +7,9 @@ use tokio::sync::watch;
 
 use crate::{Chunk, ChunkRef, Hit, Service, metadata_filter::Filter};
 pub use sanctum_db_sqlite::embedding::Coverage;
+
+mod collections;
+pub use collections::CollectionSearchResult;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
@@ -21,6 +24,36 @@ pub struct SearchResult {
     pub coverage: Coverage,
     pub profile: Option<String>,
     pub degraded: Option<&'static str>,
+}
+
+struct PreparedQuery {
+    expression: String,
+    profile: Option<String>,
+    vector: Option<Arc<[f32]>>,
+    degraded: Option<&'static str>,
+}
+
+impl PreparedQuery {
+    fn strategy(
+        &self,
+        requested: SearchMode,
+        coverage: Coverage,
+    ) -> Result<(SearchMode, Option<&'static str>)> {
+        if self.vector.is_some() && coverage.embedded > 0 {
+            return Ok((
+                requested,
+                (coverage.embedded < coverage.total).then_some("embedding_coverage_partial"),
+            ));
+        }
+        if requested == SearchMode::Lexical {
+            return Ok((requested, None));
+        }
+        let degraded = self.degraded.unwrap_or("embeddings_unavailable");
+        if requested == SearchMode::Semantic {
+            return Err(Error::Busy(degraded.into()));
+        }
+        Ok((SearchMode::Lexical, Some(degraded)))
+    }
 }
 
 struct Batch {
@@ -48,46 +81,9 @@ impl Service {
         filter: Option<Filter>,
         mode: SearchMode,
     ) -> Result<SearchResult> {
-        let expression = lexical_expression(&query, limit)?;
-        if let Some(filter) = &filter {
-            filter.validate()?;
-        }
-        let provider = self.embedding.clone();
-        let profile = provider
-            .as_ref()
-            .map(|provider| provider.profile_id().to_owned());
-        let mut degraded = None;
-        let mut query_vector = None;
-        if mode != SearchMode::Lexical {
-            degraded = match provider {
-                None => Some("embedding_disabled"),
-                Some(provider) => {
-                    let service = self.clone();
-                    let scoped = scope.clone();
-                    let selected = provider.clone();
-                    let available = blocking(move || {
-                        service
-                            .database(&scoped)?
-                            .has_embeddings(selected.profile_id())
-                    })
-                    .await?;
-                    if available {
-                        match embed(provider.as_ref(), Purpose::Query, &[query]).await {
-                            Ok(mut vectors) => {
-                                query_vector = vectors.pop();
-                                None
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error, "query embedding unavailable");
-                                Some("embedding_provider_unavailable")
-                            }
-                        }
-                    } else {
-                        Some("embeddings_unavailable")
-                    }
-                }
-            };
-        }
+        let prepared = self
+            .prepare_query(vec![scope.clone()], query, limit, filter.as_ref(), mode)
+            .await?;
 
         let service = self.clone();
         blocking(move || {
@@ -102,34 +98,19 @@ impl Service {
                 _ => Vec::new(),
             };
             let db = service.database(&scope)?;
-            let (ranked, actual_mode, coverage) = db.read_snapshot(|db| {
-                let coverage = db.embedding_coverage(profile.as_deref())?;
-                let actual_mode = if query_vector.is_some() && coverage.embedded > 0 {
-                    if coverage.embedded < coverage.total {
-                        degraded = Some("embedding_coverage_partial");
-                    }
-                    mode
-                } else {
-                    if mode != SearchMode::Lexical && degraded.is_none() {
-                        degraded = Some("embeddings_unavailable");
-                    }
-                    if mode == SearchMode::Semantic {
-                        return Err(Error::Busy(
-                            degraded.unwrap_or("embeddings_unavailable").into(),
-                        ));
-                    }
-                    SearchMode::Lexical
-                };
+            let (ranked, actual_mode, coverage, degraded) = db.read_snapshot(|db| {
+                let coverage = db.embedding_coverage(prepared.profile.as_deref())?;
+                let (actual_mode, degraded) = prepared.strategy(mode, coverage)?;
                 let candidate_limit = if actual_mode == SearchMode::Lexical {
                     limit
                 } else {
                     (limit * 4).max(32)
                 };
-                let semantic = match (query_vector, &profile) {
+                let semantic = match (&prepared.vector, &prepared.profile) {
                     (Some(query), Some(profile)) if actual_mode != SearchMode::Lexical => db
                         .search_vector(
                             profile,
-                            query,
+                            query.clone(),
                             candidate_limit,
                             filter.as_ref(),
                             &metadata,
@@ -139,7 +120,12 @@ impl Service {
                 let lexical = if actual_mode == SearchMode::Semantic {
                     Vec::new()
                 } else {
-                    db.search(&expression, candidate_limit, filter.as_ref(), &metadata)?
+                    db.search(
+                        &prepared.expression,
+                        candidate_limit,
+                        filter.as_ref(),
+                        &metadata,
+                    )?
                 };
                 let ranked = match actual_mode {
                     SearchMode::Lexical => lexical.into_iter().map(|chunk| (chunk, None)).collect(),
@@ -149,7 +135,7 @@ impl Service {
                         .collect(),
                     SearchMode::Hybrid => fuse(lexical, semantic),
                 };
-                Ok((ranked, actual_mode, coverage))
+                Ok((ranked, actual_mode, coverage, degraded))
             })?;
             let mut hits = Vec::with_capacity(limit as usize);
             let mut ranges: HashMap<_, Vec<ByteRange>> = HashMap::new();
@@ -177,11 +163,63 @@ impl Service {
                 hits,
                 mode: actual_mode,
                 coverage,
-                profile,
+                profile: prepared.profile,
                 degraded,
             })
         })
         .await
+    }
+
+    async fn prepare_query(
+        &self,
+        scopes: Vec<Scope>,
+        query: String,
+        limit: u32,
+        filter: Option<&Filter>,
+        mode: SearchMode,
+    ) -> Result<PreparedQuery> {
+        let expression = lexical_expression(&query, limit)?;
+        if let Some(filter) = filter {
+            filter.validate()?;
+        }
+        let mut prepared = PreparedQuery {
+            expression,
+            profile: self.embedding_profile().map(str::to_owned),
+            vector: None,
+            degraded: None,
+        };
+        if mode == SearchMode::Lexical {
+            return Ok(prepared);
+        }
+        let Some(provider) = self.embedding.clone() else {
+            prepared.degraded = Some("embedding_disabled");
+            return Ok(prepared);
+        };
+        let service = self.clone();
+        let profile = provider.profile_id().to_owned();
+        let available = blocking(move || {
+            let mut available = false;
+            for scope in scopes {
+                let database = service.database(&scope)?;
+                if !available {
+                    available = database.has_embeddings(&profile)?;
+                }
+            }
+            Ok(available)
+        })
+        .await?;
+        if !available {
+            prepared.degraded = Some("embeddings_unavailable");
+            return Ok(prepared);
+        }
+        match embed(provider.as_ref(), Purpose::Query, &[query]).await {
+            Ok(mut vectors) => prepared.vector = vectors.pop().map(Arc::from),
+            Err(error) => {
+                tracing::warn!(%error, "query embedding unavailable");
+                prepared.degraded = Some("embedding_provider_unavailable");
+            }
+        }
+        Ok(prepared)
     }
 
     fn embedding_batch(&self, scope: &Scope, profile: &str) -> Result<Batch> {
