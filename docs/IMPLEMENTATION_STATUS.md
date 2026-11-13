@@ -5,7 +5,7 @@ which parts have working implementations and where to find the evidence.
 
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
-| 1. Local desktop and MCP | Local Rust service and gRPC CLI with a tenant catalog, streamed UTF-8 uploads, SQLite FTS5, byte-range fetch, restartable lexical jobs, source replacement, deletion, and local cleanup | RTF extraction, local imports, metadata and reset events, embedding reuse and readiness, usage, Ollama and vector search, MCP, tray app, desktop acceptance |
+| 1. Local desktop and MCP | Local Rust service and gRPC CLI with a tenant catalog, streamed UTF-8 uploads and directory imports, SQLite FTS5, byte-range fetch, restartable lexical jobs, source replacement, deletion, and local cleanup | RTF extraction and original retention, metadata and reset events, embedding reuse and readiness, usage, Ollama and vector search, MCP, tray app, desktop acceptance |
 | 2. Providers and local integrations | Pending | Hosted provider adapters, rebuilds, watchers, URL and Git imports, metadata queries and cursors, SQL access, multi-collection retrieval, platform packaging and verification |
 | 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
@@ -48,6 +48,8 @@ Merged in [PR #3](https://github.com/ArcaneArts/Sanctum/pull/3).
 
 ## Local source lifecycle
 
+Merged in [PR #4](https://github.com/ArcaneArts/Sanctum/pull/4).
+
 - gRPC and the CLI can replace a source by its ID or external reference, with
   an optional expected revision. The collection writer serializes registration
   and publication, and the queue persists the registered replacement sequence.
@@ -63,5 +65,16 @@ Merged in [PR #3](https://github.com/ArcaneArts/Sanctum/pull/3).
   retirement to the configured embedding profile's readiness. Metadata reset
   events remain pending with the metadata and changes API.
 
-Next, add streaming RTF extraction, original retention, and local imports using
-the same upload, replacement, and recovery pipeline.
+## Local file and directory imports
+
+- `ImportLocal` and `sanctum-cli import` walk files incrementally, apply include
+  and exclude globs, and stream per-file results. Selected UTF-8 files enter
+  the existing durable queue.
+- A stable import root and relative path identify each source. Content digests
+  skip unchanged input and reuse identical pending operations. Edits use the
+  same source ID and replacement sequence as uploads.
+- The default scan reports missing files. Explicit pruning deletes selected
+  missing sources and supersedes their pending imports. The gRPC tests cover
+  selection, repeated imports, edits, pending work, and deletion.
+
+Next, add streaming RTF extraction and original retention to uploads and imports.

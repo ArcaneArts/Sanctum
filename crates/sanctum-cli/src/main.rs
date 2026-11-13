@@ -24,6 +24,16 @@ enum Command {
         collection: String,
     },
     List,
+    Import {
+        collection: String,
+        path: PathBuf,
+        #[arg(long)]
+        include: Vec<String>,
+        #[arg(long)]
+        exclude: Vec<String>,
+        #[arg(long)]
+        prune_missing: bool,
+    },
     Upload {
         collection: String,
         path: PathBuf,
@@ -87,6 +97,47 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut client = SanctumClient::connect(args.endpoint).await?;
     match args.command {
+        Command::Import {
+            collection,
+            path,
+            include,
+            exclude,
+            prune_missing,
+        } => {
+            let path = std::path::absolute(path)?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| anyhow!("import path is not UTF-8"))?;
+            let mut events = client
+                .import_local(v1::ImportLocalRequest {
+                    scope: scope(collection),
+                    path,
+                    include,
+                    exclude,
+                    prune_missing,
+                })
+                .await?
+                .into_inner();
+            let mut failures = 0;
+            while let Some(event) = events.message().await? {
+                let state = event.state();
+                println!(
+                    "{}\t{}\t{}",
+                    state.as_str_name(),
+                    event.path,
+                    event.operation_id.as_deref().unwrap_or_default()
+                );
+                if let Some(message) = event.message {
+                    eprintln!("{message}");
+                }
+                if state == v1::ImportState::Failed {
+                    failures += 1;
+                }
+            }
+            if failures > 0 {
+                return Err(anyhow!("{failures} import entries failed"));
+            }
+        }
         Command::Create { collection } => {
             client
                 .create_collection(v1::CreateCollectionRequest {

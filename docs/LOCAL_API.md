@@ -79,3 +79,31 @@ until the worker starts publication. Retry applies to failures marked
 tokenization. Results include byte offsets as `[start_byte, end_byte)` into
 the canonical UTF-8 representation. Pass the result's `ChunkRef` unchanged
 to `FetchChunk` to retrieve that range.
+
+## Local file and directory imports
+
+`ImportLocal` accepts a path on the local server's filesystem and streams
+one event per selected or missing file. The CLI resolves relative arguments
+to absolute paths before sending them. For example, import Markdown files
+and skip the drafts directory.
+
+```sh
+cargo run --locked -p sanctum-cli -- import notes ./library \
+  --include '**/*.md' --exclude drafts
+```
+
+Include and exclude globs match paths relative to the import root. Without
+include patterns, the importer selects common UTF-8 text, code, and
+configuration files. Directory traversal skips symbolic links, `.git`,
+`node_modules`, and the managed storage directory. RTF support is pending.
+
+A file's import identity combines the canonical import root with its
+relative path. Repeating an import reuses a pending operation or skips an
+unchanged file using its content digest. An edit keeps the source ID and
+queues a replacement. Each queued event includes an operation ID for
+`sanctum-cli job` or `GetIngestionJob`.
+
+Missing files are reported and kept in search by default. Pass
+`--prune-missing` on a directory import to delete missing sources selected
+by the current filters and supersede their pending imports. A scan with
+file or traversal errors skips missing-file reconciliation.

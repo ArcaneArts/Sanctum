@@ -1,5 +1,5 @@
 use sanctum_chunk::index_utf8;
-use sanctum_core::{Error, Result, Scope};
+use sanctum_core::{Error, ExternalSource, Result, Scope};
 use uuid::Uuid;
 
 use crate::{ChunkRef, Job, JobState, Revision, Service, StagedUpload};
@@ -78,11 +78,11 @@ impl Service {
                     }
                     error => error,
                 })?;
-            if !self.queue.is_latest_replacement(job)? {
-                return Err(Error::Conflict(
-                    "a newer replacement superseded this operation".into(),
-                ));
-            }
+        }
+        if !self.queue.is_latest_replacement(job)? {
+            return Err(Error::Conflict(
+                "a newer operation superseded this import or replacement".into(),
+            ));
         }
         let mut ordinal = 0;
         let mut last_progress = 0;
@@ -111,6 +111,16 @@ impl Service {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "queued input no longer matches its accepted size",
+            )));
+        }
+        if job
+            .import_hash
+            .as_ref()
+            .is_some_and(|hash| hash != &indexed.hash)
+        {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "queued import does not match its accepted digest",
             )));
         }
         let revision = revision_for(job, indexed.hash, indexed.chunks);
@@ -168,29 +178,52 @@ impl StagedUpload {
             }
             (current.source, current.external)
         } else {
-            (Uuid::new_v4(), self.upload.external)
+            (Uuid::new_v4(), self.upload.external.clone())
         };
-        let mut job = Job {
-            id: Uuid::new_v4(),
-            source,
-            revision: Uuid::new_v4(),
-            scope: self.scope,
-            name: self.upload.name,
+        let job = new_job(
+            self.scope.clone(),
+            self.upload.name.clone(),
             external,
+            source,
             bytes,
-            processed_bytes: 0,
-            attempts: 0,
-            state: JobState::Accepted,
-            failure: None,
-            hash: None,
-            chunks: None,
-            replacement: replacement.is_some(),
-            update_sequence: 0,
-        };
+            replacement.is_some(),
+        );
+        self.publish_job(job)
+    }
+
+    pub(crate) fn publish_job(self, mut job: Job) -> Result<Job> {
         self.service
             .files
             .publish(&job.scope, job.source, job.revision, self.file)?;
         self.service.queue.insert(&mut job)?;
         Ok(job)
+    }
+}
+
+pub(crate) fn new_job(
+    scope: Scope,
+    name: String,
+    external: Option<ExternalSource>,
+    source: Uuid,
+    bytes: u64,
+    replacement: bool,
+) -> Job {
+    Job {
+        id: Uuid::new_v4(),
+        source,
+        revision: Uuid::new_v4(),
+        scope,
+        name,
+        external,
+        bytes,
+        processed_bytes: 0,
+        attempts: 0,
+        state: JobState::Accepted,
+        failure: None,
+        hash: None,
+        chunks: None,
+        replacement,
+        update_sequence: 0,
+        import_hash: None,
     }
 }

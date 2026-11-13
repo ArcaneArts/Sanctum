@@ -811,3 +811,169 @@ fn expire_and_reclaim(dir: &TempDir, service: &Service) {
         })
         .unwrap();
 }
+
+#[tokio::test]
+async fn directory_import_tracks_edits_duplicates_and_removed_paths() {
+    let dir = TempDir::new().unwrap();
+    let input = TempDir::new().unwrap();
+    let nested = input.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let notes = nested.join("sample.md");
+    let removed = input.path().join("remove.md");
+    std::fs::write(&notes, "first lazurite").unwrap();
+    std::fs::write(&removed, "removed citrine").unwrap();
+    std::fs::write(input.path().join("private.md"), "excluded diamond").unwrap();
+    std::fs::write(input.path().join("ignored.rs"), "excluded rust").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(input.path(), input.path().join("cycle")).unwrap();
+
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    let request = v1::ImportLocalRequest {
+        scope: scope("default"),
+        path: input.path().to_str().unwrap().into(),
+        include: vec!["**/*.md".into()],
+        exclude: vec!["private.md".into()],
+        prune_missing: false,
+    };
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: true })
+        .await
+        .unwrap();
+    let initial = import(&mut running.client, request.clone()).await;
+    assert_eq!(initial.len(), 2);
+    let first = initial
+        .iter()
+        .find(|item| item.path == "nested/sample.md")
+        .unwrap();
+    assert_eq!(first.state(), v1::ImportState::Queued);
+    let pending = import(&mut running.client, request.clone()).await;
+    assert_eq!(pending.len(), 2);
+    let same = pending.iter().find(|item| item.path == first.path).unwrap();
+    assert_eq!(same.state(), v1::ImportState::Pending);
+    assert_eq!(same.operation_id, first.operation_id);
+
+    std::fs::write(&notes, "second tourmaline").unwrap();
+    let edited = import(&mut running.client, request.clone()).await;
+    let replacement = edited.iter().find(|item| item.path == first.path).unwrap();
+    assert_eq!(replacement.state(), v1::ImportState::Queued);
+    assert_eq!(replacement.source_id, first.source_id);
+    assert_ne!(replacement.operation_id, first.operation_id);
+
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: false })
+        .await
+        .unwrap();
+    await_ready(
+        &mut running.client,
+        job_request(replacement.operation_id.clone().unwrap()),
+    )
+    .await;
+    let removed_job = initial
+        .iter()
+        .find(|item| item.path == "remove.md")
+        .unwrap();
+    await_ready(
+        &mut running.client,
+        job_request(removed_job.operation_id.clone().unwrap()),
+    )
+    .await;
+    await_failure(
+        &mut running.client,
+        job_request(first.operation_id.clone().unwrap()),
+    )
+    .await;
+    assert!(
+        search(&mut running.client, "default", "lazurite")
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        search(&mut running.client, "default", "tourmaline")
+            .await
+            .len(),
+        1
+    );
+    assert!(
+        search(&mut running.client, "default", "diamond")
+            .await
+            .is_empty()
+    );
+
+    std::fs::write(&notes, "third fluorite").unwrap();
+    let edited = import(&mut running.client, request.clone()).await;
+    let replacement = edited.iter().find(|item| item.path == first.path).unwrap();
+    assert_eq!(replacement.state(), v1::ImportState::Queued);
+    assert_eq!(replacement.source_id, first.source_id);
+    await_ready(
+        &mut running.client,
+        job_request(replacement.operation_id.clone().unwrap()),
+    )
+    .await;
+    assert_eq!(
+        search(&mut running.client, "default", "fluorite")
+            .await
+            .len(),
+        1
+    );
+    assert!(
+        search(&mut running.client, "default", "tourmaline")
+            .await
+            .is_empty()
+    );
+
+    std::fs::remove_file(removed).unwrap();
+    let check = import(&mut running.client, request.clone()).await;
+    assert!(
+        check
+            .iter()
+            .any(|item| item.path == "nested/sample.md"
+                && item.state() == v1::ImportState::Unchanged)
+    );
+    assert!(
+        check
+            .iter()
+            .any(|item| item.path == "remove.md" && item.state() == v1::ImportState::Missing)
+    );
+    assert_eq!(
+        search(&mut running.client, "default", "citrine")
+            .await
+            .len(),
+        1
+    );
+
+    let pruned = import(
+        &mut running.client,
+        v1::ImportLocalRequest {
+            prune_missing: true,
+            ..request
+        },
+    )
+    .await;
+    assert!(
+        pruned
+            .iter()
+            .any(|item| item.path == "remove.md" && item.state() == v1::ImportState::Deleted)
+    );
+    assert!(
+        search(&mut running.client, "default", "citrine")
+            .await
+            .is_empty()
+    );
+    running.stop().await;
+}
+
+async fn import(
+    client: &mut SanctumClient<Channel>,
+    request: v1::ImportLocalRequest,
+) -> Vec<v1::ImportLocalEvent> {
+    let mut stream = client.import_local(request).await.unwrap().into_inner();
+    let mut events = Vec::new();
+    while let Some(event) = stream.message().await.unwrap() {
+        assert_ne!(event.state(), v1::ImportState::Failed, "{event:?}");
+        events.push(event);
+    }
+    events
+}
