@@ -2008,6 +2008,203 @@ async fn hosted_deletion_replays_and_defers_object_reclamation() {
 }
 
 #[tokio::test]
+async fn hosted_database_sessions_pin_a_scope_and_generation_across_instances() {
+    use std::time::{Duration, SystemTime};
+    use v1::sql_value::Value;
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let writer = catalog();
+    let scope = |collection: &str| sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: collection.parse().unwrap(),
+    };
+    writer
+        .create_collection(&scope("notes"), None)
+        .await
+        .unwrap();
+    let target = v1::DatabaseTarget {
+        tenant: "default".into(),
+        collection: None,
+    };
+    let mut first = start(catalog()).await;
+    let opened = first
+        .client
+        .open_database_session(target.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let generation: uuid::Uuid = opened.snapshot_generation.unwrap().parse().unwrap();
+    let handle = opened.session.unwrap();
+    assert!(
+        opened
+            .schema
+            .iter()
+            .any(|object| object.name == "collections")
+    );
+    first.stop().await;
+
+    writer
+        .create_collection(&scope("reference"), None)
+        .await
+        .unwrap();
+    writer.sweep_hosted_snapshots().await.unwrap();
+    let mut second = start(catalog()).await;
+    let query = v1::QueryDatabaseRequest {
+        session: Some(handle.clone()),
+        sql: "SELECT id FROM collections WHERE id >= ?1 ORDER BY id".into(),
+        parameters: vec![v1::SqlValue {
+            value: Some(Value::Text("notes".into())),
+        }],
+        ..Default::default()
+    };
+    let page = second
+        .client
+        .query_database(query.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(
+        page.rows[0].values[0].value,
+        Some(Value::Text("notes".into()))
+    );
+    let count = v1::QueryDatabaseRequest {
+        sql: "SELECT count(*) FROM collections".into(),
+        parameters: Vec::new(),
+        ..query.clone()
+    };
+    let page = second
+        .client
+        .query_database(count)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(page.rows[0].values[0].value, Some(Value::Integer(1)));
+    let forbidden = v1::QueryDatabaseRequest {
+        sql: "DELETE FROM collections".into(),
+        parameters: Vec::new(),
+        ..query.clone()
+    };
+    assert_eq!(
+        second
+            .client
+            .query_database(forbidden)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+
+    let mut wrong_scope = handle.clone();
+    wrong_scope.target.as_mut().unwrap().tenant = "other".into();
+    assert_eq!(
+        second
+            .client
+            .query_database(v1::QueryDatabaseRequest {
+                session: Some(wrong_scope),
+                ..query.clone()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+
+    let mut stream = second
+        .client
+        .download_database(handle.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(frame) = stream.message().await.unwrap() {
+        bytes.extend(frame.data);
+    }
+    assert_eq!(bytes.len() as u64, opened.bytes);
+    let key = Key::parse(format!("default/catalog/snapshots/{generation}/root.db")).unwrap();
+    let mut original = Vec::new();
+    storage
+        .get(&key)
+        .await
+        .unwrap()
+        .reader
+        .read_to_end(&mut original)
+        .await
+        .unwrap();
+    assert_eq!(bytes, original);
+
+    second
+        .client
+        .close_database_session(handle.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        second
+            .client
+            .query_database(query.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+
+    let next = second
+        .client
+        .open_database_session(target)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(
+        next.snapshot_generation.as_deref(),
+        Some(generation.to_string().as_str())
+    );
+    let expired = next.session.unwrap();
+    let unit = sanctum_db::Unit::catalog(None, &scope("notes").tenant).unwrap();
+    let record_key = unit
+        .snapshot_session(expired.generation.parse().unwrap())
+        .unwrap();
+    let mut record = storage.get(&record_key).await.unwrap();
+    let mut bytes = Vec::new();
+    record.reader.read_to_end(&mut bytes).await.unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value["expires_at"] = serde_json::to_value(SystemTime::now() - Duration::from_secs(1)).unwrap();
+    storage
+        .put_control(
+            &record_key,
+            serde_json::to_vec(&value).unwrap().into(),
+            Condition::Match(record.object.version),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second
+            .client
+            .query_database(v1::QueryDatabaseRequest {
+                session: Some(expired),
+                ..query
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(directory.path().join(record_key.as_str()))
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(901))
+        .unwrap();
+    writer.sweep_hosted_snapshots().await.unwrap();
+    assert!(matches!(
+        storage.head(&record_key).await,
+        Err(Error::NotFound(_))
+    ));
+    second.stop().await;
+}
+
+#[tokio::test]
 async fn snapshot_sweep_resumes_units_and_protects_published_generations() {
     use std::time::{Duration, SystemTime};
 

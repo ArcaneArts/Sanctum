@@ -317,3 +317,14 @@ these fields when evaluating metadata predicates. Source and chunk
 metadata reset on replacement. Collection metadata remains attached
 to the collection.
 [Metadata and changes](LOCAL_API.md#metadata-and-changes).
+
+### Hosted database inspection
+
+`OpenDatabaseSession` pins the current catalog or collection generation for
+five minutes. An object-backed handle can be used by any API instance with
+access to the same deployment prefix. It refers to the existing published
+SQLite file. API processes verify the file against its recorded size and
+BLAKE3 digest and reuse it within the configured snapshot cache budget.
+The regular snapshot sweep removes expired session records after the
+reader grace period. Close a session early to release its handle.
+[Operator SQL and export](LOCAL_API.md#read-only-sql-sessions-and-snapshots).

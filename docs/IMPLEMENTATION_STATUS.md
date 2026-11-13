@@ -669,4 +669,22 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   metadata reset in order. It also checks cursor and tenant scope.
 - A generated Python gRPC client used two MinIO-backed API processes
   to observe publication and resume replacement and reset events.
-- Hosted operator SQL and snapshot export remain open.
+- Delivered in [PR #42](https://github.com/ArcaneArts/Sanctum/pull/42).
+
+## Hosted database inspection
+
+- Scoped operator handles store the immutable publication identity
+  in object storage. Any API instance can query or download the
+  pinned SQLite generation with the same read-only SQL limits as the
+  local API. Hosted sessions reuse verified snapshots from the cache.
+- The snapshot sweep removes expired handle records. The handle
+  lasts five minutes, within the fifteen-minute reader grace for
+  retired generations.
+- The gRPC integration test covers restart, exact exported bytes,
+  scope and SQL restrictions, close, expiry, and eventual removal.
+- A generated Python client queried and exported the pinned catalog
+  from MinIO after the opening process exited. It compared the export
+  byte for byte with the object and queried the collection schema.
+- The live check found that SQLite's columnless read for `count(*)`
+  omits the schema. The SQL authorizer now handles that case while
+  retaining the same write and attachment restrictions.

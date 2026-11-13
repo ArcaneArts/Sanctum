@@ -36,11 +36,22 @@ impl SnapshotCache {
         let Some(generation) = publication.generation(unit).await? else {
             return Ok(None);
         };
+        self.read_generation(publication, unit, generation)
+            .await
+            .map(Some)
+    }
+
+    pub async fn read_generation(
+        &self,
+        publication: &Publication,
+        unit: &Unit,
+        generation: Generation,
+    ) -> Result<Arc<Materialized>> {
         if self.max_bytes == 0 || generation.bytes > self.max_bytes {
             let file = publication
                 .materialize(unit, generation, &std::env::temp_dir())
                 .await?;
-            return Ok(Some(Arc::new(file)));
+            return Ok(Arc::new(file));
         }
         let slot = self.slot(unit, &generation).await;
         let ready = slot.initialized();
@@ -58,7 +69,7 @@ impl SnapshotCache {
             cached = ready,
             "resolved hosted snapshot"
         );
-        Ok(Some(file.clone()))
+        Ok(file.clone())
     }
 
     async fn slot(&self, unit: &Unit, generation: &Generation) -> Arc<OnceCell<Arc<Materialized>>> {
@@ -75,8 +86,6 @@ impl SnapshotCache {
             return slot;
         }
 
-        // Old readers keep their own reference after a new generation is observed.
-        entries.retain(|entry| entry.unit != unit.prefix);
         let mut occupied: u64 = entries.iter().map(|entry| entry.generation.bytes).sum();
         while occupied > self.max_bytes - generation.bytes || entries.len() >= MAX_CACHED_SNAPSHOTS
         {

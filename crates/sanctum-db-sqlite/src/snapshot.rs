@@ -97,6 +97,10 @@ fn open_readonly(path: &Path) -> Result<Connection> {
     Ok(connection)
 }
 
+pub fn describe_file(path: &Path) -> Result<Description> {
+    describe(&open_readonly(path)?)
+}
+
 fn describe(connection: &Connection) -> Result<Description> {
     Ok(Description {
         schema_version: schema_version(connection)?,
@@ -235,7 +239,11 @@ fn value_bytes(value: &Value) -> usize {
 fn authorize(context: AuthContext<'_>) -> Authorization {
     let allowed = match context.action {
         AuthAction::Select | AuthAction::Recursive => true,
-        AuthAction::Read { .. } => context.database_name == Some("main"),
+        AuthAction::Read { column_name, .. } => {
+            context.database_name == Some("main")
+                // SQLite omits the schema for columnless reads such as count(*).
+                || (context.database_name.is_none() && column_name.is_empty())
+        }
         AuthAction::Function { function_name } => matches!(
             function_name.to_ascii_lowercase().as_str(),
             "abs"
