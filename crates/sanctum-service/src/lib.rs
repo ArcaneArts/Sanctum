@@ -3,6 +3,10 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+pub use db::metadata::{
+    Change, Edit as MetadataEdit, Entry as MetadataEntry, Mutation as MetadataMutation,
+    RevisionTarget,
+};
 use sanctum_core::{Error, ExternalSource, Result, Scope, ScopeId};
 use sanctum_db_sqlite::{self as db, CollectionDb};
 pub use sanctum_db_sqlite::{Chunk, ChunkRef, Revision, RevisionContent};
@@ -54,6 +58,33 @@ pub struct Hit {
 }
 
 impl Service {
+    pub fn metadata(
+        &self,
+        scope: &Scope,
+        target: Option<RevisionTarget>,
+        edits: Option<&[MetadataMutation]>,
+    ) -> Result<Vec<MetadataEntry>> {
+        match target {
+            Some(target) => self.database(scope)?.metadata(target, edits),
+            None => {
+                self.require_collection(scope)?;
+                db::metadata::catalog_metadata(
+                    &self.files.catalog_path(&scope.tenant),
+                    scope.collection.as_str(),
+                    edits,
+                )
+            }
+        }
+    }
+
+    pub fn changes(&self, scope: &Scope, after: u64, limit: u32) -> Result<Vec<Change>> {
+        if !(1..=200).contains(&limit) {
+            return Err(Error::Invalid(
+                "change page limit must be between 1 and 200".into(),
+            ));
+        }
+        self.database(scope)?.changes(after, limit)
+    }
     pub fn open(root: &Path, max_source_bytes: u64) -> Result<Self> {
         if !(1..=i64::MAX as u64).contains(&max_source_bytes) {
             return Err(Error::Invalid(

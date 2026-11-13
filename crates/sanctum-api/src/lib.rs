@@ -13,13 +13,76 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 pub fn grpc(service: Service) -> SanctumServer<Grpc> {
-    SanctumServer::new(Grpc(service)).max_decoding_message_size(UPLOAD_FRAME_BYTES + 8192)
+    // Metadata batches can contain 32 values of up to 64 KiB each.
+    SanctumServer::new(Grpc(service)).max_decoding_message_size(3 * 1024 * 1024)
 }
 
 pub struct Grpc(Service);
 
 #[tonic::async_trait]
 impl Sanctum for Grpc {
+    async fn get_metadata(
+        &self,
+        request: Request<v1::MetadataTarget>,
+    ) -> Reply<v1::MetadataResponse> {
+        let (scope, target) = metadata_target(request.into_inner())?;
+        let service = self.0.clone();
+        work(move || service.metadata(&scope, target, None))
+            .await
+            .map(metadata_response)
+            .map(Response::new)
+    }
+
+    async fn mutate_metadata(
+        &self,
+        request: Request<v1::MutateMetadataRequest>,
+    ) -> Reply<v1::MetadataResponse> {
+        let request = request.into_inner();
+        let (scope, target) = metadata_target(
+            request
+                .target
+                .ok_or_else(|| Status::invalid_argument("metadata target is required"))?,
+        )?;
+        let edits = metadata_edits(request.edits)?;
+        let service = self.0.clone();
+        work(move || service.metadata(&scope, target, Some(&edits)))
+            .await
+            .map(metadata_response)
+            .map(Response::new)
+    }
+
+    async fn list_changes(
+        &self,
+        request: Request<v1::ListChangesRequest>,
+    ) -> Reply<v1::ListChangesResponse> {
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        let service = self.0.clone();
+        work(move || {
+            let changes =
+                service.changes(&scope, request.after_cursor, request.limit.unwrap_or(100))?;
+            let next_cursor = changes
+                .last()
+                .map_or(request.after_cursor, |change| change.cursor);
+            Ok(v1::ListChangesResponse {
+                next_cursor,
+                changes: changes
+                    .into_iter()
+                    .map(|change| v1::SourceChange {
+                        cursor: change.cursor,
+                        kind: change.kind,
+                        source_id: change.source,
+                        revision_id: change.revision,
+                        previous_revision_id: change.previous_revision,
+                        chunk_ordinal: change.ordinal,
+                    })
+                    .collect(),
+            })
+        })
+        .await
+        .map(Response::new)
+    }
+
     type ImportLocalStream = ReceiverStream<std::result::Result<v1::ImportLocalEvent, Status>>;
 
     async fn import_local(
@@ -508,4 +571,77 @@ fn parse_optional_id(
     value
         .map(|id| id.parse().map_err(|_| Status::invalid_argument(error)))
         .transpose()
+}
+
+#[allow(clippy::result_large_err)]
+fn metadata_target(
+    target: v1::MetadataTarget,
+) -> std::result::Result<(Scope, Option<sanctum_service::RevisionTarget>), Status> {
+    let scope = parse_scope(target.scope)?;
+    let source = parse_optional_id(target.source_id, "invalid source ID")?;
+    let revision = parse_optional_id(target.revision_id, "invalid revision ID")?;
+    match (source, revision, target.chunk_ordinal) {
+        (None, None, None) => Ok((scope, None)),
+        (Some(source), Some(revision), ordinal) => Ok((
+            scope,
+            Some(sanctum_service::RevisionTarget {
+                source,
+                revision,
+                ordinal,
+            }),
+        )),
+        _ => Err(Status::invalid_argument(
+            "source metadata needs both source and revision IDs",
+        )),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn metadata_edits(
+    edits: Vec<v1::MetadataMutation>,
+) -> std::result::Result<Vec<sanctum_service::MetadataMutation>, Status> {
+    if !(1..=32).contains(&edits.len()) {
+        return Err(Status::invalid_argument(
+            "metadata batch must contain 1 to 32 mutations",
+        ));
+    }
+    let mut result = Vec::with_capacity(edits.len());
+    use sanctum_service::MetadataEdit;
+    use v1::metadata_mutation::Edit;
+    for edit in edits {
+        let parsed = match edit.edit {
+            Some(Edit::SetJson(json)) => MetadataEdit::Set(parse_metadata_json(&json)?),
+            Some(Edit::MergePatchJson(json)) => MetadataEdit::Patch(parse_metadata_json(&json)?),
+            Some(Edit::Remove(_)) => MetadataEdit::Remove,
+            None => return Err(Status::invalid_argument("metadata edit is required")),
+        };
+        result.push(sanctum_service::MetadataMutation {
+            namespace: edit.namespace,
+            key: edit.key,
+            edit: parsed,
+        });
+    }
+    Ok(result)
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_metadata_json(json: &str) -> std::result::Result<serde_json::Value, Status> {
+    if json.len() > 64 * 1024 {
+        return Err(Status::invalid_argument("metadata value exceeds 64 KiB"));
+    }
+    serde_json::from_str(json)
+        .map_err(|error| Status::invalid_argument(format!("invalid metadata JSON: {error}")))
+}
+
+fn metadata_response(entries: Vec<sanctum_service::MetadataEntry>) -> v1::MetadataResponse {
+    v1::MetadataResponse {
+        entries: entries
+            .into_iter()
+            .map(|entry| v1::MetadataEntry {
+                namespace: entry.namespace,
+                key: entry.key,
+                value_json: entry.json,
+            })
+            .collect(),
+    }
 }

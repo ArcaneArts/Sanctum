@@ -126,3 +126,28 @@ Missing files are reported and kept in search by default. Pass
 `--prune-missing` on a directory import to delete missing sources selected
 by the current filters and supersede their pending imports. A scan with
 file or traversal errors skips missing-file reconciliation.
+
+## Metadata and changes
+
+`GetMetadata` and `MutateMetadata` accept a scope and an optional source
+target. A source target requires the current revision ID. Supply a chunk
+ordinal to target that chunk, including ordinal zero. With scope alone, the
+request targets collection metadata.
+
+Each value has a namespace and key, with a UTF-8 JSON value. A mutation
+batch applies in order and commits atomically. Set replaces the value,
+merge patch recursively merges objects and removes properties whose patch
+value is null, and remove deletes the entire entry. Set can store JSON
+null as a value. Batches allow up to 32 edits and values up to 64 KiB.
+Each target allows up to 64 entries and 512 KiB of serialized values.
+
+Source and chunk metadata starts empty on replacement. Collection metadata
+persists across source changes. Requests for a superseded revision receive
+`FAILED_PRECONDITION`.
+
+Poll `ListChanges` with the last processed cursor for that collection. It
+returns source creation, replacement, deletion, and source or chunk metadata
+changes. Replacement records a `source_replaced` event followed by a
+`metadata_reset` event in the same commit. The change log keeps the most
+recent 10,000 events. An expired cursor returns `FAILED_PRECONDITION` and
+requires a rescan.

@@ -1099,6 +1099,7 @@ dependencies = [
  "sanctum-core",
  "sanctum-proto",
  "sanctum-service",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -1149,6 +1150,7 @@ version = "0.1.0"
 dependencies = [
  "rusqlite",
  "sanctum-core",
+ "serde_json",
  "uuid",
 ]
 
