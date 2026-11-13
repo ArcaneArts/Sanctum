@@ -791,7 +791,13 @@ impl Sanctum for Grpc {
         &self,
         request: Request<v1::IngestionJobRequest>,
     ) -> Reply<v1::IngestionJob> {
-        job_action(self.local()?, request.into_inner(), Service::retry_job).await
+        let request = request.into_inner();
+        if let Backend::Hosted(catalog) = &self.0 {
+            let (scope, id) = job_target(request)?;
+            let job = catalog.retry_upload(&scope, id).await.map_err(status)?;
+            return Ok(Response::new(wire_hosted_job(&scope, job)));
+        }
+        job_action(self.local()?, request, Service::retry_job).await
     }
 
     async fn get_local_queue(&self, _request: Request<v1::Empty>) -> Reply<v1::LocalQueueStatus> {

@@ -1960,6 +1960,121 @@ impl sanctum_embedding::Provider for HostedEmbeddingFixture {
 }
 
 #[tokio::test]
+async fn hosted_manual_retry_restores_a_dispatch_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        interrupt: AtomicU8::new(0),
+    });
+    let dispatch = Arc::new(RetryDispatch::default());
+    let catalog = || {
+        HostedCatalog::new(storage.clone(), None, 1024)
+            .unwrap()
+            .with_dispatch(dispatch.clone())
+    };
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let wire_scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    let service = catalog();
+    service.create_collection(&scope, None).await.unwrap();
+    let mut server = start(service.clone()).await;
+    let operation = uuid::Uuid::from_u128(123);
+    let header = v1::UploadTextHeader {
+        scope: Some(wire_scope.clone()),
+        name: "retry.txt".into(),
+        request_id: Some(operation.to_string()),
+        ..Default::default()
+    };
+    let accepted = server
+        .client
+        .submit_text(upload_frames(&header, [b"quartz".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let request = v1::IngestionJobRequest {
+        scope: Some(wire_scope),
+        operation_id: operation.to_string(),
+    };
+    assert_eq!(
+        &*dispatch.delivered.lock().unwrap(),
+        &[(TaskStage::Register, 0)]
+    );
+
+    storage.interrupt.store(2, Ordering::Relaxed);
+    assert_eq!(
+        server
+            .client
+            .retry_ingestion_job(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable
+    );
+    server.stop().await;
+    let restarted = catalog();
+    let report = restarted.reconcile_shard(0).await.unwrap();
+    assert_eq!((report.dispatched, report.failed), (1, 0));
+    assert_eq!(
+        &*dispatch.delivered.lock().unwrap(),
+        &[(TaskStage::Register, 0), (TaskStage::Register, 1)]
+    );
+    let mut server = start(restarted.clone()).await;
+    restarted.register_upload(&scope, operation).await.unwrap();
+    restarted.try_dispatch(&scope, operation).await;
+    let retried = server
+        .client
+        .retry_ingestion_job(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retried.state(), v1::IngestionState::Registered);
+    assert_eq!(retried.operation_id, accepted.operation_id);
+    assert_eq!(retried.source_id, accepted.source_id);
+    assert_eq!(retried.revision_id, accepted.revision_id);
+    assert_eq!(
+        &*dispatch.delivered.lock().unwrap(),
+        &[
+            (TaskStage::Register, 0),
+            (TaskStage::Register, 1),
+            (TaskStage::Index, 1),
+            (TaskStage::Index, 2),
+        ]
+    );
+    restarted.index_upload(&scope, operation).await.unwrap();
+    assert_eq!(
+        server
+            .client
+            .retry_ingestion_job(request)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    server.stop().await;
+}
+
+#[derive(Default)]
+struct RetryDispatch {
+    delivered: std::sync::Mutex<Vec<(TaskStage, u32)>>,
+}
+
+#[async_trait::async_trait]
+impl sanctum_service::Dispatch for RetryDispatch {
+    async fn send(&self, task: sanctum_service::Task<'_>) -> StorageResult<()> {
+        self.delivered
+            .lock()
+            .unwrap()
+            .push((task.stage, task.retry));
+        Ok(())
+    }
+}
+
+#[tokio::test]
 async fn dispatch_reconciliation_recovers_a_failed_handoff_and_advances_its_cursor() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());

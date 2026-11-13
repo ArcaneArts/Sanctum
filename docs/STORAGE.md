@@ -382,6 +382,21 @@ repeating the request or delivering the next worker task recovers the
 receipt and finishes cancellation. Late tasks cannot publish canceled
 input. Cancellation uses the same 30-day window as indexing.
 
+### Hosted upload retry
+
+`RetryIngestionJob` and `sanctum-cli retry COLLECTION OPERATION` request
+another delivery of pending registration, indexing, or embedding within
+the upload's 30-day window. They preserve the operation and revision IDs.
+Each retry has a distinct Cloud Tasks name, even within the current
+six-hour dispatch window. The worker keeps the same input and publication
+receipt, so an earlier delivery is safe to replay. Existing embedding
+backoff still applies.
+
+The retry counter and dispatch hint survive restarts. The dispatch repair
+scan can recover an interrupted or unavailable Cloud Tasks handoff. Without
+Cloud Tasks configured, deliver the pending stage to the private worker.
+Terminal operations require a new submission to try again.
+
 ### Hosted operation retention
 
 The upload sweep compacts terminal envelopes after 45 days without an

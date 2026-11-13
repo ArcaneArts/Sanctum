@@ -118,7 +118,7 @@ impl CloudTasks {
         };
         let mut worker = self.worker.clone();
         worker.set_path(&format!("/internal/tasks/{stage}"));
-        let identity = format!(
+        let mut identity = format!(
             "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             self.worker,
             task.scope.tenant,
@@ -128,6 +128,10 @@ impl CloudTasks {
             step.unwrap_or(0),
             task.window,
         );
+        if task.retry != 0 {
+            use std::fmt::Write;
+            write!(identity, "\n{}", task.retry).expect("writing to a string cannot fail");
+        }
         let id = blake3::hash(identity.as_bytes());
         let mut body = json!({
             "tenant": task.scope.tenant.as_str(),
@@ -245,6 +249,7 @@ mod tests {
             operation,
             stage,
             window,
+            retry: 0,
             not_before: None,
         };
         dispatcher
@@ -281,8 +286,19 @@ mod tests {
         assert_eq!(body["step"], 2);
         assert_eq!(body["operation_id"], operation.to_string());
 
+        let retry = dispatcher
+            .payload(Task {
+                retry: 1,
+                ..task(TaskStage::Register, 1)
+            })
+            .unwrap();
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 4);
+        assert_ne!(calls[0]["task"]["name"], retry["task"]["name"]);
+        assert_eq!(
+            calls[0]["task"]["httpRequest"],
+            retry["task"]["httpRequest"]
+        );
         assert_eq!(calls[0], calls[1]);
         assert_ne!(calls[0]["task"]["name"], calls[2]["task"]["name"]);
         assert_ne!(calls[0]["task"]["name"], calls[3]["task"]["name"]);
