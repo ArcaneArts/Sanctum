@@ -142,9 +142,9 @@ impl CollectionDb {
             .map_err(database_error)
     }
 
-    pub fn changes(&mut self, after: u64, limit: u32) -> Result<Vec<Change>> {
+    pub fn changes(&self, after: u64, limit: u32) -> Result<Vec<Change>> {
         let after = sql_integer(after)?;
-        let snapshot = self.0.transaction().map_err(database_error)?;
+        let snapshot = self.0.unchecked_transaction().map_err(database_error)?;
         let (oldest, newest): (Option<i64>, i64) = snapshot
             .query_row(
                 "SELECT (SELECT min(cursor) FROM source_changes),

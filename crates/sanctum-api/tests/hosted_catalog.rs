@@ -1467,6 +1467,152 @@ impl sanctum_service::Dispatch for TestDispatch {
 }
 
 #[tokio::test]
+async fn hosted_change_stream_resumes_committed_events_across_instances() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let writer = catalog();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    writer.create_collection(&scope, None).await.unwrap();
+    writer
+        .create_collection(
+            &sanctum_core::Scope {
+                tenant: "other".parse().unwrap(),
+                collection: scope.collection.clone(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let wire_scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    let cursor_request = v1::ChangeCursorRequest {
+        scope: Some(wire_scope.clone()),
+    };
+    let mut api = start(catalog()).await;
+    assert_eq!(
+        api.client
+            .get_change_cursor(cursor_request.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .cursor,
+        0
+    );
+
+    let mut page = v1::ListChangesRequest {
+        scope: Some(wire_scope.clone()),
+        after_cursor: 0,
+        limit: Some(1),
+    };
+    let mut stream = api
+        .client
+        .watch_changes(page.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(stream.message().await.unwrap().unwrap().changes.is_empty());
+
+    let header = v1::UploadTextHeader {
+        scope: Some(wire_scope.clone()),
+        name: "notes.txt".into(),
+        ..Default::default()
+    };
+    let accepted = api
+        .client
+        .submit_text(upload_frames(&header, [b"first note".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let operation = accepted.operation_id.parse().unwrap();
+    writer.register_upload(&scope, operation).await.unwrap();
+    let pending = api
+        .client
+        .list_changes(page.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(pending.changes.is_empty());
+    writer.index_upload(&scope, operation).await.unwrap();
+    let created = tokio::time::timeout(std::time::Duration::from_secs(8), stream.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(created.changes[0].kind, "source_created");
+    page.after_cursor = created.next_cursor;
+    drop(stream);
+    api.stop().await;
+
+    let mut api = start(catalog()).await;
+    let replacement = v1::UploadTextHeader {
+        replacement: Some(v1::Replacement {
+            source_id: Some(accepted.source_id.clone()),
+            expected_revision_id: Some(accepted.revision_id.clone()),
+        }),
+        ..header
+    };
+    let accepted = api
+        .client
+        .submit_text(upload_frames(&replacement, [b"new note".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let operation = accepted.operation_id.parse().unwrap();
+    writer.register_upload(&scope, operation).await.unwrap();
+    writer.index_upload(&scope, operation).await.unwrap();
+    let mut resumed = api
+        .client
+        .watch_changes(page.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let replaced = resumed.message().await.unwrap().unwrap();
+    let reset = resumed.message().await.unwrap().unwrap();
+    assert_eq!(replaced.changes[0].kind, "source_replaced");
+    assert_eq!(reset.changes[0].kind, "metadata_reset");
+    assert_eq!(reset.changes[0].revision_id, accepted.revision_id);
+    assert_eq!(reset.next_cursor, replaced.next_cursor + 1);
+    assert_eq!(
+        api.client
+            .get_change_cursor(cursor_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .cursor,
+        reset.next_cursor
+    );
+    let other = v1::ListChangesRequest {
+        scope: Some(v1::Scope {
+            tenant: "other".into(),
+            ..wire_scope
+        }),
+        ..page.clone()
+    };
+    assert_eq!(
+        api.client.list_changes(other).await.unwrap_err().code(),
+        Code::InvalidArgument
+    );
+    page.after_cursor = reset.next_cursor;
+    assert!(
+        api.client
+            .list_changes(page)
+            .await
+            .unwrap()
+            .into_inner()
+            .changes
+            .is_empty()
+    );
+    drop(resumed);
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_metadata_is_atomic_and_filters_published_revisions() {
     use v1::{
         MetadataLevel, MetadataOperator, metadata_filter::Expression, metadata_mutation::Edit,

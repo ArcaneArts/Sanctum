@@ -656,4 +656,17 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   JSON null grouping, tenant scope, and revision reset. The MinIO MCP
   smoke verifies collection and chunk writes across API instances
   and search filtered by published catalog metadata.
-- Hosted change polling and snapshot export remain open.
+- Delivered in [PR #41](https://github.com/ArcaneArts/Sanctum/pull/41).
+
+## Hosted change cursors and streams
+
+- gRPC polls and streams the collection change log from published
+  snapshots, with the same cursor contract as the filesystem service.
+  An idle hosted stream checks for new generations every two seconds.
+- The integration test subscribes before indexing, verifies that
+  registration has no visible event, observes worker publication,
+  reconnects through a new API instance, and replays replacement and
+  metadata reset in order. It also checks cursor and tenant scope.
+- A generated Python gRPC client used two MinIO-backed API processes
+  to observe publication and resume replacement and reset events.
+- Hosted operator SQL and snapshot export remain open.

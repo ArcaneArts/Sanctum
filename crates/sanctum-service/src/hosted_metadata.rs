@@ -3,8 +3,10 @@ use sanctum_db::{Command, Unit};
 use uuid::Uuid;
 
 use crate::{
-    HostedCatalog, MetadataEntry, MetadataMutation, RevisionTarget, db::metadata,
-    metadata_filter::Level, metadata_query,
+    Change, HostedCatalog, MetadataEntry, MetadataMutation, RevisionTarget,
+    db::{CollectionDb, metadata},
+    metadata_filter::Level,
+    metadata_query,
 };
 
 impl HostedCatalog {
@@ -105,5 +107,18 @@ impl HostedCatalog {
                 "collection is required only for source or chunk metadata queries".into(),
             )),
         }
+    }
+
+    pub async fn change_cursor(&self, scope: &Scope) -> Result<u64> {
+        self.with_collection(scope, CollectionDb::change_cursor)
+            .await
+            .map(|(cursor, _)| cursor)
+    }
+
+    pub async fn changes(&self, scope: &Scope, after: u64, limit: u32) -> Result<Vec<Change>> {
+        super::validate_change_limit(limit)?;
+        self.with_collection(scope, move |database| database.changes(after, limit))
+            .await
+            .map(|(changes, _)| changes)
     }
 }

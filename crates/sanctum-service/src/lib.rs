@@ -48,6 +48,15 @@ pub use worker::{run_local_maintenance, run_local_worker};
 use db::queue::LocalQueue;
 pub use db::queue::{Job, JobState};
 
+fn validate_change_limit(limit: u32) -> Result<()> {
+    if !(1..=200).contains(&limit) {
+        return Err(Error::Invalid(
+            "change page limit must be between 1 and 200".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Service {
     files: Arc<LocalFiles>,
@@ -206,13 +215,10 @@ impl Service {
     }
 
     pub fn changes(&self, scope: &Scope, after: u64, limit: u32) -> Result<Vec<Change>> {
-        if !(1..=200).contains(&limit) {
-            return Err(Error::Invalid(
-                "change page limit must be between 1 and 200".into(),
-            ));
-        }
+        validate_change_limit(limit)?;
         self.database(scope)?.changes(after, limit)
     }
+
     pub fn open(root: &Path, max_source_bytes: u64) -> Result<Self> {
         Self::open_with_embedding(root, max_source_bytes, None)
     }
