@@ -252,7 +252,7 @@ def check_hosted(bin_dir):
             raise AssertionError("hosted MCP accepted a browser Origin")
         tools = {tool["name"] for tool in rpc.request("tools/list")["tools"]}
         assert tools == {"create_collection", "list_collections", "ingest_text", "ingestion_status",
-                         "search", "search_collections", "fetch_chunk", "fetch_context", "get_metadata", "mutate_metadata"}, tools
+                         "search", "search_collections", "scan_pending_text", "fetch_chunk", "fetch_context", "get_metadata", "mutate_metadata"}, tools
         rpc.tool("create_collection", **scope)
         rpc.tool("create_collection", tenant=scope["tenant"], collection="reference")
         first_page = rpc.tool("list_collections", tenant=scope["tenant"], limit=1)
@@ -267,6 +267,10 @@ def check_hosted(bin_dir):
         conflict = rpc.request("tools/call", {"name": "ingest_text", "arguments": args | {"text": "other"}})
         assert conflict["isError"], conflict
         job = scope | {"operation_id": request}
+        pending = rpc.tool("scan_pending_text", **job, literal="café")
+        start = text.encode().index("café".encode())
+        assert pending["matches"] == [{"start_byte": start, "end_byte": start + len("café".encode())}]
+        assert pending["stop"] == "complete" and pending["scanned_bytes"] == len(text.encode())
         for stage, state in [("register", "registered"), ("index", "text_ready")]:
             delivery = urllib.request.Request(f"http://{worker['worker']}/internal/tasks/{stage}-upload",
                                               json.dumps(job).encode(),

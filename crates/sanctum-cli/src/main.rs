@@ -158,6 +158,16 @@ enum Command {
         #[arg(value_parser = ["status", "pause", "resume"])]
         action: String,
     },
+    /// Find a case-sensitive literal in the staged text of a pending upload.
+    ScanPending {
+        collection: String,
+        operation_id: String,
+        literal: String,
+        #[arg(long)]
+        byte_limit: Option<u64>,
+        #[arg(long)]
+        hit_limit: Option<u32>,
+    },
     Search {
         collection: String,
         query: String,
@@ -652,6 +662,49 @@ async fn main() -> anyhow::Result<()> {
                     .into_inner()
             };
             println!("{}", if queue.paused { "paused" } else { "running" });
+        }
+        Command::ScanPending {
+            collection,
+            operation_id,
+            literal,
+            byte_limit,
+            hit_limit,
+        } => {
+            use v1::pending_text_scan_event::Event;
+            let mut scan = client
+                .scan_pending_text(v1::ScanPendingTextRequest {
+                    job: Some(v1::IngestionJobRequest {
+                        scope: scope(collection),
+                        operation_id,
+                    }),
+                    literal,
+                    byte_limit,
+                    hit_limit,
+                })
+                .await?
+                .into_inner();
+            while let Some(event) = scan.message().await? {
+                match event.event.context("server omitted scan event")? {
+                    Event::Source(source) => eprintln!(
+                        "{} {} ({} staged bytes)",
+                        source.operation_id, source.name, source.total_bytes
+                    ),
+                    Event::Progress(progress) => {
+                        let stop = progress.stop();
+                        for hit in progress.matches {
+                            println!("[{}..{})", hit.start_byte, hit.end_byte);
+                        }
+                        if stop != v1::PendingTextScanStop::Unspecified {
+                            eprintln!(
+                                "Scanned {} bytes, read {} bytes ({})",
+                                progress.scanned_bytes,
+                                progress.read_bytes,
+                                stop.as_str_name()
+                            );
+                        }
+                    }
+                }
+            }
         }
         Command::Search {
             collection,

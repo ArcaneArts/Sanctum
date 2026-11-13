@@ -9,7 +9,8 @@ use sanctum_proto::v1::{
 };
 use sanctum_service::{
     ChunkRef, GitRepository, Hit, HostedCatalog, HostedJob, HostedJobState, ImportEvent,
-    ImportOptions, ImportState, Job, JobState, Replacement, Service, TextUpload, WatchedFolder,
+    ImportOptions, ImportState, Job, JobState, Replacement, ScanOptions, ScanStop, Service,
+    TextUpload, WatchedFolder,
 };
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -95,6 +96,7 @@ impl Sanctum for Grpc {
             "upload",
             "source_inspection",
             "retrieval",
+            "pending_literal_scan",
             "metadata",
             "changes",
             "database_sessions",
@@ -823,6 +825,86 @@ impl Sanctum for Grpc {
         })
         .await
         .map(Response::new)
+    }
+
+    type ScanPendingTextStream =
+        ReceiverStream<std::result::Result<v1::PendingTextScanEvent, Status>>;
+
+    async fn scan_pending_text(
+        &self,
+        request: Request<v1::ScanPendingTextRequest>,
+    ) -> Reply<Self::ScanPendingTextStream> {
+        use v1::pending_text_scan_event::Event;
+        let request = request.into_inner();
+        let (scope, operation) = job_target(
+            request
+                .job
+                .ok_or_else(|| Status::invalid_argument("job is required"))?,
+        )?;
+        let options = ScanOptions::new(
+            request.literal,
+            request.byte_limit.unwrap_or(1024 * 1024),
+            request.hit_limit.unwrap_or(10),
+        )
+        .map_err(status)?;
+        let pending = match &self.0 {
+            Backend::Local(service) => {
+                let service = service.clone();
+                let scope = scope.clone();
+                work(move || service.pending_text(&scope, operation)).await?
+            }
+            Backend::Hosted(catalog) => catalog
+                .pending_text(&scope, operation)
+                .await
+                .map_err(status)?,
+        };
+        let source = Event::Source(v1::PendingTextScanSource {
+            scope: Some(wire_scope(&scope)),
+            operation_id: operation.to_string(),
+            source_id: pending.source.map(|source| source.to_string()),
+            revision_id: pending.revision.to_string(),
+            name: pending.name.clone(),
+            external: pending.external.clone().map(wire_external),
+            total_bytes: pending.total_bytes,
+        });
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let shutdown = self.1.clone();
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = sender.closed() => return,
+                result = async {
+                    if sender.send(Ok(v1::PendingTextScanEvent { event: Some(source) })).await.is_err() {
+                        return Ok(());
+                    }
+                    pending.scan(&options, |page| {
+                        let stop = match page.stop {
+                            Some(ScanStop::Complete) => v1::PendingTextScanStop::Complete,
+                            Some(ScanStop::ByteLimit) => v1::PendingTextScanStop::ByteLimit,
+                            Some(ScanStop::HitLimit) => v1::PendingTextScanStop::HitLimit,
+                            Some(ScanStop::InvalidText) => v1::PendingTextScanStop::InvalidText,
+                            Some(ScanStop::ExtractionPending) => v1::PendingTextScanStop::ExtractionPending,
+                            None => v1::PendingTextScanStop::Unspecified,
+                        };
+                        let event = Event::Progress(v1::PendingTextScanProgress {
+                            scanned_bytes: page.scanned_bytes,
+                            matches: page.hits.into_iter().map(|range| v1::PendingTextMatch {
+                                start_byte: range.start,
+                                end_byte: range.end,
+                            }).collect(),
+                            stop: stop.into(),
+                            read_bytes: page.read_bytes,
+                        });
+                        let sender = sender.clone();
+                        async move { sender.send(Ok(v1::PendingTextScanEvent { event: Some(event) })).await.is_ok() }
+                    }).await
+                } => result,
+            };
+            if let Err(error) = result {
+                let _ = sender.send(Err(status(error))).await;
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
     }
 
     async fn search_text(

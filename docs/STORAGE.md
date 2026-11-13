@@ -207,7 +207,9 @@ its index.
 requests when hosted embeddings are unavailable. `FetchChunk` reads
 the hit's exact byte range and verifies its fingerprint. Hosted
 `SearchCollections` accepts one to eight collections in a tenant and
-returns the aggregate coverage and scoped references.
+returns the aggregate coverage and scoped references. The pending literal
+scan uses bounded range reads on the staged input object and reports the
+exact scan coverage. See [the scan API](LOCAL_API.md#literal-scan-of-pending-text).
 
 ### Cloud Tasks dispatch
 

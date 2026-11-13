@@ -17,6 +17,7 @@ service Sanctum {
   rpc RetryIngestionJob(IngestionJobRequest) returns (IngestionJob);
   rpc GetLocalQueue(Empty) returns (LocalQueueStatus);
   rpc SetLocalQueue(SetLocalQueueRequest) returns (LocalQueueStatus);
+  rpc ScanPendingText(ScanPendingTextRequest) returns (stream PendingTextScanEvent);
   rpc SearchText(SearchTextRequest) returns (SearchTextResponse);
   rpc SearchCollections(SearchCollectionsRequest) returns (SearchTextResponse);
   rpc FetchChunk(FetchChunkRequest) returns (TextHit);
@@ -554,6 +555,56 @@ message TextRevision {
   UrlProvenance url = 13;
   GitProvenance git = 14;
   string chunker = 15;
+}
+
+// Bounded, case-sensitive scan of the staged UTF-8 input for one pending job.
+message ScanPendingTextRequest {
+  IngestionJobRequest job = 1;
+  string literal = 2;
+  // Defaults to 1048576. Maximum 33554432.
+  optional uint64 byte_limit = 3;
+  // Defaults to 10. Maximum 100.
+  optional uint32 hit_limit = 4;
+}
+
+message PendingTextScanSource {
+  Scope scope = 1;
+  string operation_id = 2;
+  // Empty until registration resolves a replacement by external identity.
+  optional string source_id = 3;
+  string revision_id = 4;
+  string name = 5;
+  ExternalSource external = 6;
+  uint64 total_bytes = 7;
+}
+
+message PendingTextMatch {
+  uint64 start_byte = 1;
+  uint64 end_byte = 2; // Exclusive.
+}
+
+enum PendingTextScanStop {
+  PENDING_TEXT_SCAN_STOP_UNSPECIFIED = 0; // More progress to follow.
+  PENDING_TEXT_SCAN_STOP_COMPLETE = 1;
+  PENDING_TEXT_SCAN_STOP_BYTE_LIMIT = 2;
+  PENDING_TEXT_SCAN_STOP_HIT_LIMIT = 3;
+  PENDING_TEXT_SCAN_STOP_INVALID_TEXT = 4;
+  PENDING_TEXT_SCAN_STOP_EXTRACTION_PENDING = 5;
+}
+
+message PendingTextScanProgress {
+  uint64 scanned_bytes = 1;
+  repeated PendingTextMatch matches = 2;
+  PendingTextScanStop stop = 3;
+  // Cumulative bytes actually read, including the current buffer's lookahead.
+  uint64 read_bytes = 4;
+}
+
+message PendingTextScanEvent {
+  oneof event {
+    PendingTextScanSource source = 1;
+    PendingTextScanProgress progress = 2;
+  }
 }
 
 message SearchTextRequest {
