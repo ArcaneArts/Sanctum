@@ -108,8 +108,14 @@ struct Operation {
     created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dispatched_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    dispatch_retry: u32,
     #[serde(flatten)]
     stage: Stage,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Serialize, Deserialize)]
@@ -257,6 +263,55 @@ impl HostedCatalog {
         }
     }
 
+    /// Requests another delivery of the same pending work without changing its revision.
+    pub async fn retry_upload(&self, scope: &Scope, operation: Uuid) -> Result<HostedJob> {
+        self.require_collection(scope).await?;
+        let prefix = self.operation_prefix(scope, operation)?;
+        let (mut record, version) = self.require_operation(&prefix, operation).await?;
+        if !matches!(
+            record.stage,
+            Stage::PendingRegistration
+                | Stage::PendingIndexing { .. }
+                | Stage::TextReady {
+                    embedding: Some(_),
+                    ..
+                }
+        ) {
+            return Err(Error::Conflict("operation has no retryable work".into()));
+        }
+        if unix_seconds()?.saturating_sub(record.created_at) >= REGISTRATION_WINDOW.as_secs() {
+            return Err(Error::Conflict("the upload retry window expired".into()));
+        }
+        record.dispatch_retry = record
+            .dispatch_retry
+            .checked_add(1)
+            .ok_or_else(|| Error::Conflict("operation retry counter exhausted".into()))?;
+        record.dispatched_at = None;
+        // Write the hint first so a stop after the checkpoint cannot strand the request.
+        self.record_dispatch_hint(scope, operation).await?;
+        let key = envelope_key(&prefix)?;
+        let body = serde_json::to_vec(&record).map_err(|error| Error::Internal(Box::new(error)))?;
+        match self
+            .storage
+            .put_control(&key, body.into(), Condition::Match(version))
+            .await
+        {
+            Ok(_) => {
+                self.try_dispatch(scope, operation).await;
+                Ok(record.job())
+            }
+            Err(Error::Conflict(_)) => {
+                let (current, _) = self.require_operation(&prefix, operation).await?;
+                if current.dispatch_retry >= record.dispatch_retry {
+                    Ok(current.job())
+                } else {
+                    Err(Error::Busy("ingestion stage changed during retry".into()))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) async fn dispatch_pending(&self, scope: &Scope, operation: Uuid) -> Result<bool> {
         let Some(dispatcher) = self.dispatcher.as_ref() else {
             return Ok(false);
@@ -303,6 +358,7 @@ impl HostedCatalog {
                 operation,
                 stage,
                 window,
+                retry: record.dispatch_retry,
                 not_before,
             })
             .await?;
@@ -428,6 +484,7 @@ impl HostedUpload {
             chunking: self.service.chunking,
             created_at: unix_seconds()?,
             dispatched_at: None,
+            dispatch_retry: 0,
             stage: Stage::PendingRegistration,
         };
         let condition = match self.service.read_envelope(&prefix, self.operation).await? {

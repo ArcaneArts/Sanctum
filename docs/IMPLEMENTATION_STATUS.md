@@ -896,3 +896,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   after canceling a registered upload.
 - Live MinIO verified cancellation before and after registration, duplicate
   delivery across restart, input reclamation, and refusal after commit.
+- Delivered in [PR #59](https://github.com/ArcaneArts/Sanctum/pull/59).
+
+## Hosted upload retry
+
+- Hosted gRPC and CLI can request a fresh dispatch for pending upload work
+  while retaining its operation, source, revision, and SQLite receipts.
+- The transport fixture verifies a distinct Cloud Tasks name and identical
+  payload for a manual retry. The hosted integration loses the response to
+  the durable retry checkpoint and verifies dispatch repair after restart.
+- A live MinIO and CLI check verified the retry checkpoint across restart,
+  stable upload identity, and duplicate worker delivery after retry.

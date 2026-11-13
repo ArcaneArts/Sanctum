@@ -164,6 +164,7 @@ impl HostedCatalog {
                 operation,
                 stage: TaskStage::Rebuild { step },
                 window,
+                retry: 0,
                 not_before: record.not_before,
             })
             .await?;

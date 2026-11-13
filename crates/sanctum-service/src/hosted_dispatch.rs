@@ -29,6 +29,7 @@ pub struct Task<'a> {
     pub operation: Uuid,
     pub stage: TaskStage,
     pub window: u64,
+    pub retry: u32,
     pub not_before: Option<u64>,
 }
 
