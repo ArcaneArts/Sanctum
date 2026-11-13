@@ -18,7 +18,8 @@ tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 tempfile = "3"
-tokio = { version = "1", features = ["io-util", "net", "process", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "net", "process", "signal", "sync", "time"] }
+tokio-stream = "0.1"
 tonic = "0.14"
 
 [features]

@@ -5,7 +5,7 @@ import { useEffect, useState, type ReactNode } from "react"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
-import type { EmbeddingProfile, EmbeddingSettings, Settings } from "@/contracts"
+import type { EmbeddingProfile, EmbeddingSettings, ObjectStorage, Settings } from "@/contracts"
 
 function defaultEmbedding(provider: string): EmbeddingSettings | null {
   const profile = { model: "", revision: "", dimensions: 768, document_prefix: "", query_prefix: "" }
@@ -50,9 +50,26 @@ export function SettingsPanel({ run, pending, busy }: {
 
   if (!settings) return <p className="text-sm text-muted-foreground">Loading settings…</p>
   const embedding = settings.embedding
+  const storage = settings.object_storage
   function update(change: Partial<Settings>) {
     setSettings(current => current && { ...current, ...change })
     setDirty(true)
+  }
+  function chooseStorage(backend: string) {
+    const base = { bucket: "", prefix: null }
+    switch (backend) {
+      case "s3":
+        update({ object_storage: { ...base, backend, region: "us-east-1", endpoint: null, allow_http: false, virtual_hosted_style: false } })
+        break
+      case "gcs":
+        update({ object_storage: { ...base, backend } })
+        break
+      default:
+        update({ object_storage: null })
+    }
+  }
+  function updateStorage(value: ObjectStorage) {
+    update({ object_storage: value })
   }
   function updateProfile(change: Partial<EmbeddingProfile>) {
     if (embedding) update({ embedding: { ...embedding, profile: { ...embedding.profile, ...change } } })
@@ -67,7 +84,15 @@ export function SettingsPanel({ run, pending, busy }: {
   }}>
     <Card className="space-y-4 p-5">
       <h2 className="font-semibold">Storage and server</h2>
-      <div className="flex items-end gap-2">
+      <Field label="Storage backend">
+        <select className="rounded-md border border-border bg-background px-3 py-2 text-sm" value={storage?.backend ?? "filesystem"}
+          onChange={event => chooseStorage(event.currentTarget.value)}>
+          <option value="filesystem">Local folder</option>
+          <option value="s3">S3-compatible storage</option>
+          <option value="gcs">Google Cloud Storage</option>
+        </select>
+      </Field>
+      {!storage && <div className="flex items-end gap-2">
         <div className="min-w-0 flex-1">
           <Field label="Local storage folder">
             <Input value={settings.storage_root} required onChange={event => update({ storage_root: event.currentTarget.value })} />
@@ -77,14 +102,37 @@ export function SettingsPanel({ run, pending, busy }: {
           const path = await invoke<string | null>("pick_path", { folder: true })
           if (path) update({ storage_root: path })
         })}><FolderOpen size={15} /> Browse</Button>
-      </div>
+      </div>}
+      {storage && <>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="Bucket"><Input required value={storage.bucket}
+            onChange={event => updateStorage({ ...storage, bucket: event.currentTarget.value })} /></Field>
+          <Field label="Object prefix"><Input value={storage.prefix ?? ""} placeholder="Optional"
+            onChange={event => updateStorage({ ...storage, prefix: event.currentTarget.value || null })} /></Field>
+        </div>
+        {storage.backend === "s3" ? <>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field label="Region"><Input required value={storage.region}
+              onChange={event => updateStorage({ ...storage, region: event.currentTarget.value })} /></Field>
+            <Field label="S3 endpoint"><Input type="url" value={storage.endpoint ?? ""} placeholder="Optional for AWS S3"
+              onChange={event => updateStorage({ ...storage, endpoint: event.currentTarget.value || null })} /></Field>
+          </div>
+          <div className="flex flex-wrap gap-4 text-sm">
+            <label className="flex items-center gap-2"><input type="checkbox" checked={storage.allow_http}
+              onChange={event => updateStorage({ ...storage, allow_http: event.currentTarget.checked })} /> Allow HTTP endpoint</label>
+            <label className="flex items-center gap-2"><input type="checkbox" checked={storage.virtual_hosted_style}
+              onChange={event => updateStorage({ ...storage, virtual_hosted_style: event.currentTarget.checked })} /> Virtual-hosted bucket URLs</label>
+          </div>
+          <p className="text-xs text-muted-foreground">Uses AWS credentials available to the desktop process.</p>
+        </> : <p className="text-xs text-muted-foreground">Uses Google Application Default Credentials.</p>}
+      </>}
       <div className="grid grid-cols-3 gap-3">
-        <Field label="gRPC port"><Input type="number" min={0} max={65535} required value={settings.grpc_port}
+        <Field label={storage ? "gRPC and MCP port" : "gRPC port"}><Input type="number" min={0} max={65535} required value={settings.grpc_port}
           onChange={event => update({ grpc_port: event.currentTarget.valueAsNumber })} /></Field>
-        <Field label="MCP port"><Input type="number" min={0} max={65535} required value={settings.mcp_port}
+        {!storage && <><Field label="MCP port"><Input type="number" min={0} max={65535} required value={settings.mcp_port}
           onChange={event => update({ mcp_port: event.currentTarget.valueAsNumber })} /></Field>
         <Field label="Indexing workers"><Input type="number" min={1} max={32} required value={settings.local_worker_concurrency}
-          onChange={event => update({ local_worker_concurrency: event.currentTarget.valueAsNumber })} /></Field>
+          onChange={event => update({ local_worker_concurrency: event.currentTarget.valueAsNumber })} /></Field></>}
       </div>
     </Card>
     <Card className="space-y-4 p-5">

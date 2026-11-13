@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+sanctum-core = { path = "../sanctum-core" }
+tokio.workspace = true
 prost = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }

@@ -18,7 +18,7 @@ frontend edits. [Tauri development file watching](https://v2.tauri.app/develop/)
 
 ## First use
 
-1. In **Settings**, choose a local storage folder and save the changes. Select
+1. In **Settings**, choose **Local folder**, select a folder, and save the changes. Select
    **Restart server to apply**. Sanctum defaults to a folder inside your OS
    application data directory.
 2. To enable embeddings, select **Ollama** and enter the endpoint, model tag,
@@ -49,6 +49,23 @@ Closing the window leaves the server running. Use **Open Sanctum** in the
 tray menu to show it again. **Quit Sanctum** closes the host's control pipe,
 allows the server to stop, and exits. Accepted work resumes the next time
 Sanctum opens.
+
+## Object storage
+
+In **Settings**, select **S3-compatible storage** or **Google Cloud Storage**.
+Enter a bucket and an optional prefix dedicated to this server. For S3,
+enter the region and, for an S3-compatible server, its endpoint. MinIO
+uses path-style bucket URLs by default. Enable HTTP only for an endpoint
+that uses it. Launch the app with the AWS credentials available to its
+process or with Google Application Default Credentials for GCS.
+
+Save the configuration and select **Restart server to apply**. The sidecar
+runs the standalone object worker and serves gRPC and MCP on the same port.
+The **Connect** page shows that active address. In **Activity**, use
+**Upload file** to stream a selected text or RTF file and track indexing and
+embedding. Storage refresh measures the selected collection or the configured
+object store. The filesystem backend retains directory imports and queue pause
+controls. [Standalone worker settings](STORAGE.md#hosted-server-configuration).
 
 ## Development validation
 
