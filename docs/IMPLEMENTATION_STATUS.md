@@ -7,7 +7,7 @@ which parts have working implementations and where to find the evidence.
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | End-to-end acceptance in an LLM client |
 | 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, platform packaging and verification |
-| 3. Object storage and publication | Shared object contract, filesystem and MinIO-tested S3 adapters | GCS, server integration, ownership, durable publication, and recovery |
+| 3. Object storage and publication | Shared object contract, filesystem and MinIO-tested S3 adapters, and a fenced SQLite snapshot executor | GCS, server integration, durable application operations, and deployment recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
 | 5. Capacity | Pending | Representative 200 MB sources, GB-scale collections and database snapshots, cold/warm cloud performance, measured optimization |
 
@@ -364,6 +364,8 @@ Merged in [PR #23](https://github.com/ArcaneArts/Sanctum/pull/23).
 
 ## Shared object storage and MinIO
 
+Merged in [PR #24](https://github.com/ArcaneArts/Sanctum/pull/24).
+
 - `sanctum-storage` defines streaming objects, bounded exact ranges,
   conditional control writes, paginated listing, deletion, and actual
   stored-byte measurement. The filesystem implementation shares the
@@ -375,3 +377,21 @@ Merged in [PR #23](https://github.com/ArcaneArts/Sanctum/pull/23).
 - The same contract runs against the filesystem during `pnpm check`.
   The server still uses local storage while remote publication and
   backend configuration are implemented.
+
+## Fenced object-backed database publication
+
+- `sanctum-db` stores the lease, epoch, and visible snapshot in one
+  conditional HEAD object. It validates each downloaded SQLite snapshot
+  and publishes a new backup only after storing the snapshot object.
+- Prepared command outcomes are committed alongside mutations. An
+  identical retry reads its saved outcome and reuses the generation.
+  Cleanup marks retired or abandoned snapshots and gives readers a grace
+  period before deletion.
+- The filesystem and live MinIO publication tests cover independent
+  catalog/collection scopes, takeover after expiry, stale preparation,
+  duplicate and out-of-order delivery, rollback, and retained readers.
+  A fault-injection test simulates losing the response after publication
+  and verifies receipt recovery. The filesystem test also exercises
+  deletion after grace.
+- Hosted application commands and Cloud Tasks dispatch still need to
+  use the executor.
