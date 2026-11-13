@@ -207,6 +207,8 @@ Merged in [PR #13](https://github.com/ArcaneArts/Sanctum/pull/13).
 
 ## Search across collections
 
+Merged in [PR #14](https://github.com/ArcaneArts/Sanctum/pull/14).
+
 - gRPC, CLI, and MCP can search up to eight distinct collections in a
   tenant. Each collection applies the metadata filter before ranking.
   The service embeds the query at most once and combines ranked lists
@@ -217,3 +219,13 @@ Merged in [PR #13](https://github.com/ArcaneArts/Sanctum/pull/13).
   embedding per request, stable ranking, metadata filters, and tenant
   isolation. The standalone MCP check searches multiple collections
   through the stdio bridge.
+
+## OpenAI-compatible embeddings
+
+- The server supports a configurable OpenAI-compatible embedding endpoint,
+  optional dimensions in the request, and credentials read by environment
+  variable name. Response indices map embeddings back to their inputs
+  before the common shape and normalization checks.
+- The standalone local server exercises the adapter against Ollama's
+  OpenAI-compatible endpoint. Hosted OpenAI and OpenRouter verification
+  remains open.

@@ -1851,6 +1851,7 @@ version = "0.1.0"
 dependencies = [
  "sanctum-core",
  "sanctum-embedding-ollama",
+ "sanctum-embedding-openai",
  "serde",
  "serde_json",
 ]
@@ -1884,6 +1885,17 @@ dependencies = [
 
 [[package]]
 name = "sanctum-embedding-ollama"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "reqwest 0.12.28",
+ "sanctum-embedding",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sanctum-embedding-openai"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1938,7 +1950,9 @@ dependencies = [
  "axum",
  "sanctum-api",
  "sanctum-config",
+ "sanctum-embedding",
  "sanctum-embedding-ollama",
+ "sanctum-embedding-openai",
  "sanctum-mcp",
  "sanctum-proto",
  "sanctum-service",

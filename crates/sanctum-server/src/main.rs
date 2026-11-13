@@ -10,11 +10,13 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let config = Config::from_env()?;
-    let embedding = config
+    let embedding: Option<Arc<dyn sanctum_embedding::Provider>> = config
         .embedding
         .map(|embedding| match embedding {
             EmbeddingConfig::Ollama(config) => sanctum_embedding_ollama::Ollama::new(config)
-                .map(|provider| Arc::new(provider) as Arc<_>),
+                .map(|provider| Arc::new(provider) as Arc<dyn sanctum_embedding::Provider>),
+            EmbeddingConfig::OpenAi(config) => sanctum_embedding_openai::OpenAi::new(config)
+                .map(|provider| Arc::new(provider) as Arc<dyn sanctum_embedding::Provider>),
         })
         .transpose()?;
     let service =
