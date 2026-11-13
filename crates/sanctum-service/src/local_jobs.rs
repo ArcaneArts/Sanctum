@@ -36,6 +36,10 @@ impl Service {
 
     /// Runs at most one job. The database claim is atomic across local workers.
     pub fn process_next(&self) -> Result<bool> {
+        let _reader = self
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         let Some(job) = self.queue.claim()? else {
             return Ok(false);
         };
@@ -206,6 +210,11 @@ fn revision_for(job: &Job, content: RevisionContent) -> Revision {
 
 impl StagedUpload {
     pub fn enqueue(self) -> Result<Job> {
+        let service = self.service.clone();
+        let _reader = service
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         let bytes = self.file.as_file().metadata()?.len();
         if bytes > self.service.max_source_bytes {
             return Err(Error::Invalid(
@@ -251,6 +260,12 @@ impl StagedUpload {
     }
 
     pub(crate) fn publish_job(self, mut job: Job) -> Result<Job> {
+        let service = self.service.clone();
+        let _reader = service
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
+        service.require_collection(&job.scope)?;
         job.retain_original = self.upload.retain_original;
         if job.extract_rtf {
             self.service

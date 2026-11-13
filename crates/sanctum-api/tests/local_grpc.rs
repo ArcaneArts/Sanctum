@@ -97,6 +97,98 @@ impl Running {
 }
 
 #[tokio::test]
+async fn local_collection_deletion_purges_jobs_and_recovers_from_a_tombstone() {
+    let dir = TempDir::new().unwrap();
+    let mut api = Running::start(&dir).await;
+    create(&mut api.client, "default").await;
+    create(&mut api.client, "other").await;
+    let uploaded = upload(&mut api.client, header("default"), b"indexed quartz").await;
+    let session = api
+        .client
+        .open_database_session(v1::DatabaseTarget {
+            tenant: "default".into(),
+            collection: Some("notes".into()),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .session
+        .unwrap();
+    api.service.pause_queue(true).unwrap();
+    let queued = api
+        .client
+        .submit_text(tokio_stream::iter(vec![
+            header("default"),
+            v1::UploadTextFrame {
+                frame: Some(Frame::Data(b"pending text".to_vec())),
+            },
+            v1::UploadTextFrame {
+                frame: Some(Frame::End(v1::UploadTextEnd {})),
+            },
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    let request = v1::DeleteCollectionRequest {
+        scope: scope("default"),
+        request_id: None,
+    };
+    api.client.delete_collection(request.clone()).await.unwrap();
+    api.client.delete_collection(request).await.unwrap();
+    assert!(!dir.path().join("default/notes").exists());
+    assert!(dir.path().join("other/notes/meta.db").exists());
+    assert_eq!(
+        api.client
+            .get_ingestion_job(v1::IngestionJobRequest {
+                scope: scope("default"),
+                operation_id: queued.operation_id,
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    let page = api
+        .client
+        .query_database(v1::QueryDatabaseRequest {
+            session: Some(session),
+            sql: "SELECT current_revision FROM sources".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        page.rows[0].values[0].value,
+        Some(v1::sql_value::Value::Text(uploaded.revision_id))
+    );
+    api.stop().await;
+
+    // Simulate a stop after catalog publication and before removal of the files.
+    sanctum_db_sqlite::retire_local_collection(&dir.path().join("other/root.db"), "notes").unwrap();
+    assert!(dir.path().join("other/notes/meta.db").exists());
+    let mut api = Running::start(&dir).await;
+    assert!(!dir.path().join("other/notes").exists());
+    assert!(
+        sanctum_db_sqlite::deleted_catalog_collections(&dir.path().join("other/root.db"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        api.client
+            .create_collection(v1::CreateCollectionRequest {
+                scope: scope("default"),
+                request_id: None,
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn database_sessions_pin_and_download_a_scoped_read_only_generation() {
     use std::io::Write;
     use v1::sql_value::Value;

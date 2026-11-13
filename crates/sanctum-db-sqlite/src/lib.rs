@@ -22,6 +22,7 @@ const CATALOG_MIGRATIONS: &[&str] = &[
     CATALOG_SCHEMA,
     include_str!("catalog_v2.sql"),
     include_str!("catalog_v3.sql"),
+    include_str!("catalog_v4.sql"),
 ];
 const COLLECTION_SCHEMA: &str = include_str!("collection.sql");
 const COLLECTION_MIGRATIONS: &[&str] = &[
@@ -122,6 +123,48 @@ fn collection_deleted(connection: &Connection, collection: &str) -> Result<bool>
             |row| row.get(0),
         )
         .map_err(database_error)
+}
+
+pub fn deleted_catalog_collections(path: &Path) -> Result<Vec<String>> {
+    if !path.try_exists()? {
+        return Ok(Vec::new());
+    }
+    let connection = open_read_only(path)?;
+    let version = schema_version(&connection)?;
+    if version < 3 {
+        return Ok(Vec::new());
+    }
+    let sql = if version >= 4 {
+        "SELECT id FROM deleted_collections WHERE reclaimed = 0 ORDER BY id"
+    } else {
+        "SELECT id FROM deleted_collections ORDER BY id"
+    };
+    query_all(&connection, sql, [], |row| row.get(0))
+}
+
+pub fn retire_local_collection(path: &Path, collection: &str) -> Result<()> {
+    if !path.try_exists()? {
+        return Err(Error::NotFound("tenant catalog was not found".into()));
+    }
+    let mut connection = open(path, false)?;
+    migrate(&mut connection, CATALOG_MIGRATIONS)?;
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    delete_catalog_collection(&tx, collection)?;
+    tx.commit().map_err(database_error)
+}
+
+pub fn mark_local_collection_reclaimed(path: &Path, collection: &str) -> Result<()> {
+    let mut connection = open(path, false)?;
+    migrate(&mut connection, CATALOG_MIGRATIONS)?;
+    connection
+        .execute(
+            "UPDATE deleted_collections SET reclaimed = 1 WHERE id = ?1",
+            [collection],
+        )
+        .map_err(database_error)?;
+    Ok(())
 }
 
 pub fn catalog_collection_deleted(path: &Path, collection: &str) -> Result<bool> {

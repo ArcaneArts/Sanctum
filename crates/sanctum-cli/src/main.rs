@@ -31,6 +31,11 @@ enum Command {
         #[arg(long)]
         request_id: Option<String>,
     },
+    DeleteCollection {
+        collection: String,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
     List,
     Usage {
         collection: Option<String>,
@@ -439,6 +444,17 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .await?;
             println!("{collection}");
+        }
+        Command::DeleteCollection {
+            collection,
+            request_id,
+        } => {
+            client
+                .delete_collection(v1::DeleteCollectionRequest {
+                    scope: scope(collection),
+                    request_id,
+                })
+                .await?;
         }
         Command::List => {
             let mut after = None;

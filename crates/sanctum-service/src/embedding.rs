@@ -231,6 +231,10 @@ impl Service {
         profile: &str,
         outcomes: Vec<BatchOutcome>,
     ) -> Result<()> {
+        let _reader = self
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         let mut database = self.database(scope)?;
         let writer = database.write()?;
         let mut published = false;

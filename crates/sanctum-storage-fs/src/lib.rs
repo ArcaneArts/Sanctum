@@ -72,6 +72,18 @@ impl LocalFiles {
         Ok(tenants)
     }
 
+    pub fn purge_collection(&self, scope: &Scope) -> Result<()> {
+        let path = self.collection_path(scope);
+        match fs::remove_dir_all(&path) {
+            Ok(()) => sync_dirs(
+                path.parent().expect("collection has a tenant directory"),
+                &self.root,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn clear_staging(&self, scope: &Scope) -> Result<()> {
         for entry in entries_if_present(&self.collection_path(scope).join("staging"))? {
             let entry = entry?;

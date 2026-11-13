@@ -2,15 +2,56 @@ use sanctum_core::{Error, Result, Scope};
 use sanctum_db_sqlite::RevisionKey;
 use uuid::Uuid;
 
-use crate::Service;
+use crate::{Service, db};
 
 impl Service {
+    pub fn delete_collection(&self, scope: &Scope) -> Result<()> {
+        let _exclusive = self
+            .retrieval
+            .write()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
+        db::retire_local_collection(
+            &self.files.catalog_path(&scope.tenant),
+            scope.collection.as_str(),
+        )?;
+        self.purge_collection(scope)
+    }
+
+    fn purge_collection(&self, scope: &Scope) -> Result<()> {
+        self.queue.purge_collection(scope)?;
+        self.files.purge_collection(scope)?;
+        db::mark_local_collection_reclaimed(
+            &self.files.catalog_path(&scope.tenant),
+            scope.collection.as_str(),
+        )
+    }
+
+    pub(crate) fn reclaim_deleted_collections(&self) -> Result<()> {
+        let _exclusive = self
+            .retrieval
+            .write()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
+        for tenant in self.files.tenants()? {
+            for collection in db::deleted_catalog_collections(&self.files.catalog_path(&tenant))? {
+                self.purge_collection(&Scope {
+                    tenant: tenant.clone(),
+                    collection: collection.parse()?,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn delete_source(
         &self,
         scope: &Scope,
         source: Uuid,
         expected: Option<Uuid>,
     ) -> Result<Uuid> {
+        let _reader = self
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         let mut database = self.database(scope)?;
         let writer = database.write()?;
         let deleted = writer.delete_source(source, expected)?;
@@ -19,15 +60,15 @@ impl Service {
     }
 
     pub fn reclaim_retired(&self, scope: &Scope) -> Result<()> {
+        let _exclusive = self
+            .retrieval
+            .write()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         let mut database = self.database(scope)?;
         let profile = self.embedding_profile();
         if !database.has_retirement_work(profile)? {
             return Ok(());
         }
-        let _exclusive = self
-            .retrieval
-            .write()
-            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         let writer = database.write()?;
         writer.release_retirements(profile)?;
         for candidate in writer.retirement_candidates(profile)? {

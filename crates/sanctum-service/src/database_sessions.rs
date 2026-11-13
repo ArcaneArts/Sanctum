@@ -128,6 +128,10 @@ impl Service {
         target: DatabaseTarget,
         canceled: impl Fn() -> bool,
     ) -> Result<Arc<DatabaseSession>> {
+        let _reader = self
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         let source = self.session_source(&target)?;
         let slot = self.database_sessions.reserve()?;
         fs::create_dir_all(&self.database_sessions.0.staging)?;
