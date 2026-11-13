@@ -234,3 +234,75 @@ The replacement still published two full snapshots. The final snapshot was
 bytes. This change saves repeated downloads within an instance. It leaves
 full-size writes and temporary storage for private writer copies in the
 publication path.
+
+## Retrieval relevance and embedding reuse
+
+The [retrieval benchmark](../scripts/benchmark-retrieval.py) streams the
+8,674 documents in the BEIR ArguAna release through the filesystem
+server's generated gRPC client. Each source contains its title, when
+present, followed by its argument text. The server indexes UTF-8 windows
+of up to 4,096 bytes with 400 bytes of overlap. The configured Ollama
+profile uses EmbeddingGemma 2 with 768 dimensions and the model's search
+query and untitled document prefixes. [BEIR release and archive checksum](https://github.com/beir-cellar/beir#-available-datasets),
+[ArguAna dataset](https://huggingface.co/datasets/BeIR/arguana),
+[EmbeddingGemma 2 model card](https://ai.google.dev/gemma/docs/embeddinggemma/model_card_2).
+
+The evaluator uses all 1,406 test queries and one judged counterargument
+per query. It requests up to 30 chunks per search, keeps the first hit per
+document, removes identical query and document IDs, and scores the first
+ten remaining documents. Six queries exceed the server's 4,096-byte limit
+and are trimmed at a UTF-8 and word boundary. Five judged documents are
+absent from the archive corpus and count as misses. The benchmark measures
+the Sanctum API, including excerpt retrieval and the Ollama request for
+semantic and hybrid modes. [BEIR evaluation code](https://github.com/beir-cellar/beir/blob/main/beir/retrieval/evaluation.py).
+
+Download and extract ArguAna from the BEIR table. Run an Ollama server
+with the chosen EmbeddingGemma model installed and use its digest for
+`--revision`. The benchmark uses disposable local storage. A loopback
+proxy counts requests and inputs and forwards each request to Ollama.
+
+```sh
+cargo build --release --locked -p sanctum-server
+python3 -m venv /tmp/sanctum-retrieval-venv
+. /tmp/sanctum-retrieval-venv/bin/activate
+python -m pip install grpcio-tools==1.73.0
+generated="$(mktemp -d)"
+python -m grpc_tools.protoc -I proto \
+  --python_out="$generated" --grpc_python_out="$generated" \
+  proto/sanctum/v1/sanctum.proto
+PYTHONPATH="$generated" python scripts/benchmark-retrieval.py /path/to/arguana \
+  --revision eaff2253e2ba --output /tmp/sanctum-retrieval.json
+```
+
+### Results
+
+The release filesystem server ran on the Apple M4 Max host with Ollama
+0.40.16 and the NVFP4 `embeddinggemma-2:740m` build, digest
+`eaff2253e2ba`. Eight ingestion workers published all 8,674 documents in
+419.29 s. Embeddings reached 100% coverage at 422.95 s. Ollama processed
+8,647 document inputs in 674 requests for 8,695 current chunks. The
+collection's SQLite file was 54,317,056 bytes after clean shutdown,
+including the FTS index, vectors, and metadata. This run included retry
+handling for transient SQLite contention observed in a 16-worker trial.
+
+| Search mode | Recall@10 | nDCG@10 | Queries with a result | gRPC p50 | gRPC p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Lexical | 0.00071 | 0.00071 | 63/1,406 | 125.55 ms | 235.29 ms |
+| Semantic | 0.91038 | 0.63994 | 1,406/1,406 | 193.03 ms | 305.82 ms |
+| Hybrid | 0.91038 | 0.63994 | 1,406/1,406 | 208.04 ms | 344.84 ms |
+
+Lexical search requires every query term to match in a chunk. These
+paragraph-length argument queries rarely meet that condition. Hybrid
+and semantic returned the same aggregate scores on this workload.
+The latency figures include reading excerpts and collection-wide
+embedding coverage for each response. The two vector search modes
+generated 2,812 query inputs in total. These measurements describe one
+dataset and model configuration.
+
+A separate collection held a 41,000-byte source with 11 distinct chunks.
+An eight-byte replacement inside one chunk preserved the source ID,
+published a new revision, and returned to full embedding coverage.
+Ollama received 11 document inputs on initial ingestion and one on
+replacement, avoiding ten input embeddings. Each took one batched
+request. Time from upload start to complete embeddings was 1.69 s
+initially and 1.18 s after the edit, including the polling interval.

@@ -9,7 +9,7 @@ which parts have working implementations and where to find the evidence.
 | 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, Windows package and tray verification, distribution signing |
 | 3. Object storage and publication | Shared storage contract, filesystem and MinIO-tested S3, native GCS adapter, and fenced SQLite snapshot publication for hosted catalog, source, and metadata operations | Live GCS verification and cloud recovery scenarios |
 | 4. Cloud Run and Cloud Tasks | Linux API and worker containers, durable staged uploads, dispatch and repair, scheduled maintenance, and hosted gRPC and MCP | Live IAM, Cloud Run ingress, and Tasks and Scheduler delivery |
-| 5. Capacity | [200 MiB lexical ingestion and 1–2 GiB snapshot measurements](CAPACITY.md) | Representative model recall, larger active workloads, cold/warm cloud performance, measured optimization |
+| 5. Capacity | [200 MiB lexical ingestion and 1–2 GiB snapshot measurements](CAPACITY.md) | Hosted write amplification, cold/warm cloud performance, and broader retrieval workloads |
 
 ## Local text ingestion and retrieval
 
@@ -1108,3 +1108,15 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - A release rerun with 2.34 GiB of text on MinIO reduced the measured
   eight-byte replacement time from 69.73 s to 29.56 s. It still wrote two
   full snapshots. [Method and measurements](CAPACITY.md#reusing-verified-snapshots-during-publication).
+
+## Retrieval relevance and provider work avoided
+
+- A release filesystem server indexed all 8,674 BEIR ArguAna documents
+  through the generated Python gRPC client. Ollama supplied 768-dimensional
+  EmbeddingGemma 2 vectors for every current chunk.
+- Across 1,406 judged queries, semantic and hybrid each measured 0.91038
+  Recall@10 and 0.63994 nDCG@10. The all-term lexical mode returned results
+  for 63 queries and reached 0.00071 Recall@10 on the paragraph queries.
+- An eight-byte edit changed one of 11 chunks. The live Ollama request
+  contained one input, with the other ten chunks immediately able to
+  reuse vectors from the same profile. [Method and results](CAPACITY.md#retrieval-relevance-and-embedding-reuse).
