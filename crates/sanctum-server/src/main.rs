@@ -24,7 +24,8 @@ async fn main() -> anyhow::Result<()> {
         })
         .transpose()?;
     let service =
-        Service::open_with_embedding(&config.storage_root, config.max_source_bytes, embedding)?;
+        Service::open_with_embedding(&config.storage_root, config.max_source_bytes, embedding)?
+            .with_url_origins(config.url_import_origins)?;
     let listener = tokio::net::TcpListener::bind(config.grpc_listen).await?;
     let mcp_listener = if let Some(address) = config.mcp_listen {
         anyhow::ensure!(

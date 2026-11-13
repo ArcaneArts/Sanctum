@@ -16,6 +16,7 @@ serde_json.workspace = true
 uuid = { workspace = true }
 
 [dev-dependencies]
+axum.workspace = true
 async-trait.workspace = true
 rusqlite.workspace = true
 sanctum-embedding = { path = "../sanctum-embedding" }

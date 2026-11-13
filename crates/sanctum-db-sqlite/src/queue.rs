@@ -4,10 +4,12 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
-use sanctum_core::{Error, ExternalSource, Result, Scope, ScopeId};
+use sanctum_core::{Error, ExternalSource, Result, Scope, ScopeId, UrlProvenance};
 use uuid::Uuid;
 
-use super::{Revision, database_error, migrate, open, sql_integer, unsigned_column};
+use super::{
+    Revision, database_error, migrate, open, read_url, sql_integer, unsigned_column, write_url,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JobState {
@@ -65,6 +67,7 @@ pub struct Job {
     pub source_encoding: Option<String>,
     pub extractor: Option<String>,
     pub created_at: u64,
+    pub url: Option<UrlProvenance>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,7 +77,7 @@ const COLUMNS: &str = "operation_id, tenant, collection, source_id, revision_id,
     name, external_namespace, external_id, total_bytes, processed_bytes,
     attempts, status, error_code, error_message, content_hash, chunks,
     replacement, update_sequence, import_hash, extract_rtf, retain_original, extracting,
-    canonical_bytes, original_hash, source_encoding, extractor, created_at";
+    canonical_bytes, original_hash, source_encoding, extractor, created_at, url_provenance";
 
 impl LocalQueue {
     /// The caller holds the storage owner's exclusive lock for this queue.
@@ -89,6 +92,7 @@ impl LocalQueue {
                 include_str!("runtime_v4.sql"),
                 include_str!("runtime_v5.sql"),
                 include_str!("runtime_v6.sql"),
+                include_str!("runtime_v7.sql"),
             ],
         )?;
         connection
@@ -135,8 +139,8 @@ impl LocalQueue {
             .query_row(
                 "INSERT INTO ingestion_jobs (operation_id, tenant, collection, source_id,
                 revision_id, name, external_namespace, external_id, total_bytes,
-                replacement, update_sequence, import_hash, extract_rtf, retain_original)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                replacement, update_sequence, import_hash, extract_rtf, retain_original, url_provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              RETURNING created_at",
                 params![
                     job.id.to_string(),
@@ -153,6 +157,7 @@ impl LocalQueue {
                     job.import_hash,
                     job.extract_rtf,
                     job.retain_original,
+                    write_url(job.url.as_ref())?,
                 ],
                 |row| unsigned_column(row, 0),
             )
@@ -548,6 +553,7 @@ fn map_job(row: &Row<'_>) -> rusqlite::Result<Job> {
         source_encoding: row.get(24)?,
         extractor: row.get(25)?,
         created_at: unsigned_column(row, 26)?,
+        url: read_url(row, 27)?,
     })
 }
 

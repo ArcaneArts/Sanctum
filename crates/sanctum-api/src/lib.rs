@@ -1,4 +1,6 @@
-use sanctum_core::{Error, ExternalSource, Result, Scope, UPLOAD_FRAME_BYTES, UsageScope};
+use sanctum_core::{
+    Error, ExternalSource, Result, Scope, UPLOAD_FRAME_BYTES, UrlProvenance, UsageScope,
+};
 use sanctum_proto::v1::{
     self,
     sanctum_server::{Sanctum, SanctumServer},
@@ -111,6 +113,32 @@ impl Sanctum for Grpc {
         })
         .await
         .map(Response::new)
+    }
+
+    async fn import_url(
+        &self,
+        request: Request<v1::ImportUrlRequest>,
+    ) -> Reply<v1::ImportUrlResponse> {
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        let (event, url) = self
+            .0
+            .import_url(scope, &request.url, request.retain_original)
+            .await
+            .map_err(status)?;
+        Ok(Response::new(v1::ImportUrlResponse {
+            state: wire_import_state(event.state).into(),
+            source_id: event
+                .source
+                .ok_or_else(|| Status::internal("URL import omitted its source ID"))?
+                .to_string(),
+            revision_id: event
+                .revision
+                .ok_or_else(|| Status::internal("URL import omitted its revision ID"))?
+                .to_string(),
+            operation_id: event.operation.map(|id| id.to_string()),
+            url: Some(wire_url(url)),
+        }))
     }
 
     type ImportLocalStream = ReceiverStream<std::result::Result<v1::ImportLocalEvent, Status>>;
@@ -673,6 +701,7 @@ fn text_revision(job: &Job) -> Option<v1::TextRevision> {
             .unwrap_or_else(|| "UTF-8".into()),
         extractor: job.extractor.clone(),
         retain_original: job.retain_original,
+        url: job.url.clone().map(wire_url),
     })
 }
 
@@ -707,6 +736,7 @@ fn wire_job(job: Job) -> v1::IngestionJob {
         text_revision,
         update_sequence: job.update_sequence,
         created_at_unix_seconds: job.created_at,
+        url: job.url.map(wire_url),
     }
 }
 
@@ -756,18 +786,31 @@ fn wire_search_mode(mode: sanctum_service::SearchMode) -> v1::SearchMode {
     }
 }
 
-fn wire_import(event: ImportEvent) -> v1::ImportLocalEvent {
-    let state = match event.state {
+fn wire_url(url: UrlProvenance) -> v1::UrlProvenance {
+    v1::UrlProvenance {
+        requested_url: url.requested_url,
+        final_url: url.final_url,
+        etag: url.etag,
+        last_modified: url.last_modified,
+        content_type: url.content_type,
+    }
+}
+
+fn wire_import_state(state: ImportState) -> v1::ImportState {
+    match state {
         ImportState::Queued => v1::ImportState::Queued,
         ImportState::Pending => v1::ImportState::Pending,
         ImportState::Unchanged => v1::ImportState::Unchanged,
         ImportState::Missing => v1::ImportState::Missing,
         ImportState::Deleted => v1::ImportState::Deleted,
         ImportState::Failed => v1::ImportState::Failed,
-    };
+    }
+}
+
+fn wire_import(event: ImportEvent) -> v1::ImportLocalEvent {
     v1::ImportLocalEvent {
         path: event.path,
-        state: state.into(),
+        state: wire_import_state(event.state).into(),
         source_id: event.source.map(|id| id.to_string()),
         revision_id: event.revision.map(|id| id.to_string()),
         operation_id: event.operation.map(|id| id.to_string()),

@@ -6,7 +6,7 @@ which parts have working implementations and where to find the evidence.
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | End-to-end acceptance in an LLM client |
-| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, and watched folders | Live hosted provider checks, URL and Git imports, advanced metadata queries and cursors, SQL access, platform packaging and verification |
+| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL imports | Live hosted provider checks, Git imports, advanced metadata queries and cursors, SQL access, platform packaging and verification |
 | 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
 | 5. Capacity | Pending | Representative 200 MB sources, GB-scale collections and database snapshots, cold/warm cloud performance, measured optimization |
@@ -257,6 +257,8 @@ Merged in [PR #17](https://github.com/ArcaneArts/Sanctum/pull/17).
 
 ## Watched folders
 
+Merged in [PR #18](https://github.com/ArcaneArts/Sanctum/pull/18).
+
 - Watch definitions persist in the local queue and reconcile with the
   existing directory importer after restart and at configurable intervals.
   Watches preserve source IDs on edits and support explicit removal
@@ -265,3 +267,19 @@ Merged in [PR #17](https://github.com/ArcaneArts/Sanctum/pull/17).
   and edits and removals made while the server was offline. A standalone
   CLI smoke test also detected an edit while running and verified that the
   source ID stayed the same.
+
+## URL imports
+
+- The gRPC `ImportUrl` method and CLI stream HTTP(S) responses to the existing
+  local queue. The normalized requested URL identifies a source. The queue and
+  committed revision record the final URL, ETag, and Last-Modified observed
+  during acceptance. Re-import compares response bytes to preserve source
+  identity and skip duplicate indexing.
+- The operator can restrict destinations and configure a bearer token for an
+  exact HTTPS origin. Redirects reapply the origin policy. Each import makes
+  a full GET and HTML is indexed as source text.
+- The gRPC integration tests exercise redirects, real upstream errors, size
+  limits for chunked responses, RTF extraction, provenance across restart,
+  tenant isolation, and digest-based replacement. The standalone server and
+  CLI also verified exact UTF-8 fetch, recorded ETag, unchanged re-import,
+  and a surfaced HTTP 404 against a loopback HTTP server.

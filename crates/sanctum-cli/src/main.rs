@@ -46,6 +46,13 @@ enum Command {
         #[arg(long)]
         retain_original: bool,
     },
+    /// Fetch text or RTF from an HTTP(S) URL and queue it for indexing.
+    ImportUrl {
+        collection: String,
+        url: String,
+        #[arg(long)]
+        retain_original: bool,
+    },
     /// Keep a directory synchronized with a collection.
     Watch {
         collection: String,
@@ -233,6 +240,32 @@ async fn main() -> anyhow::Result<()> {
             println!(
                 "{} bytes in {} files ({}..{} Unix ms)",
                 usage.bytes, usage.files, usage.started_at_unix_ms, usage.finished_at_unix_ms
+            );
+        }
+        Command::ImportUrl {
+            collection,
+            url,
+            retain_original,
+        } => {
+            let response = client
+                .import_url(v1::ImportUrlRequest {
+                    scope: scope(collection),
+                    url,
+                    retain_original,
+                })
+                .await?
+                .into_inner();
+            let provenance = response
+                .url
+                .as_ref()
+                .context("server omitted URL provenance")?;
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                response.state().as_str_name(),
+                response.source_id,
+                response.revision_id,
+                response.operation_id.as_deref().unwrap_or_default(),
+                provenance.final_url,
             );
         }
         Command::Import {
@@ -555,6 +588,15 @@ fn print_job(job: v1::IngestionJob) {
         job.total_bytes,
         job.attempts,
     );
+    if let Some(url) = job.url {
+        println!("Final URL: {}", url.final_url);
+        if let Some(etag) = url.etag {
+            println!("ETag: {etag}");
+        }
+        if let Some(last_modified) = url.last_modified {
+            println!("Last-Modified: {last_modified}");
+        }
+    }
     if let (Some(code), Some(message)) = (job.error_code, job.error_message) {
         println!("{code}: {message}");
     }

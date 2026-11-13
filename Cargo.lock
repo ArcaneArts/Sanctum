@@ -2155,6 +2155,7 @@ name = "sanctum-api"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "rusqlite",
  "sanctum-core",
  "sanctum-embedding",
@@ -2206,6 +2207,7 @@ dependencies = [
 name = "sanctum-core"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "thiserror",
 ]
 
@@ -2332,6 +2334,8 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "globset",
+ "mime",
+ "reqwest 0.12.28",
  "sanctum-chunk",
  "sanctum-core",
  "sanctum-db-sqlite",

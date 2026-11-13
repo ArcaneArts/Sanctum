@@ -148,6 +148,7 @@ impl Service {
             encoding: extracted.map_or_else(|| "UTF-8".into(), |input| input.1.into()),
             extractor: job.extract_rtf.then(|| RTF_EXTRACTOR.into()),
             retain_original: job.retain_original,
+            url: job.url.clone(),
         };
         let revision = revision_for(job, content);
         writer.register(&revision, job.replacement, self.embedding_profile())?;
@@ -298,6 +299,7 @@ pub(crate) fn new_job(
         source_encoding: None,
         extractor: None,
         created_at: 0,
+        url: None,
     }
 }
 
