@@ -244,6 +244,7 @@ async fn sweep_uploads(State(service): State<HostedCatalog>) -> Response {
     match service.sweep_abandoned_uploads().await {
         Ok(report) => Json(serde_json::json!({
             "deleted": report.deleted,
+            "expired": report.expired,
             "failed": report.failed,
             "more": report.more,
         }))

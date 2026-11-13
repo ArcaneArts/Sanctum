@@ -3071,6 +3071,116 @@ async fn upload_sweep_reclaims_only_unreferenced_candidates_and_resumes() {
 }
 
 #[tokio::test]
+async fn hosted_upload_retention_rejects_old_work_and_preserves_published_bytes() {
+    use std::time::{Duration, SystemTime};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(sanctum_storage_fs::FileStorage::open(dir.path()).unwrap());
+    let service = HostedCatalog::new(store.clone(), None, 1024).unwrap();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    service.create_collection(&scope, None).await.unwrap();
+    let upload = |name: &str| sanctum_service::TextUpload {
+        name: name.into(),
+        external: None,
+        replacement: None,
+        retain_original: false,
+    };
+    let age = |path: &std::path::Path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(46 * 86_400))
+            .unwrap();
+    };
+    let mut published = None;
+    for (name, data) in [
+        ("notes.txt", b"retained quartz".as_slice()),
+        ("invalid.txt", &[0xff][..]),
+    ] {
+        let staged = service
+            .stage_upload(scope.clone(), upload(name), None)
+            .await
+            .unwrap();
+        std::io::Write::write_all(&mut staged.reopen().unwrap(), data).unwrap();
+        let accepted = staged.enqueue().await.unwrap();
+        service
+            .register_upload(&scope, accepted.operation)
+            .await
+            .unwrap();
+        let result = service
+            .index_upload(&scope, accepted.operation)
+            .await
+            .unwrap();
+        let operation = dir.path().join(format!(
+            "default/collections/notes/operations/{}",
+            accepted.operation
+        ));
+        age(&operation.join("operation.json"));
+        if name == "notes.txt" {
+            for input in std::fs::read_dir(operation.join("inputs")).unwrap() {
+                age(&input.unwrap().path());
+            }
+            published = Some(result);
+        }
+    }
+    let pending = service
+        .stage_upload(scope.clone(), upload("pending.txt"), None)
+        .await
+        .unwrap()
+        .enqueue()
+        .await
+        .unwrap();
+    let report = service.sweep_abandoned_uploads().await.unwrap();
+    assert_eq!(report.expired, 2);
+    assert_eq!(service.sweep_abandoned_uploads().await.unwrap().expired, 0);
+    let published = published.unwrap();
+    assert!(matches!(
+        service.ingestion_job(&scope, published.operation).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        service.register_upload(&scope, published.operation).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        service.index_upload(&scope, published.operation).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(
+        service
+            .ingestion_job(&scope, pending.operation)
+            .await
+            .is_ok()
+    );
+    let retry = service
+        .stage_upload(
+            scope.clone(),
+            upload("notes.txt"),
+            Some(published.operation),
+        )
+        .await
+        .unwrap();
+    std::io::Write::write_all(&mut retry.reopen().unwrap(), b"retained quartz").unwrap();
+    assert!(matches!(retry.enqueue().await, Err(Error::Conflict(_))));
+    let hit = service
+        .fetch(
+            &scope,
+            sanctum_service::ChunkRef {
+                source: published.source.unwrap(),
+                revision: published.revision,
+                ordinal: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(hit.excerpt, "retained quartz");
+}
+
+#[tokio::test]
 async fn upload_sweep_fences_an_in_flight_acceptance_before_reclaiming() {
     use std::time::{Duration, SystemTime};
 

@@ -110,6 +110,7 @@ struct Operation {
 enum Envelope {
     Accepted(Box<Operation>),
     Fence(AcceptanceFence),
+    Expired(ExpiredOperation),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -117,6 +118,14 @@ enum Envelope {
 struct AcceptanceFence {
     operation: Uuid,
     fence_id: Uuid,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpiredOperation {
+    operation: Uuid,
+    expired_at: u64,
+    retained_attempt: Option<Uuid>,
 }
 
 impl HostedCatalog {
@@ -352,6 +361,7 @@ impl HostedCatalog {
         let valid = match &envelope {
             Envelope::Accepted(record) => record.format == FORMAT && record.operation == operation,
             Envelope::Fence(fence) => fence.operation == operation,
+            Envelope::Expired(record) => record.operation == operation,
         };
         if !valid {
             return Err(Error::Internal(
@@ -416,6 +426,11 @@ impl HostedUpload {
                     self.service.try_dispatch(&self.scope, self.operation).await;
                 }
                 return Ok(job);
+            }
+            Some((Envelope::Expired(_), _)) => {
+                return Err(Error::Conflict(
+                    "upload request ID has expired; use a new request ID".into(),
+                ));
             }
             Some((Envelope::Fence(_), version)) => Condition::Match(version),
             None => Condition::Create,
