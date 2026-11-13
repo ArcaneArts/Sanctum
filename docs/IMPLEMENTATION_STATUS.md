@@ -788,3 +788,15 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - A generated Python client against MinIO verified that an accepted
   upload is absent from listing until publication and inspected the
   extracted UTF-8 size and external ID afterward.
+- Delivered in [PR #50](https://github.com/ArcaneArts/Sanctum/pull/50).
+
+## Bounded citation context
+
+- gRPC and MCP can fetch context around an exact chunk reference.
+  Both backends read one bounded byte range and verify the cited
+  chunk within it. The returned context is trimmed at UTF-8 code
+  point boundaries and identifies its own canonical byte range.
+- The hosted integration test exercises split UTF-8 code points,
+  clipping at source boundaries, and rejection of oversized budgets.
+- Local stdio and hosted Streamable HTTP smokes verified that the
+  context tool returns the same cited hit and exact source text.
