@@ -12,6 +12,8 @@ use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+mod metadata_filter;
+
 pub fn grpc(service: Service) -> SanctumServer<Grpc> {
     // Metadata batches can contain 32 values of up to 64 KiB each.
     SanctumServer::new(Grpc(service)).max_decoding_message_size(3 * 1024 * 1024)
@@ -262,7 +264,16 @@ impl Sanctum for Grpc {
         let service = self.0.clone();
         work(move || {
             let hits = service
-                .search(&scope, &request.query, request.limit.unwrap_or(10))?
+                .search(
+                    &scope,
+                    &request.query,
+                    request.limit.unwrap_or(10),
+                    request
+                        .metadata_filter
+                        .map(metadata_filter::parse)
+                        .transpose()?
+                        .as_ref(),
+                )?
                 .into_iter()
                 .map(|hit| wire_hit(&scope, hit))
                 .collect();

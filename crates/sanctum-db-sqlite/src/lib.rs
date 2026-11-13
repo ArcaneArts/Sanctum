@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 mod lifecycle;
 pub mod metadata;
+pub mod metadata_filter;
 pub mod queue;
 pub use lifecycle::{RevisionKey, SourceIdentity};
 
@@ -167,18 +168,38 @@ impl CollectionDb {
         ))
     }
 
-    pub fn search(&self, phrase: &str, limit: u32) -> Result<Vec<Chunk>> {
-        query_all(
-            &self.0,
+    pub fn search(
+        &self,
+        phrase: &str,
+        limit: u32,
+        filter: Option<&metadata_filter::Filter>,
+        collection_metadata: &[metadata::Entry],
+    ) -> Result<Vec<Chunk>> {
+        let mut sql = String::from(
             "SELECT c.source_id, c.revision_id, c.ordinal, s.name, s.external_namespace,
                     s.external_id, c.start_byte, c.end_byte, c.content_hash
              FROM chunks_fts
              JOIN chunks c ON c.id = chunks_fts.rowid
              JOIN sources s ON s.id = c.source_id AND s.current_revision = c.revision_id
                 AND s.deleted = 0
-             WHERE chunks_fts MATCH ?1
-             ORDER BY chunks_fts.rank, c.id LIMIT ?2",
-            params![phrase, limit],
+             WHERE chunks_fts MATCH ?1",
+        );
+        let mut arguments = vec![phrase.to_owned().into()];
+        if let Some(filter) = filter {
+            metadata_filter::append_condition(
+                &self.0,
+                &mut sql,
+                &mut arguments,
+                filter,
+                collection_metadata,
+            )?;
+        }
+        sql.push_str(" ORDER BY chunks_fts.rank, c.id LIMIT ?");
+        arguments.push(i64::from(limit).into());
+        query_all(
+            &self.0,
+            &sql,
+            rusqlite::params_from_iter(arguments),
             row_chunk,
         )
     }

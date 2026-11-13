@@ -7,6 +7,7 @@ pub use db::metadata::{
     Change, Edit as MetadataEdit, Entry as MetadataEntry, Mutation as MetadataMutation,
     RevisionTarget,
 };
+pub use db::metadata_filter;
 use sanctum_core::{Error, ExternalSource, Result, Scope, ScopeId};
 use sanctum_db_sqlite::{self as db, CollectionDb};
 pub use sanctum_db_sqlite::{Chunk, ChunkRef, Revision, RevisionContent};
@@ -155,7 +156,13 @@ impl Service {
         })
     }
 
-    pub fn search(&self, scope: &Scope, query: &str, limit: u32) -> Result<Vec<Hit>> {
+    pub fn search(
+        &self,
+        scope: &Scope,
+        query: &str,
+        limit: u32,
+        filter: Option<&metadata_filter::Filter>,
+    ) -> Result<Vec<Hit>> {
         if query.trim().is_empty() || query.len() > 4096 || query.as_bytes().contains(&0) {
             return Err(Error::Invalid(
                 "search requires a text query of at most 4096 bytes".into(),
@@ -171,12 +178,18 @@ impl Service {
             .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" AND ");
+        let collection_metadata = match filter {
+            Some(filter) if filter.uses_collection_metadata() => {
+                self.metadata(scope, None, None)?
+            }
+            _ => Vec::new(),
+        };
         let _reader = self
             .retrieval
             .read()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         self.database(scope)?
-            .search(&expression, limit)?
+            .search(&expression, limit, filter, &collection_metadata)?
             .into_iter()
             .map(|chunk| self.hit(scope, chunk))
             .collect()

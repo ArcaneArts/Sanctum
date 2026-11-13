@@ -104,6 +104,7 @@ async fn search(
             scope: scope(tenant),
             query: query.into(),
             limit: None,
+            metadata_filter: None,
         })
         .await
         .unwrap()
@@ -1390,4 +1391,213 @@ async fn write_metadata(
         })
         .await?
         .into_inner())
+}
+
+#[tokio::test]
+async fn metadata_filters_apply_to_candidates_before_limit_and_preserve_json_types() {
+    use v1::{
+        MetadataLevel as Level, MetadataOperator as Op, metadata_filter::Expression,
+        metadata_mutation::Edit, metadata_path_segment::Segment,
+    };
+
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    create(&mut running.client, "other").await;
+    let mut alternate = header("default");
+    if let Some(Frame::Header(header)) = &mut alternate.frame {
+        header.external = None;
+    }
+    let rejected = upload(&mut running.client, alternate, b"quartz quartz quartz").await;
+    let accepted = upload(
+        &mut running.client,
+        header("default"),
+        b"quartz mixed sample",
+    )
+    .await;
+    let initial = search(&mut running.client, "default", "quartz").await;
+    assert_eq!(
+        initial[0].chunk.as_ref().unwrap().source_id,
+        rejected.source_id
+    );
+
+    let source = v1::MetadataTarget {
+        scope: scope("default"),
+        source_id: Some(accepted.source_id.clone()),
+        revision_id: Some(accepted.revision_id),
+        chunk_ordinal: None,
+    };
+    write_metadata(
+        &mut running.client,
+        source.clone(),
+        vec![metadata_edit(
+            "record",
+            Edit::SetJson(
+                r#"{"item.with\"quote":[{"size":9007199254740993,"tags":["mineral",null]}]}"#
+                    .into(),
+            ),
+        )],
+    )
+    .await
+    .unwrap();
+    write_metadata(
+        &mut running.client,
+        v1::MetadataTarget {
+            chunk_ordinal: Some(0),
+            ..source
+        },
+        vec![metadata_edit("review", Edit::SetJson("null".into()))],
+    )
+    .await
+    .unwrap();
+    write_metadata(
+        &mut running.client,
+        v1::MetadataTarget {
+            scope: scope("default"),
+            ..Default::default()
+        },
+        vec![metadata_edit(
+            "catalog",
+            Edit::SetJson(r#""reference""#.into()),
+        )],
+    )
+    .await
+    .unwrap();
+
+    let segment = |segment| v1::MetadataPathSegment {
+        segment: Some(segment),
+    };
+    let nested = |key: &str| {
+        vec![
+            segment(Segment::Property("item.with\"quote".into())),
+            segment(Segment::Index(0)),
+            segment(Segment::Property(key.into())),
+        ]
+    };
+    let filter =
+        |level: Level, key: &str, operator: Op, value: Option<&str>, path| v1::MetadataFilter {
+            expression: Some(Expression::Test(v1::MetadataPredicate {
+                level: level.into(),
+                namespace: "demo.integration".into(),
+                key: key.into(),
+                operator: operator.into(),
+                operand_json: value.map(str::to_owned),
+                path,
+            })),
+        };
+    let group = |filters| v1::MetadataFilter {
+        expression: Some(Expression::All(v1::MetadataFilterGroup { filters })),
+    };
+    let eligible = group(vec![
+        filter(
+            Level::Collection,
+            "catalog",
+            Op::Equal,
+            Some(r#""reference""#),
+            vec![],
+        ),
+        filter(
+            Level::Source,
+            "record",
+            Op::Greater,
+            Some("9007199254740992.0"),
+            nested("size"),
+        ),
+        filter(
+            Level::Source,
+            "record",
+            Op::Contains,
+            Some("null"),
+            nested("tags"),
+        ),
+        filter(Level::Chunk, "review", Op::Equal, Some("null"), vec![]),
+        v1::MetadataFilter {
+            expression: Some(Expression::Not(Box::new(filter(
+                Level::Chunk,
+                "review",
+                Op::Missing,
+                None,
+                vec![],
+            )))),
+        },
+    ]);
+    let request = v1::SearchTextRequest {
+        scope: scope("default"),
+        query: "quartz".into(),
+        limit: Some(1),
+        metadata_filter: Some(eligible),
+    };
+    let hits = running
+        .client
+        .search_text(request.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .hits;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].chunk.as_ref().unwrap().source_id,
+        accepted.source_id
+    );
+    assert!(
+        running
+            .client
+            .search_text(v1::SearchTextRequest {
+                scope: scope("other"),
+                ..request.clone()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .hits
+            .is_empty()
+    );
+
+    let missing = filter(Level::Chunk, "review", Op::Missing, None, vec![]);
+    let hits = running
+        .client
+        .search_text(v1::SearchTextRequest {
+            metadata_filter: Some(missing),
+            ..request.clone()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .hits;
+    assert_eq!(
+        hits[0].chunk.as_ref().unwrap().source_id,
+        rejected.source_id
+    );
+    let string_number = filter(
+        Level::Source,
+        "record",
+        Op::Equal,
+        Some(r#""9007199254740993""#),
+        nested("size"),
+    );
+    let matches = running
+        .client
+        .search_text(v1::SearchTextRequest {
+            metadata_filter: Some(string_number),
+            ..request.clone()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .hits;
+    assert!(matches.is_empty());
+    let malformed = filter(Level::Source, "record", Op::Less, Some("true"), vec![]);
+    assert_eq!(
+        running
+            .client
+            .search_text(v1::SearchTextRequest {
+                metadata_filter: Some(malformed),
+                ..request
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    running.stop().await;
 }
