@@ -20,13 +20,42 @@ mod database;
 mod metadata_filter;
 
 pub fn grpc(service: Service, shutdown: CancellationToken) -> SanctumServer<Grpc> {
+    let runtime = v1::RuntimeInfo {
+        storage: "filesystem".into(),
+        role: "local".into(),
+        max_source_bytes: service.max_source_bytes(),
+        url_imports: true,
+        ..Default::default()
+    };
+    grpc_with_runtime(service, shutdown, runtime)
+}
+
+pub fn grpc_with_runtime(
+    service: Service,
+    shutdown: CancellationToken,
+    runtime: v1::RuntimeInfo,
+) -> SanctumServer<Grpc> {
     // Metadata batches can contain 32 values of up to 64 KiB each.
-    SanctumServer::new(Grpc(Backend::Local(service), shutdown))
+    SanctumServer::new(Grpc(Backend::Local(service), shutdown, runtime))
         .max_decoding_message_size(3 * 1024 * 1024)
 }
 
 pub fn hosted_grpc(catalog: HostedCatalog, shutdown: CancellationToken) -> SanctumServer<Grpc> {
-    SanctumServer::new(Grpc(Backend::Hosted(catalog), shutdown))
+    let runtime = v1::RuntimeInfo {
+        storage: "object".into(),
+        role: "hosted".into(),
+        max_source_bytes: catalog.max_source_bytes(),
+        ..Default::default()
+    };
+    hosted_grpc_with_runtime(catalog, shutdown, runtime)
+}
+
+pub fn hosted_grpc_with_runtime(
+    catalog: HostedCatalog,
+    shutdown: CancellationToken,
+    runtime: v1::RuntimeInfo,
+) -> SanctumServer<Grpc> {
+    SanctumServer::new(Grpc(Backend::Hosted(catalog), shutdown, runtime))
         .max_decoding_message_size(3 * 1024 * 1024)
 }
 
@@ -36,7 +65,7 @@ enum Backend {
     Hosted(HostedCatalog),
 }
 
-pub struct Grpc(Backend, CancellationToken);
+pub struct Grpc(Backend, CancellationToken, v1::RuntimeInfo);
 
 impl Grpc {
     #[allow(clippy::result_large_err)]
@@ -52,6 +81,42 @@ impl Grpc {
 
 #[tonic::async_trait]
 impl Sanctum for Grpc {
+    async fn get_runtime_info(&self, _: Request<v1::Empty>) -> Reply<v1::RuntimeInfo> {
+        let mut info = self.2.clone();
+        info.version = env!("CARGO_PKG_VERSION").into();
+        info.status = if self.1.is_cancelled() {
+            "stopping"
+        } else {
+            "serving"
+        }
+        .into();
+        let mut capabilities = vec![
+            "catalog",
+            "upload",
+            "source_inspection",
+            "retrieval",
+            "metadata",
+            "changes",
+            "database_sessions",
+            "storage_usage",
+        ];
+        if matches!(self.0, Backend::Local(_)) {
+            capabilities.extend(["local_queue", "local_import", "watched_folders"]);
+            if info.url_imports {
+                capabilities.extend(["url_import", "git_import_https"]);
+            }
+            capabilities.push("git_import_local");
+        }
+        if info.mcp {
+            capabilities.push("mcp");
+        }
+        if info.embedding_profile_id.is_some() {
+            capabilities.push("semantic_search");
+        }
+        info.capabilities = capabilities.into_iter().map(str::to_owned).collect();
+        Ok(Response::new(info))
+    }
+
     async fn open_database_session(
         &self,
         request: Request<v1::DatabaseTarget>,

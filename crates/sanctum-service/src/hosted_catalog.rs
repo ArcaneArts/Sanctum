@@ -7,6 +7,8 @@ use uuid::Uuid;
 
 use crate::{Dispatch, db};
 
+pub const DEFAULT_SNAPSHOT_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct HostedCatalog {
     pub(crate) storage: Arc<dyn Storage>,
@@ -33,7 +35,7 @@ impl HostedCatalog {
             prefix,
             max_source_bytes,
             publication,
-            snapshots: Arc::new(SnapshotCache::new(2 * 1024 * 1024 * 1024)),
+            snapshots: Arc::new(SnapshotCache::new(DEFAULT_SNAPSHOT_CACHE_BYTES)),
             dispatcher: None,
             embedding: None,
         })

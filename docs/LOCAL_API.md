@@ -117,6 +117,21 @@ points at either outer boundary. The returned half-open range identifies
 the context. The nested hit still describes the exact cited chunk and
 its verified content hash.
 
+## Runtime information
+
+`GetRuntimeInfo` reports the serving state and version of the API process,
+its storage backend and role, and effective limits and capabilities.
+It includes the configured embedding profile ID and dimensions when
+enabled. This call describes process configuration without contacting
+external dependencies. Use actual storage and retrieval requests to
+check those dependencies. The response omits paths, endpoints, resource
+names, credentials, and environment variable names. Hosted API and
+worker listeners also expose `GET /healthz` for process health.
+
+```sh
+cargo run --locked -p sanctum-cli -- info
+```
+
 ## Source inspection
 
 `ListSources` returns the current published revision of each source in

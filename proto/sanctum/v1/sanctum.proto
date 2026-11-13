@@ -3,6 +3,7 @@ syntax = "proto3";
 package sanctum.v1;
 
 service Sanctum {
+  rpc GetRuntimeInfo(Empty) returns (RuntimeInfo);
   rpc CreateCollection(CreateCollectionRequest) returns (Collection);
   rpc DeleteCollection(DeleteCollectionRequest) returns (Empty);
   rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
@@ -42,6 +43,24 @@ service Sanctum {
 }
 
 message Empty {}
+
+// Effective settings exposed by the running process. Credentials and connection
+// details are excluded. Health describes the API process.
+message RuntimeInfo {
+  string version = 1;
+  string status = 2;
+  string storage = 3;
+  string role = 4;
+  uint64 max_source_bytes = 5;
+  optional uint32 local_worker_concurrency = 6;
+  optional uint64 snapshot_cache_bytes = 7;
+  bool mcp = 8;
+  bool cloud_task_dispatch = 9;
+  optional string embedding_profile_id = 10;
+  optional uint32 embedding_dimensions = 11;
+  repeated string capabilities = 12;
+  bool url_imports = 13;
+}
 
 message DatabaseTarget {
   string tenant = 1;

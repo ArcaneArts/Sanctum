@@ -23,6 +23,27 @@ pub(crate) async fn serve(
     } else {
         (Some(config.grpc_listen), config.hosted_worker_listen)
     };
+    let mut runtime = crate::runtime_info(&config, embedding.as_deref());
+    runtime.storage = match &storage {
+        ObjectStorageConfig::S3 { .. } => "s3",
+        ObjectStorageConfig::Gcs { .. } => "gcs",
+    }
+    .into();
+    runtime.role = if config.cloud_run_role.is_some() {
+        "cloud_run_api"
+    } else {
+        "hosted"
+    }
+    .into();
+    runtime.local_worker_concurrency = None;
+    runtime.url_imports = false;
+    runtime.snapshot_cache_bytes = Some(
+        config
+            .hosted_snapshot_cache_bytes
+            .unwrap_or(sanctum_service::DEFAULT_SNAPSHOT_CACHE_BYTES),
+    );
+    runtime.cloud_task_dispatch = config.cloud_tasks.is_some();
+    runtime.mcp = grpc_address.is_some();
     let (storage, prefix): (Arc<dyn Storage>, _) = match storage {
         ObjectStorageConfig::S3 {
             bucket,
@@ -81,9 +102,10 @@ pub(crate) async fn serve(
     let cancellation = CancellationToken::new();
     let grpc = async {
         if let Some(grpc) = grpc {
-            let grpc_routes = tonic::service::Routes::new(sanctum_api::hosted_grpc(
+            let grpc_routes = tonic::service::Routes::new(sanctum_api::hosted_grpc_with_runtime(
                 catalog.clone(),
                 cancellation.child_token(),
+                runtime,
             ));
             let direct_ip = if config.cloud_run_role.is_none() {
                 Some(grpc.local_addr()?.ip())
@@ -92,6 +114,7 @@ pub(crate) async fn serve(
             };
             let routes = grpc_routes
                 .into_axum_router()
+                .route("/healthz", axum::routing::get(health))
                 .merge(sanctum_mcp::hosted_router(
                     catalog.clone(),
                     direct_ip,
@@ -113,9 +136,13 @@ pub(crate) async fn serve(
     };
     let worker = async {
         if let Some(worker) = worker {
-            axum::serve(worker, crate::hosted_worker::router(catalog.clone()))
-                .with_graceful_shutdown(cancellation.clone().cancelled_owned())
-                .await?;
+            axum::serve(
+                worker,
+                crate::hosted_worker::router(catalog.clone())
+                    .route("/healthz", axum::routing::get(health)),
+            )
+            .with_graceful_shutdown(cancellation.clone().cancelled_owned())
+            .await?;
         } else {
             cancellation.cancelled().await;
         }
@@ -144,4 +171,8 @@ async fn bind(address: Option<SocketAddr>) -> std::io::Result<Option<tokio::net:
         Some(address) => tokio::net::TcpListener::bind(address).await.map(Some),
         None => Ok(None),
     }
+}
+
+async fn health() -> axum::http::StatusCode {
+    axum::http::StatusCode::NO_CONTENT
 }
