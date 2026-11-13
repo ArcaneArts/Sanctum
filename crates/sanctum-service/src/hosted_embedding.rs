@@ -16,10 +16,7 @@ impl HostedCatalog {
         scope: &Scope,
         source_revision: Option<(Uuid, Uuid)>,
     ) -> Result<EmbeddingStatus> {
-        let profile = self
-            .embedding
-            .as_ref()
-            .map(|provider| provider.profile_id().to_owned());
+        let profile = self.embedding_profile().map(str::to_owned);
         self.with_collection(scope, move |db| {
             db.embedding_status(profile.as_deref(), source_revision)
         })
@@ -63,7 +60,7 @@ impl HostedCatalog {
         }
         let limit = provider.max_batch_size().clamp(1, 16);
         let selected = profile.clone();
-        let (chunks, generation) = self
+        let (chunks, _) = self
             .with_collection(scope, move |db| {
                 db.pending_embeddings(&selected, limit)?
                     .into_iter()
@@ -79,9 +76,10 @@ impl HostedCatalog {
             texts: Vec::with_capacity(chunks.len()),
         };
         for (chunk, key) in chunks {
-            let hit = self.read_hit(scope, chunk, key, generation).await?;
-            batch.hashes.push(hit.chunk.hash);
-            batch.texts.push(hit.excerpt);
+            batch
+                .texts
+                .push(self.read_excerpt(scope, &chunk, key).await?);
+            batch.hashes.push(chunk.hash);
         }
         let count = batch.hashes.len();
         let outcomes = embed_batch(provider.as_ref(), batch).await;

@@ -176,6 +176,7 @@ def check(bin_dir):
                 assert result["mode"] == "lexical" and result["degraded_reason"] == "embedding_disabled"
                 hit, = result["hits"]
                 assert hit["representation"] == "canonical_utf8"
+                assert hit["embedding_state"] == "disabled"
                 entry, = hit["metadata"]
                 assert entry["level"] == "collection" and json.loads(entry["value_json"]) == {"tags": ["sample", None]}
                 assert not hit["metadata_omitted"]

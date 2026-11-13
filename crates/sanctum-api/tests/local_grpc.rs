@@ -1323,6 +1323,14 @@ async fn search_collections_ranks_scoped_matches_with_one_query_embedding() {
         .map(|hit| hit.chunk.as_ref().unwrap().source_id.as_str())
         .collect();
     assert_eq!(ids, [&a.source_id, &b.source_id]);
+    assert_eq!(
+        result.hits[0].embedding_state(),
+        v1::ChunkEmbeddingState::Ready
+    );
+    assert_eq!(
+        result.hits[1].embedding_state(),
+        v1::ChunkEmbeddingState::Failed
+    );
     request.collections.reverse();
     request.mode = v1::SearchMode::Lexical.into();
     let lexical = running
@@ -1428,10 +1436,9 @@ async fn embedding_status_reports_a_scheduled_retry() {
         status.sample_error.as_deref(),
         Some("simulated document outage")
     );
-    assert_eq!(
-        search(&mut running.client, "default", "quartz").await.len(),
-        1
-    );
+    let hits = search(&mut running.client, "default", "quartz").await;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].embedding_state(), v1::ChunkEmbeddingState::Retrying);
     running.stop().await;
 }
 

@@ -686,6 +686,15 @@ message HitMetadataEntry {
   MetadataEntry entry = 2;
 }
 
+enum ChunkEmbeddingState {
+  CHUNK_EMBEDDING_STATE_UNSPECIFIED = 0;
+  CHUNK_EMBEDDING_STATE_DISABLED = 1;
+  CHUNK_EMBEDDING_STATE_PENDING = 2;
+  CHUNK_EMBEDDING_STATE_READY = 3;
+  CHUNK_EMBEDDING_STATE_RETRYING = 4;
+  CHUNK_EMBEDDING_STATE_FAILED = 5;
+}
+
 message TextHit {
   ChunkRef chunk = 1;
   string name = 2;
@@ -700,4 +709,6 @@ message TextHit {
   string representation = 10;
   repeated HitMetadataEntry metadata = 11;
   bool metadata_omitted = 12;
+  // State of this chunk's input in the active profile's embedding cache.
+  ChunkEmbeddingState embedding_state = 13;
 }

@@ -76,7 +76,9 @@ requests have a 2 MiB JSON body limit.
 Search hits identify their canonical UTF-8 representation and include
 the metadata keys used in the filter, with their level and JSON-encoded
 value. Each hit has a 4 KiB metadata budget. Use `get_metadata` when
-`metadata_omitted` is true or you need other fields.
+`metadata_omitted` is true or you need other fields. Each hit also has
+an `embedding_state` of `disabled`, `pending`, `ready`, `retrying`, or
+`failed` for the active embedding profile.
 
 For example, search for quartz in chunks whose current source metadata
 contains the `sample` tag.

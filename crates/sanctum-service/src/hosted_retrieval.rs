@@ -12,18 +12,27 @@ use crate::embedding::{
     fuse, lexical_expression, limit_hits,
 };
 use crate::{
-    Chunk, ChunkRef, Hit, HostedCatalog, SearchMode, db, hit_metadata::metadata_for_hit,
-    metadata_filter::Filter,
+    Chunk, ChunkEmbeddingState, ChunkRef, Hit, HostedCatalog, SearchMode, db,
+    hit_metadata::metadata_for_hit, metadata_filter::Filter, verified_excerpt,
 };
 
 impl HostedCatalog {
+    pub(crate) fn embedding_profile(&self) -> Option<&str> {
+        self.embedding
+            .as_ref()
+            .map(|provider| provider.profile_id())
+    }
+
     pub async fn fetch(&self, scope: &Scope, reference: ChunkRef) -> Result<Hit> {
-        let ((chunk, key), generation) = self
+        let profile = self.embedding_profile().map(str::to_owned);
+        let ((located, state), generation) = self
             .with_collection(scope, move |database| {
-                locate(database, database.fetch(&reference)?)
+                let chunk = database.fetch(&reference)?;
+                let state = database.chunk_embedding_state(profile.as_deref(), &chunk.hash)?;
+                Ok((locate(database, chunk)?, state))
             })
             .await?;
-        self.read_hit(scope, chunk, key, generation).await
+        self.read_hit(scope, located, state, generation).await
     }
 
     pub async fn retrieve(
@@ -91,15 +100,17 @@ impl HostedCatalog {
                             filter.as_ref(),
                             &metadata,
                         )?;
-                        Ok((locate(database, chunk)?, score, fields))
+                        let state = database
+                            .chunk_embedding_state(prepared.profile.as_deref(), &chunk.hash)?;
+                        Ok((locate(database, chunk)?, score, fields, state))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok((chunks, coverage, actual_mode, degraded))
             })
             .await?;
         let mut hits = Vec::with_capacity(chunks.len());
-        for ((chunk, key), score, fields) in chunks {
-            let mut hit = self.read_hit(&scope, chunk, key, generation).await?;
+        for (located, score, fields, state) in chunks {
+            let mut hit = self.read_hit(&scope, located, state, generation).await?;
             hit.score = score;
             hit.metadata = fields;
             hits.push(hit);
@@ -153,7 +164,9 @@ impl HostedCatalog {
                                 filter.as_deref(),
                                 &metadata,
                             )?;
-                            Ok((locate(database, chunk)?, fields))
+                            let state = database
+                                .chunk_embedding_state(query.profile.as_deref(), &chunk.hash)?;
+                            Ok((locate(database, chunk)?, fields, state))
                         })
                         .collect::<Result<Vec<_>>>()?;
                     Ok((located, current))
@@ -167,14 +180,16 @@ impl HostedCatalog {
                 coverage: current,
                 ranked: ranked
                     .into_iter()
-                    .map(|((chunk, key), fields)| (chunk, (key, generation, fields)))
+                    .map(|((chunk, key), fields, state)| (chunk, (key, generation, fields, state)))
                     .collect(),
             });
         }
         let (mode, degraded) = prepared.strategy(requested, coverage)?;
         let mut hits = Vec::with_capacity(limit as usize);
-        for (scope, chunk, (key, generation, fields), score) in merge(all, limit) {
-            let mut hit = self.read_hit(&scope, chunk, key, generation).await?;
+        for (scope, chunk, (key, generation, fields, state), score) in merge(all, limit) {
+            let mut hit = self
+                .read_hit(&scope, (chunk, key), state, generation)
+                .await?;
             hit.score = Some(score);
             hit.metadata = fields;
             hits.push((scope, hit));
@@ -202,10 +217,7 @@ impl HostedCatalog {
         }
         let mut prepared = PreparedQuery {
             expression,
-            profile: self
-                .embedding
-                .as_ref()
-                .map(|provider| provider.profile_id().to_owned()),
+            profile: self.embedding_profile().map(str::to_owned),
             vector: None,
             degraded: None,
         };
@@ -282,18 +294,28 @@ impl HostedCatalog {
         .map_err(|error| Error::Internal(Box::new(error)))?
     }
 
-    pub(crate) async fn read_hit(
+    async fn read_hit(
         &self,
         scope: &Scope,
-        chunk: Chunk,
-        key: String,
+        (chunk, key): (Chunk, String),
+        state: ChunkEmbeddingState,
         generation: Uuid,
     ) -> Result<Hit> {
-        let key = self.checked_text_key(scope, key)?;
-        let bytes = self.storage.read_range(&key, chunk.range).await?;
-        let mut hit = Hit::from_bytes(chunk, &bytes)?;
+        let excerpt = self.read_excerpt(scope, &chunk, key).await?;
+        let mut hit = Hit::new(chunk, excerpt, state);
         hit.database_generation = Some(generation);
         Ok(hit)
+    }
+
+    pub(crate) async fn read_excerpt(
+        &self,
+        scope: &Scope,
+        chunk: &Chunk,
+        key: String,
+    ) -> Result<String> {
+        let key = self.checked_text_key(scope, key)?;
+        let bytes = self.storage.read_range(&key, chunk.range).await?;
+        verified_excerpt(chunk, &bytes)
     }
 
     pub(crate) fn checked_text_key(&self, scope: &Scope, key: String) -> Result<Key> {

@@ -336,6 +336,13 @@ only the scope for collection coverage, or add a source ID and its current
 revision ID for source coverage. The retrying count is a subset of the failed
 count. A missing profile ID indicates embedding is disabled.
 
+Each `TextHit` also reports the cache state of its chunk for the active
+profile. `DISABLED` means there is no configured profile. `PENDING` means
+there is no vector or recorded failure, `READY` means the vector is stored,
+`RETRYING` means a failure has a scheduled retry, and `FAILED` means the
+failure has no automatic retry. A lexical hit can be `READY` during a
+query-provider outage because the document vector is still stored.
+
 ## Local file and directory imports
 
 `ImportLocal` accepts a path on the local server's filesystem and streams

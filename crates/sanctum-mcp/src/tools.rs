@@ -647,8 +647,15 @@ fn hosted_job_value(scope: &Scope, job: HostedJob) -> Value {
 }
 
 fn hit_value(scope: &Scope, hit: Hit) -> Value {
-    use sanctum_service::metadata_filter::Level;
+    use sanctum_service::{ChunkEmbeddingState, metadata_filter::Level};
     let chunk = hit.chunk;
+    let embedding_state = match hit.embedding_state {
+        ChunkEmbeddingState::Disabled => "disabled",
+        ChunkEmbeddingState::Pending => "pending",
+        ChunkEmbeddingState::Ready => "ready",
+        ChunkEmbeddingState::Retrying => "retrying",
+        ChunkEmbeddingState::Failed => "failed",
+    };
     let metadata = hit.metadata.entries.into_iter().map(|entry| {
         let level = match entry.level {
             Level::Collection => "collection",
@@ -670,6 +677,7 @@ fn hit_value(scope: &Scope, hit: Hit) -> Value {
         "representation": "canonical_utf8",
         "metadata": metadata,
         "metadata_omitted": hit.metadata.omitted,
+        "embedding_state": embedding_state,
         "external": chunk.external.map(|source| json!({"namespace": source.namespace, "id": source.id})),
         "excerpt": hit.excerpt,
         "score": hit.score,

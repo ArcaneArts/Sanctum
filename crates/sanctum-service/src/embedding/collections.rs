@@ -4,7 +4,8 @@ use sanctum_core::{ByteRange, Error, Result, Scope, ScopeId};
 
 use super::{Coverage, PreparedQuery, SearchMode, blocking, fuse};
 use crate::{
-    Chunk, Hit, HitMetadata, Service, db, hit_metadata::metadata_for_hit, metadata_filter::Filter,
+    Chunk, ChunkEmbeddingState, Hit, HitMetadata, Service, db, hit_metadata::metadata_for_hit,
+    metadata_filter::Filter,
 };
 
 const MAX_COLLECTIONS: usize = 8;
@@ -68,8 +69,8 @@ impl Service {
         }
         let (mode, degraded) = prepared.strategy(requested, coverage)?;
         let hits = merge(all, limit)
-            .map(|(scope, chunk, metadata, score)| {
-                let mut hit = self.hit(&scope, chunk)?;
+            .map(|(scope, chunk, (metadata, state), score)| {
+                let mut hit = self.hit(&scope, chunk, state)?;
                 hit.metadata = metadata;
                 hit.score = Some(score);
                 Ok((scope, hit))
@@ -91,7 +92,7 @@ impl Service {
         limit: u32,
         filter: Option<&Filter>,
         mode: SearchMode,
-    ) -> Result<Candidates<HitMetadata>> {
+    ) -> Result<Candidates<(HitMetadata, ChunkEmbeddingState)>> {
         let metadata = match filter {
             Some(filter) if filter.uses_collection_metadata() => {
                 self.metadata(&scope, None, None)?
@@ -105,7 +106,9 @@ impl Service {
                 .into_iter()
                 .map(|chunk| {
                     let fields = metadata_for_hit(db, &chunk.reference, filter, &metadata)?;
-                    Ok((chunk, fields))
+                    let state =
+                        db.chunk_embedding_state(prepared.profile.as_deref(), &chunk.hash)?;
+                    Ok((chunk, (fields, state)))
                 })
                 .collect::<Result<Vec<_>>>()?;
             Ok(Candidates {
