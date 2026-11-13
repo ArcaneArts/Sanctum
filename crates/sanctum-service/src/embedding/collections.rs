@@ -3,7 +3,9 @@ use std::collections::{HashMap, HashSet};
 use sanctum_core::{ByteRange, Error, Result, Scope, ScopeId};
 
 use super::{Coverage, PreparedQuery, SearchMode, blocking, fuse};
-use crate::{Chunk, Hit, Service, db, metadata_filter::Filter};
+use crate::{
+    Chunk, Hit, HitMetadata, Service, db, hit_metadata::metadata_for_hit, metadata_filter::Filter,
+};
 
 const MAX_COLLECTIONS: usize = 8;
 const RANK_CONSTANT: usize = 60;
@@ -66,8 +68,9 @@ impl Service {
         }
         let (mode, degraded) = prepared.strategy(requested, coverage)?;
         let hits = merge(all, limit)
-            .map(|(scope, chunk, (), score)| {
+            .map(|(scope, chunk, metadata, score)| {
                 let mut hit = self.hit(&scope, chunk)?;
+                hit.metadata = metadata;
                 hit.score = Some(score);
                 Ok((scope, hit))
             })
@@ -88,7 +91,7 @@ impl Service {
         limit: u32,
         filter: Option<&Filter>,
         mode: SearchMode,
-    ) -> Result<Candidates<()>> {
+    ) -> Result<Candidates<HitMetadata>> {
         let metadata = match filter {
             Some(filter) if filter.uses_collection_metadata() => {
                 self.metadata(&scope, None, None)?
@@ -96,12 +99,20 @@ impl Service {
             _ => Vec::new(),
         };
         let database = self.database(&scope)?;
-        let (ranked, coverage) = database
-            .read_snapshot(|db| rank_collection(db, prepared, limit, filter, &metadata, mode))?;
-        Ok(Candidates {
-            scope,
-            coverage,
-            ranked: ranked.into_iter().map(|chunk| (chunk, ())).collect(),
+        database.read_snapshot(|db| {
+            let (ranked, coverage) = rank_collection(db, prepared, limit, filter, &metadata, mode)?;
+            let ranked = ranked
+                .into_iter()
+                .map(|chunk| {
+                    let fields = metadata_for_hit(db, &chunk.reference, filter, &metadata)?;
+                    Ok((chunk, fields))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Candidates {
+                scope,
+                coverage,
+                ranked,
+            })
         })
     }
 }

@@ -175,6 +175,10 @@ def check(bin_dir):
                 result = stdio.tool("search", collection="notes", query="quartz", metadata_filter=predicate)
                 assert result["mode"] == "lexical" and result["degraded_reason"] == "embedding_disabled"
                 hit, = result["hits"]
+                assert hit["representation"] == "canonical_utf8"
+                entry, = hit["metadata"]
+                assert entry["level"] == "collection" and json.loads(entry["value_json"]) == {"tags": ["sample", None]}
+                assert not hit["metadata_omitted"]
                 combined = stdio.tool("search_collections", collections=["reference", "notes"], query="quartz")
                 assert [hit["collection"] for hit in combined["hits"]] == ["notes"], combined
                 reference = {key: hit[key] for key in ("tenant", "collection", "source_id", "revision_id", "ordinal")}
@@ -283,7 +287,9 @@ def check_hosted(bin_dir):
                           query="quartz", metadata_filter=predicate)
         assert result["mode"] == "lexical" and result["degraded_reason"] == "embedding_disabled"
         hit, = result["hits"]
-        assert hit["database_generation"]
+        entry, = hit["metadata"]
+        assert entry["level"] == "collection" and json.loads(entry["value_json"]) == edit["value"]
+        assert hit["database_generation"] and not hit["metadata_omitted"]
         reference = {key: hit[key] for key in ("tenant", "collection", "source_id", "revision_id", "ordinal")}
         exact = rpc.tool("fetch_chunk", **reference)
         context = rpc.tool("fetch_context", **reference)

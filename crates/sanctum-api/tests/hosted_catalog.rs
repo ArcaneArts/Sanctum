@@ -2260,6 +2260,53 @@ async fn hosted_metadata_is_atomic_and_filters_published_revisions() {
             ..Default::default()
         })),
     };
+    let hit = server
+        .client
+        .search_text(v1::SearchTextRequest {
+            scope: collection.scope.clone(),
+            query: "quartz".into(),
+            metadata_filter: Some(filter.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .hits
+        .remove(0);
+    assert_eq!(hit.representation, "canonical_utf8");
+    assert_eq!(hit.metadata.len(), 1);
+    assert_eq!(hit.metadata[0].level, MetadataLevel::Collection as i32);
+    assert_eq!(hit.metadata[0].entry.as_ref().unwrap().value_json, "true");
+    assert!(!hit.metadata_omitted);
+    let large = serde_json::to_string(&"x".repeat(4096)).unwrap();
+    server
+        .client
+        .mutate_metadata(change(&source, vec![edit("large", Edit::SetJson(large))]))
+        .await
+        .unwrap();
+    let hit = server
+        .client
+        .search_text(v1::SearchTextRequest {
+            scope: collection.scope.clone(),
+            query: "quartz".into(),
+            metadata_filter: Some(v1::MetadataFilter {
+                expression: Some(Expression::Test(v1::MetadataPredicate {
+                    level: MetadataLevel::Source.into(),
+                    namespace: "integration".into(),
+                    key: "large".into(),
+                    operator: MetadataOperator::Exists.into(),
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .hits
+        .remove(0);
+    assert!(hit.metadata_omitted && hit.metadata.is_empty());
+
     let grouped = v1::QueryMetadataRequest {
         tenant: "default".into(),
         collection: Some("notes".into()),

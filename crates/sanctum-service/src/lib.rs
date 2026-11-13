@@ -10,6 +10,7 @@ pub use db::metadata::{
     RevisionTarget,
 };
 pub use db::{metadata_filter, metadata_query, snapshot as database_snapshot};
+pub use hit_metadata::{HitMetadata, HitMetadataEntry};
 use sanctum_core::{Error, ExternalSource, Result, Scope, ScopeId, UsageMeasurement, UsageScope};
 use sanctum_db_sqlite::{self as db, CollectionDb};
 pub use sanctum_db_sqlite::{Chunk, ChunkRef, Revision, RevisionContent};
@@ -21,6 +22,7 @@ mod context;
 mod database_sessions;
 mod embedding;
 mod git_import;
+mod hit_metadata;
 mod hosted_catalog;
 mod hosted_database;
 mod hosted_dispatch;
@@ -130,6 +132,7 @@ pub struct Hit {
     pub excerpt: String,
     pub score: Option<f64>,
     pub database_generation: Option<Uuid>,
+    pub metadata: HitMetadata,
 }
 
 impl Service {
@@ -361,6 +364,7 @@ impl Hit {
             excerpt,
             score: None,
             database_generation: None,
+            metadata: HitMetadata::default(),
         })
     }
 }

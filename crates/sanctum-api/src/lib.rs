@@ -1608,6 +1608,29 @@ fn wire_hit(scope: &Scope, hit: Hit) -> v1::TextHit {
         content_blake3: chunk.hash,
         score: hit.score,
         database_generation: hit.database_generation.map(|id| id.to_string()),
+        representation: "canonical_utf8".into(),
+        metadata: hit
+            .metadata
+            .entries
+            .into_iter()
+            .map(|entry| {
+                use sanctum_service::metadata_filter::Level;
+                let level = match entry.level {
+                    Level::Collection => v1::MetadataLevel::Collection,
+                    Level::Source => v1::MetadataLevel::Source,
+                    Level::Chunk => v1::MetadataLevel::Chunk,
+                };
+                v1::HitMetadataEntry {
+                    level: level.into(),
+                    entry: Some(v1::MetadataEntry {
+                        namespace: entry.namespace,
+                        key: entry.key,
+                        value_json: entry.json,
+                    }),
+                }
+            })
+            .collect(),
+        metadata_omitted: hit.metadata.omitted,
     }
 }
 
