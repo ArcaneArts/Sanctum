@@ -144,7 +144,9 @@ impl Service {
                             filter.as_ref(),
                             &metadata,
                         )?;
-                        let mut hit = service.hit(&scope, chunk)?;
+                        let state =
+                            db.chunk_embedding_state(prepared.profile.as_deref(), &chunk.hash)?;
+                        let mut hit = service.hit(&scope, chunk, state)?;
                         hit.metadata = fields;
                         hit.score = score;
                         Ok(hit)
@@ -226,9 +228,8 @@ impl Service {
             texts: Vec::new(),
         };
         for chunk in chunks {
-            let hit = self.hit(scope, chunk)?;
-            batch.hashes.push(hit.chunk.hash);
-            batch.texts.push(hit.excerpt);
+            batch.texts.push(self.read_excerpt(scope, &chunk)?);
+            batch.hashes.push(chunk.hash);
         }
         Ok(batch)
     }

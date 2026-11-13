@@ -1665,6 +1665,17 @@ fn wire_hit(scope: &Scope, hit: Hit) -> v1::TextHit {
             })
             .collect(),
         metadata_omitted: hit.metadata.omitted,
+        embedding_state: {
+            use sanctum_service::ChunkEmbeddingState;
+            match hit.embedding_state {
+                ChunkEmbeddingState::Disabled => v1::ChunkEmbeddingState::Disabled,
+                ChunkEmbeddingState::Pending => v1::ChunkEmbeddingState::Pending,
+                ChunkEmbeddingState::Ready => v1::ChunkEmbeddingState::Ready,
+                ChunkEmbeddingState::Retrying => v1::ChunkEmbeddingState::Retrying,
+                ChunkEmbeddingState::Failed => v1::ChunkEmbeddingState::Failed,
+            }
+            .into()
+        },
     }
 }
 

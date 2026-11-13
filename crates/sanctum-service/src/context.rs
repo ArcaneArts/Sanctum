@@ -1,6 +1,9 @@
 use sanctum_core::{ByteRange, Error, Result, Scope};
 
-use crate::{Chunk, ChunkRef, Hit, HostedCatalog, Service, db, hosted_retrieval::locate};
+use crate::{
+    Chunk, ChunkEmbeddingState, ChunkRef, Hit, HostedCatalog, Service, db,
+    hosted_retrieval::locate, verified_excerpt,
+};
 
 const MAX_SIDE_BYTES: u32 = 16 * 1024;
 
@@ -24,13 +27,15 @@ impl Service {
             .retrieval
             .read()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
-        let (chunk, range) = self
-            .database(scope)?
-            .read_snapshot(|db| context_range(db, reference, before, after))?;
+        let (chunk, range, state) = self.database(scope)?.read_snapshot(|db| {
+            let (chunk, range) = context_range(db, reference, before, after)?;
+            let state = db.chunk_embedding_state(self.embedding_profile(), &chunk.hash)?;
+            Ok((chunk, range, state))
+        })?;
         let bytes = self
             .files
             .read_chunk(scope, reference.source, reference.revision, range)?;
-        finish_context(chunk, range, &bytes)
+        finish_context(chunk, range, &bytes, state)
     }
 }
 
@@ -43,15 +48,17 @@ impl HostedCatalog {
         after: u32,
     ) -> Result<ChunkContext> {
         validate_budget(before, after)?;
-        let (((chunk, key), range), generation) = self
+        let profile = self.embedding_profile().map(str::to_owned);
+        let (((chunk, key), range, state), generation) = self
             .with_collection(scope, move |db| {
                 let (chunk, range) = context_range(db, &reference, before, after)?;
-                Ok((locate(db, chunk)?, range))
+                let state = db.chunk_embedding_state(profile.as_deref(), &chunk.hash)?;
+                Ok((locate(db, chunk)?, range, state))
             })
             .await?;
         let key = self.checked_text_key(scope, key)?;
         let bytes = self.storage.read_range(&key, range).await?;
-        let mut context = finish_context(chunk, range, &bytes)?;
+        let mut context = finish_context(chunk, range, &bytes, state)?;
         context.hit.database_generation = Some(generation);
         Ok(context)
     }
@@ -87,7 +94,12 @@ fn context_range(
     Ok((chunk, range))
 }
 
-fn finish_context(chunk: Chunk, range: ByteRange, bytes: &[u8]) -> Result<ChunkContext> {
+fn finish_context(
+    chunk: Chunk,
+    range: ByteRange,
+    bytes: &[u8],
+    state: ChunkEmbeddingState,
+) -> Result<ChunkContext> {
     if bytes.len() as u64 != range.length()? {
         return Err(Error::Internal(
             "context byte length differs from its range".into(),
@@ -95,7 +107,8 @@ fn finish_context(chunk: Chunk, range: ByteRange, bytes: &[u8]) -> Result<ChunkC
     }
     let chunk_start = (chunk.range.start - range.start) as usize;
     let chunk_end = (chunk.range.end - range.start) as usize;
-    let hit = Hit::from_bytes(chunk, &bytes[chunk_start..chunk_end])?;
+    let excerpt = verified_excerpt(&chunk, &bytes[chunk_start..chunk_end])?;
+    let hit = Hit::new(chunk, excerpt, state);
     // If the requested start cuts a code point, trim its continuation bytes.
     let start = bytes
         .iter()

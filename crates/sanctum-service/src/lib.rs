@@ -51,7 +51,7 @@ pub use hosted_dispatch::{Dispatch, ReconcilePage, Task, TaskStage};
 pub use hosted_ingestion::{HostedJob, HostedJobState, HostedUpload, UploadSweep};
 pub use hosted_rebuild::RebuildPage;
 pub use local_import::{ImportEvent, ImportOptions, ImportState};
-pub use sanctum_db_sqlite::embedding::EmbeddingStatus;
+pub use sanctum_db_sqlite::embedding::{ChunkEmbeddingState, EmbeddingStatus};
 pub use watched_folders::{WatchedFolder, run_watched_folders};
 pub use worker::{run_local_maintenance, run_local_worker};
 
@@ -137,6 +137,7 @@ pub struct Hit {
     pub score: Option<f64>,
     pub database_generation: Option<Uuid>,
     pub metadata: HitMetadata,
+    pub embedding_state: ChunkEmbeddingState,
 }
 
 impl Service {
@@ -333,7 +334,11 @@ impl Service {
             .retrieval
             .read()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
-        self.hit(scope, self.database(scope)?.fetch(reference)?)
+        self.database(scope)?.read_snapshot(|db| {
+            let chunk = db.fetch(reference)?;
+            let state = db.chunk_embedding_state(self.embedding_profile(), &chunk.hash)?;
+            self.hit(scope, chunk, state)
+        })
     }
 
     fn require_collection(&self, scope: &Scope) -> Result<()> {
@@ -348,36 +353,45 @@ impl Service {
         CollectionDb::open(&self.files.database_path(scope))
     }
 
-    fn hit(&self, scope: &Scope, chunk: Chunk) -> Result<Hit> {
+    fn hit(&self, scope: &Scope, chunk: Chunk, state: ChunkEmbeddingState) -> Result<Hit> {
+        let excerpt = self.read_excerpt(scope, &chunk)?;
+        Ok(Hit::new(chunk, excerpt, state))
+    }
+
+    fn read_excerpt(&self, scope: &Scope, chunk: &Chunk) -> Result<String> {
         let bytes = self.files.read_chunk(
             scope,
             chunk.reference.source,
             chunk.reference.revision,
             chunk.range,
         )?;
-        Hit::from_bytes(chunk, &bytes)
+        verified_excerpt(chunk, &bytes)
     }
 }
 
 impl Hit {
-    fn from_bytes(chunk: Chunk, bytes: &[u8]) -> Result<Self> {
-        if blake3::hash(bytes).to_hex().as_str() != chunk.hash {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "stored chunk does not match its fingerprint",
-            )));
-        }
-        let excerpt = std::str::from_utf8(bytes)
-            .map_err(|error| Error::Internal(Box::new(error)))?
-            .to_owned();
-        Ok(Hit {
+    fn new(chunk: Chunk, excerpt: String, embedding_state: ChunkEmbeddingState) -> Self {
+        Self {
             chunk,
             excerpt,
             score: None,
             database_generation: None,
             metadata: HitMetadata::default(),
-        })
+            embedding_state,
+        }
     }
+}
+
+fn verified_excerpt(chunk: &Chunk, bytes: &[u8]) -> Result<String> {
+    if blake3::hash(bytes).to_hex().as_str() != chunk.hash {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stored chunk does not match its fingerprint",
+        )));
+    }
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|error| Error::Internal(Box::new(error)))
 }
 
 impl StagedUpload {

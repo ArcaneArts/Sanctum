@@ -23,6 +23,15 @@ pub struct EmbeddingStatus {
     pub sample_error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkEmbeddingState {
+    Disabled,
+    Pending,
+    Ready,
+    Retrying,
+    Failed,
+}
+
 pub struct ScoredChunk {
     pub chunk: Chunk,
     pub score: f64,
@@ -78,6 +87,35 @@ impl CollectionDb {
                 })
             }).map_err(database_error)
         })
+    }
+
+    pub fn chunk_embedding_state(
+        &self,
+        profile: Option<&str>,
+        hash: &str,
+    ) -> Result<ChunkEmbeddingState> {
+        use ChunkEmbeddingState::{Disabled, Failed, Pending, Ready, Retrying};
+        let Some(profile) = profile else {
+            return Ok(Disabled);
+        };
+        let state = self
+            .0
+            .prepare_cached(
+                "SELECT vector IS NOT NULL, retry_at IS NOT NULL, error IS NOT NULL
+                 FROM embedding_cache WHERE profile = ?1 AND input_hash = ?2",
+            )
+            .map_err(database_error)?
+            .query_row([profile, hash], |row| {
+                Ok(match (row.get(0)?, row.get(1)?, row.get(2)?) {
+                    (true, _, _) => Ready,
+                    (_, true, _) => Retrying,
+                    (_, _, true) => Failed,
+                    _ => Pending,
+                })
+            })
+            .optional()
+            .map_err(database_error)?;
+        Ok(state.unwrap_or(Pending))
     }
 
     pub fn has_embeddings(&self, profile: &str) -> Result<bool> {

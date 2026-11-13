@@ -1513,6 +1513,10 @@ async fn hosted_embeddings_reuse_current_inputs_and_isolate_profiles() {
         .into_inner();
     assert_eq!(pending.mode(), v1::SearchMode::Lexical);
     assert_eq!(
+        pending.hits[0].embedding_state(),
+        v1::ChunkEmbeddingState::Pending
+    );
+    assert_eq!(
         pending.degraded_reason.as_deref(),
         Some("embeddings_unavailable")
     );
@@ -1558,6 +1562,10 @@ async fn hosted_embeddings_reuse_current_inputs_and_isolate_profiles() {
         Some("embedding_provider_unavailable")
     );
     assert_eq!(fallback.hits.len(), 1);
+    assert_eq!(
+        fallback.hits[0].embedding_state(),
+        v1::ChunkEmbeddingState::Ready
+    );
 
     let replacement = v1::UploadTextHeader {
         replacement: Some(v1::Replacement {
@@ -1593,6 +1601,10 @@ async fn hosted_embeddings_reuse_current_inputs_and_isolate_profiles() {
         .unwrap()
         .into_inner();
     assert_eq!(changed.mode(), v1::SearchMode::Lexical);
+    assert_eq!(
+        changed.hits[0].embedding_state(),
+        v1::ChunkEmbeddingState::Pending
+    );
     let coverage = changed.embedding_coverage.unwrap();
     assert_eq!(coverage.profile_id.as_deref(), Some("fixture-v2"));
     assert_eq!(coverage.embedded_chunks, 0);
@@ -1678,19 +1690,38 @@ async fn hosted_collection_search_uses_one_query_vector_and_keeps_hits_scoped() 
     assert_eq!((coverage.total_chunks, coverage.embedded_chunks), (2, 1));
     let hits: Vec<_> = result.hits.iter().map(|hit| hit.excerpt.as_str()).collect();
     assert_eq!(hits, ["shared first 🦀", "shared second café"]);
+    assert_eq!(
+        result.hits[0].embedding_state(),
+        v1::ChunkEmbeddingState::Ready
+    );
+    assert_eq!(
+        result.hits[1].embedding_state(),
+        v1::ChunkEmbeddingState::Pending
+    );
     for hit in result.hits {
         let reference = hit.chunk.unwrap();
         assert_eq!(reference.scope.as_ref().unwrap().tenant, "default");
         let fetched = server
             .client
             .fetch_chunk(v1::FetchChunkRequest {
-                chunk: Some(reference),
+                chunk: Some(reference.clone()),
             })
             .await
             .unwrap()
             .into_inner();
         assert_eq!(fetched.excerpt, hit.excerpt);
         assert_eq!(fetched.database_generation, hit.database_generation);
+        assert_eq!(fetched.embedding_state, hit.embedding_state);
+        let context = server
+            .client
+            .fetch_context(v1::FetchContextRequest {
+                chunk: Some(reference),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(context.hit.unwrap().embedding_state, hit.embedding_state);
     }
     let wrong_tenant = v1::SearchCollectionsRequest {
         collections: vec!["private".into()],

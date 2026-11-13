@@ -7,8 +7,8 @@ which parts have working implementations and where to find the evidence.
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | End-to-end acceptance in an LLM client |
 | 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, platform packaging and verification |
-| 3. Object storage and publication | Shared object contract, filesystem and MinIO-tested S3 adapters, and a fenced SQLite snapshot executor, a native GCS adapter, and a hosted catalog | Live GCS verification, hosted source operations, and deployment recovery |
-| 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
+| 3. Object storage and publication | Shared storage contract, filesystem and MinIO-tested S3, native GCS adapter, and fenced SQLite snapshot publication for hosted catalog, source, and metadata operations | Live GCS verification and cloud recovery scenarios |
+| 4. Cloud Run and Cloud Tasks | Linux API and worker containers, durable staged uploads, dispatch and repair, scheduled maintenance, and hosted gRPC and MCP | Live IAM, Cloud Run ingress, Tasks and Scheduler delivery, and hosted job controls |
 | 5. Capacity | [SQLite snapshot transfer and publication benchmark](CAPACITY.md) | Representative 200 MB sources, GB-scale collections and database snapshots, cold/warm cloud performance, measured optimization |
 
 ## Local text ingestion and retrieval
@@ -515,8 +515,10 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   non-root Debian containers and completed upload, HTTP registration,
   indexing, and gRPC search against MinIO. The Dockerfile static check
   passed.
-- Live Cloud Run and GCS verification are still open.
-
+- A direct Linux arm64 Dockerfile build also ran both non-root roles
+  against MinIO. The container smoke verified upload, task delivery,
+  gRPC search, and SIGTERM shutdown. Live Cloud Run and GCS verification
+  are still open.
 - Delivered in [PR #32](https://github.com/ArcaneArts/Sanctum/pull/32).
 
 ## Hosted snapshot reuse
@@ -869,3 +871,15 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   runs the sweep, and verifies pending work, duplicate rejection, and
   retrieval. A live MinIO run installs a compact record fixture and
   verifies duplicate rejection and retrieval after server restart.
+- Delivered in [PR #57](https://github.com/ArcaneArts/Sanctum/pull/57).
+
+## Per-hit embedding state
+
+- Local and hosted search, chunk fetch, and context fetch report the
+  active profile's cache state on each hit. Status comes from the same
+  SQLite read as the chunk reference and does not call the provider.
+- Integration checks cover pending, ready, retrying, failed, profile
+  change, and a query outage with ready document vectors.
+- The local MCP HTTP and stdio check verifies disabled status. Live
+  MinIO and Ollama verify pending, ready, and pending after a profile
+  change over MCP HTTP, including status on fetched context.
