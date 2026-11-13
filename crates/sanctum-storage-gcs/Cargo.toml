@@ -1,0 +1,26 @@
+[package]
+name = "sanctum-storage-gcs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+google-cloud-auth.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+sanctum-core = { path = "../sanctum-core" }
+sanctum-storage = { path = "../sanctum-storage" }
+serde.workspace = true
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
+tracing.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+sanctum-storage = { path = "../sanctum-storage", features = ["test-support"] }
+serde_json.workspace = true
+uuid.workspace = true

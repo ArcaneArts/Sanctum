@@ -7,7 +7,7 @@ which parts have working implementations and where to find the evidence.
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | End-to-end acceptance in an LLM client |
 | 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, platform packaging and verification |
-| 3. Object storage and publication | Shared object contract, filesystem and MinIO-tested S3 adapters, and a fenced SQLite snapshot executor | GCS, server integration, durable application operations, and deployment recovery |
+| 3. Object storage and publication | Shared object contract, filesystem and MinIO-tested S3 adapters, and a fenced SQLite snapshot executor, and a native GCS adapter | Live GCS verification, server integration, durable application operations, and deployment recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
 | 5. Capacity | Pending | Representative 200 MB sources, GB-scale collections and database snapshots, cold/warm cloud performance, measured optimization |
 
@@ -380,6 +380,8 @@ Merged in [PR #24](https://github.com/ArcaneArts/Sanctum/pull/24).
 
 ## Fenced object-backed database publication
 
+Merged in [PR #25](https://github.com/ArcaneArts/Sanctum/pull/25).
+
 - `sanctum-db` stores the lease, epoch, and visible snapshot in one
   conditional HEAD object. It validates each downloaded SQLite snapshot
   and publishes a new backup only after storing the snapshot object.
@@ -395,3 +397,15 @@ Merged in [PR #24](https://github.com/ArcaneArts/Sanctum/pull/24).
   deletion after grace.
 - Hosted application commands and Cloud Tasks dispatch still need to
   use the executor.
+
+## Native Google Cloud Storage adapter
+
+- The GCS adapter uses the JSON API, Google Application Default
+  Credentials, generation preconditions, streaming downloads, bounded
+  resumable upload parts, and paginated recursive listing.
+- Loopback HTTP fixture tests verify the exact wire requests, generation
+  fencing even with unchanged ETags, upload offsets, range and encoding
+  validation, and list continuation. They use a fixture credential.
+- The [storage guide](STORAGE.md) documents the live contract command.
+  Actual GCS verification still requires an authorized test bucket and
+  ADC identity. The server does not yet select a remote backend.

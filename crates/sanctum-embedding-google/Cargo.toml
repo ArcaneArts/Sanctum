@@ -6,7 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-google-cloud-auth = { version = "1.19", default-features = false }
+google-cloud-auth.workspace = true
 reqwest.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 sanctum-embedding = { path = "../sanctum-embedding" }
