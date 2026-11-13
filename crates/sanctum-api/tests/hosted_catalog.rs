@@ -2468,11 +2468,11 @@ async fn upload_sweep_reclaims_only_unreferenced_candidates_and_resumes() {
             break;
         }
     }
-    assert_eq!(deleted, 11);
-    for key in losers.into_iter().chain([extract]) {
+    assert_eq!(deleted, 12);
+    for key in losers.into_iter().chain([extract, uncertain]) {
         assert!(matches!(storage.head(&key).await, Err(Error::NotFound(_))));
     }
-    for key in [winner, canonical, uncertain, young] {
+    for key in [winner, canonical, young] {
         storage.head(&key).await.unwrap();
     }
     let hit = restarted
@@ -2488,6 +2488,95 @@ async fn upload_sweep_reclaims_only_unreferenced_candidates_and_resumes() {
         .hits
         .remove(0);
     assert_eq!(hit.excerpt, "quartz note");
+}
+
+#[tokio::test]
+async fn upload_sweep_fences_an_in_flight_acceptance_before_reclaiming() {
+    use std::time::{Duration, SystemTime};
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        interrupt: AtomicU8::new(3),
+    });
+    let catalog = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    catalog.create_collection(&scope, None).await.unwrap();
+    let operation = uuid::Uuid::new_v4();
+    let input = || sanctum_service::TextUpload {
+        name: "notes.txt".into(),
+        external: None,
+        replacement: None,
+        retain_original: false,
+    };
+    let upload = catalog
+        .stage_upload(scope.clone(), input(), Some(operation))
+        .await
+        .unwrap();
+    std::io::Write::write_all(&mut upload.reopen().unwrap(), b"quartz").unwrap();
+    let original = tokio::spawn(async move { upload.enqueue().await });
+    let prefix = Key::parse(format!(
+        "default/collections/notes/operations/{operation}/inputs"
+    ))
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while storage.interrupt.load(Ordering::Relaxed) != 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let abandoned = storage
+        .list(Some(&prefix), None, 8)
+        .await
+        .unwrap()
+        .objects
+        .remove(0)
+        .key;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(directory.path().join(abandoned.as_str()))
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(901))
+        .unwrap();
+
+    let sweep = catalog.sweep_abandoned_uploads().await.unwrap();
+    assert_eq!(sweep.deleted, 1);
+    assert!(matches!(
+        catalog.ingestion_job(&scope, operation).await,
+        Err(Error::NotFound(_))
+    ));
+    storage.interrupt.store(0, Ordering::Relaxed);
+    assert!(matches!(original.await.unwrap(), Err(Error::Busy(_))));
+    assert!(matches!(
+        storage.head(&abandoned).await,
+        Err(Error::NotFound(_))
+    ));
+
+    let retry = catalog
+        .stage_upload(scope.clone(), input(), Some(operation))
+        .await
+        .unwrap();
+    std::io::Write::write_all(&mut retry.reopen().unwrap(), b"quartz").unwrap();
+    let accepted = retry.enqueue().await.unwrap();
+    assert_eq!(accepted.operation, operation);
+    catalog.register_upload(&scope, operation).await.unwrap();
+    catalog.index_upload(&scope, operation).await.unwrap();
+    let hits = catalog
+        .retrieve(
+            scope,
+            "quartz".into(),
+            5,
+            None,
+            sanctum_service::SearchMode::Lexical,
+        )
+        .await
+        .unwrap()
+        .hits;
+    assert_eq!(hits[0].excerpt, "quartz");
 }
 
 #[tokio::test]
@@ -2602,7 +2691,17 @@ impl Storage for InterruptAcceptance {
         condition: Condition,
     ) -> StorageResult<Version> {
         let interrupt = if key.as_str().ends_with("/operation.json") {
-            self.interrupt.swap(0, Ordering::Relaxed)
+            match self.interrupt.load(Ordering::Relaxed) {
+                3 => {
+                    self.interrupt.store(4, Ordering::Relaxed);
+                    while self.interrupt.load(Ordering::Relaxed) == 4 {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    0
+                }
+                1 | 2 => self.interrupt.swap(0, Ordering::Relaxed),
+                _ => 0,
+            }
         } else {
             0
         };

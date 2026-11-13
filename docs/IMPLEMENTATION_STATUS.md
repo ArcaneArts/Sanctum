@@ -702,7 +702,8 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - The live MinIO worker route preserved a recent attempt and published
   RTF text across restart. The local object-store test verifies deletion
   using controlled object ages.
-- Inputs with no acceptance envelope still require a durable fence.
+- A follow-up adds an acceptance fence for inputs without an accepted
+  envelope.
 - Delivered in [PR #44](https://github.com/ArcaneArts/Sanctum/pull/44).
 
 ## Hosted synchronous uploads
@@ -717,3 +718,18 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - The live MinIO check exercised a worker-driven synchronous upload,
   a matching replay, and a timeout that left the operation available
   for subsequent worker delivery and status polling.
+- Delivered in [PR #45](https://github.com/ArcaneArts/Sanctum/pull/45).
+
+## Fenced reclamation of unaccepted inputs
+
+- Reclamation and acceptance compete on the same conditional envelope
+  write. The sweep creates or advances a small fence before deleting an
+  old input that has no accepted envelope. A later submission can replace
+  the fence only with a new attempt. Workers still see the operation as
+  absent until an accepted envelope exists.
+- The integration test delays an admission at its conditional write,
+  reclaims the candidate, rejects the delayed write, and publishes a
+  fresh attempt with the same operation UUID.
+- The live MinIO smoke seeded a fence, replaced it using the server's
+  ETag precondition, replayed the accepted request, and indexed it
+  through the worker.

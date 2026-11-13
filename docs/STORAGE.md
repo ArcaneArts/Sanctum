@@ -143,8 +143,8 @@ cargo run --locked -p sanctum-cli -- job notes OPERATION_ID
 The server spools the stream to a temporary file and honors
 `max_source_bytes`. It streams the original bytes to a unique input key under
 `<tenant>/collections/<collection>/operations/<operation>/inputs/`.
-The sibling `operation.json` is published with a create-only precondition.
-It records the input's length and BLAKE3 digest, ingestion options, and
+The sibling `operation.json` is created conditionally or replaces an
+abandoned-input fence by version. An accepted envelope records the input's length and BLAKE3 digest, ingestion options, and
 pending registration stage. A failed conditional write with an uncertain
 outcome preserves its input for recovery. Concurrent requests with the same
 ID adopt the winning operation and discard their losing input when possible.
@@ -345,7 +345,9 @@ eight candidates per invocation. An input older than 15 minutes is
 eligible when a different attempt won the operation envelope. An RTF
 extraction candidate is eligible after the 30-day indexing window and
 15-minute reader grace if it has neither a published locator nor a
-pending source-reclamation entry. An input without an operation envelope
-is retained because acceptance may still publish it. It needs a durable
-acceptance fence before it can be reclaimed safely.
+pending source-reclamation entry. To reclaim an input without an accepted
+envelope, the sweep writes a fence to the same key that acceptance uses.
+If acceptance wins the conditional write, the sweep checks again on a
+later pass. A retry can replace a fence only with its own newly staged
+input. A fence alone is invisible to worker and status requests.
 [Cloud Scheduler configuration](CLOUD_RUN.md#schedule-dispatch-repair).
