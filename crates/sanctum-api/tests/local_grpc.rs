@@ -30,6 +30,14 @@ impl Running {
     }
 
     async fn with_embedding(dir: &TempDir, provider: Option<Arc<dyn Provider>>) -> Self {
+        Self::start_with_workers(dir, provider, true).await
+    }
+
+    async fn start_with_workers(
+        dir: &TempDir,
+        provider: Option<Arc<dyn Provider>>,
+        workers: bool,
+    ) -> Self {
         let service = Service::open_with_embedding(dir.path(), 32_768, provider).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -37,11 +45,15 @@ impl Running {
         let server_service = service.clone();
         let server = tokio::spawn(async move {
             let (stop_worker, worker_stop) = tokio::sync::watch::channel(false);
-            let worker = tokio::spawn(run_local_worker(
-                server_service.clone(),
-                worker_stop.clone(),
-            ));
-            let embedding = tokio::spawn(run_embedding_worker(server_service.clone(), worker_stop));
+            let workers = workers.then(|| {
+                let worker = tokio::spawn(run_local_worker(
+                    server_service.clone(),
+                    worker_stop.clone(),
+                ));
+                let embedding =
+                    tokio::spawn(run_embedding_worker(server_service.clone(), worker_stop));
+                (worker, embedding)
+            });
             let result = Server::builder()
                 .add_service(sanctum_api::grpc(server_service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
@@ -49,8 +61,10 @@ impl Running {
                 })
                 .await;
             let _ = stop_worker.send(true);
-            worker.await.unwrap();
-            embedding.await.unwrap();
+            if let Some((worker, embedding)) = workers {
+                worker.await.unwrap();
+                embedding.await.unwrap();
+            }
             result
         });
         let client = SanctumClient::connect(endpoint).await.unwrap();
@@ -2228,6 +2242,9 @@ async fn storage_usage_counts_retained_and_staged_files_at_each_scope() {
     .await;
     let canonical = text_path(&dir, &revision.source_id, &revision.revision_id);
     let collection = dir.path().join("default/notes");
+    // Hold the fixture still while comparing two independent walks.
+    running.stop().await;
+    let mut running = Running::start_with_workers(&dir, None, false).await;
     let staged = collection.join("staging/working-file");
     std::fs::write(&staged, b"pending bytes").unwrap();
     std::fs::write(outside.path().join("unmanaged"), vec![0; 64 * 1024]).unwrap();

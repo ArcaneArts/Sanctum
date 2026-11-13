@@ -167,6 +167,40 @@ so other chunks can proceed. Transient failures back off and retry. Correct
 a permanently rejected input with a new source revision or use a corrected
 embedding profile.
 
+## OpenAI-compatible embeddings
+
+Set `embedding.provider` to `openai` and give `base_url` as the API prefix.
+Sanctum appends `/embeddings`. Set `api_key_env` to the name of the environment
+variable holding the bearer key. Omit it for an unauthenticated loopback
+service. The URL can use HTTPS or loopback HTTP.
+
+```json
+{
+  "provider": "openai",
+  "base_url": "https://api.openai.com/v1",
+  "api_key_env": "OPENAI_API_KEY",
+  "send_dimensions": true,
+  "profile": {
+    "model": "text-embedding-3-small",
+    "revision": "1",
+    "dimensions": 1536
+  }
+}
+```
+
+Set `send_dimensions` when the provider supports a requested output size.
+It defaults to false and the returned size must still match the configured
+profile. The provider and endpoint are included in the profile fingerprint.
+For OpenRouter, use `https://openrouter.ai/api/v1`, the provider-qualified
+model name, and the name of the variable holding the OpenRouter key.
+[OpenAI embeddings](https://developers.openai.com/api/reference/resources/embeddings/methods/create), [OpenRouter embeddings](https://openrouter.ai/docs/api/api-reference/embeddings/submit-an-embedding-request).
+
+The local Ollama compatibility endpoint uses `http://127.0.0.1:11434/v1`.
+Its native adapter remains available under `provider: ollama`.
+[Ollama compatibility](https://docs.ollama.com/api/openai-compatibility).
+
+## Search across collections
+
 `SearchCollections` accepts one tenant and up to eight distinct collection
 IDs. It defaults to hybrid, reports aggregate coverage across the requested
 collections, and embeds the query at most once. Each collection applies the
