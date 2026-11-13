@@ -1037,6 +1037,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 name = "sanctum-api"
 version = "0.1.0"
 dependencies = [
+ "rusqlite",
  "sanctum-core",
  "sanctum-proto",
  "sanctum-service",
@@ -1045,6 +1046,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1129,6 +1131,8 @@ dependencies = [
  "sanctum-db-sqlite",
  "sanctum-storage-fs",
  "tempfile",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

@@ -6,8 +6,55 @@ service Sanctum {
   rpc CreateCollection(CreateCollectionRequest) returns (Collection);
   rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
   rpc UploadText(stream UploadTextFrame) returns (TextRevision);
+  rpc SubmitText(stream UploadTextFrame) returns (IngestionJob);
+  rpc GetIngestionJob(IngestionJobRequest) returns (IngestionJob);
+  rpc CancelIngestionJob(IngestionJobRequest) returns (IngestionJob);
+  rpc RetryIngestionJob(IngestionJobRequest) returns (IngestionJob);
+  rpc GetLocalQueue(Empty) returns (LocalQueueStatus);
+  rpc SetLocalQueue(SetLocalQueueRequest) returns (LocalQueueStatus);
   rpc SearchText(SearchTextRequest) returns (SearchTextResponse);
   rpc FetchChunk(FetchChunkRequest) returns (TextHit);
+}
+
+message Empty {}
+
+enum IngestionState {
+  INGESTION_STATE_UNSPECIFIED = 0;
+  INGESTION_STATE_ACCEPTED = 1;
+  INGESTION_STATE_INDEXING = 2;
+  INGESTION_STATE_PUBLISHING = 3;
+  INGESTION_STATE_TEXT_READY = 4;
+  INGESTION_STATE_FAILED = 5;
+  INGESTION_STATE_CANCELED = 6;
+}
+
+message IngestionJobRequest {
+  Scope scope = 1;
+  string operation_id = 2;
+}
+
+message IngestionJob {
+  Scope scope = 1;
+  string operation_id = 2;
+  string source_id = 3;
+  string revision_id = 4;
+  string name = 5;
+  ExternalSource external = 6;
+  uint64 total_bytes = 7;
+  uint64 processed_bytes = 8;
+  uint32 attempts = 9;
+  IngestionState state = 10;
+  optional string error_code = 11;
+  optional string error_message = 12;
+  optional TextRevision text_revision = 13;
+}
+
+message LocalQueueStatus {
+  bool paused = 1;
+}
+
+message SetLocalQueueRequest {
+  bool paused = 1;
 }
 
 message Scope {

@@ -31,6 +31,24 @@ enum Command {
         namespace: Option<String>,
         #[arg(long, requires = "namespace")]
         external_id: Option<String>,
+        #[arg(long)]
+        background: bool,
+    },
+    Job {
+        collection: String,
+        operation_id: String,
+    },
+    Cancel {
+        collection: String,
+        operation_id: String,
+    },
+    Retry {
+        collection: String,
+        operation_id: String,
+    },
+    Queue {
+        #[arg(value_parser = ["status", "pause", "resume"])]
+        action: String,
     },
     Search {
         collection: String,
@@ -87,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
             path,
             namespace,
             external_id,
+            background,
         } => {
             let file = tokio::fs::File::open(&path)
                 .await
@@ -104,6 +123,15 @@ async fn main() -> anyhow::Result<()> {
                     .map(|(namespace, id)| v1::ExternalSource { namespace, id }),
             };
             let (sender, receiver) = tokio::sync::mpsc::channel(2);
+            if background {
+                let request = client.submit_text(ReceiverStream::new(receiver));
+                let (job, ()) = tokio::try_join!(
+                    async { Ok(request.await?.into_inner()) },
+                    send_upload(sender, header, file),
+                )?;
+                print_job(job);
+                return Ok(());
+            }
             let request = client.upload_text(ReceiverStream::new(receiver));
             let (revision, ()) = tokio::try_join!(
                 async { Ok(request.await?.into_inner()) },
@@ -113,6 +141,61 @@ async fn main() -> anyhow::Result<()> {
                 "{} {} ({} chunks, {} bytes)",
                 revision.source_id, revision.revision_id, revision.chunks, revision.bytes
             );
+        }
+        Command::Job {
+            collection,
+            operation_id,
+        } => {
+            print_job(
+                client
+                    .get_ingestion_job(v1::IngestionJobRequest {
+                        scope: scope(collection),
+                        operation_id,
+                    })
+                    .await?
+                    .into_inner(),
+            );
+        }
+        Command::Cancel {
+            collection,
+            operation_id,
+        } => {
+            print_job(
+                client
+                    .cancel_ingestion_job(v1::IngestionJobRequest {
+                        scope: scope(collection),
+                        operation_id,
+                    })
+                    .await?
+                    .into_inner(),
+            );
+        }
+        Command::Retry {
+            collection,
+            operation_id,
+        } => {
+            print_job(
+                client
+                    .retry_ingestion_job(v1::IngestionJobRequest {
+                        scope: scope(collection),
+                        operation_id,
+                    })
+                    .await?
+                    .into_inner(),
+            );
+        }
+        Command::Queue { action } => {
+            let queue = if action == "status" {
+                client.get_local_queue(v1::Empty {}).await?.into_inner()
+            } else {
+                client
+                    .set_local_queue(v1::SetLocalQueueRequest {
+                        paused: action == "pause",
+                    })
+                    .await?
+                    .into_inner()
+            };
+            println!("{}", if queue.paused { "paused" } else { "running" });
         }
         Command::Search {
             collection,
@@ -194,5 +277,19 @@ async fn send_upload(
         {
             return Err(anyhow!("server closed the upload stream"));
         }
+    }
+}
+
+fn print_job(job: v1::IngestionJob) {
+    println!(
+        "{} {} {}/{} bytes (attempts: {})",
+        job.operation_id,
+        job.state().as_str_name(),
+        job.processed_bytes,
+        job.total_bytes,
+        job.attempts,
+    );
+    if let (Some(code), Some(message)) = (job.error_code, job.error_message) {
+        println!("{code}: {message}");
     }
 }

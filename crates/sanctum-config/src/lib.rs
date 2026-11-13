@@ -14,6 +14,8 @@ pub struct Config {
     pub grpc_listen: SocketAddr,
     #[serde(default = "default_max_source")]
     pub max_source_bytes: u64,
+    #[serde(default = "default_worker_concurrency")]
+    pub local_worker_concurrency: usize,
 }
 
 impl Config {
@@ -26,6 +28,11 @@ impl Config {
         if config.storage_root.as_os_str().is_empty() || config.max_source_bytes == 0 {
             return Err(Error::Invalid(
                 "storage_root and a positive max_source_bytes are required".into(),
+            ));
+        }
+        if !(1..=32).contains(&config.local_worker_concurrency) {
+            return Err(Error::Invalid(
+                "local_worker_concurrency must be between 1 and 32".into(),
             ));
         }
         Ok(config)
@@ -44,4 +51,8 @@ fn default_grpc() -> SocketAddr {
 
 fn default_max_source() -> u64 {
     1024 * 1024 * 1024
+}
+
+fn default_worker_concurrency() -> usize {
+    1
 }

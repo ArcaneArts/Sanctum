@@ -13,6 +13,7 @@ SANCTUM_CONFIG_JSON='{"version":1,"storage_root":"./local-data"}' \
 
 `grpc_listen` defaults to `127.0.0.1:47550`. `max_source_bytes` defaults to
 1 GiB. This local service trusts callers. Keep it on loopback for local use.
+`local_worker_concurrency` defaults to one and accepts 1 to 32 workers.
 
 In another terminal, create a collection, upload a UTF-8 file, and search:
 
@@ -33,7 +34,28 @@ collection, and source name. It follows with data frames of up to 256 KiB and
 an explicit end frame. Close the sending side of the stream after the end
 frame. A successful response identifies the committed revision. In this
 initial version, retrying an upload with the same external namespace and ID
-returns `ALREADY_EXISTS`.
+returns `ALREADY_EXISTS`. `UploadText` waits up to 30 seconds for lexical publication.
+If its wait expires, the response message contains the operation ID. The
+accepted work can continue after the client disconnects.
+
+Use `SubmitText` for background ingestion. It returns a durable operation
+ID and source and revision IDs once the input and queue record are stored.
+Poll `GetIngestionJob` in the same tenant and collection to see processed
+bytes, attempts, failure details, or the committed lexical revision. The
+local queue persists through process restarts.
+
+```sh
+cargo run --locked -p sanctum-cli -- upload notes /path/to/notes.md --background
+cargo run --locked -p sanctum-cli -- job notes OPERATION_ID
+cargo run --locked -p sanctum-cli -- queue pause
+cargo run --locked -p sanctum-cli -- queue resume
+cargo run --locked -p sanctum-cli -- cancel notes OPERATION_ID
+cargo run --locked -p sanctum-cli -- retry notes OPERATION_ID
+```
+
+Pause prevents new claims and lets active jobs finish. Cancellation can win
+until the worker starts publication. Retry applies to failures marked
+`retryable` and preserves the operation and revision IDs.
 
 `SearchText` matches the supplied words in a single chunk, using SQLite FTS5
 tokenization. Results include byte offsets as `[start_byte, end_byte)` into

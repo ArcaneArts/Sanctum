@@ -11,4 +11,6 @@ sanctum-db-sqlite = { path = "../sanctum-db-sqlite" }
 sanctum-chunk = { path = "../sanctum-chunk" }
 blake3 = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true }

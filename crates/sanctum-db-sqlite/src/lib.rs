@@ -6,6 +6,8 @@ use rusqlite::{
 use sanctum_core::{ByteRange, Error, ExternalSource, Result};
 use uuid::Uuid;
 
+pub mod queue;
+
 const CATALOG_SCHEMA: &str = include_str!("catalog.sql");
 const COLLECTION_SCHEMA: &str = include_str!("collection.sql");
 
@@ -96,6 +98,17 @@ pub struct CollectionDb(Connection);
 impl CollectionDb {
     pub fn open(path: &Path) -> Result<Self> {
         Ok(Self(open(path, false)?))
+    }
+
+    pub fn revision_summary(&self, source: Uuid, revision: Uuid) -> Result<Option<(String, u64)>> {
+        self.0
+            .query_row(
+                "SELECT content_hash, chunk_count FROM revisions WHERE source_id = ?1 AND id = ?2",
+                params![source.to_string(), revision.to_string()],
+                |row| Ok((row.get(0)?, unsigned_column(row, 1)?)),
+            )
+            .optional()
+            .map_err(database_error)
     }
 
     pub fn write(&mut self) -> Result<RevisionWriter<'_>> {
