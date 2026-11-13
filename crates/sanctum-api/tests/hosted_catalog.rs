@@ -834,6 +834,99 @@ async fn hosted_indexing_publishes_searchable_text_and_fences_old_replacements()
 }
 
 #[tokio::test]
+async fn dispatch_reconciliation_recovers_a_failed_handoff_and_advances_its_cursor() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let dispatch = Arc::new(TestDispatch {
+        fail: AtomicU8::new(1),
+        delivered: std::sync::Mutex::new(Vec::new()),
+    });
+    let service = HostedCatalog::new(storage.clone(), None, 1024)
+        .unwrap()
+        .with_dispatch(dispatch.clone());
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    service.create_collection(&scope, None).await.unwrap();
+    let mut server = start(service.clone()).await;
+    let operation = uuid::Uuid::from_u128(100);
+    let header = v1::UploadTextHeader {
+        scope: Some(v1::Scope {
+            tenant: scope.tenant.to_string(),
+            collection: scope.collection.to_string(),
+        }),
+        name: "recover.txt".into(),
+        request_id: Some(operation.to_string()),
+        ..Default::default()
+    };
+    let accepted = server
+        .client
+        .submit_text(upload_frames(&header, [b"recovered".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(accepted.state(), v1::IngestionState::Accepted);
+    assert!(dispatch.delivered.lock().unwrap().is_empty());
+    server.stop().await;
+
+    // The first page consists of hints left before the corresponding envelopes existed.
+    for i in 1..=16 {
+        let key = Key::parse(format!(
+            "_dispatch/00/pending/default/notes/{}",
+            uuid::Uuid::from_u128(i)
+        ))
+        .unwrap();
+        storage
+            .put_control(&key, "{}".as_bytes().into(), Condition::Create)
+            .await
+            .unwrap();
+    }
+    let first = service.reconcile_shard(0).await.unwrap();
+    assert_eq!((first.dispatched, first.failed), (0, 0));
+    assert!(first.next_cursor.is_some());
+    let restarted = HostedCatalog::new(storage.clone(), None, 1024)
+        .unwrap()
+        .with_dispatch(dispatch.clone());
+    let second = restarted.reconcile_shard(0).await.unwrap();
+    assert_eq!((second.dispatched, second.failed), (1, 0));
+    assert!(second.next_cursor.is_none());
+    assert_eq!(&*dispatch.delivered.lock().unwrap(), &[(operation, false)]);
+    restarted.try_dispatch(&scope, operation).await;
+    assert_eq!(dispatch.delivered.lock().unwrap().len(), 1);
+
+    restarted.register_upload(&scope, operation).await.unwrap();
+    restarted.try_dispatch(&scope, operation).await;
+    assert_eq!(
+        &*dispatch.delivered.lock().unwrap(),
+        &[(operation, false), (operation, true)]
+    );
+    restarted.index_upload(&scope, operation).await.unwrap();
+    restarted.try_dispatch(&scope, operation).await;
+    let key = Key::parse(format!("_dispatch/00/pending/default/notes/{operation}")).unwrap();
+    assert!(matches!(storage.head(&key).await, Err(Error::NotFound(_))));
+}
+
+struct TestDispatch {
+    fail: AtomicU8,
+    delivered: std::sync::Mutex<Vec<(uuid::Uuid, bool)>>,
+}
+
+#[async_trait::async_trait]
+impl sanctum_service::Dispatch for TestDispatch {
+    async fn send(&self, task: sanctum_service::Task<'_>) -> StorageResult<()> {
+        if self.fail.swap(0, Ordering::Relaxed) != 0 {
+            return Err(Error::Busy("dispatch interrupted".into()));
+        }
+        self.delivered.lock().unwrap().push((
+            task.operation,
+            matches!(task.stage, sanctum_service::TaskStage::Index),
+        ));
+        Ok(())
+    }
+}
+
+#[tokio::test]
 async fn hosted_submissions_recover_from_interrupted_acceptance() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance {

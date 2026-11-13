@@ -57,6 +57,7 @@ impl HostedCatalog {
         let Stage::PendingIndexing { registration } = record.stage else {
             unreachable!("stage was checked above");
         };
+        record.dispatched_at = None;
         record.stage = match outcome {
             Outcome::Ready(content) => Stage::TextReady {
                 registration,

@@ -2548,7 +2548,12 @@ name = "sanctum-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "base64 0.22.1",
+ "blake3",
+ "google-cloud-auth",
+ "reqwest 0.12.28",
  "sanctum-api",
  "sanctum-config",
  "sanctum-core",
@@ -2577,6 +2582,7 @@ dependencies = [
 name = "sanctum-service"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "globset",
  "mime",
