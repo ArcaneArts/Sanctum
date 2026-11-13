@@ -22,6 +22,7 @@ mod maintenance;
 mod worker;
 pub use embedding::{SearchMode, run_embedding_worker};
 pub use local_import::{ImportEvent, ImportOptions, ImportState};
+pub use sanctum_db_sqlite::embedding::EmbeddingStatus;
 pub use worker::{run_local_maintenance, run_local_worker};
 
 use db::queue::LocalQueue;
@@ -63,6 +64,37 @@ pub struct Hit {
 }
 
 impl Service {
+    pub fn activity(
+        &self,
+        tenant: &ScopeId,
+        collection: Option<&ScopeId>,
+        before: Option<Uuid>,
+        limit: u32,
+    ) -> Result<(Vec<Job>, Option<Uuid>)> {
+        if !(1..=100).contains(&limit) {
+            return Err(Error::Invalid(
+                "activity limit must be between 1 and 100".into(),
+            ));
+        }
+        let mut jobs = self.queue.activity(tenant, collection, before, limit + 1)?;
+        let next = if jobs.len() > limit as usize {
+            jobs.pop();
+            jobs.last().map(|job| job.id)
+        } else {
+            None
+        };
+        Ok((jobs, next))
+    }
+
+    pub fn embedding_status(
+        &self,
+        scope: &Scope,
+        source_revision: Option<(Uuid, Uuid)>,
+    ) -> Result<EmbeddingStatus> {
+        self.database(scope)?
+            .embedding_status(self.embedding_profile(), source_revision)
+    }
+
     pub fn storage_usage(&self, scope: &UsageScope) -> Result<UsageMeasurement> {
         if let UsageScope::Collection(collection) = scope {
             self.require_collection(collection)?;

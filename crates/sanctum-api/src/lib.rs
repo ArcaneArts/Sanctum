@@ -244,6 +244,72 @@ impl Sanctum for Grpc {
         job_action(&self.0, request.into_inner(), Service::job).await
     }
 
+    async fn list_ingestion_jobs(
+        &self,
+        request: Request<v1::ListIngestionJobsRequest>,
+    ) -> Reply<v1::ListIngestionJobsResponse> {
+        let request = request.into_inner();
+        let tenant = request.tenant.parse().map_err(status)?;
+        let collection = request
+            .collection
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(status)?;
+        let before = parse_optional_id(request.before_operation_id, "invalid activity cursor")?;
+        let service = self.0.clone();
+        work(move || {
+            let (jobs, next) = service.activity(
+                &tenant,
+                collection.as_ref(),
+                before,
+                request.limit.unwrap_or(25),
+            )?;
+            Ok(v1::ListIngestionJobsResponse {
+                jobs: jobs.into_iter().map(wire_job).collect(),
+                next_before_operation_id: next.map(|id| id.to_string()),
+            })
+        })
+        .await
+        .map(Response::new)
+    }
+
+    async fn get_embedding_status(
+        &self,
+        request: Request<v1::EmbeddingStatusRequest>,
+    ) -> Reply<v1::EmbeddingStatus> {
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        let source = parse_optional_id(request.source_id, "invalid source ID")?;
+        let revision = parse_optional_id(request.revision_id, "invalid revision ID")?;
+        let target = match (source, revision) {
+            (None, None) => None,
+            (Some(source), Some(revision)) => Some((source, revision)),
+            _ => {
+                return Err(Status::invalid_argument(
+                    "embedding status requires both source and revision IDs",
+                ));
+            }
+        };
+        let service = self.0.clone();
+        work(move || {
+            let status = service.embedding_status(&scope, target)?;
+            Ok(v1::EmbeddingStatus {
+                coverage: Some(v1::EmbeddingCoverage {
+                    profile_id: status.profile,
+                    total_chunks: status.coverage.total,
+                    embedded_chunks: status.coverage.embedded,
+                    failed_chunks: status.coverage.failed,
+                }),
+                retrying_chunks: status.retrying,
+                next_retry_at_unix_seconds: status.next_retry,
+                sample_error: status.sample_error,
+            })
+        })
+        .await
+        .map(Response::new)
+    }
+
     async fn cancel_ingestion_job(
         &self,
         request: Request<v1::IngestionJobRequest>,
@@ -542,6 +608,7 @@ fn wire_job(job: Job) -> v1::IngestionJob {
         error_message,
         text_revision,
         update_sequence: job.update_sequence,
+        created_at_unix_seconds: job.created_at,
     }
 }
 

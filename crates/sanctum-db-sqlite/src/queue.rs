@@ -64,6 +64,7 @@ pub struct Job {
     pub original_hash: Option<String>,
     pub source_encoding: Option<String>,
     pub extractor: Option<String>,
+    pub created_at: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -73,7 +74,7 @@ const COLUMNS: &str = "operation_id, tenant, collection, source_id, revision_id,
     name, external_namespace, external_id, total_bytes, processed_bytes,
     attempts, status, error_code, error_message, content_hash, chunks,
     replacement, update_sequence, import_hash, extract_rtf, retain_original, extracting,
-    canonical_bytes, original_hash, source_encoding, extractor";
+    canonical_bytes, original_hash, source_encoding, extractor, created_at";
 
 impl LocalQueue {
     /// The caller holds the storage owner's exclusive lock for this queue.
@@ -86,6 +87,7 @@ impl LocalQueue {
                 include_str!("runtime_v2.sql"),
                 include_str!("runtime_v3.sql"),
                 include_str!("runtime_v4.sql"),
+                include_str!("runtime_v5.sql"),
             ],
         )?;
         connection
@@ -122,12 +124,13 @@ impl LocalQueue {
                 )
                 .map_err(database_error)?;
         }
-        transaction
-            .execute(
+        job.created_at = transaction
+            .query_row(
                 "INSERT INTO ingestion_jobs (operation_id, tenant, collection, source_id,
                 revision_id, name, external_namespace, external_id, total_bytes,
                 replacement, update_sequence, import_hash, extract_rtf, retain_original)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             RETURNING created_at",
                 params![
                     job.id.to_string(),
                     job.scope.tenant.as_str(),
@@ -144,6 +147,7 @@ impl LocalQueue {
                     job.extract_rtf,
                     job.retain_original,
                 ],
+                |row| unsigned_column(row, 0),
             )
             .map_err(database_error)?;
         transaction.commit().map_err(database_error)
@@ -166,6 +170,58 @@ impl LocalQueue {
                 |row| row.get(0),
             )
             .map_err(database_error)
+    }
+
+    pub fn activity(
+        &self,
+        tenant: &ScopeId,
+        collection: Option<&ScopeId>,
+        before: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<Job>> {
+        let connection = self.connect()?;
+        let collection = collection.map(ScopeId::as_str);
+        let before = before.map(|value| value.to_string());
+        let (timestamp, operation) = if let Some(operation) = before {
+            let timestamp = connection
+                .query_row(
+                    "SELECT created_at FROM ingestion_jobs WHERE operation_id = ?1
+                   AND tenant = ?2 AND (?3 IS NULL OR collection = ?3)",
+                    params![operation, tenant.as_str(), collection],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(database_error)?
+                .ok_or_else(|| Error::Invalid("activity cursor is outside this scope".into()))?;
+            (timestamp, operation)
+        } else {
+            (i64::MAX, String::new())
+        };
+        let condition = if collection.is_some() {
+            " AND collection = ?5"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT {COLUMNS} FROM ingestion_jobs WHERE tenant = ?1
+             AND (created_at, operation_id) < (?2, ?3){condition}
+             ORDER BY created_at DESC, operation_id DESC LIMIT ?4"
+        );
+        let mut arguments: Vec<rusqlite::types::Value> = vec![
+            tenant.as_str().to_owned().into(),
+            timestamp.into(),
+            operation.into(),
+            i64::from(limit).into(),
+        ];
+        if let Some(collection) = collection {
+            arguments.push(collection.to_owned().into());
+        }
+        super::query_all(
+            &connection,
+            &sql,
+            rusqlite::params_from_iter(arguments),
+            map_job,
+        )
     }
 
     pub fn retains_input(&self, scope: &Scope, revision: super::RevisionKey) -> Result<bool> {
@@ -484,6 +540,7 @@ fn map_job(row: &Row<'_>) -> rusqlite::Result<Job> {
         original_hash: row.get(23)?,
         source_encoding: row.get(24)?,
         extractor: row.get(25)?,
+        created_at: unsigned_column(row, 26)?,
     })
 }
 

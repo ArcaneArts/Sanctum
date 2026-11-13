@@ -39,6 +39,12 @@ returns `ALREADY_EXISTS`. `UploadText` waits up to 30 seconds for lexical public
 If its wait expires, the response message contains the operation ID. The
 accepted work can continue after the client disconnects.
 
+`ListIngestionJobs` accepts a tenant, optional collection, and a page limit
+from 1 to 100 (default 25). Results sort by acceptance time, newest first,
+using the operation ID to break ties. Reuse `next_before_operation_id` as
+`before_operation_id` with the same scope to read the next page. A fresh
+first page shows newly accepted operations.
+
 A source name ending in `.rtf` selects streaming RTF text extraction. Uploads
 and directory imports use text-only retention by default. Set
 `retain_original` in the request or pass `--retain-original` to keep the
@@ -160,6 +166,12 @@ Ollama requests disable truncation. A rejected input is recorded separately
 so other chunks can proceed. Transient failures back off and retry. Correct
 a permanently rejected input with a new source revision or use a corrected
 embedding profile.
+
+`GetEmbeddingStatus` reports total, embedded, failed, and retrying chunks,
+the earliest retry time, and a sample error without invoking Ollama. Pass
+only the scope for collection coverage, or add a source ID and its current
+revision ID for source coverage. The retrying count is a subset of the failed
+count. A missing profile ID indicates embedding is disabled.
 
 ## Local file and directory imports
 

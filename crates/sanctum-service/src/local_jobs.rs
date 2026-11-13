@@ -297,6 +297,7 @@ pub(crate) fn new_job(
         original_hash: None,
         source_encoding: None,
         extractor: None,
+        created_at: 0,
     }
 }
 
