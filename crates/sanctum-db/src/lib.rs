@@ -48,6 +48,10 @@ impl Unit {
         Key::parse(format!("{}/HEAD.json", self.prefix))
     }
 
+    pub fn snapshot_session(&self, id: Uuid) -> Result<Key> {
+        Key::parse(format!("{}/snapshots/sessions/{id}.json", self.prefix))
+    }
+
     fn snapshot(&self, generation: Uuid) -> Result<Key> {
         Key::parse(format!(
             "{}/snapshots/{generation}/{}",
@@ -116,6 +120,10 @@ pub struct Materialized {
 impl Materialized {
     pub fn path(&self) -> &Path {
         self.file.path()
+    }
+
+    pub fn reopen(&self) -> Result<std::fs::File> {
+        Ok(self.file.reopen()?)
     }
 }
 
@@ -483,6 +491,18 @@ impl Lease {
             else {
                 continue;
             };
+            if generation == "sessions" && file.ends_with(".json") {
+                // A session expires five minutes after its open request started.
+                // Object age is a conservative bound even if the upload was delayed.
+                if SystemTime::now()
+                    .duration_since(object.modified_at)
+                    .is_ok_and(|age| age >= grace)
+                {
+                    self.ensure_live()?;
+                    self.publication.storage.delete(&object.key).await?;
+                }
+                continue;
+            }
             let Ok(generation) = generation.parse::<Uuid>() else {
                 continue;
             };

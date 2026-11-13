@@ -483,7 +483,7 @@ values such as `1` and `1.0` share a group.
 Pages default to 16 rows with a maximum of 32. Pass `next_offset` with the
 same request to get the next page. Each page reads current committed data.
 An integration that needs repeatable pages across concurrent edits can
-query an exported database snapshot once that API is available.
+query an exported database snapshot.
 
 ## Read-only SQL sessions and snapshots
 
@@ -495,9 +495,9 @@ and required SQLite features. Collection databases use FTS5 with
 contentless-delete support. Open a downloaded copy with SQLite 3.43 or later
 and FTS5 enabled. [SQLite FTS5 reference](https://sqlite.org/fts5.html#external_content_and_contentless_tables).
 
-The server copies one committed database generation using SQLite's online
-backup API. The session reads from that immutable copy, so later writes
-do not alter queries or downloads. `QueryDatabase` accepts a single SELECT
+The filesystem-backed server uses SQLite's online backup API. The hosted
+server uses an immutable published generation. Later writes leave both
+types of sessions pinned to their original bytes. `QueryDatabase` accepts a single SELECT
 with typed positional parameters. It supports common scalar, aggregate,
 and JSON functions. It restricts statements to the selected database and
 rejects writes, attachment, PRAGMA, and extension loading. Result pages
@@ -508,7 +508,10 @@ to gRPC cancellation.
 
 `DownloadDatabase` streams the same SQLite file in frames of at most 256 KiB.
 Use the advertised byte count to detect interrupted downloads. Each session
-expires after five minutes and is tied to the server process and its original
-scope. Close it early with `CloseDatabaseSession`. Up to four snapshot copies
-may exist at a time, including copies still held by active queries or downloads.
-A stream already in progress can finish after its handle expires or closes.
+expires after five minutes and is tied to its original scope. Close it early
+with `CloseDatabaseSession`. On a filesystem-backed server, up to four snapshot
+copies may exist in the process, including copies held by active queries or
+downloads. A hosted session can move between API processes. Its response
+includes `snapshot_generation`, and its scoped session handle refers to that
+generation until expiry or close. A stream already materializing or reading its
+snapshot can finish after its handle expires or closes.

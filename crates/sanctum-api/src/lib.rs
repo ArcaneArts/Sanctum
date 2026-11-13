@@ -56,14 +56,14 @@ impl Sanctum for Grpc {
         &self,
         request: Request<v1::DatabaseTarget>,
     ) -> Reply<v1::DatabaseSession> {
-        database::open(self.local()?, self.1.child_token(), request.into_inner()).await
+        database::open(&self.0, self.1.child_token(), request.into_inner()).await
     }
 
     async fn query_database(
         &self,
         request: Request<v1::QueryDatabaseRequest>,
     ) -> Reply<v1::QueryDatabaseResponse> {
-        database::query(self.local()?, self.1.child_token(), request.into_inner()).await
+        database::query(&self.0, self.1.child_token(), request.into_inner()).await
     }
 
     type DownloadDatabaseStream = ReceiverStream<std::result::Result<v1::DatabaseFrame, Status>>;
@@ -72,14 +72,14 @@ impl Sanctum for Grpc {
         &self,
         request: Request<v1::DatabaseSessionRef>,
     ) -> Reply<Self::DownloadDatabaseStream> {
-        database::download(self.local()?, self.1.clone(), request.into_inner()).await
+        database::download(&self.0, self.1.clone(), request.into_inner()).await
     }
 
     async fn close_database_session(
         &self,
         request: Request<v1::DatabaseSessionRef>,
     ) -> Reply<v1::Empty> {
-        database::close(self.local()?, request.into_inner()).await
+        database::close(&self.0, request.into_inner()).await
     }
 
     async fn get_storage_usage(

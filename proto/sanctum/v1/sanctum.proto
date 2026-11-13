@@ -65,6 +65,8 @@ message DatabaseSession {
   string sqlite_version = 5;
   repeated DatabaseSchemaObject schema = 6;
   repeated string sqlite_features = 7;
+  // Published object-backed generation pinned by the session, when applicable.
+  optional string snapshot_generation = 8;
 }
 
 message SqlValue {
