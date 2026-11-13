@@ -20,6 +20,11 @@ sanctum-storage-gcs = { path = "../sanctum-storage-gcs" }
 sanctum-storage-s3 = { path = "../sanctum-storage-s3" }
 anyhow = { workspace = true }
 axum.workspace = true
+async-trait.workspace = true
+base64 = "0.22"
+blake3.workspace = true
+google-cloud-auth.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true }

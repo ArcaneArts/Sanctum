@@ -6,6 +6,7 @@ use sanctum_service::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod cloud_tasks;
 mod hosted;
 mod hosted_worker;
 
@@ -19,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
         return hosted::serve(
             config.grpc_listen,
             config.hosted_worker_listen,
+            config.cloud_tasks,
             storage,
             config.max_source_bytes,
         )

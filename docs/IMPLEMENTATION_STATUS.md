@@ -478,5 +478,24 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   Unicode byte-range fetch, RTF replacement, hybrid fallback, and prior
   revision fetch. After restart, duplicate indexing left the published
   snapshot unchanged.
-- Hosted embedding work, automatic task dispatch, scheduled repair,
-  and authoritative source cleanup remain open.
+- Delivered in [PR #30](https://github.com/ArcaneArts/Sanctum/pull/30).
+
+## Cloud Tasks dispatch and repair
+
+- Hosted upload acceptance records a repair hint before committing the
+  operation envelope. The API attempts Cloud Tasks delivery after acceptance,
+  and the worker attempts the next dispatch after committing its stage.
+  The envelope records delivery by stage and time window.
+- The private maintenance endpoint scans a bounded page of a single shard
+  and persists its cursor in object storage. It reads operation envelopes
+  directly and can retry after an API or worker restart.
+- The HTTP fixture checks Google Cloud Tasks request format, OIDC audience
+  and account, deduplication, and retryable service errors. The local
+  integration test interrupts dispatch and resumes the repair cursor across
+  a fresh service instance, then advances both worker stages.
+- A standalone server with MinIO and deliberately unavailable ADC accepted
+  an upload, resumed repair after restart, and cleared its dispatch hint
+  after manual worker delivery reached text ready.
+- Actual Cloud Run ingress, Cloud Tasks delivery, Cloud Scheduler invocations,
+  and live GCS still require an authorized Sanctum Google Cloud project.
+  Hosted embedding work, cleanup, and additional retrieval APIs remain open.

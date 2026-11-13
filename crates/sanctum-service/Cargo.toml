@@ -13,6 +13,7 @@ sanctum-db-sqlite = { path = "../sanctum-db-sqlite" }
 sanctum-chunk = { path = "../sanctum-chunk" }
 sanctum-extract = { path = "../sanctum-extract" }
 sanctum-embedding = { path = "../sanctum-embedding" }
+async-trait.workspace = true
 blake3 = { workspace = true }
 globset.workspace = true
 mime.workspace = true

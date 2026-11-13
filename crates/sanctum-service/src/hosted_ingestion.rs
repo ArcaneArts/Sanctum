@@ -12,7 +12,7 @@ use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
-use crate::{HostedCatalog, RevisionContent, TextUpload};
+use crate::{HostedCatalog, RevisionContent, TaskStage, TextUpload};
 
 mod indexing;
 
@@ -85,6 +85,8 @@ struct Operation {
     blake3: String,
     attempt: Uuid,
     created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dispatched_at: Option<u64>,
     #[serde(flatten)]
     stage: Stage,
 }
@@ -158,6 +160,7 @@ impl HostedCatalog {
         released?;
         let outcome: RegistrationOutcome = serde_json::from_str(&receipts[0].outcome)
             .map_err(|error| Error::Internal(Box::new(error)))?;
+        record.dispatched_at = None;
         record.stage = match outcome {
             RegistrationOutcome::Registered(registration) => {
                 Stage::PendingIndexing { registration }
@@ -198,6 +201,50 @@ impl HostedCatalog {
                 }
                 Ok(current.job())
             }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn dispatch_pending(&self, scope: &Scope, operation: Uuid) -> Result<bool> {
+        let Some(dispatcher) = self.dispatcher.as_ref() else {
+            return Ok(false);
+        };
+        let prefix = self.operation_prefix(scope, operation)?;
+        let Some((mut record, version)) = self.read_operation(&prefix, operation).await? else {
+            return Ok(false);
+        };
+        let stage = match record.stage {
+            Stage::PendingRegistration => TaskStage::Register,
+            Stage::PendingIndexing { .. } => TaskStage::Index,
+            Stage::TextReady { .. } | Stage::Failed { .. } => {
+                self.clear_dispatch_hint(scope, operation).await?;
+                return Ok(false);
+            }
+        };
+        let now = unix_seconds()?;
+        let window = now / crate::hosted_dispatch::DISPATCH_WINDOW_SECONDS;
+        if record.dispatched_at.is_some_and(|dispatched| {
+            dispatched / crate::hosted_dispatch::DISPATCH_WINDOW_SECONDS >= window
+        }) {
+            return Ok(false);
+        }
+        dispatcher
+            .send(crate::Task {
+                scope,
+                operation,
+                stage,
+                window,
+            })
+            .await?;
+        record.dispatched_at = Some(now);
+        let key = envelope_key(&prefix)?;
+        let body = serde_json::to_vec(&record).map_err(|error| Error::Internal(Box::new(error)))?;
+        match self
+            .storage
+            .put_control(&key, body.into(), Condition::Match(version))
+            .await
+        {
+            Ok(_) | Err(Error::Conflict(_)) => Ok(true),
             Err(error) => Err(error),
         }
     }
@@ -286,10 +333,23 @@ impl HostedUpload {
             blake3,
             attempt: Uuid::new_v4(),
             created_at: unix_seconds()?,
+            dispatched_at: None,
             stage: Stage::PendingRegistration,
         };
         if let Some((saved, _)) = self.service.read_operation(&prefix, self.operation).await? {
-            return saved.replay(&candidate);
+            let job = saved.replay(&candidate)?;
+            if self.service.dispatcher.is_some()
+                && matches!(
+                    job.state,
+                    HostedJobState::Accepted | HostedJobState::Registered
+                )
+            {
+                self.service
+                    .record_dispatch_hint(&self.scope, self.operation)
+                    .await?;
+                self.service.try_dispatch(&self.scope, self.operation).await;
+            }
+            return Ok(job);
         }
         let key = envelope_key(&prefix)?;
         let input = candidate.input_key(&prefix)?;
@@ -298,7 +358,10 @@ impl HostedUpload {
         let store = self.service.storage.as_ref();
         let reader = tokio::fs::File::from_std(self.file.reopen()?);
         store.put_stream(&input, Box::pin(reader), bytes).await?;
-        match store
+        self.service
+            .record_dispatch_hint(&self.scope, self.operation)
+            .await?;
+        let job = match store
             .put_control(&key, body.into(), Condition::Create)
             .await
         {
@@ -320,7 +383,9 @@ impl HostedUpload {
             }
             // The conditional write may have committed. Preserve its input for replay.
             Err(error) => Err(error),
-        }
+        }?;
+        self.service.try_dispatch(&self.scope, self.operation).await;
+        Ok(job)
     }
 }
 

@@ -13,6 +13,7 @@ pub struct Config {
     pub storage_root: PathBuf,
     pub object_storage: Option<ObjectStorageConfig>,
     pub hosted_worker_listen: Option<SocketAddr>,
+    pub cloud_tasks: Option<CloudTasksConfig>,
     #[serde(default = "default_grpc")]
     pub grpc_listen: SocketAddr,
     #[serde(default = "default_mcp")]
@@ -23,6 +24,14 @@ pub struct Config {
     pub local_worker_concurrency: usize,
     pub embedding: Option<EmbeddingConfig>,
     pub url_import_origins: Option<HashMap<String, Option<String>>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudTasksConfig {
+    pub queue: String,
+    pub worker_url: String,
+    pub service_account: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -85,9 +94,11 @@ impl Config {
                 "storage_root is required for filesystem storage".into(),
             ));
         }
-        if config.hosted_worker_listen.is_some() && config.object_storage.is_none() {
+        if config.object_storage.is_none()
+            && (config.hosted_worker_listen.is_some() || config.cloud_tasks.is_some())
+        {
             return Err(Error::Invalid(
-                "hosted_worker_listen requires object storage".into(),
+                "hosted worker and Cloud Tasks settings require object storage".into(),
             ));
         }
         if !(1..=32).contains(&config.local_worker_concurrency) {

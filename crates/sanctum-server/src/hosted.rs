@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use sanctum_config::ObjectStorageConfig;
+use sanctum_config::{CloudTasksConfig, ObjectStorageConfig};
 use sanctum_service::HostedCatalog;
 use sanctum_storage::{Key, Storage};
 use sanctum_storage_gcs::GcsStorage;
@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) async fn serve(
     address: SocketAddr,
     worker_address: Option<SocketAddr>,
+    cloud_tasks: Option<CloudTasksConfig>,
     config: ObjectStorageConfig,
     max_source_bytes: u64,
 ) -> anyhow::Result<()> {
@@ -33,11 +34,14 @@ pub(crate) async fn serve(
         ),
         ObjectStorageConfig::Gcs { bucket, prefix } => (Arc::new(GcsStorage::new(bucket)?), prefix),
     };
-    let catalog = HostedCatalog::new(
+    let mut catalog = HostedCatalog::new(
         storage,
         prefix.map(Key::parse).transpose()?,
         max_source_bytes,
     )?;
+    if let Some(config) = cloud_tasks {
+        catalog = catalog.with_dispatch(Arc::new(crate::cloud_tasks::CloudTasks::new(config)?));
+    }
     let listener = tokio::net::TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
     let worker = if let Some(worker_address) = worker_address {

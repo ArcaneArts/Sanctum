@@ -5,7 +5,7 @@ use sanctum_db::{Command, Publication, Unit, collection_prefix, tenant_prefix};
 use sanctum_storage::{Key, Storage};
 use uuid::Uuid;
 
-use crate::db;
+use crate::{Dispatch, db};
 
 #[derive(Clone)]
 pub struct HostedCatalog {
@@ -13,6 +13,7 @@ pub struct HostedCatalog {
     pub(crate) prefix: Option<Key>,
     pub(crate) max_source_bytes: u64,
     pub(crate) publication: Publication,
+    pub(crate) dispatcher: Option<Arc<dyn Dispatch>>,
 }
 
 impl HostedCatalog {
@@ -30,6 +31,7 @@ impl HostedCatalog {
             prefix,
             max_source_bytes,
             publication,
+            dispatcher: None,
         })
     }
 

@@ -158,8 +158,8 @@ synchronous `UploadText`, retrieval, and MCP remain open.
 
 Set `hosted_worker_listen` in `SANCTUM_CONFIG_JSON` to enable the private
 HTTP worker listener. For local testing use `127.0.0.1:47552`. Restrict this
-listener to trusted callers. Deployment identity and automatic task
-delivery are pending.
+listener to trusted callers. See the Cloud Tasks configuration below for
+automatic delivery.
 
 ```sh
 curl --fail-with-body http://127.0.0.1:47552/internal/tasks/register-upload \
@@ -196,5 +196,39 @@ its index.
 `SearchText` serves collection-scoped lexical hits, including hybrid
 requests when hosted embeddings are unavailable. `FetchChunk` reads
 the hit's exact byte range and verifies its fingerprint. Hosted vectors,
-automatic dispatch, source cleanup, and multi-collection retrieval
-remain open.
+source cleanup, and multi-collection retrieval remain open.
+
+### Cloud Tasks dispatch
+
+Set `cloud_tasks` on the hosted API and worker. Use the full queue resource
+name, the private worker service's HTTPS origin, and the service account
+that Cloud Tasks will use to invoke it.
+
+```json
+{
+  "queue": "projects/PROJECT/locations/REGION/queues/QUEUE",
+  "worker_url": "https://WORKER.run.app",
+  "service_account": "sanctum-tasks@PROJECT.iam.gserviceaccount.com"
+}
+```
+
+The API and worker use Application Default Credentials to create tasks.
+Grant those identities Cloud Tasks Enqueuer on the queue and permission
+to act as the task service account. Grant that account Cloud Run Invoker
+on the private worker. The task carries an OIDC token with the worker's
+origin as its audience. [Creating tasks](https://docs.cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks/create), [Cloud Run service identity](https://docs.cloud.google.com/run/docs/authenticating/service-to-service).
+
+A dispatch error leaves accepted work discoverable in object storage. Invoke
+`POST /internal/maintenance/dispatch/{shard}` on the private worker for each
+shard from 0 through 15 with an authorized Cloud Scheduler identity. Each
+request processes at most 16 hints, persists the continuation, and reports
+`dispatched`, `failed`, and `more`. The next invocation continues the scan
+or begins a new pass when the previous pass ended. Dispatch retries keep
+the same task name within a six-hour window. A later window uses a new
+name so repair can recover tasks that exhausted their queue retries.
+Configure the scheduler frequency against the measured queue depth.
+
+Manual registration and indexing remain available with the private listener
+when `cloud_tasks` is omitted. Operations accepted before dispatch hints were
+introduced can be resubmitted with the same request ID and input to record
+a hint. Live Google Cloud deployment verification remains open.
