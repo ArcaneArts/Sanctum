@@ -366,3 +366,12 @@ then removes the retired collection's snapshots, operation objects,
 and source bytes in bounded pages. It retains the small manifest fence.
 An already materialized snapshot remains readable for the life of its
 local reader.
+
+### Hosted operation retention
+
+The upload sweep compacts terminal envelopes after 45 days without an
+envelope update. A compact record reserves the old request UUID and
+keeps the input locator if that input serves published UTF-8 text or
+a retained original. Status and worker calls treat the old operation
+as absent. A new submission must use a new UUID. Pending registration,
+indexing, or embedding work remains available for recovery.

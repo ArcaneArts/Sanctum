@@ -1,14 +1,18 @@
 use std::time::{Duration, SystemTime};
 
-use sanctum_core::{Error, Result, Scope};
+use sanctum_core::{Error, Result, Scope, is_rtf};
 use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES, Object};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
-use super::{AcceptanceFence, Envelope, HostedCatalog, REGISTRATION_WINDOW, envelope_key};
+use super::{
+    AcceptanceFence, Envelope, ExpiredOperation, HostedCatalog, REGISTRATION_WINDOW, Stage,
+    envelope_key, unix_seconds,
+};
 
 const READER_GRACE: Duration = Duration::from_secs(900);
+const OPERATION_RETENTION: Duration = Duration::from_secs(45 * 24 * 3600);
 const SCAN_PAGE: u32 = 64;
 const CANDIDATE_LIMIT: usize = 8;
 
@@ -20,12 +24,14 @@ struct Cursor {
 
 pub struct UploadSweep {
     pub deleted: usize,
+    pub expired: usize,
     pub failed: usize,
     pub more: bool,
 }
 
 enum Candidate {
     Input { operation: Uuid, attempt: Uuid },
+    Operation { operation: Uuid },
     Extracted { source: Uuid, revision: Uuid },
 }
 
@@ -86,6 +92,7 @@ impl HostedCatalog {
         }
         let mut report = UploadSweep {
             deleted: 0,
+            expired: 0,
             failed: 0,
             more: false,
         };
@@ -94,9 +101,22 @@ impl HostedCatalog {
             let Some((scope, candidate)) = candidate(self.prefix.as_ref(), &object) else {
                 continue;
             };
-            match self.reclaim_candidate(&scope, &object, candidate).await {
-                Ok(true) => report.deleted += 1,
-                Ok(false) | Err(Error::NotFound(_)) => {}
+            let result = match candidate {
+                Candidate::Operation { operation } => self
+                    .expire_operation(&scope, &object, operation)
+                    .await
+                    .map(|expired| {
+                        report.expired += usize::from(expired);
+                    }),
+                candidate => self
+                    .reclaim_candidate(&scope, &object, candidate)
+                    .await
+                    .map(|deleted| {
+                        report.deleted += usize::from(deleted);
+                    }),
+            };
+            match result {
+                Ok(()) | Err(Error::NotFound(_)) => {}
                 Err(error) => {
                     report.failed += 1;
                     tracing::warn!(%error, key = %object, "abandoned upload sweep will retry on the next pass");
@@ -116,6 +136,51 @@ impl HostedCatalog {
         Ok(report)
     }
 
+    async fn expire_operation(&self, scope: &Scope, object: &Key, operation: Uuid) -> Result<bool> {
+        let head = self.storage.head(object).await?;
+        if !old_enough(
+            &head,
+            &Candidate::Operation { operation },
+            SystemTime::now(),
+        ) {
+            return Ok(false);
+        }
+        let prefix = self.operation_prefix(scope, operation)?;
+        let Some((Envelope::Accepted(record), version)) =
+            self.read_envelope(&prefix, operation).await?
+        else {
+            return Ok(false);
+        };
+        if version != head.version {
+            return Ok(false);
+        }
+        let retained_attempt = match record.stage {
+            Stage::TextReady {
+                embedding: None, ..
+            } => (!is_rtf(&record.upload.name) || record.upload.retain_original)
+                .then_some(record.attempt),
+            Stage::Failed { .. } => None,
+            _ => return Ok(false),
+        };
+        self.clear_dispatch_hint(scope, operation).await?;
+        let compact = ExpiredOperation {
+            operation,
+            expired_at: unix_seconds()?,
+            retained_attempt,
+        };
+        let body =
+            serde_json::to_vec(&compact).map_err(|error| Error::Internal(Box::new(error)))?;
+        match self
+            .storage
+            .put_control(object, body.into(), Condition::Match(version))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(Error::Conflict(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn reclaim_candidate(
         &self,
         scope: &Scope,
@@ -131,6 +196,9 @@ impl HostedCatalog {
                 let prefix = self.operation_prefix(scope, operation)?;
                 match self.read_envelope(&prefix, operation).await? {
                     Some((Envelope::Accepted(record), _)) => record.attempt != attempt,
+                    Some((Envelope::Expired(record), _)) => {
+                        record.retained_attempt != Some(attempt)
+                    }
                     existing => {
                         let condition = existing
                             .map_or(Condition::Create, |(_, version)| Condition::Match(version));
@@ -154,6 +222,7 @@ impl HostedCatalog {
                     }
                 }
             }
+            Candidate::Operation { .. } => return Ok(false),
             Candidate::Extracted { source, revision } => {
                 let object = object.to_string();
                 let (referenced, _) = self
@@ -174,6 +243,7 @@ impl HostedCatalog {
 fn old_enough(object: &Object, candidate: &Candidate, now: SystemTime) -> bool {
     let minimum = match candidate {
         Candidate::Input { .. } => READER_GRACE,
+        Candidate::Operation { .. } => OPERATION_RETENTION,
         // Registration starts before extraction. Even a delayed index writer has
         // expired by now and cannot introduce this locator into a new snapshot.
         Candidate::Extracted { .. } => REGISTRATION_WINDOW + READER_GRACE,
@@ -199,12 +269,13 @@ fn candidate(prefix: Option<&Key>, key: &Key) -> Option<(Scope, Candidate)> {
     let candidate = match parts.next()? {
         "operations" => {
             let operation = parts.next()?.parse().ok()?;
-            if parts.next()? != "inputs" {
-                return None;
-            }
-            Candidate::Input {
-                operation,
-                attempt: parts.next()?.parse().ok()?,
+            match parts.next()? {
+                "inputs" => Candidate::Input {
+                    operation,
+                    attempt: parts.next()?.parse().ok()?,
+                },
+                "operation.json" => Candidate::Operation { operation },
+                _ => return None,
             }
         }
         "sources" => {

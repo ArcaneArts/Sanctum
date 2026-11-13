@@ -858,3 +858,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   accepted window. The hosted test verifies the resulting UTF-8 range.
 - A generated Python client verified the configured chunker identifier
   on a published RTF revision in live MinIO.
+- Delivered in [PR #56](https://github.com/ArcaneArts/Sanctum/pull/56).
+
+## Hosted operation retention
+
+- Scheduled maintenance compacts terminal upload envelopes after
+  45 days. It preserves canonical input references and reserves old
+  request UUIDs. Status and worker calls reject expired operations.
+- The filesystem integration test ages terminal records and their input,
+  runs the sweep, and verifies pending work, duplicate rejection, and
+  retrieval. A live MinIO run installs a compact record fixture and
+  verifies duplicate rejection and retrieval after server restart.
