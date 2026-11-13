@@ -564,5 +564,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - Standalone worker deliveries against MinIO and real Ollama verified
   both embedding steps, duplicate delivery, and semantic search after
   restart. The Cloud Tasks payload fixture checks delayed delivery.
-- Automatic rebuilds for collections already idle when the profile
-  changes, and hosted multi-collection retrieval remain open.
+- Delivered in [PR #35](https://github.com/ArcaneArts/Sanctum/pull/35).
+
+## Hosted search across collections
+
+- Hosted gRPC can search up to eight collections belonging to one tenant.
+  It shares a query vector across those collections, aggregates coverage,
+  and uses the same rank merge as local search. Each returned hit keeps
+  its collection and database generation.
+- The integration test verifies one provider query, partial coverage,
+  byte-range fetches for results from both collections, and tenant
+  isolation.
+- A standalone MinIO and Ollama run exercised hybrid search across an
+  embedded collection and a collection awaiting vectors. Semantic search
+  returned the embedded collection, and restart preserved both results.
+- Automatic rebuilds for idle collections after a profile change remain
+  open.

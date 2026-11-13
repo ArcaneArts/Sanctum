@@ -195,8 +195,10 @@ its index.
 `GetIngestionJob` reports `TEXT_READY` with the committed revision.
 `SearchText` serves collection-scoped lexical hits, including hybrid
 requests when hosted embeddings are unavailable. `FetchChunk` reads
-the hit's exact byte range and verifies its fingerprint. Source cleanup
-and hosted multi-collection retrieval remain open.
+the hit's exact byte range and verifies its fingerprint. Hosted
+`SearchCollections` accepts one to eight collections in a tenant and
+returns the aggregate coverage and scoped references. Source cleanup
+remains open.
 
 ### Cloud Tasks dispatch
 

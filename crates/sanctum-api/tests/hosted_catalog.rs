@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 
 use sanctum_core::{ByteRange, Error, Result as StorageResult};
@@ -851,6 +851,7 @@ async fn hosted_embeddings_reuse_current_inputs_and_isolate_profiles() {
     let provider = Arc::new(HostedEmbeddingFixture {
         profile: "fixture-v1",
         fail: AtomicU8::new(0),
+        queries: AtomicUsize::new(0),
     });
     let catalog = HostedCatalog::new(storage.clone(), None, 1024)
         .unwrap()
@@ -964,6 +965,7 @@ async fn hosted_embeddings_reuse_current_inputs_and_isolate_profiles() {
         .with_embedding(Some(Arc::new(HostedEmbeddingFixture {
             profile: "fixture-v2",
             fail: AtomicU8::new(0),
+            queries: AtomicUsize::new(0),
         })));
     let mut server = start(catalog.clone()).await;
     let changed = server
@@ -991,9 +993,120 @@ async fn hosted_embeddings_reuse_current_inputs_and_isolate_profiles() {
     server.stop().await;
 }
 
+#[tokio::test]
+async fn hosted_collection_search_uses_one_query_vector_and_keeps_hits_scoped() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let provider = Arc::new(HostedEmbeddingFixture {
+        profile: "fixture-v1",
+        fail: AtomicU8::new(0),
+        queries: AtomicUsize::new(0),
+    });
+    let service = HostedCatalog::new(storage, None, 1024)
+        .unwrap()
+        .with_embedding(Some(provider.clone()));
+    let mut server = start(service.clone()).await;
+    for (tenant, collection, text) in [
+        ("default", "first", "shared first 🦀"),
+        ("default", "second", "shared second café"),
+        ("other", "private", "shared private"),
+    ] {
+        let scope = sanctum_core::Scope {
+            tenant: tenant.parse().unwrap(),
+            collection: collection.parse().unwrap(),
+        };
+        service.create_collection(&scope, None).await.unwrap();
+        let header = v1::UploadTextHeader {
+            scope: Some(v1::Scope {
+                tenant: tenant.into(),
+                collection: collection.into(),
+            }),
+            name: "notes.txt".into(),
+            ..Default::default()
+        };
+        let accepted = server
+            .client
+            .submit_text(upload_frames(&header, [text.as_bytes()]))
+            .await
+            .unwrap()
+            .into_inner();
+        let operation = accepted.operation_id.parse().unwrap();
+        service.register_upload(&scope, operation).await.unwrap();
+        service.index_upload(&scope, operation).await.unwrap();
+        if collection == "first" {
+            assert_eq!(service.embed_collection(&scope).await.unwrap(), 1);
+        }
+    }
+    let query = v1::SearchCollectionsRequest {
+        tenant: "default".into(),
+        collections: vec!["second".into(), "first".into()],
+        query: "shared".into(),
+        mode: v1::SearchMode::Hybrid.into(),
+        ..Default::default()
+    };
+    let result = server
+        .client
+        .search_collections(query.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(provider.queries.load(Ordering::Relaxed), 1);
+    assert_eq!(result.mode(), v1::SearchMode::Hybrid);
+    assert_eq!(
+        result.degraded_reason.as_deref(),
+        Some("embedding_coverage_partial")
+    );
+    let coverage = result.embedding_coverage.unwrap();
+    assert_eq!((coverage.total_chunks, coverage.embedded_chunks), (2, 1));
+    let hits: Vec<_> = result.hits.iter().map(|hit| hit.excerpt.as_str()).collect();
+    assert_eq!(hits, ["shared first 🦀", "shared second café"]);
+    for hit in result.hits {
+        let reference = hit.chunk.unwrap();
+        assert_eq!(reference.scope.as_ref().unwrap().tenant, "default");
+        let fetched = server
+            .client
+            .fetch_chunk(v1::FetchChunkRequest {
+                chunk: Some(reference),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(fetched.excerpt, hit.excerpt);
+        assert_eq!(fetched.database_generation, hit.database_generation);
+    }
+    let wrong_tenant = v1::SearchCollectionsRequest {
+        collections: vec!["private".into()],
+        ..query.clone()
+    };
+    assert_eq!(
+        server
+            .client
+            .search_collections(wrong_tenant)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    let duplicate = v1::SearchCollectionsRequest {
+        collections: vec!["first".into(), "first".into()],
+        ..query
+    };
+    assert_eq!(
+        server
+            .client
+            .search_collections(duplicate)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    server.stop().await;
+}
+
 struct HostedEmbeddingFixture {
     profile: &'static str,
     fail: AtomicU8,
+    queries: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -1008,9 +1121,12 @@ impl sanctum_embedding::Provider for HostedEmbeddingFixture {
 
     async fn embed(
         &self,
-        _purpose: sanctum_embedding::Purpose,
+        purpose: sanctum_embedding::Purpose,
         texts: &[String],
     ) -> Result<Vec<Vec<f32>>, sanctum_embedding::EmbedError> {
+        if matches!(purpose, sanctum_embedding::Purpose::Query) {
+            self.queries.fetch_add(1, Ordering::Relaxed);
+        }
         if self.fail.load(Ordering::Relaxed) != 0 {
             return Err(sanctum_embedding::EmbedError::Transient(
                 "fixture outage".into(),
@@ -1114,6 +1230,7 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
     let provider = Arc::new(HostedEmbeddingFixture {
         profile: "fixture-v1",
         fail: AtomicU8::new(0),
+        queries: AtomicUsize::new(0),
     });
     let service = HostedCatalog::new(storage.clone(), None, 1024)
         .unwrap()
