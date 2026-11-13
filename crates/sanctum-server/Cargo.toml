@@ -23,6 +23,7 @@ axum.workspace = true
 async-trait.workspace = true
 base64 = "0.22"
 blake3.workspace = true
+chrono.workspace = true
 google-cloud-auth.workspace = true
 reqwest.workspace = true
 serde.workspace = true

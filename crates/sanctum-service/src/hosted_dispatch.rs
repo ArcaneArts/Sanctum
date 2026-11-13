@@ -16,10 +16,11 @@ struct Cursor {
     next: Option<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskStage {
     Register,
     Index,
+    Embed { step: u32 },
 }
 
 pub struct Task<'a> {
@@ -27,6 +28,7 @@ pub struct Task<'a> {
     pub operation: Uuid,
     pub stage: TaskStage,
     pub window: u64,
+    pub not_before: Option<u64>,
 }
 
 #[async_trait::async_trait]

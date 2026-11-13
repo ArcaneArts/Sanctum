@@ -5,7 +5,7 @@ use std::sync::{
 
 use sanctum_core::{ByteRange, Error, Result as StorageResult};
 use sanctum_proto::v1::{self, sanctum_client::SanctumClient, upload_text_frame::Frame};
-use sanctum_service::HostedCatalog;
+use sanctum_service::{HostedCatalog, TaskStage};
 use sanctum_storage::{Condition, Download, Key, ListPage, Object, Reader, Storage, Version};
 use tokio::{io::AsyncReadExt, net::TcpListener};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -1078,7 +1078,10 @@ async fn dispatch_reconciliation_recovers_a_failed_handoff_and_advances_its_curs
     let second = restarted.reconcile_shard(0).await.unwrap();
     assert_eq!((second.dispatched, second.failed), (1, 0));
     assert!(second.next_cursor.is_none());
-    assert_eq!(&*dispatch.delivered.lock().unwrap(), &[(operation, false)]);
+    assert_eq!(
+        &*dispatch.delivered.lock().unwrap(),
+        &[(operation, TaskStage::Register)]
+    );
     restarted.try_dispatch(&scope, operation).await;
     assert_eq!(dispatch.delivered.lock().unwrap().len(), 1);
 
@@ -1086,7 +1089,10 @@ async fn dispatch_reconciliation_recovers_a_failed_handoff_and_advances_its_curs
     restarted.try_dispatch(&scope, operation).await;
     assert_eq!(
         &*dispatch.delivered.lock().unwrap(),
-        &[(operation, false), (operation, true)]
+        &[
+            (operation, TaskStage::Register),
+            (operation, TaskStage::Index)
+        ]
     );
     restarted.index_upload(&scope, operation).await.unwrap();
     restarted.try_dispatch(&scope, operation).await;
@@ -1094,9 +1100,100 @@ async fn dispatch_reconciliation_recovers_a_failed_handoff_and_advances_its_curs
     assert!(matches!(storage.head(&key).await, Err(Error::NotFound(_))));
 }
 
+#[tokio::test]
+async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishing() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        interrupt: AtomicU8::new(0),
+    });
+    let dispatch = Arc::new(TestDispatch {
+        fail: AtomicU8::new(0),
+        delivered: std::sync::Mutex::new(Vec::new()),
+    });
+    let provider = Arc::new(HostedEmbeddingFixture {
+        profile: "fixture-v1",
+        fail: AtomicU8::new(0),
+    });
+    let service = HostedCatalog::new(storage.clone(), None, 1024)
+        .unwrap()
+        .with_dispatch(dispatch.clone())
+        .with_embedding(Some(provider.clone()));
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    service.create_collection(&scope, None).await.unwrap();
+    let mut server = start(service.clone()).await;
+    let operation = uuid::Uuid::from_u128(101);
+    let header = v1::UploadTextHeader {
+        scope: Some(v1::Scope {
+            tenant: scope.tenant.to_string(),
+            collection: scope.collection.to_string(),
+        }),
+        name: "embed.txt".into(),
+        request_id: Some(operation.to_string()),
+        ..Default::default()
+    };
+    server
+        .client
+        .submit_text(upload_frames(&header, [b"embed me".as_slice()]))
+        .await
+        .unwrap();
+    service.register_upload(&scope, operation).await.unwrap();
+    service.index_upload(&scope, operation).await.unwrap();
+    service.try_dispatch(&scope, operation).await;
+    assert_eq!(
+        dispatch.delivered.lock().unwrap().last(),
+        Some(&(operation, TaskStage::Embed { step: 0 }))
+    );
+    assert!(matches!(
+        service.embed_upload(&scope, operation, 1).await,
+        Err(Error::Busy(_))
+    ));
+
+    storage.interrupt.store(1, Ordering::Relaxed);
+    assert!(matches!(
+        service.embed_upload(&scope, operation, 0).await,
+        Err(Error::Busy(_))
+    ));
+    assert_eq!(
+        service
+            .embedding_status(&scope, None)
+            .await
+            .unwrap()
+            .coverage
+            .embedded,
+        1
+    );
+    let executor =
+        sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(15)).unwrap();
+    let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
+    let snapshot = executor.generation(&unit).await.unwrap();
+    server.stop().await;
+
+    provider.fail.store(1, Ordering::Relaxed);
+    let restarted = HostedCatalog::new(storage.clone(), None, 1024)
+        .unwrap()
+        .with_dispatch(dispatch.clone())
+        .with_embedding(Some(provider));
+    restarted.embed_upload(&scope, operation, 0).await.unwrap();
+    assert_eq!(executor.generation(&unit).await.unwrap(), snapshot);
+    restarted.reconcile_shard(0).await.unwrap();
+    assert_eq!(
+        dispatch.delivered.lock().unwrap().last(),
+        Some(&(operation, TaskStage::Embed { step: 1 }))
+    );
+    restarted.embed_upload(&scope, operation, 0).await.unwrap();
+    restarted.embed_upload(&scope, operation, 1).await.unwrap();
+    restarted.try_dispatch(&scope, operation).await;
+    let key = Key::parse(format!("_dispatch/00/pending/default/notes/{operation}")).unwrap();
+    assert!(matches!(storage.head(&key).await, Err(Error::NotFound(_))));
+}
+
 struct TestDispatch {
     fail: AtomicU8,
-    delivered: std::sync::Mutex<Vec<(uuid::Uuid, bool)>>,
+    delivered: std::sync::Mutex<Vec<(uuid::Uuid, TaskStage)>>,
 }
 
 #[async_trait::async_trait]
@@ -1105,10 +1202,10 @@ impl sanctum_service::Dispatch for TestDispatch {
         if self.fail.swap(0, Ordering::Relaxed) != 0 {
             return Err(Error::Busy("dispatch interrupted".into()));
         }
-        self.delivered.lock().unwrap().push((
-            task.operation,
-            matches!(task.stage, sanctum_service::TaskStage::Index),
-        ));
+        self.delivered
+            .lock()
+            .unwrap()
+            .push((task.operation, task.stage));
         Ok(())
     }
 }

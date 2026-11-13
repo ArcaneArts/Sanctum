@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::{HostedCatalog, RevisionContent, TaskStage, TextUpload};
 
+mod embedding_tasks;
 mod indexing;
 
 const FORMAT: u8 = 1;
@@ -58,6 +59,8 @@ enum Stage {
     TextReady {
         registration: Registration,
         content: Box<RevisionContent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        embedding: Option<EmbeddingStep>,
     },
     Failed {
         code: String,
@@ -65,6 +68,12 @@ enum Stage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         registration: Option<Registration>,
     },
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct EmbeddingStep {
+    step: u32,
+    not_before: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -213,16 +222,29 @@ impl HostedCatalog {
         let Some((mut record, version)) = self.read_operation(&prefix, operation).await? else {
             return Ok(false);
         };
-        let stage = match record.stage {
-            Stage::PendingRegistration => TaskStage::Register,
-            Stage::PendingIndexing { .. } => TaskStage::Index,
-            Stage::TextReady { .. } | Stage::Failed { .. } => {
+        let (stage, not_before) = match record.stage {
+            Stage::PendingRegistration => (TaskStage::Register, None),
+            Stage::PendingIndexing { .. } => (TaskStage::Index, None),
+            Stage::TextReady {
+                embedding: Some(embedding),
+                ..
+            } => (
+                TaskStage::Embed {
+                    step: embedding.step,
+                },
+                embedding.not_before,
+            ),
+            Stage::TextReady {
+                embedding: None, ..
+            }
+            | Stage::Failed { .. } => {
                 self.clear_dispatch_hint(scope, operation).await?;
                 return Ok(false);
             }
         };
         let now = unix_seconds()?;
-        let window = now / crate::hosted_dispatch::DISPATCH_WINDOW_SECONDS;
+        let window =
+            not_before.unwrap_or(now).max(now) / crate::hosted_dispatch::DISPATCH_WINDOW_SECONDS;
         if record.dispatched_at.is_some_and(|dispatched| {
             dispatched / crate::hosted_dispatch::DISPATCH_WINDOW_SECONDS >= window
         }) {
@@ -234,9 +256,10 @@ impl HostedCatalog {
                 operation,
                 stage,
                 window,
+                not_before,
             })
             .await?;
-        record.dispatched_at = Some(now);
+        record.dispatched_at = Some(not_before.unwrap_or(now).max(now));
         let key = envelope_key(&prefix)?;
         let body = serde_json::to_vec(&record).map_err(|error| Error::Internal(Box::new(error)))?;
         match self
@@ -426,6 +449,7 @@ impl Operation {
             Stage::TextReady {
                 registration,
                 content,
+                ..
             } => (
                 HostedJobState::TextReady,
                 Some(registration),

@@ -259,4 +259,11 @@ curl --fail-with-body http://127.0.0.1:47552/internal/tasks/embed-collection \
 profile. Changing that profile immediately excludes previous vectors.
 Semantic queries require matching vectors. Hybrid queries fall back to
 lexical results while embeddings are pending or the query provider is
-unavailable. Automatic scheduling of hosted embedding batches remains open.
+unavailable.
+
+With Cloud Tasks configured, lexical publication schedules bounded
+embedding steps automatically. The worker checkpoints each step and
+schedules retryable provider work at its recorded retry time. The
+reconciler can recover a missing delivery. For collections already idle
+when a profile changes, invoke the manual batch endpoint until coverage
+is complete.
