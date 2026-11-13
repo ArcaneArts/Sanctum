@@ -35,10 +35,16 @@ async fn recovering_from_a_lost_publish_response_reuses_its_receipt() {
     let storage = Arc::new(LosePublishResponse {
         inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
         lose: std::sync::atomic::AtomicBool::new(true),
+        snapshot_gets: std::sync::atomic::AtomicUsize::new(0),
     });
     let unit = Unit::catalog(None, &"default".parse().unwrap()).unwrap();
-    let short = Publication::new(storage.clone(), Duration::from_millis(400)).unwrap();
-    let long = Publication::new(storage, Duration::from_secs(15)).unwrap();
+    let cache = Arc::new(sanctum_db::SnapshotCache::new(1024 * 1024));
+    let short = Publication::new(storage.clone(), Duration::from_millis(400))
+        .unwrap()
+        .with_snapshot_cache(cache.clone());
+    let long = Publication::new(storage, Duration::from_secs(15))
+        .unwrap()
+        .with_snapshot_cache(cache);
     let mut writer = short.acquire(&unit).await.unwrap();
     let operation = Uuid::new_v4();
     let result = writer.apply(vec![command(operation, 7)], apply_value).await;
@@ -111,9 +117,73 @@ async fn snapshot_cache_reuses_verified_files_and_preserves_active_readers() {
     assert!(!Arc::ptr_eq(&a, &b));
 }
 
+#[tokio::test]
+async fn publication_reuses_immutable_snapshots_for_receipts_and_subsequent_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(LosePublishResponse {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        lose: std::sync::atomic::AtomicBool::new(false),
+        snapshot_gets: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let unit = Unit::catalog(None, &"default".parse().unwrap()).unwrap();
+    let cache = Arc::new(sanctum_db::SnapshotCache::new(1024 * 1024));
+    let publication = Publication::new(storage.clone(), Duration::from_secs(15))
+        .unwrap()
+        .with_snapshot_cache(cache.clone());
+    let first = Uuid::new_v4();
+    let mut writer = publication.acquire(&unit).await.unwrap();
+    let (generation, _) = writer
+        .apply(vec![command(first, 5)], apply_value)
+        .await
+        .unwrap();
+    writer.release().await.unwrap();
+    let old = cache.read(&publication, &unit).await.unwrap().unwrap();
+    assert_eq!(old.generation, generation);
+    assert_eq!(
+        publication.receipt(&unit, first).await.unwrap().as_deref(),
+        Some("5")
+    );
+    let gets = || {
+        storage
+            .snapshot_gets
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    assert_eq!(gets(), 0);
+
+    let second = Uuid::new_v4();
+    let mut writer = publication.acquire(&unit).await.unwrap();
+    writer
+        .apply(vec![command(second, 7)], apply_value)
+        .await
+        .unwrap();
+    writer.release().await.unwrap();
+    assert_eq!(value(old.path()), 5);
+    assert_eq!(
+        publication.receipt(&unit, second).await.unwrap().as_deref(),
+        Some("12")
+    );
+    let current = cache.read(&publication, &unit).await.unwrap().unwrap();
+    assert_eq!(value(current.path()), 12);
+    assert_eq!(gets(), 0);
+
+    let separate = Publication::new(storage.clone(), Duration::from_secs(15)).unwrap();
+    let mut writer = separate.acquire(&unit).await.unwrap();
+    writer
+        .apply(vec![command(Uuid::new_v4(), 1)], apply_value)
+        .await
+        .unwrap();
+    writer.release().await.unwrap();
+    assert_eq!(gets(), 1);
+    let fresh = cache.read(&publication, &unit).await.unwrap().unwrap();
+    assert_eq!(value(fresh.path()), 13);
+    assert_eq!(value(current.path()), 12);
+    assert_eq!(gets(), 2);
+}
+
 struct LosePublishResponse {
     inner: sanctum_storage_fs::FileStorage,
     lose: std::sync::atomic::AtomicBool,
+    snapshot_gets: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -129,6 +199,10 @@ impl Storage for LosePublishResponse {
         &self,
         key: &sanctum_storage::Key,
     ) -> sanctum_core::Result<sanctum_storage::Download> {
+        if key.as_str().contains("/snapshots/") {
+            self.snapshot_gets
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.inner.get(key).await
     }
 

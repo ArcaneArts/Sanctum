@@ -1094,3 +1094,17 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   old search hit, and returned the exact new MCP range. Text readiness took
   69.73 s. Registration and indexing each wrote a complete SQLite snapshot.
   [Method and measurements](CAPACITY.md#small-edit-in-a-multi-gib-collection).
+
+## Publication snapshot reuse
+
+- Hosted receipt lookups, readers, and writers share the verified snapshot
+  cache. A writer modifies a private copy and caches the new SQLite backup
+  after the manifest compare-and-swap succeeds.
+- The regression test counted zero object downloads for cached reads and
+  subsequent writes, preserved active readers of prior generations, and
+  refreshed after publication from another instance. The filesystem and
+  live MinIO publication contract tests passed, including recovery after a
+  lost publish response.
+- A release rerun with 2.34 GiB of text on MinIO reduced the measured
+  eight-byte replacement time from 69.73 s to 29.56 s. It still wrote two
+  full snapshots. [Method and measurements](CAPACITY.md#reusing-verified-snapshots-during-publication).
