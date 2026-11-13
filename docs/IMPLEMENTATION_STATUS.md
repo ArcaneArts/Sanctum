@@ -7,7 +7,7 @@ which parts have working implementations and where to find the evidence.
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | End-to-end acceptance in an LLM client |
 | 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, platform packaging and verification |
-| 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
+| 3. Object storage and publication | Shared object contract, filesystem and MinIO-tested S3 adapters | GCS, server integration, ownership, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
 | 5. Capacity | Pending | Representative 200 MB sources, GB-scale collections and database snapshots, cold/warm cloud performance, measured optimization |
 
@@ -345,6 +345,8 @@ Merged in [PR #22](https://github.com/ArcaneArts/Sanctum/pull/22).
 
 ## Read-only SQL sessions and snapshot export
 
+Merged in [PR #23](https://github.com/ArcaneArts/Sanctum/pull/23).
+
 - The operator gRPC API pins one catalog or collection generation with
   SQLite's online backup API, exposes its schema, and serves typed
   parameterized SELECT pages and streamed snapshot downloads.
@@ -359,3 +361,17 @@ Merged in [PR #22](https://github.com/ArcaneArts/Sanctum/pull/22).
 - A generated Python client opened a session on the standalone server,
   ran a parameterized query, downloaded the advertised byte count,
   and read the same revision using Python's SQLite library.
+
+## Shared object storage and MinIO
+
+- `sanctum-storage` defines streaming objects, bounded exact ranges,
+  conditional control writes, paginated listing, deletion, and actual
+  stored-byte measurement. The filesystem implementation shares the
+  existing range reader and filesystem ownership lock.
+- The live S3 contract ran against an isolated MinIO container. It
+  streamed a 17 MiB multipart payload, read an exact UTF-8 byte range,
+  raced two ETag-conditional writers, rejected mismatched lengths,
+  and verified pagination, prefix isolation, byte totals, and deletion.
+- The same contract runs against the filesystem during `pnpm check`.
+  The server still uses local storage while remote publication and
+  backend configuration are implemented.

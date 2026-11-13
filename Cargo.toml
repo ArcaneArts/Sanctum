@@ -13,9 +13,12 @@ anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
 blake3 = "1"
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 globset = "0.4"
+futures = "0.3"
 mime = "0.3"
+object_store = { version = "0.12.5", default-features = false, features = ["aws", "tls-webpki-roots"] }
 encoding_rs = "0.8"
 prost = "0.14"
 protox = "0.9"

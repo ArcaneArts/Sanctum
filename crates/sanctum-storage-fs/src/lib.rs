@@ -8,7 +8,9 @@ use sanctum_core::{ByteRange, Error, Result, Scope, ScopeId};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+mod objects;
 mod usage;
+pub use objects::FileStorage;
 
 pub struct LocalFiles {
     root: PathBuf,
@@ -211,11 +213,11 @@ impl LocalFiles {
         if length > 64 * 1024 {
             return Err(Error::Invalid("chunk range exceeds the read limit".into()));
         }
-        let mut file = File::open(self.text_path(scope, source, revision))?;
-        file.seek(SeekFrom::Start(range.start))?;
-        let mut bytes = vec![0; length as usize];
-        file.read_exact(&mut bytes)?;
-        Ok(bytes)
+        read_exact_range(
+            File::open(self.text_path(scope, source, revision))?,
+            range.start,
+            length as usize,
+        )
     }
 
     fn collection_path(&self, scope: &Scope) -> PathBuf {
@@ -231,6 +233,13 @@ impl LocalFiles {
             .join(revision.to_string())
             .join("text.utf8")
     }
+}
+
+fn read_exact_range(mut file: File, start: u64, length: usize) -> Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = vec![0; length];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn remove_file_if_present(path: &Path) -> Result<()> {
