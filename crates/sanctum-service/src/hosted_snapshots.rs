@@ -102,8 +102,7 @@ impl HostedCatalog {
                 continue;
             };
             match self
-                .publication
-                .reclaim(&unit, GRACE, pending.next.as_deref())
+                .sweep_snapshot_unit(&manifest, &unit, pending.next.as_deref())
                 .await
             {
                 Ok(page) => {
@@ -132,6 +131,20 @@ impl HostedCatalog {
             .put_control(&key, body.into(), condition)
             .await?;
         Ok(report)
+    }
+
+    async fn sweep_snapshot_unit(
+        &self,
+        manifest: &Key,
+        unit: &Unit,
+        cursor: Option<&str>,
+    ) -> Result<sanctum_db::CleanupPage> {
+        if let Some(scope) = collection_manifest(self.prefix.as_ref(), manifest)
+            && self.collection_retired(&scope).await?
+        {
+            self.publication.fence_deletion(unit).await?;
+        }
+        self.publication.reclaim(unit, GRACE, cursor).await
     }
 }
 

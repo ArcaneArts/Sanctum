@@ -18,7 +18,11 @@ pub mod watched_folders;
 pub use lifecycle::{RevisionKey, SourceIdentity};
 
 const CATALOG_SCHEMA: &str = include_str!("catalog.sql");
-const CATALOG_MIGRATIONS: &[&str] = &[CATALOG_SCHEMA, include_str!("catalog_v2.sql")];
+const CATALOG_MIGRATIONS: &[&str] = &[
+    CATALOG_SCHEMA,
+    include_str!("catalog_v2.sql"),
+    include_str!("catalog_v3.sql"),
+];
 const COLLECTION_SCHEMA: &str = include_str!("collection.sql");
 const COLLECTION_MIGRATIONS: &[&str] = &[
     COLLECTION_SCHEMA,
@@ -98,6 +102,9 @@ pub fn initialize_collection(transaction: &Transaction<'_>) -> Result<()> {
 }
 
 pub fn activate_collection(transaction: &Transaction<'_>, collection: &str) -> Result<bool> {
+    if collection_deleted(transaction, collection)? {
+        return Err(Error::Conflict("collection ID was retired".into()));
+    }
     transaction
         .execute(
             "INSERT OR IGNORE INTO collections (id) VALUES (?1)",
@@ -105,6 +112,45 @@ pub fn activate_collection(transaction: &Transaction<'_>, collection: &str) -> R
         )
         .map(|count| count == 1)
         .map_err(database_error)
+}
+
+fn collection_deleted(connection: &Connection, collection: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM deleted_collections WHERE id = ?1)",
+            [collection],
+            |row| row.get(0),
+        )
+        .map_err(database_error)
+}
+
+pub fn catalog_collection_deleted(path: &Path, collection: &str) -> Result<bool> {
+    let connection = open_read_only(path)?;
+    if schema_version(&connection)? < 3 {
+        return Ok(false);
+    }
+    collection_deleted(&connection, collection)
+}
+
+pub fn delete_catalog_collection(transaction: &Transaction<'_>, collection: &str) -> Result<()> {
+    if collection_deleted(transaction, collection)? {
+        return Ok(());
+    }
+    let deleted = transaction
+        .execute("DELETE FROM collections WHERE id = ?1", [collection])
+        .map_err(database_error)?;
+    if deleted == 0 {
+        return Err(Error::NotFound(format!(
+            "collection {collection} was not found"
+        )));
+    }
+    transaction
+        .execute(
+            "INSERT INTO deleted_collections(id) VALUES(?1)",
+            [collection],
+        )
+        .map_err(database_error)?;
+    Ok(())
 }
 
 pub fn list_collections(path: &Path) -> Result<Vec<String>> {

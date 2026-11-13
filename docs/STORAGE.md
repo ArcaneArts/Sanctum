@@ -351,3 +351,14 @@ If acceptance wins the conditional write, the sweep checks again on a
 later pass. A retry can replace a fence only with its own newly staged
 input. A fence alone is invisible to worker and status requests.
 [Cloud Scheduler configuration](CLOUD_RUN.md#schedule-dispatch-repair).
+
+### Hosted collection deletion
+
+`DeleteCollection` publishes a tombstone in the tenant catalog and removes
+the collection from catalog reads. It then fences the collection manifest
+so delayed tasks cannot publish. Supply a request UUID to resume the
+same deletion after an ambiguous response. If a current writer delays
+the fence, retry the request or let the snapshot sweep finish it from
+the catalog tombstone. Deleted collection IDs remain reserved.
+Existing database inspection handles can read their pinned generation
+until expiry. Physical cleanup of the deleted collection is tracked separately.
