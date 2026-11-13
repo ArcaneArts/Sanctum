@@ -18,6 +18,8 @@ service Sanctum {
   rpc SearchText(SearchTextRequest) returns (SearchTextResponse);
   rpc SearchCollections(SearchCollectionsRequest) returns (SearchTextResponse);
   rpc FetchChunk(FetchChunkRequest) returns (TextHit);
+  rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
+  rpc GetSource(GetSourceRequest) returns (GetSourceResponse);
   rpc DeleteSource(DeleteSourceRequest) returns (DeletedSource);
   rpc ImportLocal(ImportLocalRequest) returns (stream ImportLocalEvent);
   rpc ImportUrl(ImportUrlRequest) returns (ImportUrlResponse);
@@ -338,6 +340,29 @@ message Replacement {
   // When absent, resolve the target using UploadTextHeader.external.
   optional string source_id = 1;
   optional string expected_revision_id = 2;
+}
+
+message ListSourcesRequest {
+  Scope scope = 1;
+  optional string after_source_id = 2;
+  optional uint32 limit = 3;
+}
+
+message ListSourcesResponse {
+  repeated TextRevision sources = 1;
+  optional string next_after_source_id = 2;
+  optional string database_generation = 3;
+}
+
+message GetSourceRequest {
+  Scope scope = 1;
+  string source_id = 2;
+  optional string expected_revision_id = 3;
+}
+
+message GetSourceResponse {
+  TextRevision current_revision = 1;
+  optional string database_generation = 2;
 }
 
 message DeleteSourceRequest {

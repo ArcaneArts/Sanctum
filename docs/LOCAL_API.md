@@ -110,6 +110,21 @@ single chunk using SQLite FTS5 tokenization. Results include byte offsets as
 the canonical UTF-8 representation. Pass the result's `ChunkRef` unchanged
 to `FetchChunk` to retrieve that range.
 
+## Source inspection
+
+`ListSources` returns the current published revision of each source in
+one collection. Pass `next_after_source_id` as `after_source_id` to
+continue in source UUID order. Pages default to 25 and allow up to 100
+sources. A page reads current data at the time of that request.
+
+`GetSource` takes a source UUID and an optional expected revision UUID.
+It returns the current revision, including external reference, provenance,
+canonical and original digests, size, chunk count, and retention policy.
+A mismatched revision returns `FAILED_PRECONDITION`. Unpublished or
+deleted sources are absent. Use `GetIngestionJob` for pending work and
+`GetEmbeddingStatus` for processing coverage. Hosted results also
+include the database generation used for the read.
+
 ## Collection deletion
 
 `DeleteCollection` removes a collection, its sources, and its queued

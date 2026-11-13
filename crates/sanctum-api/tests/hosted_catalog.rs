@@ -367,6 +367,155 @@ async fn hosted_collection_reclamation_keeps_open_snapshots_and_resumes() {
 }
 
 #[tokio::test]
+async fn hosted_sources_page_current_revisions_and_keep_tenant_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(sanctum_storage_fs::FileStorage::open(dir.path()).unwrap());
+    let catalog = HostedCatalog::new(store, None, 1024).unwrap();
+    let mut api = start(catalog.clone()).await;
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let wire_scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    catalog.create_collection(&scope, None).await.unwrap();
+    catalog
+        .create_collection(
+            &sanctum_core::Scope {
+                tenant: "other".parse().unwrap(),
+                collection: scope.collection.clone(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let header = v1::UploadTextHeader {
+        scope: Some(wire_scope.clone()),
+        name: "notes.rtf".into(),
+        external: Some(v1::ExternalSource {
+            namespace: "integration".into(),
+            id: "first".into(),
+        }),
+        retain_original: true,
+        ..Default::default()
+    };
+    let pending = api
+        .client
+        .submit_text(upload_frames(&header, [br"{\rtf1\ansi quartz}".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut list = v1::ListSourcesRequest {
+        scope: Some(wire_scope.clone()),
+        limit: Some(1),
+        ..Default::default()
+    };
+    assert!(
+        api.client
+            .list_sources(list.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .sources
+            .is_empty()
+    );
+    let operation = pending.operation_id.parse().unwrap();
+    catalog.register_upload(&scope, operation).await.unwrap();
+    catalog.index_upload(&scope, operation).await.unwrap();
+    let other = v1::UploadTextHeader {
+        name: "second.txt".into(),
+        external: None,
+        ..header.clone()
+    };
+    let job = api
+        .client
+        .submit_text(upload_frames(&other, [b"second".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let operation = job.operation_id.parse().unwrap();
+    catalog.register_upload(&scope, operation).await.unwrap();
+    catalog.index_upload(&scope, operation).await.unwrap();
+
+    let first_page = api
+        .client
+        .list_sources(list.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    list.after_source_id = first_page.next_after_source_id.clone();
+    assert!(list.after_source_id.is_some());
+    let second_page = api.client.list_sources(list).await.unwrap().into_inner();
+    assert_eq!(
+        first_page.database_generation,
+        second_page.database_generation
+    );
+    assert!(first_page.database_generation.is_some());
+    assert_ne!(
+        first_page.sources[0].source_id,
+        second_page.sources[0].source_id
+    );
+    assert!(second_page.next_after_source_id.is_none());
+
+    let mut inspect = v1::GetSourceRequest {
+        scope: Some(wire_scope.clone()),
+        source_id: pending.source_id.clone(),
+        expected_revision_id: Some(pending.revision_id.clone()),
+    };
+    let found = api
+        .client
+        .get_source(inspect.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let current = found.current_revision.unwrap();
+    assert_eq!(current.bytes, 6);
+    assert_eq!(current.external, header.external);
+    assert_ne!(current.content_blake3, current.original_blake3);
+    assert!(current.retain_original && current.extractor.is_some());
+    inspect.expected_revision_id = Some(uuid::Uuid::new_v4().to_string());
+    assert_eq!(
+        api.client
+            .get_source(inspect.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    inspect.scope = Some(v1::Scope {
+        tenant: "other".into(),
+        ..wire_scope.clone()
+    });
+    assert_eq!(
+        api.client
+            .get_source(inspect.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    api.client
+        .delete_source(v1::DeleteSourceRequest {
+            scope: Some(wire_scope.clone()),
+            source_id: pending.source_id,
+            expected_revision_id: Some(pending.revision_id),
+            request_id: None,
+        })
+        .await
+        .unwrap();
+    inspect.scope = Some(wire_scope);
+    inspect.expected_revision_id = None;
+    assert_eq!(
+        api.client.get_source(inspect).await.unwrap_err().code(),
+        Code::NotFound
+    );
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_synchronous_upload_waits_for_worker_and_replays() {
     use std::time::Duration;
 

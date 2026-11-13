@@ -14,6 +14,7 @@ pub mod metadata_filter;
 pub mod metadata_query;
 pub mod queue;
 pub mod snapshot;
+mod sources;
 pub mod watched_folders;
 pub use lifecycle::{RevisionKey, SourceIdentity};
 
@@ -274,19 +275,7 @@ impl CollectionDb {
                     source_encoding, extractor, retain_original, url_provenance, git_provenance
                  FROM revisions WHERE source_id = ?1 AND id = ?2",
                 params![source.to_string(), revision.to_string()],
-                |row| {
-                    Ok(RevisionContent {
-                        hash: row.get(0)?,
-                        chunks: unsigned_column(row, 1)?,
-                        bytes: unsigned_column(row, 2)?,
-                        original_hash: row.get(3)?,
-                        encoding: row.get(4)?,
-                        extractor: row.get(5)?,
-                        retain_original: row.get(6)?,
-                        url: read_json(row, 7)?,
-                        git: read_json(row, 8)?,
-                    })
-                },
+                |row| row_revision_content(row, 0),
             )
             .optional()
             .map_err(database_error)
@@ -573,25 +562,40 @@ fn query_all<T>(
         .map_err(database_error)
 }
 
+fn row_revision_content(row: &Row<'_>, offset: usize) -> rusqlite::Result<RevisionContent> {
+    Ok(RevisionContent {
+        hash: row.get(offset)?,
+        chunks: unsigned_column(row, offset + 1)?,
+        bytes: unsigned_column(row, offset + 2)?,
+        original_hash: row.get(offset + 3)?,
+        encoding: row.get(offset + 4)?,
+        extractor: row.get(offset + 5)?,
+        retain_original: row.get(offset + 6)?,
+        url: read_json(row, offset + 7)?,
+        git: read_json(row, offset + 8)?,
+    })
+}
+
+fn row_uuid(row: &Row<'_>, column: usize) -> rusqlite::Result<Uuid> {
+    let value: String = row.get(column)?;
+    Uuid::parse_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
 fn row_chunk(row: &Row<'_>) -> rusqlite::Result<Chunk> {
-    let uuid = |column| {
-        let value: String = row.get(column)?;
-        Uuid::parse_str(&value).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                column,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })
-    };
     let external = match (row.get(4)?, row.get(5)?) {
         (Some(namespace), Some(id)) => Some(ExternalSource { namespace, id }),
         _ => None,
     };
     Ok(Chunk {
         reference: ChunkRef {
-            source: uuid(0)?,
-            revision: uuid(1)?,
+            source: row_uuid(row, 0)?,
+            revision: row_uuid(row, 1)?,
             ordinal: unsigned_column(row, 2)?,
         },
         name: row.get(3)?,

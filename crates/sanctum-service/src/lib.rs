@@ -32,6 +32,7 @@ mod hosted_snapshots;
 mod local_import;
 mod local_jobs;
 mod maintenance;
+mod source_inspection;
 mod url_import;
 mod watched_folders;
 mod worker;
