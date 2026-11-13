@@ -143,6 +143,7 @@ impl HostedCatalog {
     }
 
     pub async fn ingestion_job(&self, scope: &Scope, operation: Uuid) -> Result<HostedJob> {
+        self.require_collection(scope).await?;
         let prefix = self.operation_prefix(scope, operation)?;
         let (record, _) = self.require_operation(&prefix, operation).await?;
         Ok(record.job())
@@ -416,6 +417,7 @@ impl HostedUpload {
             Some((Envelope::Fence(_), version)) => Condition::Match(version),
             None => Condition::Create,
         };
+        self.service.require_collection(&self.scope).await?;
         let key = envelope_key(&prefix)?;
         let input = candidate.input_key(&prefix)?;
         let body =
@@ -423,6 +425,14 @@ impl HostedUpload {
         let store = self.service.storage.as_ref();
         let reader = tokio::fs::File::from_std(self.file.reopen()?);
         store.put_stream(&input, Box::pin(reader), bytes).await?;
+        if let Err(error) = self.service.require_collection(&self.scope).await {
+            if matches!(error, Error::NotFound(_))
+                && let Err(cleanup) = store.delete(&input).await
+            {
+                tracing::warn!(%cleanup, %input, "could not discard input for a deleted collection");
+            }
+            return Err(error);
+        }
         self.service
             .record_dispatch_hint(&self.scope, self.operation)
             .await?;

@@ -143,6 +143,7 @@ impl HostedCatalog {
             && self.collection_retired(&scope).await?
         {
             self.publication.fence_deletion(unit).await?;
+            return self.publication.reclaim_retired(unit, GRACE, cursor).await;
         }
         self.publication.reclaim(unit, GRACE, cursor).await
     }
