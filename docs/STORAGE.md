@@ -197,8 +197,7 @@ its index.
 requests when hosted embeddings are unavailable. `FetchChunk` reads
 the hit's exact byte range and verifies its fingerprint. Hosted
 `SearchCollections` accepts one to eight collections in a tenant and
-returns the aggregate coverage and scoped references. Source cleanup
-remains open.
+returns the aggregate coverage and scoped references.
 
 ### Cloud Tasks dispatch
 
@@ -272,3 +271,21 @@ and queues collections from their manifests. A persisted cursor resumes
 discovery on the next invocation. Workers rebuild each collection in
 bounded steps and ignore old run IDs. See the
 [Cloud Run schedule](CLOUD_RUN.md#schedule-dispatch-repair).
+
+### Hosted source deletion and reclamation
+
+`DeleteSource` removes a source from the active index, invalidates
+registered replacements, and records a tombstone. Supply an expected
+revision to reject a stale deletion and a request UUID to replay a
+committed deletion after a lost response. The CLI accepts these as
+`--expected-revision` and `--request-id`.
+
+The scheduled source sweep removes retired locators and records their
+object keys in the same SQLite publication. Physical deletion waits
+another 15 minutes so requests holding an older snapshot can finish.
+Hosted gRPC requests have a 10-minute server deadline.
+A failed object deletion stays in the durable cleanup table. An obsolete
+replacement is eligible once its successor has coverage for the active
+profile. Text-only RTF ingestion discards the original after committing
+its canonical revision. The [Cloud Run guide](CLOUD_RUN.md#schedule-dispatch-repair)
+shows the scheduler configuration.

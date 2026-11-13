@@ -30,6 +30,7 @@ const COLLECTION_MIGRATIONS: &[&str] = &[
     include_str!("collection_v7.sql"),
     include_str!("collection_v8.sql"),
     include_str!("collection_v9.sql"),
+    include_str!("collection_v10.sql"),
 ];
 
 #[derive(Debug)]

@@ -343,7 +343,7 @@ fn scoped_id(run: Uuid, scope: &Scope, step: u64) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-fn collection_manifest(prefix: Option<&Key>, key: &Key) -> Option<Scope> {
+pub(crate) fn collection_manifest(prefix: Option<&Key>, key: &Key) -> Option<Scope> {
     let path = match prefix {
         Some(prefix) => key
             .as_str()

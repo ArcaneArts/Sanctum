@@ -241,11 +241,10 @@ impl<T: std::ops::Deref<Target = rusqlite::Connection>> RevisionWrite<T> {
         Ok(())
     }
 
-    pub fn retire(&self, revision: RevisionKey) -> Result<()> {
+    pub(super) fn revision_held(&self, revision: RevisionKey) -> Result<bool> {
         let source = revision.source.to_string();
         let rev = revision.revision.to_string();
-        let is_held: bool = self
-            .0
+        self.0
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sources WHERE id = ?1 AND current_revision = ?2
               AND (deleted = 0 OR EXISTS (
@@ -254,8 +253,13 @@ impl<T: std::ops::Deref<Target = rusqlite::Connection>> RevisionWrite<T> {
                 params![source, rev],
                 |row| row.get(0),
             )
-            .map_err(database_error)?;
-        if is_held {
+            .map_err(database_error)
+    }
+
+    pub fn retire(&self, revision: RevisionKey) -> Result<()> {
+        let source = revision.source.to_string();
+        let rev = revision.revision.to_string();
+        if self.revision_held(revision)? {
             return Ok(());
         }
         self.0

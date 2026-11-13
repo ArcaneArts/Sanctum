@@ -819,16 +819,26 @@ impl Sanctum for Grpc {
             .map_err(|_| Status::invalid_argument("invalid source ID"))?;
         let expected =
             parse_optional_id(request.expected_revision_id, "invalid expected revision ID")?;
-        let service = self.local()?.clone();
-        work(move || {
-            let revision = service.delete_source(&scope, source, expected)?;
-            Ok(v1::DeletedSource {
-                source_id: source.to_string(),
-                revision_id: revision.to_string(),
-            })
-        })
-        .await
-        .map(Response::new)
+        let request_id = parse_optional_id(request.request_id, "invalid request ID")?;
+        let revision = match &self.0 {
+            Backend::Local(service) => {
+                if request_id.is_some() {
+                    return Err(Status::invalid_argument(
+                        "deletion request IDs are supported by hosted storage",
+                    ));
+                }
+                let service = service.clone();
+                work(move || service.delete_source(&scope, source, expected)).await?
+            }
+            Backend::Hosted(service) => service
+                .delete_source(&scope, source, expected, request_id)
+                .await
+                .map_err(status)?,
+        };
+        Ok(Response::new(v1::DeletedSource {
+            source_id: source.to_string(),
+            revision_id: revision.to_string(),
+        }))
     }
 }
 

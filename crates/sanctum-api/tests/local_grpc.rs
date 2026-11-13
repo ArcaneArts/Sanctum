@@ -2191,6 +2191,7 @@ async fn deletion_blocks_queued_replacement_and_reclaims_all_revisions() {
         scope: scope("default"),
         source_id: current.source_id.clone(),
         expected_revision_id: Some(first.revision_id.clone()),
+        request_id: None,
     };
     assert_eq!(
         running

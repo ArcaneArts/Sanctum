@@ -25,6 +25,7 @@ pub(crate) fn router(service: HostedCatalog) -> Router {
             post(discover_profile),
         )
         .route("/internal/maintenance/dispatch/{shard}", post(reconcile))
+        .route("/internal/maintenance/source-sweep", post(sweep_sources))
         .layer(DefaultBodyLimit::max(4096))
         .with_state(service)
 }
@@ -198,6 +199,22 @@ async fn rebuild_collection(
             tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
                 operation = %task.operation_id, step = task.step, "profile rebuild will need a retry");
             StatusCode::SERVICE_UNAVAILABLE
+        }
+    }
+}
+
+async fn sweep_sources(State(service): State<HostedCatalog>) -> Response {
+    match service.sweep_hosted_sources().await {
+        Ok(report) => Json(serde_json::json!({
+            "deleted": report.deleted,
+            "collections": report.collections,
+            "failed": report.failed,
+            "more": report.more,
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "hosted source sweep will need a retry");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
 }
