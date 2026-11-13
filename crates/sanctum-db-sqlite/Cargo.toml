@@ -7,4 +7,5 @@ rust-version.workspace = true
 [dependencies]
 sanctum-core = { path = "../sanctum-core" }
 rusqlite = { workspace = true }
+serde_json.workspace = true
 uuid = { workspace = true }

@@ -1142,3 +1142,252 @@ fn rtf_header(retain_original: bool, external_id: &str) -> v1::UploadTextFrame {
     }
     request
 }
+
+#[tokio::test]
+async fn metadata_is_atomic_and_scoped_to_the_current_revision() {
+    use v1::metadata_mutation::Edit;
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    create(&mut running.client, "other").await;
+    let original = upload(&mut running.client, header("default"), b"metadata apatite").await;
+
+    let collection = v1::MetadataTarget {
+        scope: scope("default"),
+        ..Default::default()
+    };
+    let source = v1::MetadataTarget {
+        scope: scope("default"),
+        source_id: Some(original.source_id.clone()),
+        revision_id: Some(original.revision_id.clone()),
+        chunk_ordinal: None,
+    };
+    let chunk = v1::MetadataTarget {
+        chunk_ordinal: Some(0),
+        ..source.clone()
+    };
+
+    write_metadata(
+        &mut running.client,
+        collection.clone(),
+        vec![metadata_edit(
+            "category",
+            Edit::SetJson(r#""reference""#.into()),
+        )],
+    )
+    .await
+    .unwrap();
+    write_metadata(
+        &mut running.client,
+        source.clone(),
+        vec![metadata_edit(
+            "details",
+            Edit::SetJson(r#"{"tag":["green"],"drop":4,"nested":{"kept":true}}"#.into()),
+        )],
+    )
+    .await
+    .unwrap();
+    let result = write_metadata(
+        &mut running.client,
+        source.clone(),
+        vec![
+            metadata_edit(
+                "details",
+                Edit::MergePatchJson(r#"{"drop":null,"nested":{"added":3}}"#.into()),
+            ),
+            metadata_edit("nullable", Edit::SetJson("null".into())),
+        ],
+    )
+    .await
+    .unwrap();
+    let merged: serde_json::Value = serde_json::from_str(&result.entries[0].value_json).unwrap();
+    assert_eq!(
+        merged,
+        serde_json::json!({"tag":["green"], "nested":{"kept":true,"added":3}})
+    );
+    assert_eq!(result.entries[1].value_json, "null");
+    write_metadata(
+        &mut running.client,
+        chunk.clone(),
+        vec![metadata_edit(
+            "confidence-from-client",
+            Edit::SetJson("0.75".into()),
+        )],
+    )
+    .await
+    .unwrap();
+
+    let failure = write_metadata(
+        &mut running.client,
+        source.clone(),
+        vec![
+            metadata_edit("nullable", Edit::Remove(v1::Empty {})),
+            metadata_edit("", Edit::SetJson("true".into())),
+        ],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(failure.code(), Code::InvalidArgument);
+    assert_eq!(
+        running
+            .client
+            .get_metadata(source.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .entries
+            .len(),
+        2
+    );
+    let removed = write_metadata(
+        &mut running.client,
+        source.clone(),
+        vec![metadata_edit("nullable", Edit::Remove(v1::Empty {}))],
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed.entries.len(), 1);
+    assert!(
+        running
+            .client
+            .get_metadata(v1::MetadataTarget {
+                scope: scope("other"),
+                ..collection.clone()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .entries
+            .is_empty()
+    );
+    assert_eq!(
+        running
+            .client
+            .get_metadata(v1::MetadataTarget {
+                scope: scope("other"),
+                ..source.clone()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+
+    let page = running
+        .client
+        .list_changes(v1::ListChangesRequest {
+            scope: scope("default"),
+            after_cursor: 0,
+            limit: Some(2),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(page.changes.len(), 2);
+    assert_eq!(page.changes[0].kind, "source_created");
+    assert_eq!(page.changes[1].kind, "metadata_changed");
+    let second = running
+        .client
+        .list_changes(v1::ListChangesRequest {
+            scope: scope("default"),
+            after_cursor: page.next_cursor,
+            limit: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second.changes.len(), 3);
+    assert!(
+        second
+            .changes
+            .iter()
+            .any(|change| change.chunk_ordinal == Some(0))
+    );
+
+    let updated = upload(
+        &mut running.client,
+        replacement(Some(&original.source_id), None),
+        b"metadata fluorite",
+    )
+    .await;
+    let stale = write_metadata(
+        &mut running.client,
+        chunk,
+        vec![metadata_edit("later", Edit::SetJson("true".into()))],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale.code(), Code::FailedPrecondition);
+    let current = v1::MetadataTarget {
+        revision_id: Some(updated.revision_id.clone()),
+        ..source
+    };
+    assert!(
+        running
+            .client
+            .get_metadata(current)
+            .await
+            .unwrap()
+            .into_inner()
+            .entries
+            .is_empty()
+    );
+    assert_eq!(
+        running
+            .client
+            .get_metadata(collection)
+            .await
+            .unwrap()
+            .into_inner()
+            .entries
+            .len(),
+        1
+    );
+
+    let changes = running
+        .client
+        .list_changes(v1::ListChangesRequest {
+            scope: scope("default"),
+            after_cursor: second.next_cursor,
+            limit: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        changes
+            .changes
+            .iter()
+            .map(|change| change.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["source_replaced", "metadata_reset"]
+    );
+    assert_eq!(changes.changes[1].revision_id, updated.revision_id);
+    assert_eq!(
+        changes.changes[1].previous_revision_id.as_deref(),
+        Some(original.revision_id.as_str())
+    );
+    running.stop().await;
+}
+
+fn metadata_edit(key: &str, edit: v1::metadata_mutation::Edit) -> v1::MetadataMutation {
+    v1::MetadataMutation {
+        namespace: "demo.integration".into(),
+        key: key.into(),
+        edit: Some(edit),
+    }
+}
+
+async fn write_metadata(
+    client: &mut SanctumClient<Channel>,
+    target: v1::MetadataTarget,
+    edits: Vec<v1::MetadataMutation>,
+) -> Result<v1::MetadataResponse, Box<tonic::Status>> {
+    Ok(client
+        .mutate_metadata(v1::MutateMetadataRequest {
+            target: Some(target),
+            edits,
+        })
+        .await?
+        .into_inner())
+}

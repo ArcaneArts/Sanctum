@@ -16,9 +16,66 @@ service Sanctum {
   rpc FetchChunk(FetchChunkRequest) returns (TextHit);
   rpc DeleteSource(DeleteSourceRequest) returns (DeletedSource);
   rpc ImportLocal(ImportLocalRequest) returns (stream ImportLocalEvent);
+  rpc GetMetadata(MetadataTarget) returns (MetadataResponse);
+  rpc MutateMetadata(MutateMetadataRequest) returns (MetadataResponse);
+  rpc ListChanges(ListChangesRequest) returns (ListChangesResponse);
 }
 
 message Empty {}
+
+message MetadataTarget {
+  Scope scope = 1;
+  // Omit source to target collection metadata. A source always needs a revision.
+  optional string source_id = 2;
+  optional string revision_id = 3;
+  optional uint64 chunk_ordinal = 4;
+}
+
+message MetadataEntry {
+  string namespace = 1;
+  string key = 2;
+  // UTF-8 JSON, including scalar and null values.
+  string value_json = 3;
+}
+
+message MetadataMutation {
+  string namespace = 1;
+  string key = 2;
+  oneof edit {
+    string set_json = 3;
+    string merge_patch_json = 4;
+    Empty remove = 5;
+  }
+}
+
+message MutateMetadataRequest {
+  MetadataTarget target = 1;
+  repeated MetadataMutation edits = 2;
+}
+
+message MetadataResponse {
+  repeated MetadataEntry entries = 1;
+}
+
+message ListChangesRequest {
+  Scope scope = 1;
+  uint64 after_cursor = 2;
+  optional uint32 limit = 3;
+}
+
+message SourceChange {
+  uint64 cursor = 1;
+  string kind = 2;
+  string source_id = 3;
+  string revision_id = 4;
+  optional string previous_revision_id = 5;
+  optional uint64 chunk_ordinal = 6;
+}
+
+message ListChangesResponse {
+  repeated SourceChange changes = 1;
+  uint64 next_cursor = 2;
+}
 
 enum IngestionState {
   INGESTION_STATE_UNSPECIFIED = 0;

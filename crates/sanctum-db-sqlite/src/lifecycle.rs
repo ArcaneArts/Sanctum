@@ -106,6 +106,28 @@ impl RevisionWriter<'_> {
         let previous = self.find_source(Some(data.source), None)?;
         self.0
             .execute(
+                "DELETE FROM revision_metadata WHERE source = ?1 AND revision = ?2",
+                params![previous.source.to_string(), previous.revision.to_string()],
+            )
+            .map_err(database_error)?;
+        super::metadata::record_change(
+            &self.0,
+            "source_replaced",
+            data.source,
+            data.revision,
+            Some(previous.revision),
+            None,
+        )?;
+        super::metadata::record_change(
+            &self.0,
+            "metadata_reset",
+            data.source,
+            data.revision,
+            Some(previous.revision),
+            None,
+        )?;
+        self.0
+            .execute(
                 "UPDATE sources SET current_revision = ?2, name = ?3 WHERE id = ?1",
                 params![
                     data.source.to_string(),
@@ -152,6 +174,14 @@ impl RevisionWriter<'_> {
                 "the current source revision has changed".into(),
             ));
         }
+        super::metadata::record_change(
+            &self.0,
+            "source_deleted",
+            source,
+            current.revision,
+            None,
+            None,
+        )?;
         self.0
             .execute(
                 "INSERT INTO deleted_sources (id, expires_at) VALUES (?1, unixepoch() + ?2)",

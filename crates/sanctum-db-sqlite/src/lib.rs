@@ -7,15 +7,18 @@ use sanctum_core::{ByteRange, Error, ExternalSource, Result};
 use uuid::Uuid;
 
 mod lifecycle;
+pub mod metadata;
 pub mod queue;
 pub use lifecycle::{RevisionKey, SourceIdentity};
 
 const CATALOG_SCHEMA: &str = include_str!("catalog.sql");
+const CATALOG_MIGRATIONS: &[&str] = &[CATALOG_SCHEMA, include_str!("catalog_v2.sql")];
 const COLLECTION_SCHEMA: &str = include_str!("collection.sql");
 const COLLECTION_MIGRATIONS: &[&str] = &[
     COLLECTION_SCHEMA,
     include_str!("collection_v2.sql"),
     include_str!("collection_v3.sql"),
+    include_str!("collection_v4.sql"),
 ];
 
 #[derive(Debug)]
@@ -57,7 +60,7 @@ pub struct Chunk {
 pub fn create_collection(catalog_path: &Path, db_path: &Path, collection: &str) -> Result<()> {
     fs::create_dir_all(catalog_path.parent().expect("catalog has a parent"))?;
     let mut catalog = open(catalog_path, true)?;
-    migrate(&mut catalog, &[CATALOG_SCHEMA])?;
+    migrate(&mut catalog, CATALOG_MIGRATIONS)?;
     let transaction = catalog
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(database_error)?;
@@ -249,6 +252,14 @@ impl RevisionWriter<'_> {
             self.replace_current(data)?;
         } else {
             self.register_source(data)?;
+            metadata::record_change(
+                &self.0,
+                "source_created",
+                data.source,
+                data.revision,
+                None,
+                None,
+            )?;
         }
         self.0
             .execute(

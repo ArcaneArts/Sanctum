@@ -5,7 +5,7 @@ which parts have working implementations and where to find the evidence.
 
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
-| 1. Local desktop and MCP | Local Rust service and gRPC CLI with a tenant catalog, streamed UTF-8 and RTF ingestion, original retention, directory imports, SQLite FTS5, byte-range fetch, restartable lexical jobs, source replacement, deletion, and local cleanup | Metadata and reset events, embedding reuse and readiness, usage, Ollama and vector search, MCP, tray app, desktop acceptance |
+| 1. Local desktop and MCP | Local Rust service and gRPC CLI with streamed UTF-8 and RTF ingestion, original retention, directory imports, SQLite FTS5, byte-range fetch, restartable lexical jobs, source lifecycle, metadata CRUD, and reset events | Metadata filtering, embedding reuse and readiness, usage, Ollama and vector search, MCP, tray app, desktop acceptance |
 | 2. Providers and local integrations | Pending | Hosted provider adapters, rebuilds, watchers, URL and Git imports, metadata queries and cursors, SQL access, multi-collection retrieval, platform packaging and verification |
 | 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
@@ -62,8 +62,7 @@ Merged in [PR #4](https://github.com/ArcaneArts/Sanctum/pull/4).
   competing queued replacements, deletion during queued work, and retirement
   of old index rows and files. A v1 fixture verifies migration and orphan cleanup.
 - Retirement currently follows lexical readiness. Adding embeddings must link
-  retirement to the configured embedding profile's readiness. Metadata reset
-  events remain pending with the metadata and changes API.
+  retirement to the configured embedding profile's readiness.
 
 ## Local file and directory imports
 
@@ -81,6 +80,8 @@ Merged in [PR #5](https://github.com/ArcaneArts/Sanctum/pull/5).
 
 ## Streaming RTF and original retention
 
+Merged in [PR #6](https://github.com/ArcaneArts/Sanctum/pull/6).
+
 - Local uploads and imports extract RTF in bounded buffers before indexing
   canonical UTF-8. Revision records store both digests, input encoding, the
   extractor version, and retention choice. Byte ranges use the canonical text.
@@ -92,4 +93,15 @@ Merged in [PR #5](https://github.com/ArcaneArts/Sanctum/pull/5).
   restart, retention, exact excerpts, and directory re-import.
 - Full size and memory measurements remain part of the capacity milestone.
 
-Next, add collection, source, and chunk metadata with revision-aware updates.
+## Revision-aware metadata and change polling
+
+- The gRPC API reads and atomically mutates namespaced JSON on collections,
+  current source revisions, and their chunks. Batch edits support set,
+  merge patch, and remove.
+- Replacement resets source and chunk metadata in the publication transaction.
+  Scoped cursor polling returns lifecycle and metadata events and rejects
+  expired cursors. Collection metadata stays independent of source changes.
+- The gRPC integration test covers JSON null and merge behavior, transaction
+  rollback, tenant scope, cursor pages, and stale writes after replacement.
+- Metadata predicates, sorting, aggregation, and optional subscriptions
+  remain open. Next, use the stored metadata to filter lexical candidates.
