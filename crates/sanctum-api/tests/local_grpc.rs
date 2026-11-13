@@ -1,5 +1,5 @@
 use sanctum_proto::v1::{self, sanctum_client::SanctumClient, upload_text_frame::Frame};
-use sanctum_service::Service;
+use sanctum_service::{Service, run_local_worker};
 use tempfile::TempDir;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -21,12 +21,17 @@ impl Running {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let (stop, shutdown) = oneshot::channel();
         let server = tokio::spawn(async move {
-            Server::builder()
+            let (stop_worker, worker_stop) = tokio::sync::watch::channel(false);
+            let worker = tokio::spawn(run_local_worker(service.clone(), worker_stop));
+            let result = Server::builder()
                 .add_service(sanctum_api::grpc(service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                     let _ = shutdown.await;
                 })
-                .await
+                .await;
+            stop_worker.send(true).unwrap();
+            worker.await.unwrap();
+            result
         });
         let client = SanctumClient::connect(endpoint).await.unwrap();
         Self {
@@ -236,6 +241,253 @@ async fn unfinished_oversized_and_invalid_uploads_leave_no_searchable_chunks() {
         .unwrap();
     assert_eq!(
         search(&mut running.client, "default", "published")
+            .await
+            .len(),
+        1
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn accepted_jobs_and_pause_survive_restart_and_cancellation_is_scoped() {
+    let dir = TempDir::new().unwrap();
+    let mut first = Running::start(&dir).await;
+    create(&mut first.client, "default").await;
+    first
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: true })
+        .await
+        .unwrap();
+
+    let queued = first
+        .client
+        .submit_text(tokio_stream::iter([
+            header("default"),
+            data(b"queued zeolite"),
+            end(),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    let canceled = first
+        .client
+        .submit_text(tokio_stream::iter([
+            header("default"),
+            data(b"canceled celestine"),
+            end(),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(queued.state(), v1::IngestionState::Accepted);
+    assert!(
+        search(&mut first.client, "default", "zeolite")
+            .await
+            .is_empty()
+    );
+    first.stop().await;
+
+    let mut second = Running::start(&dir).await;
+    assert!(
+        second
+            .client
+            .get_local_queue(v1::Empty {})
+            .await
+            .unwrap()
+            .into_inner()
+            .paused
+    );
+    let id = v1::IngestionJobRequest {
+        scope: scope("default"),
+        operation_id: queued.operation_id,
+    };
+    assert_eq!(
+        second
+            .client
+            .get_ingestion_job(id.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .state(),
+        v1::IngestionState::Accepted
+    );
+
+    let unauthorized_scope = v1::IngestionJobRequest {
+        scope: scope("other"),
+        operation_id: canceled.operation_id.clone(),
+    };
+    assert_eq!(
+        second
+            .client
+            .cancel_ingestion_job(unauthorized_scope)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    let canceled_id = v1::IngestionJobRequest {
+        scope: scope("default"),
+        operation_id: canceled.operation_id,
+    };
+    let job = second
+        .client
+        .cancel_ingestion_job(canceled_id)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(job.state(), v1::IngestionState::Canceled);
+
+    second
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: false })
+        .await
+        .unwrap();
+    let done = await_ready(&mut second.client, id).await;
+    assert_eq!(done.attempts, 1);
+    assert_eq!(done.processed_bytes, done.total_bytes);
+    assert_eq!(done.text_revision.unwrap().revision_id, queued.revision_id);
+    assert_eq!(
+        search(&mut second.client, "default", "zeolite").await.len(),
+        1
+    );
+    assert!(
+        search(&mut second.client, "default", "celestine")
+            .await
+            .is_empty()
+    );
+    second.stop().await;
+}
+
+#[tokio::test]
+async fn recovery_reuses_a_collection_commit_with_a_missing_queue_receipt() {
+    let dir = TempDir::new().unwrap();
+    let mut first = Running::start(&dir).await;
+    create(&mut first.client, "default").await;
+    let job = first
+        .client
+        .submit_text(tokio_stream::iter([
+            header("default"),
+            data(b"receipt recovery zircon"),
+            end(),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    let id = v1::IngestionJobRequest {
+        scope: scope("default"),
+        operation_id: job.operation_id,
+    };
+    let complete = await_ready(&mut first.client, id.clone()).await;
+    first.stop().await;
+
+    let connection = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE ingestion_jobs SET status = 'publishing', content_hash = NULL, chunks = NULL
+         WHERE operation_id = ?1",
+            [&id.operation_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut second = Running::start(&dir).await;
+    let recovered = await_ready(&mut second.client, id).await;
+    assert_eq!(recovered.attempts, 2);
+    assert_eq!(recovered.text_revision, complete.text_revision);
+    assert_eq!(
+        search(&mut second.client, "default", "zircon").await.len(),
+        1
+    );
+    second.stop().await;
+}
+
+async fn await_ready(
+    client: &mut SanctumClient<Channel>,
+    request: v1::IngestionJobRequest,
+) -> v1::IngestionJob {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let job = client
+                .get_ingestion_job(request.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            match job.state() {
+                v1::IngestionState::TextReady => return job,
+                v1::IngestionState::Failed | v1::IngestionState::Canceled => panic!("{job:?}"),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn retry_preserves_the_operation_and_revision_after_a_storage_failure() {
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: true })
+        .await
+        .unwrap();
+    let job = running
+        .client
+        .submit_text(tokio_stream::iter([
+            header("default"),
+            data(b"recoverable labradorite"),
+            end(),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    let path = dir
+        .path()
+        .join("default/notes/sources")
+        .join(&job.source_id)
+        .join(&job.revision_id)
+        .join("text.utf8");
+    let backup = path.with_extension("backup");
+    std::fs::rename(&path, &backup).unwrap();
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: false })
+        .await
+        .unwrap();
+    let id = v1::IngestionJobRequest {
+        scope: scope("default"),
+        operation_id: job.operation_id,
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let state = running
+                .client
+                .get_ingestion_job(id.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            if state.state() == v1::IngestionState::Failed {
+                assert_eq!(state.error_code.as_deref(), Some("retryable"));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::rename(&backup, &path).unwrap();
+    running
+        .client
+        .retry_ingestion_job(id.clone())
+        .await
+        .unwrap();
+    let ready = await_ready(&mut running.client, id).await;
+    assert_eq!(ready.attempts, 2);
+    assert_eq!(ready.revision_id, job.revision_id);
+    assert_eq!(
+        search(&mut running.client, "default", "labradorite")
             .await
             .len(),
         1

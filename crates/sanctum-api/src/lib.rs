@@ -4,7 +4,7 @@ use sanctum_proto::v1::{
     sanctum_server::{Sanctum, SanctumServer},
     upload_text_frame::Frame,
 };
-use sanctum_service::{ChunkRef, Hit, Service, TextUpload};
+use sanctum_service::{ChunkRef, Hit, Job, JobState, Service, TextUpload};
 use tokio::io::AsyncWriteExt;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -59,79 +59,94 @@ impl Sanctum for Grpc {
         &self,
         request: Request<Streaming<v1::UploadTextFrame>>,
     ) -> Reply<v1::TextRevision> {
-        let mut stream = request.into_inner();
-        let header = match stream.message().await?.and_then(|message| message.frame) {
-            Some(Frame::Header(header)) => header,
-            _ => {
-                return Err(Status::invalid_argument(
-                    "first upload frame must be a header",
-                ));
-            }
-        };
-        let scope = parse_scope(header.scope)?;
-        let wire_scope = wire_scope(&scope);
-        let service = self.0.clone();
-        let max_bytes = service.max_source_bytes();
-        let (staged, file) = work(move || {
-            let staged = service.stage_upload(
-                scope,
-                TextUpload {
-                    name: header.name,
-                    external: header.external.map(|value| ExternalSource {
-                        namespace: value.namespace,
-                        id: value.id,
-                    }),
-                },
-            )?;
-            let file = staged.reopen()?;
-            Ok((staged, file))
-        })
-        .await?;
-
-        let mut file = tokio::fs::File::from_std(file);
-        let mut written = 0;
+        let mut job = submit(&self.0, request.into_inner()).await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            let data = match stream.message().await?.and_then(|message| message.frame) {
-                Some(Frame::Data(data)) => data,
-                Some(Frame::End(_)) => break,
-                _ => {
-                    return Err(Status::invalid_argument(
-                        "expected data or explicit upload end",
-                    ));
+            match job.state {
+                JobState::TextReady => {
+                    return text_revision(&job)
+                        .map(Response::new)
+                        .ok_or_else(|| Status::internal("completed revision receipt is missing"));
                 }
-            };
-            if data.len() > UPLOAD_FRAME_BYTES {
-                return Err(Status::invalid_argument("upload frame exceeds 256 KiB"));
+                JobState::Failed => {
+                    let failure = job
+                        .failure
+                        .ok_or_else(|| Status::internal("ingestion failed"))?;
+                    return Err(match failure.code.as_str() {
+                        "invalid_source" => Status::invalid_argument(failure.message),
+                        "conflict" => Status::already_exists(failure.message),
+                        _ => Status::unavailable(failure.message),
+                    });
+                }
+                JobState::Canceled => return Err(Status::cancelled("ingestion canceled")),
+                _ => {}
             }
-            written += data.len() as u64;
-            if written > max_bytes {
-                return Err(Status::resource_exhausted(
-                    "source exceeds the configured upload limit",
-                ));
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(format!(
+                    "upload is still processing; query operation {}",
+                    job.id
+                )));
             }
-            file.write_all(&data)
-                .await
-                .map_err(|error| status(error.into()))?;
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let service = self.0.clone();
+            job = work(move || service.job(&job.scope, job.id)).await?;
         }
-        if stream.message().await?.is_some() {
-            return Err(Status::invalid_argument(
-                "unexpected frame after upload end",
-            ));
-        }
-        file.flush().await.map_err(|error| status(error.into()))?;
-        drop(file);
+    }
 
-        let revision = work(move || staged.commit()).await?;
-        Ok(Response::new(v1::TextRevision {
-            scope: Some(wire_scope),
-            source_id: revision.source.to_string(),
-            revision_id: revision.revision.to_string(),
-            name: revision.name,
-            external: revision.external.map(wire_external),
-            bytes: revision.bytes,
-            chunks: revision.chunks,
-            content_blake3: revision.hash,
-        }))
+    async fn submit_text(
+        &self,
+        request: Request<Streaming<v1::UploadTextFrame>>,
+    ) -> Reply<v1::IngestionJob> {
+        submit(&self.0, request.into_inner())
+            .await
+            .map(wire_job)
+            .map(Response::new)
+    }
+
+    async fn get_ingestion_job(
+        &self,
+        request: Request<v1::IngestionJobRequest>,
+    ) -> Reply<v1::IngestionJob> {
+        job_action(&self.0, request.into_inner(), Service::job).await
+    }
+
+    async fn cancel_ingestion_job(
+        &self,
+        request: Request<v1::IngestionJobRequest>,
+    ) -> Reply<v1::IngestionJob> {
+        job_action(&self.0, request.into_inner(), Service::cancel_job).await
+    }
+
+    async fn retry_ingestion_job(
+        &self,
+        request: Request<v1::IngestionJobRequest>,
+    ) -> Reply<v1::IngestionJob> {
+        job_action(&self.0, request.into_inner(), Service::retry_job).await
+    }
+
+    async fn get_local_queue(&self, _request: Request<v1::Empty>) -> Reply<v1::LocalQueueStatus> {
+        let service = self.0.clone();
+        work(move || {
+            Ok(v1::LocalQueueStatus {
+                paused: service.queue_paused()?,
+            })
+        })
+        .await
+        .map(Response::new)
+    }
+
+    async fn set_local_queue(
+        &self,
+        request: Request<v1::SetLocalQueueRequest>,
+    ) -> Reply<v1::LocalQueueStatus> {
+        let paused = request.into_inner().paused;
+        let service = self.0.clone();
+        work(move || {
+            service.pause_queue(paused)?;
+            Ok(v1::LocalQueueStatus { paused })
+        })
+        .await
+        .map(Response::new)
     }
 
     async fn search_text(
@@ -179,6 +194,134 @@ impl Sanctum for Grpc {
         work(move || Ok(wire_hit(&scope, service.fetch(&scope, &reference)?)))
             .await
             .map(Response::new)
+    }
+}
+
+async fn submit(
+    service: &Service,
+    mut stream: Streaming<v1::UploadTextFrame>,
+) -> std::result::Result<Job, Status> {
+    let header = match stream.message().await?.and_then(|message| message.frame) {
+        Some(Frame::Header(header)) => header,
+        _ => {
+            return Err(Status::invalid_argument(
+                "first upload frame must be a header",
+            ));
+        }
+    };
+    let scope = parse_scope(header.scope)?;
+    let service = service.clone();
+    let max_bytes = service.max_source_bytes();
+    let (staged, file) = work(move || {
+        let staged = service.stage_upload(
+            scope,
+            TextUpload {
+                name: header.name,
+                external: header.external.map(|value| ExternalSource {
+                    namespace: value.namespace,
+                    id: value.id,
+                }),
+            },
+        )?;
+        let file = staged.reopen()?;
+        Ok((staged, file))
+    })
+    .await?;
+
+    let mut file = tokio::fs::File::from_std(file);
+    let mut written = 0;
+    loop {
+        let data = match stream.message().await?.and_then(|message| message.frame) {
+            Some(Frame::Data(data)) => data,
+            Some(Frame::End(_)) => break,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "expected data or explicit upload end",
+                ));
+            }
+        };
+        if data.len() > UPLOAD_FRAME_BYTES {
+            return Err(Status::invalid_argument("upload frame exceeds 256 KiB"));
+        }
+        written += data.len() as u64;
+        if written > max_bytes {
+            return Err(Status::resource_exhausted(
+                "source exceeds the configured upload limit",
+            ));
+        }
+        file.write_all(&data)
+            .await
+            .map_err(|error| status(error.into()))?;
+    }
+    if stream.message().await?.is_some() {
+        return Err(Status::invalid_argument(
+            "unexpected frame after upload end",
+        ));
+    }
+    file.flush().await.map_err(|error| status(error.into()))?;
+    drop(file);
+
+    work(move || staged.enqueue()).await
+}
+
+async fn job_action(
+    service: &Service,
+    request: v1::IngestionJobRequest,
+    action: fn(&Service, &Scope, uuid::Uuid) -> Result<Job>,
+) -> Reply<v1::IngestionJob> {
+    let scope = parse_scope(request.scope)?;
+    let id = request
+        .operation_id
+        .parse()
+        .map_err(|_| Status::invalid_argument("invalid operation ID"))?;
+    let service = service.clone();
+    work(move || action(&service, &scope, id))
+        .await
+        .map(wire_job)
+        .map(Response::new)
+}
+
+fn text_revision(job: &Job) -> Option<v1::TextRevision> {
+    Some(v1::TextRevision {
+        scope: Some(wire_scope(&job.scope)),
+        source_id: job.source.to_string(),
+        revision_id: job.revision.to_string(),
+        name: job.name.clone(),
+        external: job.external.clone().map(wire_external),
+        bytes: job.bytes,
+        chunks: job.chunks?,
+        content_blake3: job.hash.clone()?,
+    })
+}
+
+fn wire_job(job: Job) -> v1::IngestionJob {
+    let state = match job.state {
+        JobState::Accepted => v1::IngestionState::Accepted,
+        JobState::Indexing => v1::IngestionState::Indexing,
+        JobState::Publishing => v1::IngestionState::Publishing,
+        JobState::TextReady => v1::IngestionState::TextReady,
+        JobState::Failed => v1::IngestionState::Failed,
+        JobState::Canceled => v1::IngestionState::Canceled,
+    };
+    let text_revision = text_revision(&job);
+    let (error_code, error_message) = match job.failure {
+        Some(failure) => (Some(failure.code), Some(failure.message)),
+        None => (None, None),
+    };
+    v1::IngestionJob {
+        scope: Some(wire_scope(&job.scope)),
+        operation_id: job.id.to_string(),
+        source_id: job.source.to_string(),
+        revision_id: job.revision.to_string(),
+        name: job.name,
+        external: job.external.map(wire_external),
+        total_bytes: job.bytes,
+        processed_bytes: job.processed_bytes,
+        attempts: job.attempts,
+        state: state.into(),
+        error_code,
+        error_message,
+        text_revision,
     }
 }
 

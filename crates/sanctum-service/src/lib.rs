@@ -1,20 +1,22 @@
-use std::{
-    io::{Seek, SeekFrom},
-    path::Path,
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 
-use sanctum_chunk::index_utf8;
 use sanctum_core::{Error, ExternalSource, Result, Scope, ScopeId};
 use sanctum_db_sqlite::{self as db, CollectionDb};
 pub use sanctum_db_sqlite::{Chunk, ChunkRef, Revision};
 use sanctum_storage_fs::LocalFiles;
 use tempfile::NamedTempFile;
-use uuid::Uuid;
+
+mod local_jobs;
+mod worker;
+pub use worker::run_local_worker;
+
+use db::queue::LocalQueue;
+pub use db::queue::{Job, JobState};
 
 #[derive(Clone)]
 pub struct Service {
     files: Arc<LocalFiles>,
+    queue: LocalQueue,
     max_source_bytes: u64,
 }
 
@@ -43,8 +45,11 @@ impl Service {
                 "max_source_bytes is outside the supported range".into(),
             ));
         }
+        let files = Arc::new(LocalFiles::open(root)?);
+        let queue = LocalQueue::open(files.runtime_path())?;
         Ok(Self {
-            files: Arc::new(LocalFiles::open(root)?),
+            files,
+            queue,
             max_source_bytes,
         })
     }
@@ -151,52 +156,5 @@ impl Service {
 impl StagedUpload {
     pub fn reopen(&self) -> Result<std::fs::File> {
         Ok(self.file.reopen()?)
-    }
-
-    pub fn commit(mut self) -> Result<Revision> {
-        let mut input = self.file.reopen()?;
-        input.seek(SeekFrom::Start(0))?;
-        if input.metadata()?.len() > self.service.max_source_bytes {
-            return Err(Error::Invalid(
-                "source exceeds the configured upload limit".into(),
-            ));
-        }
-
-        let source = Uuid::new_v4();
-        let revision = Uuid::new_v4();
-        let mut database = self.service.database(&self.scope)?;
-        let writer = database.write()?;
-        let mut ordinal = 0;
-        let result = index_utf8(&mut input, |range, text| {
-            let reference = ChunkRef {
-                source,
-                revision,
-                ordinal,
-            };
-            writer.add_chunk(
-                &reference,
-                range,
-                blake3::hash(text.as_bytes()).to_hex().as_str(),
-                text,
-            )?;
-            ordinal += 1;
-            Ok(())
-        })?;
-        drop(input);
-        let data = Revision {
-            source,
-            revision,
-            name: std::mem::take(&mut self.upload.name),
-            external: self.upload.external.take(),
-            bytes: result.bytes,
-            chunks: result.chunks,
-            hash: result.hash,
-        };
-        writer.register(&data)?;
-        self.service
-            .files
-            .publish(&self.scope, source, revision, self.file)?;
-        writer.commit()?;
-        Ok(data)
     }
 }

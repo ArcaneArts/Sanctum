@@ -43,6 +43,32 @@ impl LocalFiles {
         self.collection_path(scope).join("meta.db")
     }
 
+    pub fn runtime_path(&self) -> PathBuf {
+        self.root.join("runtime.db")
+    }
+
+    pub fn open_text(&self, scope: &Scope, source: Uuid, revision: Uuid) -> Result<File> {
+        Ok(File::open(self.text_path(scope, source, revision))?)
+    }
+
+    pub fn discard_text(&self, scope: &Scope, source: Uuid, revision: Uuid) -> Result<()> {
+        let text = self.text_path(scope, source, revision);
+        let parent = text.parent().expect("text path has a revision directory");
+        match fs::remove_file(&text) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        fs::remove_dir(parent)?;
+        let source_dir = parent.parent().expect("revision has a source directory");
+        match fs::remove_dir(source_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
     pub fn stage(&self, scope: &Scope) -> Result<NamedTempFile> {
         let staging = self.collection_path(scope).join("staging");
         fs::create_dir_all(&staging)?;
