@@ -1,7 +1,7 @@
 use std::io::{self, BufReader, BufWriter, Write};
 
-use sanctum_chunk::index_utf8;
-use sanctum_core::{Error, Result, Scope, is_rtf};
+use sanctum_chunk::index_utf8_with_settings;
+use sanctum_core::{ChunkSettings, Error, Result, Scope, is_rtf};
 use sanctum_db::{Command, Unit, collection_prefix};
 use sanctum_db_sqlite::hosted::{
     Registration, RevisionObjects, is_registered, publish_revision, release_intent,
@@ -143,6 +143,7 @@ impl HostedCatalog {
             .map(|provider| provider.profile_id().to_owned());
         let operation = record.operation;
         let revision = record.revision;
+        let chunking = record.chunking;
         let registration = Registration {
             source: registration.source,
             external: registration.external.clone(),
@@ -183,8 +184,9 @@ impl HostedCatalog {
                                     profile.as_deref(),
                                     |writer| {
                                         let mut ordinal = 0;
-                                        index_utf8(
+                                        index_utf8_with_settings(
                                             BufReader::new(prepared.file.reopen()?),
+                                            chunking,
                                             |range, text| {
                                                 let reference = ChunkRef {
                                                     source: registration.source,
@@ -245,8 +247,9 @@ impl HostedCatalog {
         }
         let is_rtf = is_rtf(&record.upload.name);
         let expected = record.blake3.clone();
+        let chunking = record.chunking;
         let (file, mut content) =
-            tokio::task::spawn_blocking(move || prepare_text(staged, is_rtf, expected))
+            tokio::task::spawn_blocking(move || prepare_text(staged, is_rtf, expected, chunking))
                 .await
                 .map_err(|error| Error::Internal(Box::new(error)))??;
         content.retain_original = record.upload.retain_original;
@@ -287,6 +290,7 @@ fn prepare_text(
     input: NamedTempFile,
     is_rtf: bool,
     original_hash: String,
+    chunking: ChunkSettings,
 ) -> Result<(NamedTempFile, RevisionContent)> {
     let (file, encoding) = if is_rtf {
         let mut hash = blake3::Hasher::new();
@@ -302,7 +306,7 @@ fn prepare_text(
     } else {
         (input, "UTF-8")
     };
-    let index = index_utf8(BufReader::new(file.reopen()?), |_, _| Ok(()))?;
+    let index = index_utf8_with_settings(BufReader::new(file.reopen()?), chunking, |_, _| Ok(()))?;
     if !is_rtf && index.hash != original_hash {
         return Err(invalid_input());
     }
@@ -311,6 +315,7 @@ fn prepare_text(
         RevisionContent {
             bytes: index.bytes,
             chunks: index.chunks,
+            chunker: chunking.identifier(),
             hash: index.hash,
             original_hash,
             encoding: encoding.into(),

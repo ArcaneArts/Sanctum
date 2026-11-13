@@ -1,6 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
-use sanctum_core::{Error, Result};
+use sanctum_core::{ChunkSettings, Error, Result};
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_ENV: &str = "SANCTUM_CONFIG_JSON";
@@ -24,6 +24,8 @@ pub struct Config {
     pub max_source_bytes: u64,
     #[serde(default = "default_worker_concurrency")]
     pub local_worker_concurrency: usize,
+    #[serde(default)]
+    pub chunking: ChunkSettings,
     pub embedding: Option<EmbeddingConfig>,
     pub url_import_origins: Option<HashMap<String, Option<String>>>,
 }
@@ -95,6 +97,7 @@ impl Config {
         if config.version != 1 {
             return Err(Error::Invalid("expected configuration version 1".into()));
         }
+        config.chunking.validate()?;
         if config.max_source_bytes == 0 {
             return Err(Error::Invalid("max_source_bytes must be positive".into()));
         }

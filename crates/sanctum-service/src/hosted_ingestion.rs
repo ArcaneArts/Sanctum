@@ -3,7 +3,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use sanctum_core::{Error, ExternalSource, Result, Scope};
+use sanctum_core::{ChunkSettings, Error, ExternalSource, Result, Scope};
 use sanctum_db::{Command, Unit, collection_prefix};
 use sanctum_db_sqlite::hosted::{Registration, RevisionIntent, Target, register_revision};
 use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES, Version};
@@ -96,6 +96,8 @@ struct Operation {
     bytes: u64,
     blake3: String,
     attempt: Uuid,
+    #[serde(default)]
+    chunking: ChunkSettings,
     created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dispatched_at: Option<u64>,
@@ -394,6 +396,7 @@ impl HostedUpload {
             bytes,
             blake3,
             attempt: Uuid::new_v4(),
+            chunking: self.service.chunking,
             created_at: unix_seconds()?,
             dispatched_at: None,
             stage: Stage::PendingRegistration,

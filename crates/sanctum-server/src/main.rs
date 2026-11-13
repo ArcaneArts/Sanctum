@@ -34,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
     let mut runtime = runtime_info(&config, embedding.as_deref());
     let service =
         Service::open_with_embedding(&config.storage_root, config.max_source_bytes, embedding)?
+            .with_chunking(config.chunking)?
             .with_url_origins(config.url_import_origins)?;
     let listener = tokio::net::TcpListener::bind(config.grpc_listen).await?;
     let mcp_listener = if let Some(address) = config.mcp_listen {
@@ -113,6 +114,8 @@ fn runtime_info(
 ) -> sanctum_proto::v1::RuntimeInfo {
     sanctum_proto::v1::RuntimeInfo {
         max_source_bytes: config.max_source_bytes,
+        chunk_window_bytes: config.chunking.window_bytes,
+        chunk_overlap_bytes: config.chunking.overlap_bytes,
         embedding_profile_id: embedding.map(|provider| provider.profile_id().to_owned()),
         embedding_dimensions: embedding.and_then(|provider| provider.dimensions().try_into().ok()),
         storage: "filesystem".into(),

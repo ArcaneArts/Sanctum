@@ -61,6 +61,8 @@ message RuntimeInfo {
   optional uint32 embedding_dimensions = 11;
   repeated string capabilities = 12;
   bool url_imports = 13;
+  uint32 chunk_window_bytes = 14;
+  uint32 chunk_overlap_bytes = 15;
 }
 
 message DatabaseTarget {
@@ -551,6 +553,7 @@ message TextRevision {
   bool retain_original = 12;
   UrlProvenance url = 13;
   GitProvenance git = 14;
+  string chunker = 15;
 }
 
 message SearchTextRequest {

@@ -1,6 +1,6 @@
 use std::io::{BufReader, BufWriter, Read};
 
-use sanctum_chunk::index_utf8;
+use sanctum_chunk::index_utf8_with_settings;
 use sanctum_core::{Error, ExternalSource, Result, Scope, is_rtf};
 use sanctum_extract::{RTF_EXTRACTOR, rtf_to_utf8};
 use uuid::Uuid;
@@ -106,7 +106,7 @@ impl Service {
         }
         let mut ordinal = 0;
         let mut last_progress = 0;
-        let indexed = index_utf8(input, |range, text| {
+        let indexed = index_utf8_with_settings(input, job.chunking, |range, text| {
             if !job.extract_rtf && range.end - last_progress >= PROGRESS_STEP {
                 if !self.queue.progress(job.id, range.end)? {
                     return Err(Error::Conflict("indexing canceled".into()));
@@ -149,6 +149,7 @@ impl Service {
             hash: indexed.hash,
             bytes: indexed.bytes,
             chunks: indexed.chunks,
+            chunker: job.chunking.identifier(),
             encoding: extracted.map_or_else(|| "UTF-8".into(), |input| input.1.into()),
             extractor: job.extract_rtf.then(|| RTF_EXTRACTOR.into()),
             retain_original: job.retain_original,
@@ -267,6 +268,7 @@ impl StagedUpload {
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         service.require_collection(&job.scope)?;
         job.retain_original = self.upload.retain_original;
+        job.chunking = self.service.chunking;
         if job.extract_rtf {
             self.service
                 .files
@@ -317,6 +319,7 @@ pub(crate) fn new_job(
         created_at: 0,
         url: None,
         git: None,
+        chunking: Default::default(),
     }
 }
 

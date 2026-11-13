@@ -7,7 +7,7 @@ use super::{CollectionDb, Revision, database_error, query_all, row_revision_cont
 const CURRENT: &str =
     "SELECT s.id, s.current_revision, s.name, s.external_namespace, s.external_id,
     r.content_hash, r.chunk_count, r.bytes, COALESCE(r.original_hash, r.content_hash),
-    r.source_encoding, r.extractor, r.retain_original, r.url_provenance, r.git_provenance
+    r.source_encoding, r.extractor, r.retain_original, r.url_provenance, r.git_provenance, r.chunker
     FROM sources s JOIN revisions r ON r.source_id = s.id AND r.id = s.current_revision
     WHERE s.deleted = 0";
 

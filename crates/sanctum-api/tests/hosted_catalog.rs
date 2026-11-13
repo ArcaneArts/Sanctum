@@ -489,6 +489,69 @@ async fn hosted_context_trims_utf8_boundaries_and_bounds_the_response() {
 }
 
 #[tokio::test]
+async fn hosted_upload_keeps_accepted_chunk_settings_across_worker_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(sanctum_storage_fs::FileStorage::open(dir.path()).unwrap());
+    let configured = HostedCatalog::new(store.clone(), None, 32_768)
+        .unwrap()
+        .with_chunking(sanctum_core::ChunkSettings {
+            window_bytes: 257,
+            overlap_bytes: 33,
+        })
+        .unwrap();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    configured.create_collection(&scope, None).await.unwrap();
+    let upload = configured
+        .stage_upload(
+            scope.clone(),
+            sanctum_service::TextUpload {
+                name: "notes.txt".into(),
+                external: None,
+                replacement: None,
+                retain_original: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let text = "🦀".repeat(300);
+    std::io::Write::write_all(&mut upload.reopen().unwrap(), text.as_bytes()).unwrap();
+    let accepted = upload.enqueue().await.unwrap();
+
+    let worker = HostedCatalog::new(store, None, 32_768).unwrap();
+    worker
+        .register_upload(&scope, accepted.operation)
+        .await
+        .unwrap();
+    let result = worker
+        .index_upload(&scope, accepted.operation)
+        .await
+        .unwrap();
+    let content = result.content.unwrap();
+    assert_eq!(content.chunker, "utf8-overlap-v1/257/33");
+    assert!(content.chunks > 1);
+    let reference = sanctum_service::ChunkRef {
+        source: result.source.unwrap(),
+        revision: result.revision,
+        ordinal: 1,
+    };
+    let hit = worker.fetch(&scope, reference).await.unwrap();
+    assert_eq!(
+        hit.excerpt,
+        text[hit.chunk.range.start as usize..hit.chunk.range.end as usize]
+    );
+    assert!(hit.excerpt.len() <= 257);
+    let (stored, _) = worker
+        .source(&scope, result.source.unwrap(), None)
+        .await
+        .unwrap();
+    assert_eq!(stored.content.chunker, content.chunker);
+}
+
+#[tokio::test]
 async fn hosted_sources_page_current_revisions_and_keep_tenant_scope() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(sanctum_storage_fs::FileStorage::open(dir.path()).unwrap());
