@@ -402,6 +402,7 @@ fn job_value(job: Job) -> Value {
         "total_bytes": job.bytes,
         "processed_bytes": job.processed_bytes,
         "attempts": job.attempts,
+        "created_at_unix_seconds": job.created_at,
         "failure": job.failure.map(|error| json!({"code": error.code, "message": error.message})),
     })
 }

@@ -1,5 +1,6 @@
-use rusqlite::{functions::FunctionFlags, params, params_from_iter};
-use sanctum_core::Result;
+use rusqlite::{OptionalExtension, functions::FunctionFlags, params, params_from_iter};
+use sanctum_core::{Error, Result};
+use uuid::Uuid;
 
 use super::{
     Chunk, CollectionDb, RevisionWriter, database_error, metadata, metadata_filter, query_all,
@@ -13,12 +14,71 @@ pub struct Coverage {
     pub failed: u64,
 }
 
+pub struct EmbeddingStatus {
+    pub profile: Option<String>,
+    pub coverage: Coverage,
+    pub retrying: u64,
+    pub next_retry: Option<u64>,
+    pub sample_error: Option<String>,
+}
+
 pub struct ScoredChunk {
     pub chunk: Chunk,
     pub score: f64,
 }
 
 impl CollectionDb {
+    pub fn embedding_status(
+        &self,
+        profile: Option<&str>,
+        source_revision: Option<(Uuid, Uuid)>,
+    ) -> Result<EmbeddingStatus> {
+        self.read_snapshot(|db| {
+            let source = source_revision.map(|(source, _)| source.to_string());
+            if let Some((_, revision)) = source_revision {
+                let current: Option<String> = db.0.query_row(
+                    "SELECT current_revision FROM sources WHERE id = ?1 AND deleted = 0",
+                    [&source], |row| row.get(0),
+                ).optional().map_err(database_error)?;
+                match current {
+                    None => return Err(Error::NotFound("source was not found".into())),
+                    Some(current) if current != revision.to_string() => {
+                        return Err(Error::StaleRevision("embedding status requires the current revision".into()));
+                    }
+                    _ => {}
+                }
+            }
+            let condition = if source.is_some() { " AND s.id = ?2" } else { "" };
+            let sql = format!(
+                "SELECT count(*), count(e.vector), count(e.error), count(e.retry_at),
+                        min(e.retry_at), min(e.error)
+                 FROM chunks c JOIN sources s ON s.id = c.source_id AND s.current_revision = c.revision_id
+                 LEFT JOIN embedding_cache e ON e.profile = ?1 AND e.input_hash = c.content_hash
+                 WHERE s.deleted = 0{condition}"
+            );
+            let mut arguments = vec![profile];
+            if let Some(source) = source.as_deref() {
+                arguments.push(Some(source));
+            }
+            db.0.query_row(&sql, params_from_iter(arguments), |row| {
+                Ok(EmbeddingStatus {
+                    profile: profile.map(str::to_owned),
+                    coverage: Coverage {
+                        total: unsigned_column(row, 0)?,
+                        embedded: unsigned_column(row, 1)?,
+                        failed: unsigned_column(row, 2)?,
+                    },
+                    retrying: unsigned_column(row, 3)?,
+                    next_retry: row.get::<_, Option<i64>>(4)?
+                        .map(|time| u64::try_from(time)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, time)))
+                        .transpose()?,
+                    sample_error: row.get(5)?,
+                })
+            }).map_err(database_error)
+        })
+    }
+
     pub fn has_embeddings(&self, profile: &str) -> Result<bool> {
         self.0
             .query_row(

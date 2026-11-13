@@ -72,6 +72,7 @@ impl Running {
 struct EmbeddingFixture {
     profile: &'static str,
     fail_queries: AtomicBool,
+    fail_documents: AtomicBool,
     reject_input: bool,
     document_inputs: AtomicUsize,
 }
@@ -81,6 +82,7 @@ impl EmbeddingFixture {
         Arc::new(Self {
             profile,
             fail_queries: AtomicBool::new(false),
+            fail_documents: AtomicBool::new(false),
             reject_input,
             document_inputs: AtomicUsize::new(0),
         })
@@ -102,6 +104,9 @@ impl Provider for EmbeddingFixture {
             return Err(EmbedError::Transient("simulated provider outage".into()));
         }
         if matches!(purpose, Purpose::Document) {
+            if self.fail_documents.load(Ordering::SeqCst) {
+                return Err(EmbedError::Transient("simulated document outage".into()));
+            }
             if self.reject_input && texts.iter().any(|text| text.contains("reject input")) {
                 return Err(EmbedError::Input("simulated context limit".into()));
             }
@@ -135,11 +140,14 @@ async fn await_coverage(client: &mut SanctumClient<Channel>, embedded: u64, fail
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let coverage = client
-                .search_text(vector_search("quartz", v1::SearchMode::Lexical))
+                .get_embedding_status(v1::EmbeddingStatusRequest {
+                    scope: scope("default"),
+                    ..Default::default()
+                })
                 .await
                 .unwrap()
                 .into_inner()
-                .embedding_coverage
+                .coverage
                 .unwrap();
             if coverage.embedded_chunks == embedded && coverage.failed_chunks == failed {
                 return;
@@ -149,6 +157,38 @@ async fn await_coverage(client: &mut SanctumClient<Channel>, embedded: u64, fail
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn embedding_status_reports_a_scheduled_retry() {
+    let dir = TempDir::new().unwrap();
+    let provider = EmbeddingFixture::new("retry-profile", false);
+    provider.fail_documents.store(true, Ordering::SeqCst);
+    let mut running = Running::with_embedding(&dir, Some(provider)).await;
+    create(&mut running.client, "default").await;
+    let revision = upload(&mut running.client, header("default"), b"quartz specimen").await;
+    await_coverage(&mut running.client, 0, 1).await;
+    let status = running
+        .client
+        .get_embedding_status(v1::EmbeddingStatusRequest {
+            scope: scope("default"),
+            source_id: Some(revision.source_id),
+            revision_id: Some(revision.revision_id),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(status.retrying_chunks, 1);
+    assert!(status.next_retry_at_unix_seconds.is_some());
+    assert_eq!(
+        status.sample_error.as_deref(),
+        Some("simulated document outage")
+    );
+    assert_eq!(
+        search(&mut running.client, "default", "quartz").await.len(),
+        1
+    );
+    running.stop().await;
 }
 
 #[tokio::test]
@@ -258,6 +298,29 @@ async fn embedding_search_reuses_vectors_and_isolates_profiles() {
     )
     .await;
     await_coverage(&mut running.client, 1, 1).await;
+    let status_request = |revision_id: &str| v1::EmbeddingStatusRequest {
+        scope: scope("default"),
+        source_id: Some(changed.source_id.clone()),
+        revision_id: Some(revision_id.into()),
+    };
+    let embedding_status = running
+        .client
+        .get_embedding_status(status_request(&changed.revision_id))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(embedding_status.retrying_chunks, 0);
+    assert_eq!(
+        embedding_status.sample_error.as_deref(),
+        Some("simulated context limit")
+    );
+    assert_eq!(embedding_status.coverage.unwrap().failed_chunks, 1);
+    let stale = running
+        .client
+        .get_embedding_status(status_request(&same.revision_id))
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), Code::FailedPrecondition);
     expire_and_reclaim(&dir, &running.service);
     assert!(text_path(&dir, &same.source_id, &same.revision_id).exists());
     assert_eq!(
@@ -334,6 +397,107 @@ fn scope(tenant: &str) -> Option<v1::Scope> {
         tenant: tenant.into(),
         collection: "notes".into(),
     })
+}
+
+#[tokio::test]
+async fn queue_activity_pages_persist_and_stay_in_scope() {
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    create(&mut running.client, "other").await;
+    running
+        .client
+        .create_collection(v1::CreateCollectionRequest {
+            scope: Some(v1::Scope {
+                tenant: "default".into(),
+                collection: "reference".into(),
+            }),
+        })
+        .await
+        .unwrap();
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: true })
+        .await
+        .unwrap();
+    let mut accepted = Vec::new();
+    for (tenant, collection) in [
+        ("default", "notes"),
+        ("default", "reference"),
+        ("other", "notes"),
+    ] {
+        let mut request = header(tenant);
+        if let Some(Frame::Header(header)) = &mut request.frame {
+            header.scope.as_mut().unwrap().collection = collection.into();
+        }
+        let job = running
+            .client
+            .submit_text(tokio_stream::iter([request, data(b"queued text"), end()]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(job.state(), v1::IngestionState::Accepted);
+        assert!(job.created_at_unix_seconds > 0);
+        accepted.push(job);
+    }
+    running.stop().await;
+
+    let mut restarted = Running::start(&dir).await;
+    let mut request = v1::ListIngestionJobsRequest {
+        tenant: "default".into(),
+        limit: Some(1),
+        ..Default::default()
+    };
+    let first = restarted
+        .client
+        .list_ingestion_jobs(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.jobs.len(), 1);
+    request.before_operation_id = first.next_before_operation_id;
+    assert!(request.before_operation_id.is_some());
+    let second = restarted
+        .client
+        .list_ingestion_jobs(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second.jobs.len(), 1);
+    assert!(second.next_before_operation_id.is_none());
+    let mut ids = [
+        first.jobs[0].operation_id.as_str(),
+        second.jobs[0].operation_id.as_str(),
+    ];
+    ids.sort_unstable();
+    let mut expected = [
+        accepted[0].operation_id.as_str(),
+        accepted[1].operation_id.as_str(),
+    ];
+    expected.sort_unstable();
+    assert_eq!(ids, expected);
+
+    request.tenant = "other".into();
+    assert_eq!(
+        restarted
+            .client
+            .list_ingestion_jobs(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    request.tenant = "default".into();
+    request.collection = Some("notes".into());
+    request.before_operation_id = None;
+    let notes = restarted
+        .client
+        .list_ingestion_jobs(request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(notes.jobs, accepted[..1]);
+    restarted.stop().await;
 }
 
 fn header(tenant: &str) -> v1::UploadTextFrame {

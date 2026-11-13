@@ -8,6 +8,8 @@ service Sanctum {
   rpc UploadText(stream UploadTextFrame) returns (TextRevision);
   rpc SubmitText(stream UploadTextFrame) returns (IngestionJob);
   rpc GetIngestionJob(IngestionJobRequest) returns (IngestionJob);
+  rpc ListIngestionJobs(ListIngestionJobsRequest) returns (ListIngestionJobsResponse);
+  rpc GetEmbeddingStatus(EmbeddingStatusRequest) returns (EmbeddingStatus);
   rpc CancelIngestionJob(IngestionJobRequest) returns (IngestionJob);
   rpc RetryIngestionJob(IngestionJobRequest) returns (IngestionJob);
   rpc GetLocalQueue(Empty) returns (LocalQueueStatus);
@@ -110,6 +112,18 @@ message IngestionJobRequest {
   string operation_id = 2;
 }
 
+message ListIngestionJobsRequest {
+  string tenant = 1;
+  optional string collection = 2;
+  optional uint32 limit = 3;
+  optional string before_operation_id = 4;
+}
+
+message ListIngestionJobsResponse {
+  repeated IngestionJob jobs = 1;
+  optional string next_before_operation_id = 2;
+}
+
 message IngestionJob {
   Scope scope = 1;
   string operation_id = 2;
@@ -125,6 +139,7 @@ message IngestionJob {
   optional string error_message = 12;
   optional TextRevision text_revision = 13;
   uint64 update_sequence = 14;
+  uint64 created_at_unix_seconds = 15;
 }
 
 message LocalQueueStatus {
@@ -318,6 +333,20 @@ message EmbeddingCoverage {
   uint64 total_chunks = 2;
   uint64 embedded_chunks = 3;
   uint64 failed_chunks = 4;
+}
+
+message EmbeddingStatusRequest {
+  Scope scope = 1;
+  // Supply both IDs to inspect a current source revision. Omit both for the collection.
+  optional string source_id = 2;
+  optional string revision_id = 3;
+}
+
+message EmbeddingStatus {
+  EmbeddingCoverage coverage = 1;
+  uint64 retrying_chunks = 2;
+  optional uint64 next_retry_at_unix_seconds = 3;
+  optional string sample_error = 4;
 }
 
 message ChunkRef {

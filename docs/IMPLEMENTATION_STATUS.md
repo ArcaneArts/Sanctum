@@ -5,7 +5,7 @@ which parts have working implementations and where to find the evidence.
 
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
-| 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, text ingestion and directory imports, byte-range fetch, source lifecycle, metadata and filters, filesystem usage, and Ollama-backed semantic and hybrid search | Tray app, per-source embedding progress, desktop and LLM client acceptance |
+| 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, text ingestion and directory imports, byte-range fetch, source lifecycle, metadata and filters, filesystem usage, and Ollama-backed search with queue and embedding status | Tray app, desktop and LLM client acceptance |
 | 2. Providers and local integrations | Pending | Hosted provider adapters, rebuilds, watchers, URL and Git imports, metadata queries and cursors, SQL access, multi-collection retrieval, platform packaging and verification |
 | 3. Object storage and publication | Pending | MinIO and GCS, backend contract tests, ownership, snapshots, durable publication, and recovery |
 | 4. Cloud Run and Cloud Tasks | Pending | Linux deployment, dispatch and repair, identity, status, hosted ingress, crash and replay scenarios |
@@ -152,10 +152,12 @@ Merged in [PR #10](https://github.com/ArcaneArts/Sanctum/pull/10).
   `embeddinggemma-2:740m` model, verified two persisted 768-dimensional
   vectors, and ranked a relevant source for a query with no lexical match.
   It also exercised hybrid search.
-- Per-source embedding progress, explicit retry of permanent failures,
-  cross-collection ranking, and capacity measurement remain open.
+- Explicit retry of permanent failures, cross-collection ranking, and
+  capacity measurement remain open.
 
 ## Local MCP
+
+Merged in [PR #11](https://github.com/ArcaneArts/Sanctum/pull/11).
 
 - The server hosts MCP Streamable HTTP on a configurable loopback listener.
   The CLI's `mcp-stdio` bridges tool discovery and calls to that listener.
@@ -166,4 +168,16 @@ Merged in [PR #10](https://github.com/ArcaneArts/Sanctum/pull/10).
 - The standalone integration check starts the server and CLI, verifies
   tool discovery and shared state over HTTP, stdio, and gRPC, and checks
   cross-tenant fetch rejection and HTTP Host and Origin validation.
+
+## Local activity and embedding status
+
+- `ListIngestionJobs` pages durable ingestion activity across a tenant or
+  within one collection, using the stored acceptance timestamp and operation
+  ID. The existing queue operations still control individual jobs.
+- `GetEmbeddingStatus` reports the configured profile's coverage and failure
+  information for a collection or one current source revision without
+  running a search or contacting the embedding provider.
+- The local gRPC tests cover pagination across restart, cursor tenant
+  isolation, current and stale revision checks, and recorded embedding
+  failures.
 - Next, implement the desktop host, configuration, tray, and first-use flow.
