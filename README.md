@@ -49,7 +49,8 @@ The hosted deployment targets **Google Cloud Run, Cloud Storage, and Cloud
 Tasks**, with Linux server builds. Filesystem storage and S3 storage through
 MinIO provide local development and integration-test paths. Hosted instances
 will download database snapshots on demand and reuse them while warm, with
-durable queued work and coordinated database publication.
+durable queued work and coordinated database publication. See the
+[Cloud Run deployment guide](docs/CLOUD_RUN.md) for the API and worker setup.
 
 Sanctum is always multi-tenant internally. A local installation normally uses
 the tenant ID `default`. The hosted service is operated by trusted applications;

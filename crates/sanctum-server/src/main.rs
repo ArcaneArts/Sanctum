@@ -17,14 +17,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let mut config = Config::from_env()?;
     if let Some(storage) = config.object_storage.take() {
-        return hosted::serve(
-            config.grpc_listen,
-            config.hosted_worker_listen,
-            config.cloud_tasks,
-            storage,
-            config.max_source_bytes,
-        )
-        .await;
+        return hosted::serve(config, storage).await;
     }
     let embedding: Option<Arc<dyn sanctum_embedding::Provider>> = config
         .embedding
@@ -82,12 +75,6 @@ async fn main() -> anyhow::Result<()> {
             cancellation.clone().cancelled_owned(),
         );
     tokio::pin!(grpc, mcp);
-    let shutdown = async {
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => signal,
-            _ = host_shutdown() => Ok(()),
-        }
-    };
     let result = tokio::select! {
         result = &mut grpc => {
             cancellation.cancel();
@@ -99,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
             let _ = stop.send(true);
             result.and(grpc.await.map_err(anyhow::Error::from))
         }
-        signal = shutdown => {
+        signal = shutdown_signal() => {
             cancellation.cancel();
             let _ = stop.send(true);
             let (grpc, mcp) = tokio::join!(grpc, mcp);
@@ -111,6 +98,20 @@ async fn main() -> anyhow::Result<()> {
     }
     result?;
     Ok(())
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    #[cfg(unix)]
+    let termination = terminate.recv();
+    #[cfg(not(unix))]
+    let termination = std::future::pending::<Option<()>>();
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => signal,
+        _ = termination => Ok(()),
+        _ = host_shutdown() => Ok(()),
+    }
 }
 
 async fn host_shutdown() {
