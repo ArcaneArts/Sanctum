@@ -24,6 +24,7 @@ mod hosted_dispatch;
 mod hosted_embedding;
 mod hosted_ingestion;
 mod hosted_lifecycle;
+mod hosted_metadata;
 mod hosted_rebuild;
 mod hosted_retrieval;
 mod hosted_snapshots;

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use rusqlite::{
-    Connection, OptionalExtension, TransactionBehavior, params, params_from_iter,
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
     types::Value as SqlValue,
 };
 use sanctum_core::{Error, Result};
@@ -74,11 +74,31 @@ pub fn read_catalog_metadata(path: &Path, collection: &str) -> Result<Vec<Entry>
     catalog_entries(&connection, collection, None)
 }
 
+pub fn mutate_catalog_metadata(
+    transaction: &Transaction<'_>,
+    collection: &str,
+    edits: &[Mutation],
+) -> Result<Vec<Entry>> {
+    catalog_entries(transaction, collection, Some(edits))
+}
+
 fn catalog_entries(
     connection: &Connection,
     collection: &str,
     edits: Option<&[Mutation]>,
 ) -> Result<Vec<Entry>> {
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?1)",
+            [collection],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    if !exists {
+        return Err(Error::NotFound(format!(
+            "collection {collection} was not found"
+        )));
+    }
     apply(
         connection,
         "collection_metadata",
@@ -103,55 +123,13 @@ impl CollectionDb {
                 TransactionBehavior::Deferred
             })
             .map_err(database_error)?;
-        let source = target.source.to_string();
-        let revision = target.revision.to_string();
-        let current: Option<String> = transaction
-            .query_row(
-                "SELECT current_revision FROM sources WHERE id = ?1 AND deleted = 0",
-                [&source],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(database_error)?;
-        match current {
-            None => return Err(Error::NotFound("source was not found".into())),
-            Some(current) if current != revision => {
-                return Err(Error::StaleRevision(
-                    "metadata target is not the current revision".into(),
-                ));
-            }
-            _ => {}
-        }
-        let ordinal = target.ordinal.map(sql_integer).transpose()?;
-        if let Some(ordinal) = ordinal {
-            let exists: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM chunks WHERE source_id = ?1 AND revision_id = ?2 AND ordinal = ?3)",
-                params![source, revision, ordinal], |row| row.get(0),
-            ).map_err(database_error)?;
-            if !exists {
-                return Err(Error::NotFound("chunk was not found".into()));
-            }
-        }
-        let entries = apply(
-            &transaction,
-            "revision_metadata",
-            "source = ?1 AND revision = ?2 AND ordinal = ?3",
-            "source, revision, ordinal",
-            vec![source.into(), revision.into(), ordinal.unwrap_or(-1).into()],
-            edits,
-        )?;
-        if edits.is_some() {
-            record_change(
-                &transaction,
-                "metadata_changed",
-                target.source,
-                target.revision,
-                None,
-                ordinal,
-            )?;
-        }
+        let entries = revision_entries(&transaction, target, edits)?;
         transaction.commit().map_err(database_error)?;
         Ok(entries)
+    }
+
+    pub fn read_metadata(&self, target: RevisionTarget) -> Result<Vec<Entry>> {
+        revision_entries(&self.0, target, None)
     }
 
     pub fn change_cursor(&self) -> Result<u64> {
@@ -204,6 +182,69 @@ impl CollectionDb {
         snapshot.commit().map_err(database_error)?;
         Ok(result)
     }
+}
+
+pub fn mutate_revision_metadata(
+    transaction: &Transaction<'_>,
+    target: RevisionTarget,
+    edits: &[Mutation],
+) -> Result<Vec<Entry>> {
+    revision_entries(transaction, target, Some(edits))
+}
+
+fn revision_entries(
+    connection: &Connection,
+    target: RevisionTarget,
+    edits: Option<&[Mutation]>,
+) -> Result<Vec<Entry>> {
+    let source = target.source.to_string();
+    let revision = target.revision.to_string();
+    let current: Option<String> = connection
+        .query_row(
+            "SELECT current_revision FROM sources WHERE id = ?1 AND deleted = 0",
+            [&source],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error)?;
+    match current {
+        None => return Err(Error::NotFound("source was not found".into())),
+        Some(current) if current != revision => {
+            return Err(Error::StaleRevision(
+                "metadata target is not the current revision".into(),
+            ));
+        }
+        _ => {}
+    }
+    let ordinal = target.ordinal.map(sql_integer).transpose()?;
+    if let Some(ordinal) = ordinal {
+        let exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM chunks WHERE source_id = ?1 AND revision_id = ?2 AND ordinal = ?3)",
+                params![source, revision, ordinal], |row| row.get(0),
+            ).map_err(database_error)?;
+        if !exists {
+            return Err(Error::NotFound("chunk was not found".into()));
+        }
+    }
+    let entries = apply(
+        connection,
+        "revision_metadata",
+        "source = ?1 AND revision = ?2 AND ordinal = ?3",
+        "source, revision, ordinal",
+        vec![source.into(), revision.into(), ordinal.unwrap_or(-1).into()],
+        edits,
+    )?;
+    if edits.is_some() {
+        record_change(
+            connection,
+            "metadata_changed",
+            target.source,
+            target.revision,
+            None,
+            ordinal,
+        )?;
+    }
+    Ok(entries)
 }
 
 pub(super) fn record_change(

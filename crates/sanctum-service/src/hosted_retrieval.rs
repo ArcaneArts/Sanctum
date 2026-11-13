@@ -238,6 +238,14 @@ impl HostedCatalog {
         scope: &Scope,
         read: impl FnOnce(&db::CollectionDb) -> Result<T> + Send + 'static,
     ) -> Result<(T, Uuid)> {
+        self.with_owned_collection(scope, move |db| read(&db)).await
+    }
+
+    pub(crate) async fn with_owned_collection<T: Send + 'static>(
+        &self,
+        scope: &Scope,
+        read: impl FnOnce(db::CollectionDb) -> Result<T> + Send + 'static,
+    ) -> Result<(T, Uuid)> {
         self.require_collection(scope).await?;
         let unit = Unit::collection(self.prefix.as_ref(), scope)?;
         let database = self
@@ -246,7 +254,7 @@ impl HostedCatalog {
             .await?
             .ok_or_else(|| Error::NotFound("collection database was not found".into()))?;
         tokio::task::spawn_blocking(move || {
-            let value = read(&db::CollectionDb::open_read_only(database.path())?)?;
+            let value = read(db::CollectionDb::open_read_only(database.path())?)?;
             Ok((value, database.generation.id))
         })
         .await

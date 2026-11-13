@@ -640,4 +640,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   verifies request replay across instances, shared gRPC and MCP data,
   exact UTF-8 ranges, tenant scope, and HTTP/1.1 and h2c on one port.
 - The deployment guide includes an authenticated MCP request. Actual
-  Cloud Run ingress and hosted metadata tools remain open.
+  Cloud Run ingress remains open.
+- Delivered in [PR #40](https://github.com/ArcaneArts/Sanctum/pull/40).
+
+## Hosted metadata
+
+- Hosted gRPC and MCP read and mutate collection, current source, and
+  chunk metadata through their shared fenced publication service.
+  The transaction returns its own metadata rows while the durable
+  receipt stores only a short outcome.
+- Hosted gRPC lists, sorts, counts, and groups metadata matches from
+  read-only snapshots. Retrieval evaluates metadata filters against
+  current data. Source and chunk edits record change events.
+- The gRPC integration test verifies rollback, restart, merge-patch,
+  JSON null grouping, tenant scope, and revision reset. The MinIO MCP
+  smoke verifies collection and chunk writes across API instances
+  and search filtered by published catalog metadata.
+- Hosted change polling and snapshot export remain open.

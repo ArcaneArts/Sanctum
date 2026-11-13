@@ -1467,6 +1467,233 @@ impl sanctum_service::Dispatch for TestDispatch {
 }
 
 #[tokio::test]
+async fn hosted_metadata_is_atomic_and_filters_published_revisions() {
+    use v1::{
+        MetadataLevel, MetadataOperator, metadata_filter::Expression, metadata_mutation::Edit,
+        query_metadata_request::View,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let service = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let mut server = start(service.clone()).await;
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    service.create_collection(&scope, None).await.unwrap();
+    let collection = v1::MetadataTarget {
+        scope: Some(v1::Scope {
+            tenant: "default".into(),
+            collection: "notes".into(),
+        }),
+        ..Default::default()
+    };
+    let edit = |key: &str, value: Edit| v1::MetadataMutation {
+        namespace: "integration".into(),
+        key: key.into(),
+        edit: Some(value),
+    };
+    let change = |target: &v1::MetadataTarget, edits| v1::MutateMetadataRequest {
+        target: Some(target.clone()),
+        edits,
+    };
+    let header = v1::UploadTextHeader {
+        scope: collection.scope.clone(),
+        name: "notes.txt".into(),
+        ..Default::default()
+    };
+    let accepted = server
+        .client
+        .submit_text(upload_frames(&header, [b"quartz notes".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let operation = accepted.operation_id.parse().unwrap();
+    service.register_upload(&scope, operation).await.unwrap();
+    service.index_upload(&scope, operation).await.unwrap();
+    let source = v1::MetadataTarget {
+        source_id: Some(accepted.source_id.clone()),
+        revision_id: Some(accepted.revision_id.clone()),
+        ..collection.clone()
+    };
+    let chunk = v1::MetadataTarget {
+        chunk_ordinal: Some(0),
+        ..source.clone()
+    };
+    for (target, value) in [
+        (&collection, "true"),
+        (&source, r#"{"score":7}"#),
+        (&chunk, "null"),
+    ] {
+        server
+            .client
+            .mutate_metadata(change(
+                target,
+                vec![edit("status", Edit::SetJson(value.into()))],
+            ))
+            .await
+            .unwrap();
+    }
+    let invalid = change(
+        &source,
+        vec![
+            edit("status", Edit::SetJson("false".into())),
+            edit("", Edit::SetJson("true".into())),
+        ],
+    );
+    assert_eq!(
+        server
+            .client
+            .mutate_metadata(invalid)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+
+    server.stop().await;
+    let mut server = start(HostedCatalog::new(storage, None, 1024).unwrap()).await;
+    let entries = server
+        .client
+        .get_metadata(source.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .entries;
+    assert_eq!(entries[0].value_json, r#"{"score":7}"#);
+    let patched = server
+        .client
+        .mutate_metadata(change(
+            &source,
+            vec![edit(
+                "status",
+                Edit::MergePatchJson(r#"{"score":8,"extra":true}"#.into()),
+            )],
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(patched.entries[0].value_json, r#"{"extra":true,"score":8}"#);
+
+    let filter = v1::MetadataFilter {
+        expression: Some(Expression::Test(v1::MetadataPredicate {
+            level: MetadataLevel::Collection.into(),
+            namespace: "integration".into(),
+            key: "status".into(),
+            operator: MetadataOperator::Equal.into(),
+            operand_json: Some("true".into()),
+            ..Default::default()
+        })),
+    };
+    let grouped = v1::QueryMetadataRequest {
+        tenant: "default".into(),
+        collection: Some("notes".into()),
+        level: MetadataLevel::Chunk.into(),
+        filter: Some(filter.clone()),
+        view: Some(View::Count(v1::MetadataCount {
+            group_by: Some(v1::MetadataField {
+                level: MetadataLevel::Chunk.into(),
+                namespace: "integration".into(),
+                key: "status".into(),
+                ..Default::default()
+            }),
+        })),
+        ..Default::default()
+    };
+    let groups = server
+        .client
+        .query_metadata(grouped)
+        .await
+        .unwrap()
+        .into_inner()
+        .groups;
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].count, 1);
+    assert_eq!(groups[0].value_json.as_deref(), Some("null"));
+
+    for (tenant, expected) in [("default", 1), ("other", 0)] {
+        let result = server
+            .client
+            .query_metadata(v1::QueryMetadataRequest {
+                tenant: tenant.into(),
+                level: MetadataLevel::Collection.into(),
+                filter: Some(filter.clone()),
+                view: Some(View::Count(v1::MetadataCount { group_by: None })),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.groups[0].count, expected);
+    }
+
+    let replacement = v1::UploadTextHeader {
+        replacement: Some(v1::Replacement {
+            source_id: Some(accepted.source_id.clone()),
+            expected_revision_id: Some(accepted.revision_id.clone()),
+        }),
+        ..header
+    };
+    let updated = server
+        .client
+        .submit_text(upload_frames(&replacement, [b"new quartz".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let operation = updated.operation_id.parse().unwrap();
+    service.register_upload(&scope, operation).await.unwrap();
+    service.index_upload(&scope, operation).await.unwrap();
+    assert_eq!(
+        server
+            .client
+            .get_metadata(source.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    assert_eq!(
+        server
+            .client
+            .mutate_metadata(change(
+                &chunk,
+                vec![edit("status", Edit::Remove(v1::Empty {}))]
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    let new_source = v1::MetadataTarget {
+        revision_id: Some(updated.revision_id),
+        ..source
+    };
+    assert!(
+        server
+            .client
+            .get_metadata(new_source)
+            .await
+            .unwrap()
+            .into_inner()
+            .entries
+            .is_empty()
+    );
+    assert_eq!(
+        server
+            .client
+            .get_metadata(collection)
+            .await
+            .unwrap()
+            .into_inner()
+            .entries[0]
+            .value_json,
+        "true"
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_deletion_replays_and_defers_object_reclamation() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());

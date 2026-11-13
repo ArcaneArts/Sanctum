@@ -114,11 +114,14 @@ impl Sanctum for Grpc {
         request: Request<v1::MetadataTarget>,
     ) -> Reply<v1::MetadataResponse> {
         let (scope, target) = metadata_target(request.into_inner())?;
-        let service = self.local()?.clone();
-        work(move || service.metadata(&scope, target, None))
-            .await
-            .map(metadata_response)
-            .map(Response::new)
+        let entries = match &self.0 {
+            Backend::Local(service) => {
+                let service = service.clone();
+                work(move || service.metadata(&scope, target, None)).await?
+            }
+            Backend::Hosted(catalog) => catalog.metadata(&scope, target).await.map_err(status)?,
+        };
+        Ok(Response::new(metadata_response(entries)))
     }
 
     async fn mutate_metadata(
@@ -132,11 +135,17 @@ impl Sanctum for Grpc {
                 .ok_or_else(|| Status::invalid_argument("metadata target is required"))?,
         )?;
         let edits = metadata_edits(request.edits)?;
-        let service = self.local()?.clone();
-        work(move || service.metadata(&scope, target, Some(&edits)))
-            .await
-            .map(metadata_response)
-            .map(Response::new)
+        let entries = match &self.0 {
+            Backend::Local(service) => {
+                let service = service.clone();
+                work(move || service.metadata(&scope, target, Some(&edits))).await?
+            }
+            Backend::Hosted(catalog) => catalog
+                .mutate_metadata(&scope, target, edits)
+                .await
+                .map_err(status)?,
+        };
+        Ok(Response::new(metadata_response(entries)))
     }
 
     async fn query_metadata(
@@ -145,7 +154,7 @@ impl Sanctum for Grpc {
     ) -> Reply<v1::QueryMetadataResponse> {
         use sanctum_service::metadata_query::Results;
         let request = request.into_inner();
-        let tenant = request.tenant.parse().map_err(status)?;
+        let tenant: sanctum_core::ScopeId = request.tenant.parse().map_err(status)?;
         let collection = request
             .collection
             .as_ref()
@@ -153,45 +162,50 @@ impl Sanctum for Grpc {
             .transpose()
             .map_err(status)?;
         let query = metadata_filter::parse_query(request).map_err(status)?;
-        let service = self.local()?.clone();
-        work(move || {
-            let page = service.query_metadata(&tenant, collection, query)?;
-            let mut reply = v1::QueryMetadataResponse {
-                next_offset: page.next_offset,
-                ..Default::default()
-            };
-            match page.results {
-                Results::Matches(matches) => {
-                    reply.matches = matches
-                        .into_iter()
-                        .map(|row| v1::MetadataMatch {
-                            target: Some(v1::MetadataTarget {
-                                scope: Some(v1::Scope {
-                                    tenant: tenant.to_string(),
-                                    collection: row.collection,
-                                }),
-                                source_id: row.source,
-                                revision_id: row.revision,
-                                chunk_ordinal: row.ordinal,
-                            }),
-                            value_json: row.value_json,
-                        })
-                        .collect();
-                }
-                Results::Counts(groups) => {
-                    reply.groups = groups
-                        .into_iter()
-                        .map(|group| v1::MetadataGroup {
-                            count: group.count,
-                            value_json: group.value_json,
-                        })
-                        .collect();
-                }
+        let page = match &self.0 {
+            Backend::Local(service) => {
+                let service = service.clone();
+                let tenant = tenant.clone();
+                work(move || service.query_metadata(&tenant, collection, query)).await?
             }
-            Ok(reply)
-        })
-        .await
-        .map(Response::new)
+            Backend::Hosted(catalog) => catalog
+                .query_metadata(&tenant, collection, query)
+                .await
+                .map_err(status)?,
+        };
+        let mut reply = v1::QueryMetadataResponse {
+            next_offset: page.next_offset,
+            ..Default::default()
+        };
+        match page.results {
+            Results::Matches(matches) => {
+                reply.matches = matches
+                    .into_iter()
+                    .map(|row| v1::MetadataMatch {
+                        target: Some(v1::MetadataTarget {
+                            scope: Some(v1::Scope {
+                                tenant: tenant.to_string(),
+                                collection: row.collection,
+                            }),
+                            source_id: row.source,
+                            revision_id: row.revision,
+                            chunk_ordinal: row.ordinal,
+                        }),
+                        value_json: row.value_json,
+                    })
+                    .collect();
+            }
+            Results::Counts(groups) => {
+                reply.groups = groups
+                    .into_iter()
+                    .map(|group| v1::MetadataGroup {
+                        count: group.count,
+                        value_json: group.value_json,
+                    })
+                    .collect();
+            }
+        }
+        Ok(Response::new(reply))
     }
 
     async fn list_changes(

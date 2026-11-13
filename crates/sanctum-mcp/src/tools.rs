@@ -42,12 +42,9 @@ impl Tools {
     }
 
     pub(crate) fn hosted(catalog: HostedCatalog) -> Self {
-        let mut tool_router = Self::tool_router();
-        tool_router.remove_route("get_metadata");
-        tool_router.remove_route("mutate_metadata");
         Self {
             backend: Backend::Hosted(catalog),
-            tool_router,
+            tool_router: Self::tool_router(),
         }
     }
 }
@@ -483,18 +480,22 @@ impl Tools {
         description = "Read namespaced JSON metadata on a collection, current source, or chunk."
     )]
     async fn get_metadata(&self, Parameters(args): Parameters<Target>) -> CallToolResult {
-        let Backend::Local(service) = &self.backend else {
-            return response(Err(Error::Invalid(
-                "metadata tools require local storage".into(),
-            )));
-        };
-        response(
-            local(service, move |service| {
-                let scope = args.scope.scope()?;
-                metadata_value(service.metadata(&scope, args.revision()?, None)?)
-            })
-            .await,
-        )
+        let result = async {
+            let scope = args.scope.scope()?;
+            let target = args.revision()?;
+            let entries = match &self.backend {
+                Backend::Local(service) => {
+                    local(service, move |service| {
+                        service.metadata(&scope, target, None)
+                    })
+                    .await?
+                }
+                Backend::Hosted(catalog) => catalog.metadata(&scope, target).await?,
+            };
+            metadata_value(entries)
+        }
+        .await;
+        response(result)
     }
 
     #[tool(description = "Atomically set, merge-patch, or remove namespaced JSON metadata.")]
@@ -502,31 +503,35 @@ impl Tools {
         &self,
         Parameters(args): Parameters<MetadataUpdate>,
     ) -> CallToolResult {
-        let Backend::Local(service) = &self.backend else {
-            return response(Err(Error::Invalid(
-                "metadata tools require local storage".into(),
-            )));
-        };
-        response(
-            local(service, move |service| {
-                let scope = args.target.scope.scope()?;
-                let edits: Vec<_> = args
-                    .edits
-                    .into_iter()
-                    .map(|edit| MetadataMutation {
-                        namespace: edit.namespace,
-                        key: edit.key,
-                        edit: match edit.edit {
-                            Edit::Set { value } => MetadataEdit::Set(value),
-                            Edit::Patch { value } => MetadataEdit::Patch(value),
-                            Edit::Remove => MetadataEdit::Remove,
-                        },
+        let result = async {
+            let scope = args.target.scope.scope()?;
+            let target = args.target.revision()?;
+            let edits: Vec<_> = args
+                .edits
+                .into_iter()
+                .map(|edit| MetadataMutation {
+                    namespace: edit.namespace,
+                    key: edit.key,
+                    edit: match edit.edit {
+                        Edit::Set { value } => MetadataEdit::Set(value),
+                        Edit::Patch { value } => MetadataEdit::Patch(value),
+                        Edit::Remove => MetadataEdit::Remove,
+                    },
+                })
+                .collect();
+            let entries = match &self.backend {
+                Backend::Local(service) => {
+                    local(service, move |service| {
+                        service.metadata(&scope, target, Some(&edits))
                     })
-                    .collect();
-                metadata_value(service.metadata(&scope, args.target.revision()?, Some(&edits))?)
-            })
-            .await,
-        )
+                    .await?
+                }
+                Backend::Hosted(catalog) => catalog.mutate_metadata(&scope, target, edits).await?,
+            };
+            metadata_value(entries)
+        }
+        .await;
+        response(result)
     }
 }
 

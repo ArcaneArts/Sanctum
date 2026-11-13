@@ -149,6 +149,10 @@ impl Publication {
         self.acquire_unit(unit, true).await
     }
 
+    pub async fn acquire_existing(&self, unit: &Unit) -> Result<Lease> {
+        self.acquire_unit(unit, false).await
+    }
+
     async fn acquire_unit(&self, unit: &Unit, create: bool) -> Result<Lease> {
         let key = unit.head()?;
         let (mut head, condition) = match self.read_head(unit).await? {
@@ -221,7 +225,7 @@ impl Publication {
                 "snapshot cleanup requires at least five minutes of grace".into(),
             ));
         }
-        let mut lease = self.acquire_unit(unit, false).await?;
+        let mut lease = self.acquire_existing(unit).await?;
         let result = lease.reclaim(grace, cursor).await;
         let release = lease.release().await;
         result.and_then(|page| release.map(|()| page))
