@@ -16,6 +16,7 @@ use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 mod embedding;
+mod git_import;
 mod local_import;
 mod local_jobs;
 mod maintenance;
@@ -23,6 +24,7 @@ mod url_import;
 mod watched_folders;
 mod worker;
 pub use embedding::{CollectionSearchResult, SearchMode, run_embedding_worker};
+pub use git_import::{GitImportEvent, GitRepository};
 pub use local_import::{ImportEvent, ImportOptions, ImportState};
 pub use sanctum_db_sqlite::embedding::EmbeddingStatus;
 pub use watched_folders::{WatchedFolder, run_watched_folders};
@@ -37,6 +39,7 @@ pub struct Service {
     queue: LocalQueue,
     max_source_bytes: u64,
     url_importer: url_import::UrlImporter,
+    git_imports: git_import::ActiveImports,
     retrieval: Arc<RwLock<()>>,
     embedding: Option<Arc<dyn sanctum_embedding::Provider>>,
 }
@@ -153,6 +156,7 @@ impl Service {
             queue,
             max_source_bytes,
             url_importer: url_import::UrlImporter::new()?,
+            git_imports: Default::default(),
             retrieval: Arc::new(RwLock::new(())),
             embedding,
         };

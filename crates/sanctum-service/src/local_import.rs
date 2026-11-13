@@ -5,7 +5,8 @@ use std::{
 };
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use sanctum_core::{Error, ExternalSource, Result, Scope, UrlProvenance, is_rtf};
+use sanctum_core::{Error, ExternalSource, GitProvenance, Result, Scope, UrlProvenance, is_rtf};
+use sanctum_db_sqlite::{RevisionWriter, SourceIdentity};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -50,7 +51,7 @@ impl ImportEvent {
         }
     }
 
-    fn failed(path: &str, error: &impl std::fmt::Display) -> Self {
+    pub(crate) fn failed(path: &str, error: &impl std::fmt::Display) -> Self {
         Self {
             message: Some(error.to_string()),
             ..Self::new(path, ImportState::Failed)
@@ -58,14 +59,14 @@ impl ImportEvent {
     }
 }
 
-struct Selection {
+pub(crate) struct Selection {
     include: GlobSet,
     exclude: GlobSet,
-    prune_missing: bool,
+    pub(crate) prune_missing: bool,
 }
 
 impl Selection {
-    fn new(options: &ImportOptions) -> Result<Self> {
+    pub(crate) fn new(options: &ImportOptions) -> Result<Self> {
         Ok(Self {
             include: globs(&options.include)?,
             exclude: globs(&options.exclude)?,
@@ -80,7 +81,7 @@ impl Selection {
             || self.exclude.is_match(relative)
     }
 
-    fn file_selected(&self, relative: &Path) -> bool {
+    pub(crate) fn file_selected(&self, relative: &Path) -> bool {
         !self.exclude.is_match(relative)
             && !relative
                 .ancestors()
@@ -254,7 +255,32 @@ impl Service {
         )?;
         let mut input = File::open(path)?;
         let before = input.metadata()?;
-        let mut output = staged.reopen()?;
+        let (bytes, digest) = staged.copy_import(&mut input, &stopped)?;
+        let after = input.metadata()?;
+        if bytes != before.len()
+            || bytes != after.len()
+            || before.modified().ok() != after.modified().ok()
+        {
+            return Err(Error::Busy(
+                "source changed while it was being imported".into(),
+            ));
+        }
+        staged.enqueue_import(bytes, digest, None)
+    }
+}
+
+pub(crate) enum ImportProvenance {
+    Url(UrlProvenance),
+    Git(GitProvenance),
+}
+
+impl StagedUpload {
+    pub(crate) fn copy_import(
+        &self,
+        mut input: impl Read,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<(u64, String)> {
+        let mut output = self.reopen()?;
         let mut buffer = [0; 64 * 1024];
         let mut hasher = blake3::Hasher::new();
         let mut bytes = 0;
@@ -267,7 +293,7 @@ impl Service {
                 break;
             }
             bytes += read as u64;
-            if bytes > self.max_source_bytes {
+            if bytes > self.service.max_source_bytes {
                 return Err(Error::Invalid(
                     "file exceeds the configured upload limit".into(),
                 ));
@@ -275,79 +301,26 @@ impl Service {
             hasher.update(&buffer[..read]);
             output.write_all(&buffer[..read])?;
         }
-        let after = input.metadata()?;
-        if bytes != before.len()
-            || bytes != after.len()
-            || before.modified().ok() != after.modified().ok()
-        {
-            return Err(Error::Busy(
-                "source changed while it was being imported".into(),
-            ));
-        }
-        drop(output);
-        staged.enqueue_import(bytes, hasher.finalize().to_hex().to_string(), None)
+        Ok((bytes, hasher.finalize().to_hex().to_string()))
     }
-}
 
-impl StagedUpload {
     pub(crate) fn enqueue_import(
         self,
         bytes: u64,
         hash: String,
-        url: Option<UrlProvenance>,
+        provenance: Option<ImportProvenance>,
     ) -> Result<ImportEvent> {
         let service = self.service.clone();
         let scope = &self.scope;
-        let external = self
-            .upload
-            .external
-            .clone()
-            .expect("imports have an external ID");
+        let external = self.import_external();
         let id = external.id.clone();
-        let retain_original = self.upload.retain_original;
-        let extract_rtf = is_rtf(&self.upload.name);
         let mut database = service.database(scope)?;
         let writer = database.write()?;
-        let current = match writer.find_source(None, Some(&external)) {
-            Ok(current) => Some(current),
-            Err(Error::NotFound(_)) => None,
-            Err(error) => return Err(error),
-        };
-        let pending = service
-            .queue
-            .pending_external(scope, &external)?
-            .filter(|job| {
-                job.import_hash.is_some()
-                    && match &current {
-                        Some(source) => source.source == job.source,
-                        None => !job.replacement,
-                    }
-            });
-        if let Some(pending) = pending.as_ref().filter(|job| {
-            job.import_hash.as_ref() == Some(&hash)
-                && job.retain_original == retain_original
-                && job.extract_rtf == extract_rtf
-        }) {
-            return Ok(ImportEvent {
-                source: Some(pending.source),
-                revision: Some(pending.revision),
-                operation: Some(pending.id),
-                ..ImportEvent::new(&id, ImportState::Pending)
-            });
-        }
-        if let Some(current) = current.as_ref().filter(|source| {
-            source.hash == hash
-                && source.extracted == extract_rtf
-                && (!extract_rtf || source.retain_original == retain_original)
-        }) {
-            if let Some(pending) = &pending {
-                service.queue.supersede_import(scope, pending)?;
-            }
-            return Ok(ImportEvent {
-                source: Some(current.source),
-                revision: Some(current.revision),
-                ..ImportEvent::new(&id, ImportState::Unchanged)
-            });
+        let (current, pending) = self.import_heads(&writer)?;
+        if let Some(event) = self.reuse_import(&current, &pending, |digest, _| {
+            digest == Some(hash.as_str())
+        })? {
+            return Ok(event);
         }
         let source = current
             .as_ref()
@@ -358,13 +331,17 @@ impl StagedUpload {
         let mut job = new_job(
             scope.clone(),
             name,
-            Some(external),
+            Some(external.clone()),
             source,
             bytes,
             current.is_some(),
         );
         job.import_hash = Some(hash);
-        job.url = url;
+        match provenance {
+            Some(ImportProvenance::Url(url)) => job.url = Some(url),
+            Some(ImportProvenance::Git(git)) => job.git = Some(git),
+            None => {}
+        }
         let job = self.publish_job(job)?;
         drop(writer);
         Ok(ImportEvent {
@@ -373,6 +350,89 @@ impl StagedUpload {
             operation: Some(job.id),
             ..ImportEvent::new(&id, ImportState::Queued)
         })
+    }
+
+    pub(crate) fn reuse_git_import(&self, git: &GitProvenance) -> Result<Option<ImportEvent>> {
+        let mut database = self.service.database(&self.scope)?;
+        let writer = database.write()?;
+        let (current, pending) = self.import_heads(&writer)?;
+        self.reuse_import(&current, &pending, |_, recorded| {
+            recorded.is_some_and(|recorded| {
+                recorded.repository == git.repository
+                    && recorded.reference == git.reference
+                    && recorded.path == git.path
+                    && recorded.blob == git.blob
+            })
+        })
+    }
+
+    fn import_external(&self) -> &ExternalSource {
+        self.upload
+            .external
+            .as_ref()
+            .expect("imports have an external ID")
+    }
+
+    fn import_heads(
+        &self,
+        writer: &RevisionWriter<'_>,
+    ) -> Result<(Option<SourceIdentity>, Option<crate::Job>)> {
+        let external = self.import_external();
+        let current = match writer.find_source(None, Some(external)) {
+            Ok(current) => Some(current),
+            Err(Error::NotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let pending = self
+            .service
+            .queue
+            .pending_external(&self.scope, external)?
+            .filter(|job| {
+                job.import_hash.is_some()
+                    && match &current {
+                        Some(source) => source.source == job.source,
+                        None => !job.replacement,
+                    }
+            });
+        Ok((current, pending))
+    }
+
+    fn reuse_import(
+        &self,
+        current: &Option<SourceIdentity>,
+        pending: &Option<crate::Job>,
+        matches: impl Fn(Option<&str>, Option<&GitProvenance>) -> bool,
+    ) -> Result<Option<ImportEvent>> {
+        let id = &self.import_external().id;
+        let retain_original = self.upload.retain_original;
+        let extract_rtf = is_rtf(&self.upload.name);
+        if let Some(job) = pending.as_ref().filter(|job| {
+            matches(job.import_hash.as_deref(), job.git.as_ref())
+                && job.retain_original == retain_original
+                && job.extract_rtf == extract_rtf
+        }) {
+            return Ok(Some(ImportEvent {
+                source: Some(job.source),
+                revision: Some(job.revision),
+                operation: Some(job.id),
+                ..ImportEvent::new(id, ImportState::Pending)
+            }));
+        }
+        if let Some(source) = current.as_ref().filter(|source| {
+            matches(Some(&source.hash), source.git.as_ref())
+                && source.extracted == extract_rtf
+                && (!extract_rtf || source.retain_original == retain_original)
+        }) {
+            if let Some(pending) = pending {
+                self.service.queue.supersede_import(&self.scope, pending)?;
+            }
+            return Ok(Some(ImportEvent {
+                source: Some(source.source),
+                revision: Some(source.revision),
+                ..ImportEvent::new(id, ImportState::Unchanged)
+            }));
+        }
+        Ok(None)
     }
 }
 
@@ -435,7 +495,7 @@ impl Service {
         }
     }
 
-    fn missing_import(
+    pub(crate) fn missing_import(
         &self,
         scope: &Scope,
         namespace: &str,

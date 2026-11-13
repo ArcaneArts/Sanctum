@@ -149,6 +149,7 @@ impl Service {
             extractor: job.extract_rtf.then(|| RTF_EXTRACTOR.into()),
             retain_original: job.retain_original,
             url: job.url.clone(),
+            git: job.git.clone(),
         };
         let revision = revision_for(job, content);
         writer.register(&revision, job.replacement, self.embedding_profile())?;
@@ -300,6 +301,7 @@ pub(crate) fn new_job(
         extractor: None,
         created_at: 0,
         url: None,
+        git: None,
     }
 }
 

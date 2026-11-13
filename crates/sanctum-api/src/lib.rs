@@ -1,5 +1,6 @@
 use sanctum_core::{
-    Error, ExternalSource, Result, Scope, UPLOAD_FRAME_BYTES, UrlProvenance, UsageScope,
+    Error, ExternalSource, GitProvenance, Result, Scope, UPLOAD_FRAME_BYTES, UrlProvenance,
+    UsageScope,
 };
 use sanctum_proto::v1::{
     self,
@@ -7,8 +8,8 @@ use sanctum_proto::v1::{
     upload_text_frame::Frame,
 };
 use sanctum_service::{
-    ChunkRef, Hit, ImportEvent, ImportOptions, ImportState, Job, JobState, Replacement, Service,
-    TextUpload, WatchedFolder,
+    ChunkRef, GitRepository, Hit, ImportEvent, ImportOptions, ImportState, Job, JobState,
+    Replacement, Service, TextUpload, WatchedFolder,
 };
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -139,6 +140,57 @@ impl Sanctum for Grpc {
             operation_id: event.operation.map(|id| id.to_string()),
             url: Some(wire_url(url)),
         }))
+    }
+
+    type ImportGitStream = ReceiverStream<std::result::Result<v1::ImportGitEvent, Status>>;
+
+    async fn import_git(
+        &self,
+        request: Request<v1::ImportGitRequest>,
+    ) -> Reply<Self::ImportGitStream> {
+        use v1::import_git_request::Repository;
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        let repository = match request.repository {
+            Some(Repository::LocalPath(path)) if !path.is_empty() => {
+                GitRepository::Local(path.into())
+            }
+            Some(Repository::HttpsUrl(url)) if !url.is_empty() => GitRepository::Remote(url),
+            _ => return Err(Status::invalid_argument("Git repository is required")),
+        };
+        let options = ImportOptions {
+            include: request.include,
+            exclude: request.exclude,
+            prune_missing: request.prune_missing,
+            retain_original: request.retain_original,
+        };
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        let service = self.0.clone();
+        tokio::spawn(async move {
+            let events = sender.clone();
+            let result = work(move || {
+                service.import_git(
+                    &scope,
+                    repository,
+                    &request.reference,
+                    &options,
+                    || events.is_closed(),
+                    |event| {
+                        events
+                            .blocking_send(Ok(v1::ImportGitEvent {
+                                file: Some(wire_import(event.import)),
+                                git: event.git.map(wire_git),
+                            }))
+                            .is_ok()
+                    },
+                )
+            })
+            .await;
+            if let Err(error) = result {
+                let _ = sender.send(Err(error)).await;
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
     }
 
     type ImportLocalStream = ReceiverStream<std::result::Result<v1::ImportLocalEvent, Status>>;
@@ -702,6 +754,7 @@ fn text_revision(job: &Job) -> Option<v1::TextRevision> {
         extractor: job.extractor.clone(),
         retain_original: job.retain_original,
         url: job.url.clone().map(wire_url),
+        git: job.git.clone().map(wire_git),
     })
 }
 
@@ -737,6 +790,7 @@ fn wire_job(job: Job) -> v1::IngestionJob {
         update_sequence: job.update_sequence,
         created_at_unix_seconds: job.created_at,
         url: job.url.map(wire_url),
+        git: job.git.map(wire_git),
     }
 }
 
@@ -783,6 +837,16 @@ fn wire_search_mode(mode: sanctum_service::SearchMode) -> v1::SearchMode {
         sanctum_service::SearchMode::Lexical => v1::SearchMode::Lexical,
         sanctum_service::SearchMode::Semantic => v1::SearchMode::Semantic,
         sanctum_service::SearchMode::Hybrid => v1::SearchMode::Hybrid,
+    }
+}
+
+fn wire_git(git: GitProvenance) -> v1::GitProvenance {
+    v1::GitProvenance {
+        repository: git.repository,
+        reference: git.reference,
+        commit: git.commit,
+        path: git.path,
+        blob: git.blob,
     }
 }
 

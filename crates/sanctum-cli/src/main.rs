@@ -46,6 +46,28 @@ enum Command {
         #[arg(long)]
         retain_original: bool,
     },
+    /// Import committed text from a local Git repository or an HTTPS remote.
+    ImportGit {
+        collection: String,
+        #[arg(
+            long,
+            required_unless_present = "https_url",
+            conflicts_with = "https_url"
+        )]
+        path: Option<PathBuf>,
+        #[arg(long)]
+        https_url: Option<String>,
+        #[arg(long = "ref", default_value = "HEAD")]
+        reference: String,
+        #[arg(long)]
+        include: Vec<String>,
+        #[arg(long)]
+        exclude: Vec<String>,
+        #[arg(long)]
+        prune_missing: bool,
+        #[arg(long)]
+        retain_original: bool,
+    },
     /// Fetch text or RTF from an HTTP(S) URL and queue it for indexing.
     ImportUrl {
         collection: String,
@@ -241,6 +263,66 @@ async fn main() -> anyhow::Result<()> {
                 "{} bytes in {} files ({}..{} Unix ms)",
                 usage.bytes, usage.files, usage.started_at_unix_ms, usage.finished_at_unix_ms
             );
+        }
+        Command::ImportGit {
+            collection,
+            path,
+            https_url,
+            reference,
+            include,
+            exclude,
+            prune_missing,
+            retain_original,
+        } => {
+            use v1::import_git_request::Repository;
+            let repository = if let Some(url) = https_url {
+                Repository::HttpsUrl(url)
+            } else {
+                let path = std::path::absolute(path.context("repository path is required")?)?
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| anyhow!("Git repository path is not UTF-8"))?;
+                Repository::LocalPath(path)
+            };
+            let mut events = client
+                .import_git(v1::ImportGitRequest {
+                    scope: scope(collection),
+                    repository: Some(repository),
+                    reference,
+                    include,
+                    exclude,
+                    prune_missing,
+                    retain_original,
+                })
+                .await?
+                .into_inner();
+            let mut failures = 0;
+            while let Some(event) = events.message().await? {
+                let file = event
+                    .file
+                    .context("server omitted Git import file result")?;
+                let state = file.state();
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    state.as_str_name(),
+                    file.path,
+                    file.operation_id.as_deref().unwrap_or_default(),
+                    event
+                        .git
+                        .as_ref()
+                        .map(|git| git.commit.as_str())
+                        .unwrap_or_default()
+                );
+                if let Some(message) = file.message {
+                    eprintln!("{message}");
+                }
+                if state == v1::ImportState::Failed {
+                    failures += 1;
+                }
+            }
+            if failures > 0 {
+                return Err(anyhow!("{failures} Git import entries failed"));
+            }
         }
         Command::ImportUrl {
             collection,
@@ -588,6 +670,10 @@ fn print_job(job: v1::IngestionJob) {
         job.total_bytes,
         job.attempts,
     );
+    if let Some(git) = job.git {
+        println!("Git commit: {}", git.commit);
+        println!("Git blob: {}", git.blob);
+    }
     if let Some(url) = job.url {
         println!("Final URL: {}", url.final_url);
         if let Some(etag) = url.etag {

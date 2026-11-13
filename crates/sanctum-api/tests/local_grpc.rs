@@ -94,6 +94,204 @@ impl Running {
 }
 
 #[tokio::test]
+async fn git_import_reads_committed_text_and_reconciles_each_ref() {
+    use v1::{ImportState, import_git_request::Repository};
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git_fixture(root, &["init", "-b", "main"]);
+    std::fs::write(root.join("keep.md"), "Committed rhodonite café.").unwrap();
+    std::fs::write(root.join("gone.md"), "An old peridot note.").unwrap();
+    std::fs::write(root.join("ignored.yml"), "unselected: serpentine").unwrap();
+    git_fixture(root, &["add", "."]);
+    git_fixture(root, &["commit", "-m", "Initial"]);
+    let initial = git_fixture(root, &["rev-parse", "HEAD"]);
+    let initial_blob = git_fixture(root, &["rev-parse", "HEAD:keep.md"]);
+    git_fixture(root, &["tag", "-a", "first", "-m", "First"]);
+    std::fs::write(root.join("keep.md"), "Uncommitted kunzite.").unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    create(&mut running.client, "other").await;
+    let mut request = v1::ImportGitRequest {
+        scope: scope("default"),
+        repository: Some(Repository::LocalPath(root.to_str().unwrap().into())),
+        reference: "refs/heads/main".into(),
+        include: vec!["*.md".into()],
+        ..Default::default()
+    };
+    let events = git_events(&mut running.client, request.clone()).await;
+    assert_eq!(events.len(), 2);
+    let original = events
+        .iter()
+        .find(|event| event.file.as_ref().unwrap().path == "keep.md")
+        .unwrap();
+    let original_file = original.file.as_ref().unwrap();
+    let original_git = original.git.as_ref().unwrap();
+    assert_eq!(original_git.commit, initial);
+    assert_eq!(original_git.blob, initial_blob);
+    let source = original_file.source_id.clone();
+    let revision = original_file.revision_id.clone();
+    for event in &events {
+        let file = event.file.as_ref().unwrap();
+        assert_eq!(file.state(), ImportState::Queued);
+        let job = await_ready(
+            &mut running.client,
+            job_request(file.operation_id.clone().unwrap()),
+        )
+        .await;
+        assert_eq!(job.git, event.git);
+        assert_eq!(job.text_revision.unwrap().git, event.git);
+    }
+    assert_eq!(
+        search(&mut running.client, "default", "rhodonite").await[0].excerpt,
+        "Committed rhodonite café."
+    );
+    assert!(
+        search(&mut running.client, "default", "kunzite")
+            .await
+            .is_empty()
+    );
+    assert!(
+        search(&mut running.client, "default", "serpentine")
+            .await
+            .is_empty()
+    );
+    assert!(
+        search(&mut running.client, "other", "rhodonite")
+            .await
+            .is_empty()
+    );
+
+    let repeated = git_events(&mut running.client, request.clone()).await;
+    assert!(
+        repeated
+            .iter()
+            .all(|event| event.file.as_ref().unwrap().state() == ImportState::Unchanged)
+    );
+
+    std::fs::write(root.join("keep.md"), "Updated citrine café.").unwrap();
+    std::fs::remove_file(root.join("gone.md")).unwrap();
+    git_fixture(root, &["add", "-A"]);
+    git_fixture(root, &["commit", "-m", "Update"]);
+    let second = git_fixture(root, &["rev-parse", "HEAD"]);
+    let events = git_events(&mut running.client, request.clone()).await;
+    assert_eq!(events.len(), 2);
+    let updated = events
+        .iter()
+        .find(|event| event.file.as_ref().unwrap().state() == ImportState::Queued)
+        .unwrap();
+    assert_eq!(updated.git.as_ref().unwrap().commit, second);
+    let file = updated.file.as_ref().unwrap();
+    assert_eq!(file.source_id, source);
+    assert_ne!(file.revision_id, revision);
+    await_ready(
+        &mut running.client,
+        job_request(file.operation_id.clone().unwrap()),
+    )
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.file.as_ref().unwrap().state() == ImportState::Missing)
+    );
+    assert_eq!(
+        search(&mut running.client, "default", "peridot")
+            .await
+            .len(),
+        1
+    );
+
+    // A too-large committed blob leaves existing data intact even with pruning enabled.
+    std::fs::write(root.join("oversize.md"), vec![b'a'; 32_769]).unwrap();
+    git_fixture(root, &["add", "oversize.md"]);
+    git_fixture(root, &["commit", "-m", "Oversized file"]);
+    request.prune_missing = true;
+    let bad = git_events(&mut running.client, request.clone()).await;
+    assert!(
+        bad.iter()
+            .any(|event| event.file.as_ref().unwrap().state() == ImportState::Failed)
+    );
+    assert!(
+        bad.iter()
+            .all(|event| event.file.as_ref().unwrap().state() != ImportState::Deleted)
+    );
+    assert_eq!(
+        search(&mut running.client, "default", "peridot")
+            .await
+            .len(),
+        1
+    );
+
+    git_fixture(root, &["rm", "oversize.md"]);
+    git_fixture(root, &["commit", "-m", "Remove oversized file"]);
+    let events = git_events(&mut running.client, request.clone()).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.file.as_ref().unwrap().state() == ImportState::Deleted)
+    );
+    assert!(
+        search(&mut running.client, "default", "peridot")
+            .await
+            .is_empty()
+    );
+
+    request.reference = "refs/tags/first".into();
+    let tagged = git_events(&mut running.client, request).await;
+    assert_eq!(tagged.len(), 2);
+    assert!(
+        tagged
+            .iter()
+            .all(|event| event.git.as_ref().unwrap().commit == initial)
+    );
+    assert!(
+        tagged
+            .iter()
+            .all(|event| event.file.as_ref().unwrap().source_id != source)
+    );
+    running.stop().await;
+}
+
+async fn git_events(
+    client: &mut SanctumClient<Channel>,
+    request: v1::ImportGitRequest,
+) -> Vec<v1::ImportGitEvent> {
+    let mut stream = client.import_git(request).await.unwrap().into_inner();
+    let mut events = Vec::new();
+    while let Some(event) = stream.message().await.unwrap() {
+        events.push(event);
+    }
+    events
+}
+
+fn git_fixture(path: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(path)
+        .args([
+            "-c",
+            "user.name=Sanctum Test",
+            "-c",
+            "user.email=test@example.org",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "tag.gpgSign=false",
+            "-c",
+            "core.hooksPath=",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Git fixture: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+#[tokio::test]
 async fn url_import_tracks_provenance_and_reconciles_content() {
     use axum::{Router, http::header, response::Redirect, routing::get};
 
