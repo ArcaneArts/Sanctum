@@ -137,3 +137,42 @@ keeps the Rust scorer and its existing storage format. The measured cost of
 unfiltered exact scans at this size motivates testing candidate indexes or
 vector layouts against a representative corpus with the same filter and recall
 requirements.
+
+## Concurrent collections among 1,000 tenants
+
+The release benchmark creates one collection each for 1,000 tenant IDs in
+MinIO. Four tenants then run concurrently through one standalone Sanctum API
+and its object worker. Each active tenant uploads a roughly 1 MiB source,
+searches it nine times, and replaces it twice. The benchmark checks that
+replacement preserves the source ID, removes the old search result, and
+keeps each tenant's results isolated. The other 996 collections are empty
+and remain idle during the active workload. The server uses lexical search
+with embeddings disabled.
+
+Supply a [standalone S3 configuration](STORAGE.md#hosted-server-configuration)
+with a dedicated empty prefix. The script leaves the benchmark data in that
+prefix for inspection.
+
+```sh
+cargo build --release --locked -p sanctum-server -p sanctum-cli
+python3 scripts/benchmark-tenants.py
+```
+
+The Apple M4 Max and loopback MinIO setup above created the catalogs and
+collections in 30.80 seconds with eight concurrent clients. The four active
+workflows finished in 2.47 seconds. End-to-end query timings include spawning
+the release CLI and a loopback gRPC call. Replacement publication includes
+polling every 100 ms. The first search followed ingestion on the same server.
+
+| Operation | Samples | p50 | p95 |
+| --- | ---: | ---: | ---: |
+| First search after publication | 4 | 24.70 ms | 55.30 ms |
+| Repeated search | 32 | 18.32 ms | 54.88 ms |
+| Replacement accepted | 8 | 55.72 ms | 128.77 ms |
+| Replacement text ready | 8 | 658.74 ms | 860.10 ms |
+
+The cluster usage API listed 4,052 objects totaling 209,418,168 bytes in
+539.34 ms. An independent paginated MinIO listing matched both totals.
+The benchmark covers one process, small active databases, and four active
+writers submitting to a serial worker. It provides no estimate for many
+simultaneously active tenants, large vector queries, or Cloud Run ingress.

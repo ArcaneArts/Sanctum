@@ -9,7 +9,7 @@ which parts have working implementations and where to find the evidence.
 | 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, and URL and Git imports | Live hosted provider checks, Windows package and tray verification, distribution signing |
 | 3. Object storage and publication | Shared storage contract, filesystem and MinIO-tested S3, native GCS adapter, and fenced SQLite snapshot publication for hosted catalog, source, and metadata operations | Live GCS verification and cloud recovery scenarios |
 | 4. Cloud Run and Cloud Tasks | Linux API and worker containers, durable staged uploads, dispatch and repair, scheduled maintenance, and hosted gRPC and MCP | Live IAM, Cloud Run ingress, and Tasks and Scheduler delivery |
-| 5. Capacity | [200 MiB lexical ingestion and 1–2 GiB snapshot measurements](CAPACITY.md) | Representative GB-scale text and vector workloads, many-tenant concurrency, cold/warm cloud performance, measured optimization |
+| 5. Capacity | [200 MiB lexical ingestion and 1–2 GiB snapshot measurements](CAPACITY.md) | Representative GB-scale text and model recall, larger active workloads, cold/warm cloud performance, measured optimization |
 
 ## Local text ingestion and retrieval
 
@@ -1076,3 +1076,12 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - The Linux package evidence covers Ubuntu ARM64 and this X11 tray host.
   Windows, other Linux desktop environments, and signed distribution remain
   open. [Native package commands](DESKTOP.md#native-packages).
+
+## Mostly idle tenant capacity
+
+- A release build initialized 1,000 tenants and exercised four active collections
+  concurrently against live MinIO. Repeated searches had an 18.32 ms p50 and
+  54.88 ms p95. Eight source replacements reached lexical readiness with a
+  658.74 ms p50 and 860.10 ms p95. Source identity and tenant isolation held.
+- The measured cluster usage matched a separate MinIO listing across 4,052
+  objects. [Method and results](CAPACITY.md#concurrent-collections-among-1000-tenants).
