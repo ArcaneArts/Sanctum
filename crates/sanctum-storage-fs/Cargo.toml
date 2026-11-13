@@ -5,7 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+sanctum-storage = { path = "../sanctum-storage" }
+tokio.workspace = true
 sanctum-core = { path = "../sanctum-core" }
 tempfile = { workspace = true }
 uuid = { workspace = true }
 walkdir.workspace = true
+
+[dev-dependencies]
+sanctum-storage = { path = "../sanctum-storage", features = ["test-support"] }
