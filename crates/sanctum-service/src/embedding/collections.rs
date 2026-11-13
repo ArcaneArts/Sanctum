@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use sanctum_core::{ByteRange, Error, Result, Scope, ScopeId};
+use sanctum_db_sqlite::vector_index::VectorIndex;
 
 use super::{Coverage, PreparedQuery, SearchMode, blocking, fuse};
 use crate::{

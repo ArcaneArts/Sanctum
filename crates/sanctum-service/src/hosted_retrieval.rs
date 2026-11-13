@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use sanctum_core::{Error, Result, Scope, ScopeId};
 use sanctum_db::{Unit, collection_prefix};
+use sanctum_db_sqlite::vector_index::VectorIndex;
 use sanctum_embedding::{Purpose, embed};
 use sanctum_storage::Key;
 use uuid::Uuid;

@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use sanctum_core::{ByteRange, Error, Result, Scope};
-use sanctum_db_sqlite::embedding::ScoredChunk;
+use sanctum_db_sqlite::vector_index::{ScoredChunk, VectorIndex};
 use sanctum_embedding::{EmbedError, Provider, Purpose, embed};
 use tokio::sync::watch;
 
