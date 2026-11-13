@@ -8,8 +8,8 @@ use sanctum_proto::v1::{
     upload_text_frame::Frame,
 };
 use sanctum_service::{
-    ChunkRef, GitRepository, Hit, ImportEvent, ImportOptions, ImportState, Job, JobState,
-    Replacement, Service, TextUpload, WatchedFolder,
+    ChunkRef, GitRepository, Hit, HostedCatalog, ImportEvent, ImportOptions, ImportState, Job,
+    JobState, Replacement, Service, TextUpload, WatchedFolder,
 };
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -21,10 +21,33 @@ mod metadata_filter;
 
 pub fn grpc(service: Service, shutdown: CancellationToken) -> SanctumServer<Grpc> {
     // Metadata batches can contain 32 values of up to 64 KiB each.
-    SanctumServer::new(Grpc(service, shutdown)).max_decoding_message_size(3 * 1024 * 1024)
+    SanctumServer::new(Grpc(Backend::Local(service), shutdown))
+        .max_decoding_message_size(3 * 1024 * 1024)
 }
 
-pub struct Grpc(Service, CancellationToken);
+pub fn hosted_grpc(catalog: HostedCatalog, shutdown: CancellationToken) -> SanctumServer<Grpc> {
+    SanctumServer::new(Grpc(Backend::Hosted(catalog), shutdown))
+        .max_decoding_message_size(3 * 1024 * 1024)
+}
+
+enum Backend {
+    Local(Service),
+    Hosted(HostedCatalog),
+}
+
+pub struct Grpc(Backend, CancellationToken);
+
+impl Grpc {
+    #[allow(clippy::result_large_err)]
+    fn local(&self) -> std::result::Result<&Service, Status> {
+        match &self.0 {
+            Backend::Local(service) => Ok(service),
+            Backend::Hosted(_) => Err(Status::unimplemented(
+                "this operation requires the local filesystem service",
+            )),
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl Sanctum for Grpc {
@@ -32,14 +55,14 @@ impl Sanctum for Grpc {
         &self,
         request: Request<v1::DatabaseTarget>,
     ) -> Reply<v1::DatabaseSession> {
-        database::open(&self.0, self.1.child_token(), request.into_inner()).await
+        database::open(self.local()?, self.1.child_token(), request.into_inner()).await
     }
 
     async fn query_database(
         &self,
         request: Request<v1::QueryDatabaseRequest>,
     ) -> Reply<v1::QueryDatabaseResponse> {
-        database::query(&self.0, self.1.child_token(), request.into_inner()).await
+        database::query(self.local()?, self.1.child_token(), request.into_inner()).await
     }
 
     type DownloadDatabaseStream = ReceiverStream<std::result::Result<v1::DatabaseFrame, Status>>;
@@ -48,14 +71,14 @@ impl Sanctum for Grpc {
         &self,
         request: Request<v1::DatabaseSessionRef>,
     ) -> Reply<Self::DownloadDatabaseStream> {
-        database::download(&self.0, self.1.clone(), request.into_inner()).await
+        database::download(self.local()?, self.1.clone(), request.into_inner()).await
     }
 
     async fn close_database_session(
         &self,
         request: Request<v1::DatabaseSessionRef>,
     ) -> Reply<v1::Empty> {
-        database::close(&self.0, request.into_inner()).await
+        database::close(self.local()?, request.into_inner()).await
     }
 
     async fn get_storage_usage(
@@ -72,26 +95,26 @@ impl Sanctum for Grpc {
             Some(WireScope::Cluster(_)) => UsageScope::Cluster,
             None => return Err(Status::invalid_argument("storage usage scope is required")),
         };
-        let service = self.0.clone();
-        work(move || {
-            let measured = service.storage_usage(&scope)?;
-            Ok(v1::StorageUsage {
-                scope: Some(request),
-                bytes: measured.bytes,
-                files: measured.files,
-                started_at_unix_ms: unix_ms(measured.started_at)?,
-                finished_at_unix_ms: unix_ms(measured.finished_at)?,
-            })
-        })
-        .await
-        .map(Response::new)
+        let measured = if let Backend::Hosted(catalog) = &self.0 {
+            catalog.storage_usage(&scope).await.map_err(status)?
+        } else {
+            let service = self.local()?.clone();
+            work(move || service.storage_usage(&scope)).await?
+        };
+        Ok(Response::new(v1::StorageUsage {
+            scope: Some(request),
+            bytes: measured.bytes,
+            files: measured.files,
+            started_at_unix_ms: unix_ms(measured.started_at).map_err(status)?,
+            finished_at_unix_ms: unix_ms(measured.finished_at).map_err(status)?,
+        }))
     }
     async fn get_metadata(
         &self,
         request: Request<v1::MetadataTarget>,
     ) -> Reply<v1::MetadataResponse> {
         let (scope, target) = metadata_target(request.into_inner())?;
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         work(move || service.metadata(&scope, target, None))
             .await
             .map(metadata_response)
@@ -109,7 +132,7 @@ impl Sanctum for Grpc {
                 .ok_or_else(|| Status::invalid_argument("metadata target is required"))?,
         )?;
         let edits = metadata_edits(request.edits)?;
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         work(move || service.metadata(&scope, target, Some(&edits)))
             .await
             .map(metadata_response)
@@ -130,7 +153,7 @@ impl Sanctum for Grpc {
             .transpose()
             .map_err(status)?;
         let query = metadata_filter::parse_query(request).map_err(status)?;
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         work(move || {
             let page = service.query_metadata(&tenant, collection, query)?;
             let mut reply = v1::QueryMetadataResponse {
@@ -178,7 +201,7 @@ impl Sanctum for Grpc {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
         changes_page(
-            self.0.clone(),
+            self.local()?.clone(),
             scope,
             request.after_cursor,
             request.limit.unwrap_or(100),
@@ -196,7 +219,7 @@ impl Sanctum for Grpc {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
         let limit = request.limit.unwrap_or(100);
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         let first =
             changes_page(service.clone(), scope.clone(), request.after_cursor, limit).await?;
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
@@ -215,7 +238,7 @@ impl Sanctum for Grpc {
         request: Request<v1::ChangeCursorRequest>,
     ) -> Reply<v1::ChangeCursor> {
         let scope = parse_scope(request.into_inner().scope)?;
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         work(move || {
             Ok(v1::ChangeCursor {
                 cursor: service.change_cursor(&scope)?,
@@ -232,7 +255,7 @@ impl Sanctum for Grpc {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
         let (event, url) = self
-            .0
+            .local()?
             .import_url(scope, &request.url, request.retain_original)
             .await
             .map_err(status)?;
@@ -274,7 +297,7 @@ impl Sanctum for Grpc {
             retain_original: request.retain_original,
         };
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         tokio::spawn(async move {
             let events = sender.clone();
             let result = work(move || {
@@ -314,7 +337,7 @@ impl Sanctum for Grpc {
             return Err(Status::invalid_argument("import path is required"));
         }
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         tokio::spawn(async move {
             let events = sender.clone();
             let result = work(move || {
@@ -345,7 +368,7 @@ impl Sanctum for Grpc {
     ) -> Reply<v1::WatchedFolder> {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         work(move || {
             let options = ImportOptions {
                 include: request.include,
@@ -373,7 +396,7 @@ impl Sanctum for Grpc {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
         let after = parse_optional_id(request.after_id, "invalid watched folder cursor")?;
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         work(move || {
             let (folders, next) =
                 service.watched_folders(&scope, after, request.limit.unwrap_or(10))?;
@@ -393,7 +416,7 @@ impl Sanctum for Grpc {
             .id
             .parse()
             .map_err(|_| Status::invalid_argument("invalid watched folder ID"))?;
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         work(move || {
             service.unwatch_folder(&scope, id)?;
             Ok(v1::Empty {})
@@ -406,46 +429,88 @@ impl Sanctum for Grpc {
         &self,
         request: Request<v1::CreateCollectionRequest>,
     ) -> Reply<v1::Collection> {
-        let scope = parse_scope(request.into_inner().scope)?;
-        let service = self.0.clone();
-        work(move || {
-            service.create_collection(&scope)?;
-            Ok(v1::Collection {
-                scope: Some(wire_scope(&scope)),
-            })
-        })
-        .await
-        .map(Response::new)
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        let operation = parse_optional_id(request.request_id, "request ID must be a UUID")?;
+        if let Backend::Hosted(catalog) = &self.0 {
+            catalog
+                .create_collection(&scope, operation)
+                .await
+                .map_err(status)?;
+        } else {
+            let service = self.local()?.clone();
+            let target = scope.clone();
+            work(move || service.create_collection(&target)).await?;
+        }
+        Ok(Response::new(v1::Collection {
+            scope: Some(wire_scope(&scope)),
+        }))
     }
 
     async fn list_collections(
         &self,
         request: Request<v1::ListCollectionsRequest>,
     ) -> Reply<v1::ListCollectionsResponse> {
-        let tenant = request.into_inner().tenant.parse().map_err(status)?;
-        let service = self.0.clone();
-        work(move || {
-            let collections = service
-                .list_collections(&tenant)?
-                .into_iter()
-                .map(|collection| v1::Collection {
-                    scope: Some(v1::Scope {
-                        tenant: tenant.to_string(),
-                        collection,
-                    }),
-                })
-                .collect();
-            Ok(v1::ListCollectionsResponse { collections })
-        })
-        .await
-        .map(Response::new)
+        let request = request.into_inner();
+        let tenant: sanctum_core::ScopeId = request.tenant.parse().map_err(status)?;
+        let after = request
+            .after
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(status)?;
+        let paginated = matches!(self.0, Backend::Hosted(_))
+            || request.after.is_some()
+            || request.limit.is_some();
+        let limit = request.limit.unwrap_or(50);
+        if !(1..=99).contains(&limit) {
+            return Err(Status::invalid_argument(
+                "collection page limit must be between 1 and 99",
+            ));
+        }
+        let mut ids = if let Backend::Hosted(catalog) = &self.0 {
+            catalog
+                .list_collections(&tenant, after.as_ref(), limit + 1)
+                .await
+                .map_err(status)?
+        } else {
+            let service = self.local()?.clone();
+            let tenant = tenant.clone();
+            work(move || {
+                if paginated {
+                    service.list_collections_page(&tenant, after.as_ref(), limit + 1)
+                } else {
+                    service.list_collections(&tenant)
+                }
+            })
+            .await?
+        };
+        let next_after = if paginated && ids.len() > limit as usize {
+            ids.pop();
+            ids.last().cloned()
+        } else {
+            None
+        };
+        let collections = ids
+            .into_iter()
+            .map(|collection| v1::Collection {
+                scope: Some(v1::Scope {
+                    tenant: tenant.to_string(),
+                    collection,
+                }),
+            })
+            .collect();
+        Ok(Response::new(v1::ListCollectionsResponse {
+            collections,
+            next_after,
+        }))
     }
 
     async fn upload_text(
         &self,
         request: Request<Streaming<v1::UploadTextFrame>>,
     ) -> Reply<v1::TextRevision> {
-        let mut job = submit(&self.0, request.into_inner()).await?;
+        let mut job = submit(self.local()?, request.into_inner()).await?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             match job.state {
@@ -474,7 +539,7 @@ impl Sanctum for Grpc {
                 )));
             }
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            let service = self.0.clone();
+            let service = self.local()?.clone();
             job = work(move || service.job(&job.scope, job.id)).await?;
         }
     }
@@ -483,7 +548,7 @@ impl Sanctum for Grpc {
         &self,
         request: Request<Streaming<v1::UploadTextFrame>>,
     ) -> Reply<v1::IngestionJob> {
-        submit(&self.0, request.into_inner())
+        submit(self.local()?, request.into_inner())
             .await
             .map(wire_job)
             .map(Response::new)
@@ -493,7 +558,7 @@ impl Sanctum for Grpc {
         &self,
         request: Request<v1::IngestionJobRequest>,
     ) -> Reply<v1::IngestionJob> {
-        job_action(&self.0, request.into_inner(), Service::job).await
+        job_action(self.local()?, request.into_inner(), Service::job).await
     }
 
     async fn list_ingestion_jobs(
@@ -509,7 +574,7 @@ impl Sanctum for Grpc {
             .transpose()
             .map_err(status)?;
         let before = parse_optional_id(request.before_operation_id, "invalid activity cursor")?;
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         work(move || {
             let (jobs, next) = service.activity(
                 &tenant,
@@ -543,7 +608,7 @@ impl Sanctum for Grpc {
                 ));
             }
         };
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         work(move || {
             let status = service.embedding_status(&scope, target)?;
             Ok(v1::EmbeddingStatus {
@@ -566,18 +631,18 @@ impl Sanctum for Grpc {
         &self,
         request: Request<v1::IngestionJobRequest>,
     ) -> Reply<v1::IngestionJob> {
-        job_action(&self.0, request.into_inner(), Service::cancel_job).await
+        job_action(self.local()?, request.into_inner(), Service::cancel_job).await
     }
 
     async fn retry_ingestion_job(
         &self,
         request: Request<v1::IngestionJobRequest>,
     ) -> Reply<v1::IngestionJob> {
-        job_action(&self.0, request.into_inner(), Service::retry_job).await
+        job_action(self.local()?, request.into_inner(), Service::retry_job).await
     }
 
     async fn get_local_queue(&self, _request: Request<v1::Empty>) -> Reply<v1::LocalQueueStatus> {
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         work(move || {
             Ok(v1::LocalQueueStatus {
                 paused: service.queue_paused()?,
@@ -592,7 +657,7 @@ impl Sanctum for Grpc {
         request: Request<v1::SetLocalQueueRequest>,
     ) -> Reply<v1::LocalQueueStatus> {
         let paused = request.into_inner().paused;
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         work(move || {
             service.pause_queue(paused)?;
             Ok(v1::LocalQueueStatus { paused })
@@ -614,7 +679,7 @@ impl Sanctum for Grpc {
             .transpose()
             .map_err(status)?;
         let result = self
-            .0
+            .local()?
             .retrieve(
                 scope.clone(),
                 request.query,
@@ -660,7 +725,7 @@ impl Sanctum for Grpc {
             .transpose()
             .map_err(status)?;
         let result = self
-            .0
+            .local()?
             .retrieve_collections(
                 tenant,
                 collections,
@@ -710,7 +775,7 @@ impl Sanctum for Grpc {
                 .map_err(|_| Status::invalid_argument("invalid revision ID"))?,
             ordinal: reference.ordinal,
         };
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         work(move || Ok(wire_hit(&scope, service.fetch(&scope, &reference)?)))
             .await
             .map(Response::new)
@@ -728,7 +793,7 @@ impl Sanctum for Grpc {
             .map_err(|_| Status::invalid_argument("invalid source ID"))?;
         let expected =
             parse_optional_id(request.expected_revision_id, "invalid expected revision ID")?;
-        let service = self.0.clone();
+        let service = self.local()?.clone();
         work(move || {
             let revision = service.delete_source(&scope, source, expected)?;
             Ok(v1::DeletedSource {

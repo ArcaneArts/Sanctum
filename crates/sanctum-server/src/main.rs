@@ -6,12 +6,17 @@ use sanctum_service::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod hosted;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
-    let config = Config::from_env()?;
+    let mut config = Config::from_env()?;
+    if let Some(storage) = config.object_storage.take() {
+        return hosted::serve(config.grpc_listen, storage).await;
+    }
     let embedding: Option<Arc<dyn sanctum_embedding::Provider>> = config
         .embedding
         .map(|embedding| match embedding {

@@ -14,6 +14,9 @@ sanctum-embedding = { path = "../sanctum-embedding" }
 sanctum-mcp = { path = "../sanctum-mcp", features = ["http"] }
 sanctum-proto = { path = "../sanctum-proto" }
 sanctum-service = { path = "../sanctum-service" }
+sanctum-storage = { path = "../sanctum-storage" }
+sanctum-storage-gcs = { path = "../sanctum-storage-gcs" }
+sanctum-storage-s3 = { path = "../sanctum-storage-s3" }
 anyhow = { workspace = true }
 axum.workspace = true
 serde_json.workspace = true

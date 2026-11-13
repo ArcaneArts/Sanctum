@@ -32,8 +32,8 @@ export AWS_SECRET_ACCESS_KEY=YOUR_TEST_SECRET_KEY
 cargo test --locked -p sanctum-storage-s3 --test minio -- --ignored
 ```
 
-The server currently uses its filesystem service. S3 can be used through the
-storage crate while database publication and server integration are in progress.
+The server can select S3 for its hosted catalog. See the
+[configuration example](#hosted-catalog-configuration).
 
 ## Object-backed database publication
 
@@ -62,8 +62,8 @@ are retained for 45 days. The dispatch layer must reject expired
 operation envelopes when it invokes this executor.
 
 The executor runs against the filesystem and MinIO in its contract
-tests. It is available as a Rust library while the hosted service
-wires its application commands to the executor.
+tests. Hosted catalog operations use it to publish initial collection
+databases and activate them in the tenant catalog.
 
 ## Google Cloud Storage adapter
 
@@ -87,3 +87,41 @@ cargo test --locked -p sanctum-storage-gcs --test live -- --ignored
 
 The regular test suite checks the JSON API contract with a loopback HTTP
 fixture. Live bucket verification remains open.
+
+## Hosted catalog configuration
+
+Set `object_storage` in `SANCTUM_CONFIG_JSON` to select the backend.
+For a local MinIO bucket, start the server with a configuration such as
+the following. AWS credentials come from the process environment.
+
+```json
+{
+  "version": 1,
+  "grpc_listen": "127.0.0.1:47550",
+  "object_storage": {
+    "backend": "s3",
+    "endpoint": "http://127.0.0.1:9000",
+    "bucket": "sanctum",
+    "region": "us-east-1",
+    "prefix": "development",
+    "allow_http": true
+  }
+}
+```
+
+For GCS, set `object_storage` to
+`{"backend":"gcs","bucket":"your-bucket","prefix":"sanctum"}`.
+The prefix is optional. Use a dedicated bucket or prefix for each deployment.
+Omit `object_storage` and provide `storage_root` for the local filesystem
+service. The hosted catalog listens on gRPC and supports collection
+creation, listing, and scoped storage usage. Hosted ingestion, retrieval,
+and MCP are still in progress. Keep this listener within the controlling
+application's trusted network.
+
+The hosted create operation initializes the collection database before
+activating its catalog record. If a request is interrupted between those
+steps, repeat it to activate the existing database. Pass a UUID through
+`CreateCollectionRequest.request_id` or `sanctum-cli create --request-id`
+to replay a successful activation after an ambiguous response. The
+request ID applies within the tenant catalog. Hosted lists default to
+50 items. Pass `next_after` as `after` to continue the same tenant's list.

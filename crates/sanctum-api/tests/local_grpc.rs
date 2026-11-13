@@ -1105,6 +1105,7 @@ async fn search_collections_ranks_scoped_matches_with_one_query_embedding() {
         .client
         .create_collection(v1::CreateCollectionRequest {
             scope: reference_scope.clone(),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1504,6 +1505,7 @@ async fn queue_activity_pages_persist_and_stay_in_scope() {
                 tenant: "default".into(),
                 collection: "reference".into(),
             }),
+            request_id: None,
         })
         .await
         .unwrap();
@@ -1623,6 +1625,7 @@ async fn create(client: &mut SanctumClient<Channel>, tenant: &str) {
     client
         .create_collection(v1::CreateCollectionRequest {
             scope: scope(tenant),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1685,6 +1688,7 @@ async fn upload_search_fetch_survives_restart_and_stays_in_tenant() {
         .client
         .list_collections(v1::ListCollectionsRequest {
             tenant: "default".into(),
+            ..Default::default()
         })
         .await
         .unwrap()

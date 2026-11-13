@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+sanctum-db = { path = "../sanctum-db" }
+sanctum-storage = { path = "../sanctum-storage" }
 sanctum-core = { path = "../sanctum-core" }
 sanctum-storage-fs = { path = "../sanctum-storage-fs" }
 sanctum-db-sqlite = { path = "../sanctum-db-sqlite" }

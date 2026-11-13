@@ -103,7 +103,8 @@ pub(crate) async fn overview(host: State<'_, Host>, collection: Option<String>) 
     let mut jobs_client = client.clone();
     let result = tokio::try_join!(
         client.list_collections(v1::ListCollectionsRequest {
-            tenant: "default".into()
+            tenant: "default".into(),
+            ..Default::default()
         }),
         queue_client.get_local_queue(v1::Empty {}),
         jobs_client.list_ingestion_jobs(v1::ListIngestionJobsRequest {
@@ -195,6 +196,7 @@ pub(crate) async fn create_collection(host: State<'_, Host>, collection: String)
         .map_err(error)?
         .create_collection(v1::CreateCollectionRequest {
             scope: scope(collection),
+            ..Default::default()
         })
         .await
         .map_err(|status| status.message().to_owned())?;
