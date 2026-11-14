@@ -1649,3 +1649,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   and successful repair of the same upload ID in an active collection.
   Queue creation used a loopback Cloud Tasks fixture.
   [Cloud Tasks dispatch](STORAGE.md#cloud-tasks-dispatch).
+
+## Dispatch repair under a stalled handoff
+
+- Hosted repair processes up to four independent hints concurrently.
+  It gives each attempt 30 seconds and the whole page 240 seconds.
+  Unfinished attempts remain discoverable after a timeout.
+- The filesystem regression accepted 17 uploads under one shard. While
+  the first dispatch stalled, 15 other handoffs completed. A new worker
+  resumed after a page timeout, recorded the per-hint failure, moved to
+  the next page, and recovered the timed-out hint on the next pass.
+  [Scheduler setup](CLOUD_RUN.md#schedule-dispatch-repair).
