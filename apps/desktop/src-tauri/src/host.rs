@@ -345,12 +345,12 @@ impl Host {
             };
             self.transition(&tray_status, "starting", None, None, generation)
                 .await;
-            let error = match self.start(settings).await {
-                Ok(Running {
+            let error = match self.start(settings, generation).await {
+                Ok(Some(Running {
                     ready,
                     mut child,
                     control,
-                }) => {
+                })) => {
                     let started = std::time::Instant::now();
                     self.transition(&tray_status, "running", None, Some(ready), generation)
                         .await;
@@ -372,6 +372,10 @@ impl Host {
                             continue;
                         }
                     }
+                }
+                Ok(None) => {
+                    backoff = Duration::from_secs(1);
+                    continue;
                 }
                 Err(error) => error.to_string(),
             };
@@ -419,7 +423,7 @@ impl Host {
         });
     }
 
-    async fn start(&self, settings: Settings) -> Result<Running> {
+    async fn start(&self, settings: Settings, generation: u64) -> Result<Option<Running>> {
         let config = settings.config()?;
         let storage_backend = match &config.object_storage {
             None => "filesystem",
@@ -457,7 +461,7 @@ impl Host {
                 recent.push_back(line);
             }
         });
-        let ready = tokio::time::timeout(START_TIMEOUT, async {
+        let ready = async {
             let mut line = String::new();
             ensure!(
                 out.read_line(&mut line).await? != 0,
@@ -475,30 +479,36 @@ impl Host {
                 storage_backend,
                 client,
             })
-        })
-        .await;
-        match ready {
-            Ok(Ok(ready)) => Ok(Running {
-                ready,
-                child,
-                control,
-            }),
-            failure => {
-                drop(control);
-                stop_child(&mut child).await;
-                let _ = drain.await;
-                let error = logs.lock().await.back().cloned();
-                let reason = match failure {
-                    Ok(Err(error)) => error.to_string(),
-                    Err(_) => "Timed out waiting for the server to start".into(),
-                    Ok(Ok(_)) => unreachable!(),
-                };
-                Err(anyhow!(
-                    "{}",
-                    error.map_or(reason.clone(), |line| format!("{reason}. {line}"))
-                ))
+        };
+        let startup = tokio::select! {
+            biased;
+            _ = self.wait_for_change(generation) => None,
+            ready = tokio::time::timeout(START_TIMEOUT, ready) => Some(ready),
+        };
+        let reason = match startup {
+            Some(Ok(Ok(ready))) => {
+                return Ok(Some(Running {
+                    ready,
+                    child,
+                    control,
+                }));
             }
-        }
+            Some(Ok(Err(error))) => Some(error.to_string()),
+            Some(Err(_)) => Some("Timed out waiting for the server to start".into()),
+            None => None,
+        };
+        drop(control);
+        stop_child(&mut child).await;
+        let Some(reason) = reason else {
+            drain.abort();
+            return Ok(None);
+        };
+        let _ = drain.await;
+        let error = logs.lock().await.back().cloned();
+        Err(anyhow!(match error {
+            Some(line) => format!("{reason}. {line}"),
+            None => reason,
+        }))
     }
 }
 
@@ -602,6 +612,81 @@ mod tests {
                 assert!(!host.snapshot().await.0.restart_pending);
                 host.apply_settings().await;
                 assert_no_restart(&host, applied).await;
+            });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn applying_settings_interrupts_startup_and_waits_for_the_child() {
+        assert_interrupts_startup(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quitting_interrupts_startup_and_waits_for_the_child() {
+        assert_interrupts_startup(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_interrupts_startup(quit: bool) {
+        use std::os::unix::fs::PermissionsExt;
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let root = tempfile::tempdir().unwrap();
+                let started = root.path().join("started");
+                let stopped = root.path().join("stopped");
+                let server = root.path().join("sanctum-server");
+                std::fs::write(
+                    &server,
+                    "#!/bin/sh\ncd -- \"$(dirname -- \"$0\")\" || exit 1\n: > started\nIFS= read -r request\n: > stopped\n",
+                )
+                .unwrap();
+                std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o700)).unwrap();
+                let initial = Settings {
+                    storage_root: root.path().join("store").to_string_lossy().into_owned(),
+                    object_storage: None,
+                    grpc_port: 0,
+                    mcp_port: 0,
+                    local_worker_concurrency: 1,
+                    embedding: None,
+                };
+                let host = Host::new(root.path().join("config.json"), initial.clone(), server, PathBuf::new());
+                let worker = host.clone();
+                let startup = tokio::spawn(async move { worker.start(initial, 1).await });
+
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !started.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("sidecar must begin waiting for startup");
+                let quit = if quit {
+                    let host = host.clone();
+                    Some(tokio::spawn(async move { host.quit().await }))
+                } else {
+                    let mut changed = host.settings().await;
+                    changed.grpc_port = 48001;
+                    host.save_settings(changed).await.unwrap();
+                    host.apply_settings().await;
+                    None
+                };
+
+                let running = tokio::time::timeout(Duration::from_secs(5), startup)
+                    .await
+                    .expect("startup should stop promptly")
+                    .unwrap()
+                    .unwrap();
+                assert!(running.is_none());
+                assert!(stopped.exists(), "wait for the sidecar to receive EOF and exit");
+                if let Some(quit) = quit {
+                    host.inner.desired.lock().await.quit.take().unwrap().send(()).unwrap();
+                    assert!(quit.await.unwrap());
+                }
             });
     }
 

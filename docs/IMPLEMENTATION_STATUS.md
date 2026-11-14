@@ -292,6 +292,19 @@ Merged in [PR #13](https://github.com/ArcaneArts/Sanctum/pull/13).
   saving a newer configuration while an earlier change was being applied.
   [PR #141](https://github.com/ArcaneArts/Sanctum/pull/141).
 
+### Interrupting desktop sidecar startup
+
+- Quit and settings restart interrupt readiness waiting. The host closes
+  the sidecar control pipe and waits for the old process before exiting or
+  starting another. The desktop check passed five Rust tests, including
+  two that exercise a child waiting on its real stdin pipe.
+- A background macOS Tauri launch used a sidecar fixture that withheld
+  readiness. `SIGINT` exercised the same quit handler as the tray and
+  exited in 46 ms. The child recorded EOF on stdin and was reaped.
+  With the real sidecar restored, a generated Python gRPC client created a
+  collection, observed the listener stop on quit, and listed the persisted
+  collection after relaunch.
+
 ## Search across collections
 
 Merged in [PR #14](https://github.com/ArcaneArts/Sanctum/pull/14).
