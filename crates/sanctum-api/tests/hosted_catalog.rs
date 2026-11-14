@@ -4519,3 +4519,106 @@ async fn start(catalog: HostedCatalog) -> Running {
         server,
     }
 }
+
+#[tokio::test]
+async fn hosted_database_export_replays_a_pinned_page_delta_on_another_instance() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let catalog = || HostedCatalog::new(storage.clone(), None, 2 * 1024 * 1024).unwrap();
+    let writer = catalog().with_snapshot_page_deltas(true);
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    writer.create_collection(&scope, None).await.unwrap();
+    let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
+    let publication =
+        sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(30))
+            .unwrap()
+            .with_page_deltas(true);
+    let mut lease = publication.acquire(&unit).await.unwrap();
+    lease
+        .apply(
+            vec![sanctum_db::Command { operation: uuid::Uuid::new_v4(), payload: () }],
+            |tx, ()| {
+                tx.execute_batch(
+                    "CREATE TABLE document (body BLOB); INSERT INTO document VALUES (zeroblob(524288));",
+                ).map_err(|error| Error::Internal(Box::new(error)))?;
+                Ok("created".into())
+            },
+        )
+        .await
+        .unwrap();
+    let update = |byte| sanctum_db::Command {
+        operation: uuid::Uuid::new_v4(),
+        payload: byte,
+    };
+    let insert = |tx: &rusqlite::Transaction<'_>, byte: u8| {
+        tx.execute(
+            "INSERT INTO document VALUES (?1)",
+            rusqlite::params![[byte]],
+        )
+        .map_err(|error| Error::Internal(Box::new(error)))?;
+        Ok("added".into())
+    };
+    let (generation, _) = lease.apply(vec![update(1)], insert).await.unwrap();
+    lease.release().await.unwrap();
+    let delta_key = Key::parse(format!(
+        "default/collections/notes/snapshots/{}/pages.delta",
+        generation.id
+    ))
+    .unwrap();
+    assert!(storage.head(&delta_key).await.is_ok());
+
+    let mut first = start(catalog()).await;
+    let opened = first
+        .client
+        .open_database_session(v1::DatabaseTarget {
+            tenant: "default".into(),
+            collection: Some("notes".into()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(opened.snapshot_generation, Some(generation.id.to_string()));
+    first.stop().await;
+
+    // Switch back to full snapshots while the first session remains open.
+    let full =
+        sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(30)).unwrap();
+    let mut lease = full.acquire(&unit).await.unwrap();
+    let (newest, _) = lease.apply(vec![update(2)], insert).await.unwrap();
+    lease.release().await.unwrap();
+    let full_key = Key::parse(format!(
+        "default/collections/notes/snapshots/{}/meta.db",
+        newest.id
+    ))
+    .unwrap();
+    assert!(storage.head(&full_key).await.is_ok());
+    writer.sweep_hosted_snapshots().await.unwrap();
+
+    let mut second = start(catalog()).await;
+    let mut stream = second
+        .client
+        .download_database(opened.session.unwrap())
+        .await
+        .unwrap()
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(frame) = stream.message().await.unwrap() {
+        bytes.extend(frame.data);
+    }
+    assert_eq!(bytes.len() as u64, opened.bytes);
+    let exported = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(exported.path(), bytes).unwrap();
+    let database = rusqlite::Connection::open_with_flags(
+        exported.path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let rows: u32 = database
+        .query_row("SELECT count(*) FROM document", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 2);
+    second.stop().await;
+}

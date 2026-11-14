@@ -65,6 +65,31 @@ The executor runs against the filesystem and MinIO in its contract
 tests. Hosted catalog operations use it to publish initial collection
 databases and activate them in the tenant catalog.
 
+### Optional SQLite page deltas
+
+Set `"hosted_snapshot_page_deltas": true` to publish small changes as
+immutable `pages.delta` objects. The writer still creates a consistent
+SQLite backup and records the stage receipt in that backup. It uploads
+the changed pages before the conditional HEAD write. A reader downloads
+the verified base and ordered deltas, applies them to a private file,
+and checks the reconstructed database against the committed digest.
+Read-only database sessions still expose complete SQLite files.
+
+Each HEAD can reference up to four deltas. Their combined size must be
+at most half the resulting database size. A new full backup starts the
+next chain when either limit is reached, the database shrinks, or the
+page size changes. Cleanup retains every object in the current chain.
+After a full backup replaces the chain, its objects enter ordinary
+reader grace. Existing session records include the chain they opened.
+
+Deploy servers that support HEAD format 2 to all roles on a storage
+prefix before enabling the option. Older servers only understand
+format 1. Setting the option back to `false` keeps existing chains
+readable and resumes full backups on subsequent writes. Allow old
+read-only sessions to expire and confirm every HEAD uses format 1
+before rolling back to a server without delta support.
+[Capacity measurements](CAPACITY.md#sqlite-page-changes-during-a-source-replacement).
+
 ## Google Cloud Storage adapter
 
 The native adapter uses the GCS JSON API and Application Default
@@ -274,8 +299,8 @@ writer resolves the generation from its acquired lease, copies a retained
 snapshot to a private working file, and publishes a SQLite backup. Only
 successful conditional publication makes the new backup eligible for the
 cache. Reads continue to resolve HEAD, including after another instance
-publishes or a collection is deleted. Each write still uploads a complete
-snapshot.
+publishes or a collection is deleted. Full backups are the default wire
+format. [Optional SQLite page deltas](#optional-sqlite-page-deltas).
 
 ### Hosted embedding batches
 
@@ -355,7 +380,7 @@ to the collection.
 `OpenDatabaseSession` pins the current catalog or collection generation for
 five minutes. An object-backed handle can be used by any API instance with
 access to the same deployment prefix. It refers to the existing published
-SQLite file. API processes verify the file against its recorded size and
+SQLite generation. API processes verify the complete file against its recorded size and
 BLAKE3 digest and reuse it within the configured snapshot cache budget.
 The regular snapshot sweep removes expired session records after the
 reader grace period. Close a session early to release its handle.

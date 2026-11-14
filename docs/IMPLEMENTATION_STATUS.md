@@ -9,7 +9,7 @@ which parts have working implementations and where to find the evidence.
 | 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, URL and Git imports, and a Windows x64 installer build | Live hosted provider checks, Windows installation and tray verification, distribution signing |
 | 3. Object storage and publication | Shared storage contract, filesystem and MinIO-tested S3, native GCS adapter, and fenced SQLite snapshot publication for hosted catalog, source, and metadata operations | Live GCS verification and cloud recovery scenarios |
 | 4. Cloud Run and Cloud Tasks | Linux API and worker containers, durable staged uploads, dispatch and repair, scheduled maintenance, and hosted gRPC and MCP | Live IAM, Cloud Run ingress, and Tasks and Scheduler delivery |
-| 5. Capacity | [200 MiB lexical ingestion and 1–2 GiB snapshot measurements](CAPACITY.md) | Hosted write amplification, cold/warm cloud performance, and broader retrieval workloads |
+| 5. Capacity | [200 MiB lexical ingestion and 1–2 GiB snapshot measurements](CAPACITY.md) | Cold/warm Cloud Run performance, broader retrieval workloads, and production rollout limits |
 
 ## Local text ingestion and retrieval
 
@@ -1145,3 +1145,24 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - This measurement supports trying bounded delta publication with fenced
   commits, verified replay, and dependency-aware retirement.
   [Method and results](CAPACITY.md#sqlite-page-changes-during-a-source-replacement).
+
+## Bounded hosted SQLite page deltas
+
+- Hosted writers can publish ordered page deltas under the same fenced
+  HEAD protocol as full backups. Readers verify each object and the
+  reconstructed SQLite digest. The option defaults off and the first
+  base remains a standard SQLite backup.
+- The filesystem and live MinIO contract tests covered four deltas,
+  full-backup compaction, idempotent receipts, cold reads, and retirement
+  grace. A fault fixture verified an uploaded but unpublished delta, a
+  lost HEAD response after commit, and rejection of a corrupted delta.
+- A gRPC database session opened against a delta generation exported a
+  complete SQLite file on another instance after a full backup replaced
+  its chain. The MinIO hosted MCP smoke ran across two API processes and
+  a worker with delta publication enabled.
+  [Storage format and rollout](STORAGE.md#optional-sqlite-page-deltas).
+- In the 2.34 GiB MinIO benchmark the eight-byte edit reached lexical
+  readiness in 20.38 s and uploaded 145,351,400 bytes of database data.
+  The full-backup comparison took 30.00 s and uploaded 1,432,829,952
+  bytes. Cold search increased from 2.68 s to 3.71 s in these runs.
+  [Measurement](CAPACITY.md#publishing-the-deltas-on-minio).

@@ -18,6 +18,8 @@ pub struct Config {
     pub cloud_tasks: Option<CloudTasksConfig>,
     pub cloud_run_role: Option<CloudRunRole>,
     pub hosted_snapshot_cache_bytes: Option<u64>,
+    #[serde(default)]
+    pub hosted_snapshot_page_deltas: bool,
     #[serde(default = "default_grpc")]
     pub grpc_listen: SocketAddr,
     #[serde(default = "default_mcp")]
@@ -113,6 +115,7 @@ impl Config {
                 || config.cloud_tasks.is_some()
                 || config.cloud_run_role.is_some()
                 || config.hosted_snapshot_cache_bytes.is_some()
+                || config.hosted_snapshot_page_deltas
                 || config.standalone_object_worker)
         {
             return Err(Error::Invalid(
