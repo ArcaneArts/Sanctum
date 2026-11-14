@@ -334,6 +334,21 @@ async fn opening_object(
         calls.len()
     };
     match (scenario, attempt) {
+        ("metadata-only", 1) => StatusCode::TOO_MANY_REQUESTS.into_response(),
+        ("metadata-only", 2) => {
+            let body = stream::iter([Ok(Bytes::from_static(b"{\"name\":\""))]).chain(stream::once(
+                async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "metadata response interrupted",
+                    ))
+                },
+            ));
+            Body::from_stream(body).into_response()
+        }
+        ("metadata-only", 3) => Json(metadata(key, 6, 12)).into_response(),
+        ("metadata-missing", 1) => StatusCode::NOT_FOUND.into_response(),
         ("retry", 1) => StatusCode::TOO_MANY_REQUESTS.into_response(),
         ("retry", 2) => Json(metadata(key, 6, 11)).into_response(),
         ("retry", 3) => {
@@ -710,6 +725,56 @@ async fn download_returns_retryable_error_when_every_generation_is_replaced() {
             "metadata", "11", "metadata", "12", "metadata", "13", "metadata", "14"
         ],
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn head_retries_throttling_and_an_interrupted_metadata_body() {
+    let (storage, fixture, server) = start().await;
+    let key = Key::parse("default/notes/open-metadata-only").unwrap();
+    let object = storage.head(&key).await.unwrap();
+    assert_eq!(object.key, key);
+    assert_eq!(object.length, 6);
+    assert_eq!(object.version.generation.as_deref(), Some("12"));
+    assert_eq!(*fixture.reads.lock().unwrap(), ["metadata"; 3]);
+    server.abort();
+}
+
+#[tokio::test]
+async fn head_bounds_retries_and_preserves_permanent_errors() {
+    let (storage, fixture, server) = start().await;
+    let key = Key::parse("default/notes/open-unavailable").unwrap();
+    assert!(matches!(storage.head(&key).await, Err(Error::Busy(_))));
+    assert_eq!(*fixture.reads.lock().unwrap(), ["metadata"; 3]);
+
+    fixture.reads.lock().unwrap().clear();
+    let key = Key::parse("default/notes/open-metadata-missing").unwrap();
+    assert!(matches!(storage.head(&key).await, Err(Error::NotFound(_))));
+    assert_eq!(*fixture.reads.lock().unwrap(), ["metadata"]);
+
+    fixture.reads.lock().unwrap().clear();
+    let key = Key::parse("default/notes/open-forbidden").unwrap();
+    assert!(matches!(storage.head(&key).await, Err(Error::Invalid(_))));
+    assert_eq!(*fixture.reads.lock().unwrap(), ["metadata"]);
+
+    fixture.reads.lock().unwrap().clear();
+    let key = Key::parse("default/notes/open-wrong-key").unwrap();
+    assert!(matches!(storage.head(&key).await, Err(Error::Io(error))
+        if error.kind() == io::ErrorKind::InvalidData));
+    assert_eq!(*fixture.reads.lock().unwrap(), ["metadata"]);
+    server.abort();
+}
+
+#[tokio::test]
+async fn head_retries_a_stalled_metadata_request() {
+    let (storage, fixture, server) = start().await;
+    let key = Key::parse("default/notes/open-stalled").unwrap();
+    let object = storage
+        .read_object_metadata(&key, Duration::from_millis(250))
+        .await
+        .unwrap();
+    assert_eq!(object.version.generation.as_deref(), Some("12"));
+    assert_eq!(*fixture.reads.lock().unwrap(), ["metadata"; 2]);
     server.abort();
 }
 

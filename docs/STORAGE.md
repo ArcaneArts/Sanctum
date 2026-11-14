@@ -130,6 +130,13 @@ again from fresh metadata. It uses up to four attempts, with 20 seconds per
 attempt and exponential backoff. Authorization errors and invalid response
 metadata end the request. [Google Cloud retry strategy](https://docs.cloud.google.com/storage/docs/retry-strategy).
 
+Direct object metadata reads, including the reads used by snapshot
+and abandoned-upload cleanup, retry transient HTTP errors, interrupted
+bodies, and timeouts for the same key. These reads use up to three attempts
+of ten seconds each, plus backoff. Missing objects, authorization failures,
+and invalid metadata return immediately. A full download has its own
+retry budget and reads fresh metadata once per open attempt.
+
 Once a full download starts, the adapter can resume an interrupted body
 at the next undelivered byte using a range request pinned to the original
 generation. It checks the resumed interval and object length and attempts
