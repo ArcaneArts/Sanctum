@@ -7,7 +7,9 @@ use uuid::Uuid;
 
 mod notifications;
 
-use crate::{ImportOptions, ImportState, Service};
+use crate::{ImportOptions, ImportState, Service, local_import::LocalScan};
+
+const BUSY_RETRY_SECONDS: u32 = 5;
 
 pub struct WatchedFolder {
     pub id: Uuid,
@@ -131,7 +133,7 @@ impl Service {
         let folder = WatchedFolder::try_from(folder)?;
         let mut counts = Counts::default();
         let mut error = None;
-        let scan = self.import_local_until(
+        let scan = self.scan_local_until(
             &folder.scope,
             Path::new(&folder.path),
             &folder.options,
@@ -157,9 +159,17 @@ impl Service {
         if *stop.borrow() {
             return Ok(false);
         }
-        if let Err(failure) = scan {
-            counts.failed += 1;
-            error = Some(failure.to_string());
+        match scan {
+            Ok(LocalScan::AlreadyRunning) => {
+                self.queue
+                    .defer_busy_folder(folder.id, BUSY_RETRY_SECONDS)?;
+                return Ok(true);
+            }
+            Ok(LocalScan::Finished) => {}
+            Err(failure) => {
+                counts.failed += 1;
+                error = Some(failure.to_string());
+            }
         }
         let error: Option<String> = error.map(|reason| reason.chars().take(512).collect());
         self.queue
@@ -201,5 +211,78 @@ pub async fn run_watched_folders(service: Service, mut stop: watch::Receiver<boo
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             changed = stop.changed() => if changed.is_err() { return; }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, thread, time::Instant};
+
+    use super::*;
+
+    #[test]
+    fn busy_watch_preserves_scan_state_and_retries_before_the_normal_interval() {
+        let storage = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let service = Service::open(storage.path(), 1024).unwrap();
+        let scope = Scope {
+            tenant: "default".parse().unwrap(),
+            collection: "notes".parse().unwrap(),
+        };
+        service.create_collection(&scope).unwrap();
+        fs::write(first.path().join("manual.txt"), "manual input").unwrap();
+        fs::write(first.path().join("watched.md"), "watched quartz").unwrap();
+        fs::write(second.path().join("other.md"), "other spinel").unwrap();
+        let watched_only = ImportOptions {
+            include: vec!["*.md".into()],
+            ..Default::default()
+        };
+        let watched = service
+            .watch_folder(&scope, first.path(), &watched_only, 3600)
+            .unwrap();
+        let (_stop, stopping) = watch::channel(false);
+        let explicit = ImportOptions {
+            include: vec!["*.txt".into()],
+            ..Default::default()
+        };
+        let mut scanned_manual = false;
+        service
+            .import_local(&scope, first.path(), &explicit, |event| {
+                assert!(matches!(event.state, ImportState::Queued));
+                assert_eq!(event.path, "manual.txt");
+                scanned_manual = true;
+                assert!(service.scan_next_folder(&stopping, None).unwrap());
+                let folder = &service.queue.folders(&scope, "", 1).unwrap()[0];
+                assert!(folder.scanned.is_none());
+                assert!(folder.error.is_none());
+                assert_eq!(folder.counts.failed, 0);
+                assert!(service.queue.next_folder().unwrap().is_none());
+
+                let next = service
+                    .watch_folder(&scope, second.path(), &watched_only, 3600)
+                    .unwrap();
+                assert!(service.scan_next_folder(&stopping, None).unwrap());
+                let after = service.queue.folders(&scope, "", 2).unwrap();
+                let other = after.iter().find(|folder| folder.id == next.id).unwrap();
+                assert!(other.scanned.is_some());
+                assert_eq!(other.counts.queued, 1);
+                true
+            })
+            .unwrap();
+        assert!(scanned_manual);
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !service.scan_next_folder(&stopping, None).unwrap() {
+            assert!(Instant::now() < deadline, "watch missed its retry");
+            thread::sleep(Duration::from_millis(50));
+        }
+        let after = service.queue.folders(&scope, "", 2).unwrap();
+        let scanned = after.iter().find(|folder| folder.id == watched.id).unwrap();
+        assert!(scanned.scanned.is_some());
+        assert_eq!(scanned.counts.queued, 1);
+        assert_eq!(scanned.counts.failed, 0);
+        assert!(scanned.error.is_none());
+        assert!(service.queue.next_folder().unwrap().is_none());
     }
 }

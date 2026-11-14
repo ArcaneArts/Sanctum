@@ -642,7 +642,10 @@ also scans when a watch is added, after restart, and at the configured
 interval (60 seconds by default). Periodic scans cover filesystems where
 notifications are unavailable and edits the backend missed. Every scan
 uses content hashes. Pausing the local queue prevents new scans. Scans
-already in progress may finish after pause or removal.
+already in progress may finish after pause or removal. If a manual import
+is already scanning the same root in the same collection, the watch keeps
+its last scan result. It becomes eligible to retry after five seconds, or
+sooner if its configured interval is shorter.
 
 Missing files are reported by default. Use `--prune-missing` to delete
 selected sources whose files disappeared or stopped being regular files.

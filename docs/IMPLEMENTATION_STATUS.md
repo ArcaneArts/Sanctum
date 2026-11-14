@@ -509,6 +509,12 @@ Merged in [PR #18](https://github.com/ArcaneArts/Sanctum/pull/18).
 - Native filesystem notifications request debounced scans without waiting for
   the periodic reconciliation interval. The service schedules a full scan
   after notification loss and retains the periodic scan for missed edits.
+- A watch that encounters a manual import of the same root preserves its
+  last scan result and schedules a retry in at most five seconds. A
+  regression held the real import open with different file filters, ran
+  another due watch, then verified that the deferred watch queued its own
+  file without waiting for the configured one-hour interval.
+  [Watch scheduling](LOCAL_API.md#watched-folders).
 - The gRPC test ran on macOS and in a Linux ARM64 container with a one-hour
   reconciliation interval. It picked up a newly created nested file and
   coalesced three rapid saves into one replacement. The overflow fixture

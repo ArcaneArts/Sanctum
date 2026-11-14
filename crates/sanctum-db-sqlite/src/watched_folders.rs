@@ -124,6 +124,17 @@ impl LocalQueue {
         transaction.commit().map_err(database_error)
     }
 
+    pub fn defer_busy_folder(&self, id: Uuid, retry_seconds: u32) -> Result<()> {
+        self.connect()?
+            .execute(
+                "UPDATE watched_folders SET next_scan_at = unixepoch() + min(interval_seconds, ?2)
+                 WHERE id = ?1",
+                params![id.to_string(), retry_seconds],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
     pub fn scanned_folder(&self, id: Uuid, counts: Counts, error: Option<&str>) -> Result<()> {
         self.connect()?
             .execute(

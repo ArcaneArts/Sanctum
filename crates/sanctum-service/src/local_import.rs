@@ -24,6 +24,7 @@ pub(crate) enum ImportTarget {
 }
 
 type ImportKey = (ScopeId, ScopeId, ImportTarget);
+const LOCAL_IMPORT_BUSY: &str = "this path is already being imported into the collection";
 
 #[derive(Clone, Default)]
 pub(crate) struct ActiveImports(Arc<Mutex<HashSet<ImportKey>>>);
@@ -35,31 +36,30 @@ pub(crate) struct ActiveImport {
 
 impl ActiveImports {
     pub(crate) fn begin(&self, scope: &Scope, target: ImportTarget) -> Result<ActiveImport> {
+        let message = match &target {
+            ImportTarget::Local(_) => LOCAL_IMPORT_BUSY,
+            ImportTarget::Git(_) => {
+                "this repository and ref are already being imported into the collection"
+            }
+            ImportTarget::Url(_) => "this URL is already being imported into the collection",
+        };
+        self.try_begin(scope, target)?
+            .ok_or_else(|| Error::Busy(message.into()))
+    }
+
+    fn try_begin(&self, scope: &Scope, target: ImportTarget) -> Result<Option<ActiveImport>> {
         let key = (scope.tenant.clone(), scope.collection.clone(), target);
         let mut imports = self
             .0
             .lock()
             .map_err(|_| Error::Busy("import coordinator is unavailable".into()))?;
         if !imports.insert(key.clone()) {
-            return Err(Error::Busy(
-                match key.2 {
-                    ImportTarget::Local(_) => {
-                        "this path is already being imported into the collection"
-                    }
-                    ImportTarget::Git(_) => {
-                        "this repository and ref are already being imported into the collection"
-                    }
-                    ImportTarget::Url(_) => {
-                        "this URL is already being imported into the collection"
-                    }
-                }
-                .into(),
-            ));
+            return Ok(None);
         }
-        Ok(ActiveImport {
+        Ok(Some(ActiveImport {
             imports: self.clone(),
             key,
-        })
+        }))
     }
 }
 
@@ -77,6 +77,11 @@ pub struct ImportOptions {
     pub exclude: Vec<String>,
     pub prune_missing: bool,
     pub retain_original: bool,
+}
+
+pub(crate) enum LocalScan {
+    Finished,
+    AlreadyRunning,
 }
 
 #[derive(Clone, Copy)]
@@ -194,8 +199,22 @@ impl Service {
         path: &Path,
         options: &ImportOptions,
         stopped: impl Fn() -> bool,
-        mut emit: impl FnMut(ImportEvent) -> bool,
+        emit: impl FnMut(ImportEvent) -> bool,
     ) -> Result<()> {
+        match self.scan_local_until(scope, path, options, stopped, emit)? {
+            LocalScan::Finished => Ok(()),
+            LocalScan::AlreadyRunning => Err(Error::Busy(LOCAL_IMPORT_BUSY.into())),
+        }
+    }
+
+    pub(crate) fn scan_local_until(
+        &self,
+        scope: &Scope,
+        path: &Path,
+        options: &ImportOptions,
+        stopped: impl Fn() -> bool,
+        mut emit: impl FnMut(ImportEvent) -> bool,
+    ) -> Result<LocalScan> {
         self.require_collection(scope)?;
         let file_type = fs::symlink_metadata(path)?.file_type();
         if !(file_type.is_dir() || file_type.is_file()) {
@@ -215,9 +234,12 @@ impl Service {
             "local-fs:{}",
             blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex(),
         );
-        let _active = self
+        let Some(_active) = self
             .imports
-            .begin(scope, ImportTarget::Local(namespace.clone()))?;
+            .try_begin(scope, ImportTarget::Local(namespace.clone()))?
+        else {
+            return Ok(LocalScan::AlreadyRunning);
+        };
         let base = if file_type.is_dir() {
             root.as_path()
         } else {
@@ -238,7 +260,7 @@ impl Service {
                     had_errors = true;
                     let path = error.path().unwrap_or(&root).display().to_string();
                     if !emit(ImportEvent::failed(&path, &error)) {
-                        return Ok(());
+                        return Ok(LocalScan::Finished);
                     }
                     continue;
                 }
@@ -262,7 +284,7 @@ impl Service {
                 Err(error) => {
                     had_errors = true;
                     if !emit(ImportEvent::failed(&relative.display().to_string(), &error)) {
-                        return Ok(());
+                        return Ok(LocalScan::Finished);
                     }
                     continue;
                 }
@@ -282,13 +304,13 @@ impl Service {
                 }
             };
             if stopped() || !emit(event) {
-                return Ok(());
+                return Ok(LocalScan::Finished);
             }
         }
         if file_type.is_dir() && !had_errors && !stopped() {
             self.reconcile_import(scope, &root, &namespace, &select, &stopped, emit)?;
         }
-        Ok(())
+        Ok(LocalScan::Finished)
     }
 
     fn import_file(
