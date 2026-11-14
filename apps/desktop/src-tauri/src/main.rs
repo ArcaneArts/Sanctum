@@ -63,6 +63,7 @@ fn main() {
             commands::save_settings,
             commands::apply_settings,
             commands::overview,
+            commands::ingestion_activity,
             commands::create_collection,
             commands::pick_path,
             commands::import_local,

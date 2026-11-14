@@ -47,6 +47,8 @@ export type Job = {
   embedding_retry_at: number | null
 }
 
+export type ActivityPage = { jobs: Job[], next: string | null }
+
 export type Overview = {
   runtime: {
     phase: "starting" | "running" | "stopping" | "retrying"
@@ -59,7 +61,6 @@ export type Overview = {
   }
   collections: string[]
   paused: boolean | null
-  jobs: Job[]
   embedding: { enabled: boolean, total: number, embedded: number, failed: number, retrying: number, error: string | null } | null
   api_error: string | null
 }

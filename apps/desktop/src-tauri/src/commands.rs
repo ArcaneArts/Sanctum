@@ -16,9 +16,14 @@ pub(crate) struct Overview {
     runtime: RuntimeStatus,
     collections: Vec<String>,
     paused: Option<bool>,
-    jobs: Vec<Job>,
     embedding: Option<Embedding>,
     api_error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ActivityPage {
+    jobs: Vec<Job>,
+    next: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -106,7 +111,6 @@ pub(crate) async fn overview(host: State<'_, Host>, collection: Option<String>) 
         runtime,
         collections: Vec::new(),
         paused: None,
-        jobs: Vec::new(),
         embedding: None,
         api_error: None,
     };
@@ -160,24 +164,58 @@ pub(crate) async fn overview(host: State<'_, Host>, collection: Option<String>) 
     overview.collections = collections;
     overview.paused = queue;
     let collection = collection.filter(|id| overview.collections.contains(id));
-    let jobs = match client
+    if let Some(collection) = collection.or_else(|| overview.collections.first().cloned()) {
+        match client
+            .get_embedding_status(v1::EmbeddingStatusRequest {
+                scope: scope(collection),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(result) => {
+                let result = result.into_inner();
+                let coverage = result.coverage.unwrap_or_default();
+                overview.embedding = Some(Embedding {
+                    enabled: coverage.profile_id.is_some(),
+                    total: coverage.total_chunks,
+                    embedded: coverage.embedded_chunks,
+                    failed: coverage.failed_chunks,
+                    retrying: result.retrying_chunks,
+                    error: result.sample_error,
+                });
+            }
+            Err(error) => overview.api_error = Some(error.message().to_owned()),
+        }
+    }
+    Ok(overview)
+}
+
+#[tauri::command]
+pub(crate) async fn ingestion_activity(
+    host: State<'_, Host>,
+    collection: Option<String>,
+    cursor: Option<String>,
+) -> Reply<ActivityPage> {
+    let (runtime, client) = host.snapshot().await;
+    let mut client = client.ok_or_else(|| "Sanctum server is unavailable".to_owned())?;
+    let filesystem = runtime.storage_backend == Some("filesystem");
+    let (before_operation_id, page_token) = if filesystem {
+        (cursor, None)
+    } else {
+        (None, cursor)
+    };
+    let page = client
         .list_ingestion_jobs(v1::ListIngestionJobsRequest {
             tenant: "default".into(),
-            collection: collection.clone(),
+            collection,
             limit: Some(25),
-            before_operation_id: None,
-            page_token: None,
+            before_operation_id,
+            page_token,
         })
         .await
-    {
-        Ok(jobs) => jobs,
-        Err(error) => {
-            overview.api_error = Some(error.message().to_owned());
-            return Ok(overview);
-        }
-    };
-    overview.jobs = jobs
-        .into_inner()
+        .map_err(|error| error.message().to_owned())?
+        .into_inner();
+    let jobs = page
         .jobs
         .into_iter()
         .map(|job| {
@@ -235,30 +273,10 @@ pub(crate) async fn overview(host: State<'_, Host>, collection: Option<String>) 
             }
         })
         .collect();
-    if let Some(collection) = collection.or_else(|| overview.collections.first().cloned()) {
-        match client
-            .get_embedding_status(v1::EmbeddingStatusRequest {
-                scope: scope(collection),
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(result) => {
-                let result = result.into_inner();
-                let coverage = result.coverage.unwrap_or_default();
-                overview.embedding = Some(Embedding {
-                    enabled: coverage.profile_id.is_some(),
-                    total: coverage.total_chunks,
-                    embedded: coverage.embedded_chunks,
-                    failed: coverage.failed_chunks,
-                    retrying: result.retrying_chunks,
-                    error: result.sample_error,
-                });
-            }
-            Err(error) => overview.api_error = Some(error.message().to_owned()),
-        }
-    }
-    Ok(overview)
+    Ok(ActivityPage {
+        jobs,
+        next: page.next_before_operation_id.or(page.next_page_token),
+    })
 }
 
 #[tauri::command]

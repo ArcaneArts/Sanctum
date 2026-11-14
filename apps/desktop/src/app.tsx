@@ -5,7 +5,8 @@ import { useCallback, useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
-import { bytes, type ImportEvent, type Job, type Overview } from "@/contracts"
+import { type ImportEvent, type Job, type Overview } from "@/contracts"
+import { IngestionActivity } from "@/ingestion-activity"
 import { cn } from "@/lib/utils"
 import { SettingsPanel } from "@/settings"
 import { StorageCard } from "@/storage-card"
@@ -27,6 +28,7 @@ export function App() {
   const [section, setSection] = useState<(typeof navigation)[number]["id"]>("activity")
   const [overview, setOverview] = useState<Overview | null>(null)
   const [collection, setCollection] = useState("")
+  const [activityRevision, setActivityRevision] = useState(0)
   const [newCollection, setNewCollection] = useState("")
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
@@ -77,26 +79,26 @@ export function App() {
       if (!filesystem) {
         await invoke("upload_file", { collection: target, path })
         setNotice("Upload queued")
-        setCollection(target)
-        return
-      }
-      let queued = 0
-      let unchanged = 0
-      let failures = 0
-      let sample = ""
-      const events = new Channel<ImportEvent>()
-      events.onmessage = event => {
-        if (event.state === "queued" || event.state === "pending") queued++
-        if (event.state === "unchanged") unchanged++
-        if (event.state === "failed") {
-          failures++
-          sample ||= event.message ? `${event.path}: ${event.message}` : event.path
+      } else {
+        let queued = 0
+        let unchanged = 0
+        let failures = 0
+        let sample = ""
+        const events = new Channel<ImportEvent>()
+        events.onmessage = event => {
+          if (event.state === "queued" || event.state === "pending") queued++
+          if (event.state === "unchanged") unchanged++
+          if (event.state === "failed") {
+            failures++
+            sample ||= event.message ? `${event.path}: ${event.message}` : event.path
+          }
+          setNotice(`Import: ${queued} queued, ${unchanged} unchanged, ${failures} failed`)
         }
-        setNotice(`Import: ${queued} queued, ${unchanged} unchanged, ${failures} failed`)
+        await invoke("import_local", { collection: target, path, events })
+        if (sample) setOperationError(sample)
       }
-      await invoke("import_local", { collection: target, path, events })
-      if (sample) setOperationError(sample)
       setCollection(target)
+      setActivityRevision(revision => revision + 1)
     })
   }
 
@@ -182,25 +184,8 @@ export function App() {
             </p>}
           </Card>
         </div>
-        <Card className="p-4">
-          <h2 className="mb-3 font-semibold">{filesystem ? "Recent ingestion" : "Ingestion activity"}</h2>
-          {!overview?.jobs.length && <p className="text-sm text-muted-foreground">No ingestion activity yet.</p>}
-          <ul className="divide-y divide-border">
-            {overview?.jobs.map(job => <li key={job.id} className="flex items-start justify-between gap-3 py-3">
-              <div className="min-w-0">
-                <p className="break-all text-sm font-medium">{job.name}</p>
-                <p className="mt-1 text-xs text-muted-foreground">{job.collection} · {job.state} · {bytes(job.processed_bytes)} / {bytes(job.total_bytes)}</p>
-                {job.cancelable && job.total_bytes > 0 && <progress aria-label={`${job.name} ingestion`} className="mt-1 max-w-full" max={job.total_bytes} value={job.processed_bytes} />}
-                {job.embedding_batch != null && <p className="mt-1 text-xs text-muted-foreground">
-                  Embedding batch {job.embedding_batch + 1}{job.embedding_retry_at != null && ` · Retry ${new Date(job.embedding_retry_at * 1000).toLocaleString()}`}
-                </p>}
-                {job.error && <p className="mt-1 break-all text-xs text-amber-200">{job.error}</p>}
-              </div>
-              {job.retryable && <Button variant="outline" size="small" disabled={busy} onClick={() => actOnJob(job, "retry_job")}>Retry</Button>}
-              {job.cancelable && <Button variant="ghost" size="small" disabled={busy} onClick={() => actOnJob(job, "cancel_job")}>Cancel</Button>}
-            </li>)}
-          </ul>
-        </Card>
+        <IngestionActivity key={JSON.stringify([activeCollection, overview?.runtime.generation, overview?.runtime.mcp_url, running, activityRevision])}
+          collection={activeCollection} running={running} busy={busy} onJobAction={actOnJob} />
       </div>}
 
       {section === "settings" && <SettingsPanel run={run} busy={busy} pending={overview?.runtime.restart_pending ?? false} />}
