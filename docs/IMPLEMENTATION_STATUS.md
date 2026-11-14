@@ -1285,3 +1285,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   The local MCP check also passed with default logging and with logs
   disabled after switching it to the server's managed startup output.
   [Runbook](CLOUD_RUN.md#repeatable-ingestion-and-range-check).
+
+## Capacity across 10,000 mostly idle tenants
+
+- The release API created 10,000 tenant catalogs and collections against
+  live MinIO. Eight active collections exercised search and replacement.
+  Repeated search measured 12.66 ms p50 and 21.90 ms p95. Replacement
+  reached lexical readiness in 873.08 ms p50 and 1,304.38 ms p95.
+- The cluster usage API counted 40,100 objects and 1,995,800,329 bytes.
+  A separate paginated listing matched both numbers. The run used a
+  dedicated prefix and removed its objects after verification.
+  [Method and results](CAPACITY.md#10000-mostly-idle-tenants).

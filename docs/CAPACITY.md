@@ -177,6 +177,36 @@ The benchmark covers one process, small active databases, and four active
 writers submitting to a serial worker. It provides no estimate for many
 simultaneously active tenants, large vector queries, or Cloud Run ingress.
 
+### 10,000 mostly idle tenants
+
+The same benchmark can extend catalog setup and usage measurement to
+10,000 tenant IDs. This run selected eight active collections, each with
+the same source size, search count, and replacement workload as above.
+The other 9,992 collections were empty.
+
+```sh
+python3 scripts/benchmark-tenants.py --tenants 10000 --active 8 --setup-concurrency 8
+```
+
+The Apple M4 Max and loopback MinIO setup created the 10,000 catalogs
+and collections in 165.68 s. The eight active workflows finished in
+3.17 s. Each query still includes release CLI startup and loopback
+gRPC latency.
+
+| Operation | Samples | p50 | p95 |
+| --- | ---: | ---: | ---: |
+| First search after publication | 8 | 12.30 ms | 21.28 ms |
+| Repeated search | 64 | 12.66 ms | 21.90 ms |
+| Replacement accepted | 16 | 42.73 ms | 66.94 ms |
+| Replacement text ready | 16 | 873.08 ms | 1,304.38 ms |
+
+Cluster usage enumerated 40,100 objects totaling 1,995,800,329 bytes
+in 1.68 s. An independent paginated MinIO listing matched both totals.
+The measurements cover one release API and its serial object worker,
+with lexical search and eight simultaneous active collections. They
+leave Cloud Run concurrency, cold starts, and vector search at this
+tenant count unmeasured.
+
 ## Small edit in a multi-GiB collection
 
 The release benchmark publishes twelve 200 MiB sources to one MinIO-backed
