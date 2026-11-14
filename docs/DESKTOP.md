@@ -122,3 +122,44 @@ window, confirm the MCP server still serves the collection, and reopen
 window. Select **Quit Sanctum**, verify the listener stops, and relaunch to
 check the stored collection. Platform results and signing status are in the
 [implementation status](IMPLEMENTATION_STATUS.md).
+
+## macOS distribution signing
+
+On the release build machine, use the Developer ID Application identity
+installed in Keychain. Tauri uses `APPLE_SIGNING_IDENTITY` to sign the app
+and its bundled executables. Set this variable in the release shell and
+build from the repository root. [Tauri macOS signing](https://v2.tauri.app/distribute/sign/macos/).
+
+```sh
+export APPLE_SIGNING_IDENTITY="Developer ID Application: YOUR ORGANIZATION (TEAM_ID)"
+pnpm --filter @sanctum/desktop tauri build --bundles app
+
+app=apps/desktop/src-tauri/target/release/bundle/macos/Sanctum.app
+codesign --verify --deep --strict --verbose=2 "$app"
+for program in sanctum-desktop sanctum-server sanctum-cli; do
+  codesign --display --verbose=4 "$app/Contents/MacOS/$program"
+done
+```
+
+Verify that all three executables show the release team's Developer ID
+authority and the hardened runtime flag. To use Apple's notary service
+separately from Tauri, store the release credentials once with
+`xcrun notarytool store-credentials Sanctum` and enter them at its prompts.
+Keep the signing identity and notary credentials in Keychain. [Apple's notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
+
+```sh
+archive="$(mktemp -d)/Sanctum.zip"
+ditto -c -k --keepParent "$app" "$archive"
+xcrun notarytool submit "$archive" --keychain-profile Sanctum --wait
+```
+
+After Apple reports `Accepted`, staple and validate the ticket on the
+original app before preparing the distribution archive.
+
+```sh
+xcrun stapler staple "$app"
+xcrun stapler validate "$app"
+spctl --assess --type execute --verbose=4 "$app"
+rm "$archive"
+ditto -c -k --keepParent "$app" "$archive"
+```

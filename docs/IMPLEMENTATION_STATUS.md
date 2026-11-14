@@ -6,7 +6,7 @@ which parts have working implementations and where to find the evidence.
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | Personal workflow verified on macOS. Cross-platform packaging and tray verification are tracked in milestone 2. |
-| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, URL and Git imports, and a Windows x64 installer build | Live hosted provider checks, Windows installation and tray verification, distribution signing |
+| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, URL and Git imports, a Windows x64 installer build, and verified macOS Developer ID signing | Live hosted provider checks, Windows installation and tray verification, Windows distribution signing, and macOS notarization |
 | 3. Object storage and publication | Shared storage contract, filesystem and MinIO-tested S3, native GCS adapter, and fenced SQLite snapshot publication for hosted catalog, source, and metadata operations | Live GCS verification and cloud recovery scenarios |
 | 4. Cloud Run and Cloud Tasks | Linux API and worker containers, durable staged uploads, dispatch and repair, scheduled maintenance, and hosted gRPC and MCP | Live IAM, Cloud Run ingress, and Tasks and Scheduler delivery |
 | 5. Capacity | [200 MiB ingestion, GiB-scale snapshots, 10,000 MinIO tenants, and real embedding benchmarks](CAPACITY.md) | Cold/warm Cloud Run performance and production rollout limits |
@@ -20,8 +20,10 @@ which parts have working implementations and where to find the evidence.
   package passed the [X11 tray workflow](#native-desktop-package-verification).
   The [Windows x64 installer](#windows-x64-installer-build) needs installation,
   WebView2 startup, and tray lifecycle verification on a licensed Windows
-  machine or an authorized evaluation guest. Distribution signing and macOS
-  notarization also remain open.
+  machine or an authorized evaluation guest. Windows distribution signing
+  remains open. The macOS bundle and both sidecars passed Developer ID
+  signature verification. Notarization needs the release team's Keychain
+  profile. [macOS release build](#macos-developer-id-release-build).
 - **Embedding providers.** Ollama and the OpenAI-compatible adapter have
   returned real embeddings. The latter used Ollama's compatibility endpoint.
   Vertex AI's next check is a real document and query prediction with the
@@ -1230,7 +1232,8 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   isolated application data directory, and the bundled CLI saw a collection
   created before the app restart. The build used local ad-hoc signing.
 - The macOS tray and native file picker were exercised in the earlier debug
-  builds. Distribution signing and notarization remain open.
+  builds. The [release signing check](#macos-developer-id-release-build) used a
+  later build.
 - The ARM64 Debian package built and installed on Ubuntu 24.04.5 with
   WebKitGTK 4.1. In an isolated X11 session with Openbox and the Xfce 4.18
   tray host, the installed app registered its tray menu and displayed
@@ -1286,6 +1289,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - An eight-byte edit changed one of 11 chunks. The live Ollama request
   contained one input, with the other ten chunks immediately able to
   reuse vectors from the same profile. [Method and results](CAPACITY.md#retrieval-relevance-and-embedding-reuse).
+
+## macOS Developer ID release build
+
+- On Apple Silicon, the production Tauri build emitted a 60.63 MiB app.
+  The app and both sidecars passed strict signature verification. The
+  desktop executable, server, and CLI each had an Arcane Arts Developer ID
+  Application signature and the hardened runtime flag.
+- The bundled server created a collection over MCP in an isolated storage
+  root. The bundled CLI read the collection over gRPC.
+- Apple's notary submission could not authenticate because the `Sanctum`
+  Keychain profile was absent. Gatekeeper returned `Unnotarized Developer ID`.
+  Submission, stapling, and final Gatekeeper acceptance remain open.
+  [Release commands](DESKTOP.md#macos-distribution-signing),
+  [PR #133](https://github.com/ArcaneArts/Sanctum/pull/133).
 
 ## Windows x64 installer build
 
