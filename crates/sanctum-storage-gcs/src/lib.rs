@@ -251,20 +251,14 @@ impl GcsStorage {
 
     async fn upload_part(&self, session: &Url, range: String, bytes: Bytes) -> Result<Response> {
         // A resumable upload URI grants access to that session. Keep it out of errors.
-        let response = self
-            .client
+        self.client
             .put(session.clone())
             .header(header::CONTENT_RANGE, range)
             .header(header::CONTENT_LENGTH, bytes.len())
             .body(bytes)
             .send()
             .await
-            .map_err(transfer_error)?;
-        match response.status() {
-            StatusCode::OK | StatusCode::CREATED | StatusCode::PERMANENT_REDIRECT => Ok(response),
-            StatusCode::REQUEST_TIMEOUT => Err(Error::Busy("GCS upload request timed out".into())),
-            status => Err(http_error(status)),
-        }
+            .map_err(transfer_error)
     }
 
     async fn put_resumable(&self, key: &Key, reader: Reader, length: u64) -> Result<Version> {
@@ -355,13 +349,26 @@ impl GcsStorage {
                 .await
             };
             let outcome = match response {
-                Ok(response) if response.status() == StatusCode::PERMANENT_REDIRECT => {
-                    upload_offset(response.headers()).map(UploadOutcome::Incomplete)
-                }
-                Ok(response) if sent_until == length => upload_version(response, key, length)
-                    .await
-                    .map(UploadOutcome::Complete),
-                Ok(_) => return Err(invalid_response("GCS completed a resumable upload early")),
+                Ok(response) => match response.status() {
+                    StatusCode::PERMANENT_REDIRECT => {
+                        upload_offset(response.headers()).map(UploadOutcome::Incomplete)
+                    }
+                    StatusCode::OK | StatusCode::CREATED if sent_until == length => {
+                        upload_version(response, key, length)
+                            .await
+                            .map(UploadOutcome::Complete)
+                    }
+                    StatusCode::OK | StatusCode::CREATED => {
+                        return Err(invalid_response("GCS completed a resumable upload early"));
+                    }
+                    StatusCode::NOT_FOUND | StatusCode::GONE => {
+                        // This session cannot accept more bytes or answer another probe.
+                        return Err(Error::Busy(
+                            "GCS resumable upload must restart with a new session".into(),
+                        ));
+                    }
+                    status => Err(http_error(status)),
+                },
                 Err(error) => Err(error),
             };
             match outcome {

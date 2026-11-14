@@ -2435,6 +2435,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   uploads and lost-response recovery still return the verified generation.
   [GCS storage adapter](STORAGE.md#google-cloud-storage-adapter).
 
+- A session returning HTTP 404 or 410 now yields a retryable error.
+  The loopback JSON API acknowledged the first part, then returned each
+  status on a subsequent part and on a status probe. Apart from bounded
+  cleanup, the adapter stopped using the session. The hosted request can
+  recover a committed upload by digest or retry with a fresh session.
+  The live GCS contract still needs an authorized bucket and ADC.
+  [GCS storage adapter](STORAGE.md#google-cloud-storage-adapter).
+
 ## Consistent reads during GCS manifest replacement
 
 - Full reads restart with fresh metadata when a concurrent write changes
