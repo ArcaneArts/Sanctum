@@ -13,8 +13,12 @@ can leave incomplete parts, so configure the bucket's incomplete multipart
 upload lifecycle rule. [S3 multipart uploads](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html).
 
 Canonical objects use identity encoding. Range reads check the response
-range and body length and cap requested bytes at 4 MiB. The higher-level
-retrieval path also verifies the chunk digest against its database record.
+range and body length and cap requested bytes at 4 MiB. After a body
+interruption, the S3 client can resume from the next byte. The adapter
+validates each response's interval, total length, encoding, ETag, and
+version ID when present before releasing resumed bytes. The stream also
+enforces the declared length. Higher-level retrieval verifies the chunk
+digest against its database record. [S3 GetObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html).
 Listing returns sizes and a continuation cursor. Usage sums actual stored
 object lengths and includes its measurement window.
 

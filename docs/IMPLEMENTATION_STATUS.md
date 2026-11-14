@@ -1776,3 +1776,17 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   recovered catalog generation were reused. Actual Cloud Run ingress
   and Scheduler delivery remain open.
   [Snapshot maintenance](STORAGE.md#scheduled-snapshot-reclamation).
+
+## S3 validation after an interrupted download
+
+- The S3 adapter validates every resumed response against the requested
+  range and the original length, ETag, and version ID when present. It
+  also checks identity encoding and the final byte count.
+- The loopback HTTP fixture interrupted full and bounded downloads after
+  delivering initial bytes. It verified exact continuation and rejection
+  of a full response, wrong range, changed total length, changed version
+  with the same ETag, and unsupported encoding.
+- The shared storage contract passed against live MinIO, directly and
+  through a proxy that closed a 17 MiB multipart object's download after
+  1,048,576 bytes. The next request started at that offset and the contract
+  verified all 17,825,799 bytes. [S3 storage behavior](STORAGE.md#storage-backends).

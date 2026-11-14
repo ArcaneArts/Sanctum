@@ -1,10 +1,9 @@
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use futures::TryStreamExt;
+use futures::{TryStreamExt, stream};
 use object_store::{
-    Attribute, ClientOptions, GetOptions, GetRange, ObjectMeta, ObjectStore, PutMode, PutResult,
-    UpdateVersion,
+    ClientOptions, ObjectMeta, ObjectStore, PutMode, PutResult, UpdateVersion,
     aws::{AmazonS3, AmazonS3Builder, S3ConditionalPut},
     list::{PaginatedListOptions, PaginatedListStore},
     path::Path,
@@ -16,6 +15,10 @@ use sanctum_storage::{
 };
 use tokio::io::AsyncReadExt;
 use tokio_util::io::StreamReader;
+
+mod download;
+#[cfg(test)]
+mod download_tests;
 
 const PART_BYTES: usize = 8 * 1024 * 1024;
 
@@ -37,6 +40,7 @@ impl S3Storage {
             .with_region(config.region)
             .with_virtual_hosted_style_request(config.virtual_hosted_style)
             .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .with_http_connector(download::CheckedConnector)
             .with_client_options(
                 ClientOptions::new()
                     .with_allow_http(config.allow_http)
@@ -57,10 +61,28 @@ impl Storage for S3Storage {
     }
 
     async fn get(&self, key: &Key) -> Result<Download> {
-        let response = self.0.get(&path(key)).await.map_err(storage_error)?;
-        require_identity(&response)?;
+        let response = self
+            .0
+            .get_opts(&path(key), download::read_options(None))
+            .await
+            .map_err(storage_error)?;
         let object = object(response.meta.clone())?;
-        let stream = response.into_stream().map_err(std::io::Error::other);
+        let stream = stream::try_unfold(
+            (response.into_stream(), object.length),
+            |(mut body, remaining)| async move {
+                match body.try_next().await.map_err(std::io::Error::other)? {
+                    Some(bytes) if bytes.len() as u64 <= remaining => {
+                        let remaining = remaining - bytes.len() as u64;
+                        Ok(Some((bytes, (body, remaining))))
+                    }
+                    None if remaining == 0 => Ok(None),
+                    _ => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "S3 download length differs from its metadata",
+                    )),
+                }
+            },
+        );
         Ok(Download {
             object,
             reader: Box::pin(StreamReader::new(stream)),
@@ -72,16 +94,9 @@ impl Storage for S3Storage {
         let requested = range.start..range.end;
         let response = self
             .0
-            .get_opts(
-                &path(key),
-                GetOptions {
-                    range: Some(GetRange::Bounded(requested.clone())),
-                    ..Default::default()
-                },
-            )
+            .get_opts(&path(key), download::read_options(Some(requested.clone())))
             .await
             .map_err(storage_error)?;
-        require_identity(&response)?;
         if response.range != requested {
             return Err(invalid_response("S3 returned a different byte range"));
         }
@@ -208,19 +223,6 @@ async fn require_eof(reader: &mut Reader) -> Result<()> {
     if reader.read(&mut byte).await? != 0 {
         return Err(Error::Invalid(
             "object body is longer than its declared length".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn require_identity(response: &object_store::GetResult) -> Result<()> {
-    if response
-        .attributes
-        .get(&Attribute::ContentEncoding)
-        .is_some_and(|encoding| !encoding.as_ref().eq_ignore_ascii_case("identity"))
-    {
-        return Err(invalid_response(
-            "S3 object has an unsupported content encoding",
         ));
     }
     Ok(())
