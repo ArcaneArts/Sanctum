@@ -2,7 +2,25 @@ use rusqlite::{OptionalExtension, Row, params};
 use sanctum_core::{Error, ExternalSource, Result};
 use uuid::Uuid;
 
-use super::{CollectionDb, Revision, database_error, query_all, row_revision_content, row_uuid};
+use super::{
+    CollectionDb, Revision, database_error, embedding::EmbeddingStatus, query_all,
+    row_revision_content, row_uuid, schema_version, unsigned_column,
+};
+
+pub struct SourceStatus {
+    pub revision: Revision,
+    pub embedding: EmbeddingStatus,
+    pub retained_revisions: u64,
+    pub pending_revision_cleanup: u64,
+    pub pending_object_cleanup: Option<u64>,
+}
+
+impl SourceStatus {
+    pub fn ready(&self) -> bool {
+        self.embedding.profile.is_none()
+            || self.embedding.coverage.embedded == self.embedding.coverage.total
+    }
+}
 
 const CURRENT: &str =
     "SELECT s.id, s.current_revision, s.name, s.external_namespace, s.external_id,
@@ -12,6 +30,52 @@ const CURRENT: &str =
     WHERE s.deleted = 0";
 
 impl CollectionDb {
+    pub fn source_status(
+        &self,
+        id: Uuid,
+        expected: Option<Uuid>,
+        profile: Option<&str>,
+    ) -> Result<SourceStatus> {
+        self.read_snapshot(|db| {
+            let revision = db.source(id, expected)?;
+            let source = id.to_string();
+            let embedding = db.read_embedding_status(profile, Some(&source))?;
+            let (retained_revisions, pending_revision_cleanup) =
+                db.0.query_row(
+                    "SELECT
+                    (SELECT count(*) FROM revisions WHERE source_id = ?1 AND id <> ?2),
+                    (SELECT count(*) FROM revision_garbage WHERE source_id = ?1)",
+                    params![source, revision.revision.to_string()],
+                    |row| Ok((unsigned_column(row, 0)?, unsigned_column(row, 1)?)),
+                )
+                .map_err(database_error)?;
+            let pending_object_cleanup = if schema_version(&db.0)? >= 12 {
+                db.0.query_row(
+                    "SELECT CASE WHEN EXISTS (
+                        SELECT 1 FROM hosted_object_garbage WHERE source_id IS NULL
+                     ) THEN NULL ELSE (
+                        SELECT count(*) FROM hosted_object_garbage WHERE source_id = ?1
+                     ) END",
+                    [&source],
+                    |row| match row.get_ref(0)? {
+                        rusqlite::types::ValueRef::Null => Ok(None),
+                        _ => unsigned_column(row, 0).map(Some),
+                    },
+                )
+                .map_err(database_error)?
+            } else {
+                None
+            };
+            Ok(SourceStatus {
+                revision,
+                embedding,
+                retained_revisions,
+                pending_revision_cleanup,
+                pending_object_cleanup,
+            })
+        })
+    }
+
     pub fn list_sources(&self, after: Option<Uuid>, limit: u32) -> Result<Vec<Revision>> {
         query_all(
             &self.0,

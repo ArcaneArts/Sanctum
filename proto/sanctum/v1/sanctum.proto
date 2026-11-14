@@ -467,6 +467,20 @@ message GetSourceRequest {
 message GetSourceResponse {
   TextRevision current_revision = 1;
   optional string database_generation = 2;
+  SourceProcessing processing = 3;
+}
+
+message SourceProcessing {
+  // True when lexical publication and all required embeddings are committed.
+  bool ready = 1;
+  EmbeddingStatus embedding = 2;
+  // Superseded revisions still present in the index database.
+  uint64 retained_revisions = 3;
+  // Local revisions whose database entries are gone and whose files await removal.
+  uint64 pending_revision_cleanup = 4;
+  // Object-backed source objects awaiting deletion after their locators were retired.
+  // Absent if the database has unassigned entries from an older schema.
+  optional uint64 pending_object_cleanup = 5;
 }
 
 message DeleteSourceRequest {

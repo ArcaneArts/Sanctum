@@ -1475,3 +1475,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   events and a final count of 12,002 files. Chromium exercised the
   desktop progress, error, and collection-switch states with simulated
   Tauri IPC. [Storage API](LOCAL_API.md#storage-usage).
+
+## Source readiness and pending cleanup
+
+- `GetSource` returns active-profile embedding coverage and errors,
+  readiness, and cleanup counts from the same snapshot as the current
+  revision. Hosted snapshots track the source ID of newly queued objects.
+  The per-source hosted count is omitted when legacy entries lack that ID.
+- `pnpm check` passed. The local gRPC regression covered failed
+  embeddings retaining the previous revision and cleanup after a profile
+  rebuild. The hosted regression covered an unfinished replacement,
+  readiness, reader grace, object deletion, and legacy cleanup entries.
+- A generated Python client on live MinIO and Ollama checked lexical
+  readiness before enrichment and then verified the changed source became
+  ready after its new vector was committed. The previous revision remained
+  held in both replacement states. The run removed all 16 fixture objects.
+  [Source inspection](LOCAL_API.md#source-inspection).

@@ -272,6 +272,17 @@ deleted sources are absent. Use `GetIngestionJob` for pending work and
 `GetEmbeddingStatus` for processing coverage. Hosted results also
 include the database generation used for the read.
 
+`GetSource.processing` reports readiness, embedding coverage and errors,
+and pending cleanup from the same snapshot as the current revision.
+`ready` means lexical publication succeeded and the active profile has
+every required embedding. A ready source can still have older data held
+for readers. `retained_revisions` counts superseded revisions still in
+SQLite. `pending_revision_cleanup` counts local revisions whose files
+remain queued for deletion. `pending_object_cleanup` counts hosted objects
+after their locators leave the index and before deletion is acknowledged.
+The last field is absent if an older snapshot or legacy garbage records
+prevent an exact per-source object count.
+
 ## Collection names
 
 `ListCollections` returns each collection's stable scope, display name,
