@@ -1402,6 +1402,22 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   and an unchanged creation time after restart.
 - Delivered in [PR #55](https://github.com/ArcaneArts/Sanctum/pull/55).
 
+## Re-import with updated chunk settings
+
+- Local file, watched-folder, URL, and Git imports compare current chunk
+  settings with the pending job or published revision before reusing it.
+  An unchanged input can publish a new representation under the same
+  source ID when settings change. The old revision keeps its ranges
+  through the ordinary replacement grace period.
+- The gRPC regression covers unchanged files and Git blobs across a
+  server restart. It verifies a single pending replacement per source,
+  metadata reset events, and exact UTF-8 search citation ranges.
+- A generated Python client fetched the same URL before and after restart
+  with new settings. The standalone server published 28 chunks and reached
+  full coverage with real Ollama embeddings. MCP semantic search returned
+  exact UTF-8 citations for the new revision under the original source ID.
+  [Chunk configuration](LOCAL_API.md#chunk-configuration).
+
 ## Configurable chunking
 
 - Server JSON controls the bounded streaming UTF-8 window and overlap.

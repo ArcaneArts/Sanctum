@@ -682,6 +682,149 @@ async fn local_upload_keeps_accepted_chunk_settings_across_restart() {
 }
 
 #[tokio::test]
+async fn reimport_applies_new_chunk_settings_to_unchanged_file_and_git_inputs() {
+    use v1::{ImportState, import_git_request::Repository};
+
+    let storage = TempDir::new().unwrap();
+    let repository = TempDir::new().unwrap();
+    let root = repository.path();
+    let file = root.join("notes.md");
+    let text = "quartz and café\n".repeat(38);
+    std::fs::write(&file, &text).unwrap();
+    git_fixture(root, &["init", "-b", "main"]);
+    git_fixture(root, &["add", "notes.md"]);
+    git_fixture(root, &["commit", "-m", "Keep this blob unchanged"]);
+
+    let fetch = async |client: &mut SanctumClient<Channel>| {
+        let mut local = client
+            .import_local(v1::ImportLocalRequest {
+                scope: scope("default"),
+                path: file.to_str().unwrap().into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let local_file = local.message().await.unwrap().unwrap();
+        assert!(local.message().await.unwrap().is_none());
+        let mut events = git_events(
+            client,
+            v1::ImportGitRequest {
+                scope: scope("default"),
+                repository: Some(Repository::LocalPath(root.to_str().unwrap().into())),
+                reference: "refs/heads/main".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(events.len(), 1);
+        [local_file, events.remove(0).file.unwrap()]
+    };
+
+    let mut first = Running::start(&storage).await;
+    create(&mut first.client, "default").await;
+    let originals = fetch(&mut first.client).await;
+    for original in &originals {
+        assert_eq!(original.state(), ImportState::Queued);
+        let job = await_ready(
+            &mut first.client,
+            job_request(original.operation_id.clone().unwrap()),
+        )
+        .await;
+        let revision = job.text_revision.unwrap();
+        assert_eq!(revision.chunks, 1);
+        assert_eq!(revision.chunker, "utf8-overlap-v1");
+    }
+    let before_reimport = first
+        .client
+        .get_change_cursor(v1::ChangeCursorRequest {
+            scope: scope("default"),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .cursor;
+    first.stop().await;
+
+    let settings = sanctum_core::ChunkSettings {
+        window_bytes: 256,
+        overlap_bytes: 0,
+        max_tokens: Some(32),
+    };
+    let service = Service::open(storage.path(), 32_768)
+        .unwrap()
+        .with_chunking(settings)
+        .unwrap();
+    let mut second = Running::with_service(service, false).await;
+    let replacements = fetch(&mut second.client).await;
+    let pending = fetch(&mut second.client).await;
+    for ((original, replacement), pending) in originals.iter().zip(&replacements).zip(pending) {
+        assert_eq!(replacement.state(), ImportState::Queued);
+        assert_eq!(replacement.source_id, original.source_id);
+        assert_ne!(replacement.revision_id, original.revision_id);
+        assert_eq!(pending.state(), ImportState::Pending);
+        assert_eq!(pending.operation_id, replacement.operation_id);
+    }
+    second.stop().await;
+
+    let restarted = Service::open(storage.path(), 32_768)
+        .unwrap()
+        .with_chunking(settings)
+        .unwrap();
+    let mut third = Running::with_service(restarted, true).await;
+    for replacement in &replacements {
+        let job = await_ready(
+            &mut third.client,
+            job_request(replacement.operation_id.clone().unwrap()),
+        )
+        .await;
+        let revision = job.text_revision.unwrap();
+        assert_eq!(revision.chunker, settings.identifier());
+        assert!(revision.chunks > 1);
+    }
+    for (unchanged, replacement) in fetch(&mut third.client).await.iter().zip(&replacements) {
+        assert_eq!(unchanged.state(), ImportState::Unchanged);
+        assert_eq!(unchanged.revision_id, replacement.revision_id);
+    }
+    let changes = third
+        .client
+        .list_changes(v1::ListChangesRequest {
+            scope: scope("default"),
+            after_cursor: before_reimport,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .changes;
+    assert_eq!(changes.len(), 4);
+    for (original, replacement) in originals.iter().zip(&replacements) {
+        let events: Vec<_> = changes
+            .iter()
+            .filter(|event| Some(event.revision_id.as_str()) == replacement.revision_id.as_deref())
+            .map(|event| {
+                assert_eq!(event.previous_revision_id, original.revision_id);
+                event.kind.as_str()
+            })
+            .collect();
+        assert_eq!(events, ["source_replaced", "metadata_reset"]);
+    }
+    let hits = search(&mut third.client, "default", "quartz").await;
+    assert!(!hits.is_empty());
+    for hit in hits {
+        let chunk = hit.chunk.as_ref().unwrap();
+        assert!(replacements.iter().any(|replacement| {
+            replacement.revision_id.as_deref() == Some(chunk.revision_id.as_str())
+        }));
+        assert_eq!(
+            &text.as_bytes()[hit.start_byte as usize..hit.end_byte as usize],
+            hit.excerpt.as_bytes()
+        );
+    }
+    third.stop().await;
+}
+
+#[tokio::test]
 async fn local_collection_creation_recovers_before_and_after_database_initialization() {
     let dir = TempDir::new().unwrap();
     let mut api = Running::start(&dir).await;
