@@ -26,6 +26,7 @@ const ENDPOINT: &str = "https://storage.googleapis.com/";
 const CLOUD_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 const PART_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_UPLOAD_RETRIES: u32 = 4;
+const MAX_DOWNLOAD_ATTEMPTS: u32 = 4;
 
 #[async_trait::async_trait]
 trait Credential: Send + Sync {
@@ -400,24 +401,26 @@ impl Storage for GcsStorage {
 
     async fn get(&self, key: &Key) -> Result<Download> {
         // The metadata response reliably carries the version even on media
-        // endpoints that omit x-goog-generation. Fence the data request to it.
-        let object = self.head(key).await?;
-        let response = self
-            .media(key, None, object.version.generation.as_deref())
-            .await?;
-        if response
-            .content_length()
-            .is_some_and(|length| length != object.length)
-        {
-            return Err(invalid_response(
-                "GCS download length differs from its metadata",
-            ));
+        // endpoints that omit x-goog-generation. During replacement, retry
+        // both requests before exposing any bytes to the caller.
+        for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
+            let object = self.head(key).await?;
+            match self
+                .media(key, None, object.version.generation.as_deref())
+                .await
+            {
+                Ok(response) => return download(object, response),
+                Err(Error::Conflict(_) | Error::NotFound(_)) => {
+                    if attempt < MAX_DOWNLOAD_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(10 << (attempt - 1))).await;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
-        let reader = StreamReader::new(response.bytes_stream().map_err(std::io::Error::other));
-        Ok(Download {
-            object,
-            reader: Box::pin(reader),
-        })
+        Err(Error::Busy(
+            "GCS object changed repeatedly during download".into(),
+        ))
     }
 
     async fn read_range(&self, key: &Key, range: ByteRange) -> Result<Bytes> {
@@ -532,6 +535,22 @@ impl Storage for GcsStorage {
             check(response.status())
         }
     }
+}
+
+fn download(object: Object, response: Response) -> Result<Download> {
+    if response
+        .content_length()
+        .is_some_and(|length| length != object.length)
+    {
+        return Err(invalid_response(
+            "GCS download length differs from its metadata",
+        ));
+    }
+    let reader = StreamReader::new(response.bytes_stream().map_err(std::io::Error::other));
+    Ok(Download {
+        object,
+        reader: Box::pin(reader),
+    })
 }
 
 #[derive(Deserialize)]

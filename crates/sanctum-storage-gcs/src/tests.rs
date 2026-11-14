@@ -25,6 +25,7 @@ impl Credential for TestCredential {
 struct Fixture {
     writes: Mutex<Vec<String>>,
     parts: Mutex<Vec<String>>,
+    reads: Mutex<Vec<String>>,
 }
 
 async fn start() -> (GcsStorage, Arc<Fixture>, tokio::task::JoinHandle<()>) {
@@ -121,11 +122,19 @@ async fn list(
 }
 
 async fn object(
+    State(fixture): State<Arc<Fixture>>,
     Path(key): Path<String>,
     Query(query): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
 ) -> axum::response::Response {
     assert_credentials(&headers);
+    if key.ends_with("/replaced") || key.ends_with("/removed") || key.ends_with("/changing") {
+        return changing_object(
+            &fixture,
+            &key,
+            query.get("ifGenerationMatch").map(String::as_str),
+        );
+    }
     if !query.contains_key("alt") {
         return Json(metadata(&key, 6, 11)).into_response();
     }
@@ -164,10 +173,39 @@ async fn object(
         };
     }
     assert_eq!(query["ifGenerationMatch"], "11");
-    if key.ends_with("/changed") {
-        return StatusCode::PRECONDITION_FAILED.into_response();
-    }
     "abcdef".into_response()
+}
+
+fn changing_object(
+    fixture: &Fixture,
+    key: &str,
+    condition: Option<&str>,
+) -> axum::response::Response {
+    let mut reads = fixture.reads.lock().unwrap();
+    let attempt = reads.len() / 2;
+    let generation = 11 + attempt as u64;
+    let body = "new manifest";
+    match condition {
+        None => {
+            reads.push("metadata".into());
+            if key.ends_with("/removed") && attempt > 0 {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            let length = if attempt == 0 { 6 } else { body.len() as u64 };
+            Json(metadata(key, length, generation)).into_response()
+        }
+        Some(condition) => {
+            reads.push(condition.into());
+            assert_eq!(condition, generation.to_string());
+            if key.ends_with("/removed") {
+                StatusCode::NOT_FOUND.into_response()
+            } else if attempt == 0 || key.ends_with("/changing") {
+                StatusCode::PRECONDITION_FAILED.into_response()
+            } else {
+                body.into_response()
+            }
+        }
+    }
 }
 
 fn metadata(name: &str, size: u64, generation: u64) -> serde_json::Value {
@@ -226,13 +264,6 @@ async fn native_downloads_are_generation_fenced_and_ranges_are_exact() {
     let mut result = Vec::new();
     download.reader.read_to_end(&mut result).await.unwrap();
     assert_eq!(result, b"abcdef");
-    assert!(matches!(
-        storage
-            .get(&Key::parse("default/notes/changed").unwrap())
-            .await,
-        Err(Error::Conflict(_))
-    ));
-
     let range = ByteRange { start: 1, end: 5 };
     assert_eq!(storage.read_range(&key, range).await.unwrap(), "bcde");
     for name in ["full", "encoding", "truncated", "wrong"] {
@@ -249,6 +280,49 @@ async fn native_downloads_are_generation_fenced_and_ranges_are_exact() {
             .unwrap()
             .next_cursor
             .is_none()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn download_retries_a_generation_replaced_between_metadata_and_media() {
+    let (storage, fixture, server) = start().await;
+    let key = Key::parse("default/notes/replaced").unwrap();
+    let mut download = storage.get(&key).await.unwrap();
+    assert_eq!(download.object.version.generation.as_deref(), Some("12"));
+    assert_eq!(download.object.length, 12);
+    let mut body = String::new();
+    download.reader.read_to_string(&mut body).await.unwrap();
+    assert_eq!(body, "new manifest");
+    assert_eq!(
+        *fixture.reads.lock().unwrap(),
+        ["metadata", "11", "metadata", "12"]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn download_rechecks_metadata_after_the_object_disappears() {
+    let (storage, fixture, server) = start().await;
+    let key = Key::parse("default/notes/removed").unwrap();
+    assert!(matches!(storage.get(&key).await, Err(Error::NotFound(_))));
+    assert_eq!(
+        *fixture.reads.lock().unwrap(),
+        ["metadata", "11", "metadata"]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn download_returns_retryable_error_when_every_generation_is_replaced() {
+    let (storage, fixture, server) = start().await;
+    let key = Key::parse("default/notes/changing").unwrap();
+    assert!(matches!(storage.get(&key).await, Err(Error::Busy(_))));
+    assert_eq!(
+        *fixture.reads.lock().unwrap(),
+        [
+            "metadata", "11", "metadata", "12", "metadata", "13", "metadata", "14"
+        ],
     );
     server.abort();
 }
