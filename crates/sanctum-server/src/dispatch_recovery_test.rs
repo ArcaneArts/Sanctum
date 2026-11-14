@@ -456,18 +456,24 @@ async fn verify_retirement(
     })
     .await
     .unwrap();
-    let first_hint = scoped_key(
-        prefix,
-        &format!("_dispatch/00/pending/default/retired/{operation}"),
-    );
-    let second_hint = scoped_key(
-        prefix,
-        &format!("_dispatch/00/pending/default/retired/{second}"),
-    );
-    let live_hint = scoped_key(
-        prefix,
-        &format!("_dispatch/00/pending/default/repair/{operation}"),
-    );
+    let hint = |collection, operation| {
+        let storage = storage.clone();
+        async move {
+            let envelope = scoped_key(
+                prefix,
+                &format!("default/collections/{collection}/operations/{operation}/operation.json"),
+            );
+            let (record, _) = read_control(storage.as_ref(), &envelope).await;
+            let attempt = record["attempt"].as_str().unwrap();
+            scoped_key(
+                prefix,
+                &format!("_dispatch/00/pending/default/{collection}/{operation}.{attempt}"),
+            )
+        }
+    };
+    let first_hint = hint("retired", operation).await;
+    let second_hint = hint("retired", second).await;
+    let live_hint = hint("repair", operation).await;
     let active_uncommitted = scoped_key(
         prefix,
         &format!("_dispatch/00/pending/default/repair/{}", Uuid::from_u128(3)),
@@ -478,6 +484,15 @@ async fn verify_retirement(
             Bytes::from_static(b"{}"),
             Condition::Create,
         )
+        .await
+        .unwrap();
+    let abandoned_attempt = Uuid::from_u128(5);
+    let losing_hint = scoped_key(
+        prefix,
+        &format!("_dispatch/00/pending/default/repair/{operation}.{abandoned_attempt}"),
+    );
+    storage
+        .put_control(&losing_hint, Bytes::from_static(b"{}"), Condition::Create)
         .await
         .unwrap();
     let head = scoped_key(prefix, "default/collections/retired/HEAD.json");
@@ -504,12 +519,20 @@ async fn verify_retirement(
         storage.head(&second_hint).await,
         Err(Error::NotFound(_))
     ));
+    assert!(matches!(
+        storage.head(&losing_hint).await,
+        Err(Error::NotFound(_))
+    ));
     storage.head(&operation_key).await.unwrap();
     storage.head(&live_hint).await.unwrap();
 
-    // Simulate a hint left by an older server or an interrupted cleanup.
+    // Simulate an operation-only hint left by an older server.
+    let legacy_hint = scoped_key(
+        prefix,
+        &format!("_dispatch/00/pending/default/retired/{second}"),
+    );
     storage
-        .put_control(&second_hint, Bytes::from_static(b"{}"), Condition::Create)
+        .put_control(&legacy_hint, Bytes::from_static(b"{}"), Condition::Create)
         .await
         .unwrap();
     let (mut manifest, version) = read_control(storage.as_ref(), &head).await;
@@ -539,7 +562,7 @@ async fn verify_retirement(
         storage.head(&operation_key).await,
         Err(Error::NotFound(_))
     ));
-    storage.head(&second_hint).await.unwrap();
+    storage.head(&legacy_hint).await.unwrap();
 
     queue.enabled.store(true, Ordering::SeqCst);
     let (resumed, _resumed_server) = serve_http(crate::hosted_worker::router(make_catalog())).await;
@@ -556,7 +579,7 @@ async fn verify_retirement(
         json!({"dispatched": 1, "failed": 0, "more": false}),
     );
     assert!(matches!(
-        storage.head(&second_hint).await,
+        storage.head(&legacy_hint).await,
         Err(Error::NotFound(_))
     ));
     assert!(matches!(

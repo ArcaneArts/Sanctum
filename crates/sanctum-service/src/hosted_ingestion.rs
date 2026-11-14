@@ -14,7 +14,9 @@ use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
-use crate::{HostedCatalog, RevisionContent, TaskStage, TextUpload, telemetry};
+use crate::{
+    HostedCatalog, RevisionContent, TaskStage, TextUpload, hosted_dispatch::UploadHint, telemetry,
+};
 
 mod activity;
 mod cancellation;
@@ -360,7 +362,8 @@ impl HostedCatalog {
             .ok_or_else(|| Error::Conflict("operation retry counter exhausted".into()))?;
         record.dispatched_at = None;
         // Write the hint first so a stop after the checkpoint cannot strand the request.
-        self.record_dispatch_hint(scope, operation).await?;
+        self.record_dispatch_hint(scope, operation, record.attempt)
+            .await?;
         let key = envelope_key(&prefix)?;
         let body = serde_json::to_vec(&record).map_err(|error| Error::Internal(Box::new(error)))?;
         match self
@@ -384,15 +387,26 @@ impl HostedCatalog {
         }
     }
 
-    pub(crate) async fn dispatch_pending(&self, scope: &Scope, operation: Uuid) -> Result<bool> {
+    pub(super) async fn dispatch_pending(
+        &self,
+        scope: &Scope,
+        operation: Uuid,
+        hint: Option<UploadHint>,
+    ) -> Result<bool> {
         let Some(dispatcher) = self.dispatcher.as_ref() else {
             return Ok(false);
         };
         if self.clear_retired_dispatch(scope, operation, false).await? {
+            if let Some(hint) = hint {
+                self.delete_hint(&hint.object.key).await?;
+            }
             return Ok(false);
         }
         let prefix = self.operation_prefix(scope, operation)?;
-        let Some((mut record, version)) = self.read_operation(&prefix, operation).await? else {
+        let Some((mut record, version)) = self
+            .read_dispatched_upload(&prefix, operation, hint)
+            .await?
+        else {
             return Ok(false);
         };
         let Some((stage, not_before)) = self.pending_upload_task(scope, operation, &record).await?
@@ -455,16 +469,21 @@ impl HostedCatalog {
         }
     }
 
-    pub(crate) async fn work_standalone_upload(
+    pub(super) async fn work_standalone_upload(
         &self,
         scope: &Scope,
         operation: Uuid,
+        hint: UploadHint,
     ) -> Result<bool> {
         if self.clear_retired_dispatch(scope, operation, false).await? {
+            self.delete_hint(&hint.object.key).await?;
             return Ok(false);
         }
         let prefix = self.operation_prefix(scope, operation)?;
-        let Some((record, _)) = self.read_operation(&prefix, operation).await? else {
+        let Some((record, _)) = self
+            .read_dispatched_upload(&prefix, operation, Some(hint))
+            .await?
+        else {
             return Ok(false);
         };
         let Some((stage, not_before)) = self.pending_upload_task(scope, operation, &record).await?
@@ -499,8 +518,7 @@ impl HostedCatalog {
         record: &Operation,
     ) -> Result<Option<(TaskStage, Option<u64>)>> {
         if record.is_pending() && unix_seconds()? >= record.expires_at() {
-            self.settle_expired_upload(scope, operation, &record.stage)
-                .await?;
+            self.settle_expired_upload(scope, record).await?;
             return Ok(None);
         }
         let task = match record.stage {
@@ -523,7 +541,8 @@ impl HostedCatalog {
             }
             | Stage::Canceled { .. }
             | Stage::Failed { .. } => {
-                self.clear_dispatch_hint(scope, operation).await?;
+                self.clear_dispatch_hint(scope, operation, record.attempt)
+                    .await?;
                 return Ok(None);
             }
         };
@@ -591,6 +610,46 @@ impl HostedCatalog {
             Some((Envelope::Accepted(record), version)) => Some((*record, version)),
             _ => None,
         })
+    }
+
+    async fn read_dispatched_upload(
+        &self,
+        prefix: &Key,
+        operation: Uuid,
+        hint: Option<UploadHint>,
+    ) -> Result<Option<(Operation, Version)>> {
+        let envelope = self.read_envelope(prefix, operation).await?;
+        match envelope {
+            Some((Envelope::Accepted(record), version)) => {
+                if let Some(hint) = hint
+                    && hint
+                        .attempt
+                        .is_some_and(|attempt| attempt != record.attempt)
+                {
+                    self.delete_hint(&hint.object.key).await?;
+                    return Ok(None);
+                }
+                Ok(Some((*record, version)))
+            }
+            Some((Envelope::Expired(_), _)) => {
+                if let Some(hint) = hint {
+                    self.delete_hint(&hint.object.key).await?;
+                }
+                Ok(None)
+            }
+            unaccepted => {
+                if let Some(hint) = hint
+                    && hint.attempt.is_some()
+                    && orphan_cleanup::admission_grace_elapsed(&hint.object)
+                    && self
+                        .fence_unaccepted_upload(prefix, operation, unaccepted)
+                        .await?
+                {
+                    self.delete_hint(&hint.object.key).await?;
+                }
+                Ok(None)
+            }
+        }
     }
 
     async fn read_envelope(
@@ -676,6 +735,7 @@ impl HostedUpload {
         };
         let condition = match self.service.read_envelope(&prefix, self.operation).await? {
             Some((Envelope::Accepted(saved), _)) => {
+                let attempt = saved.attempt;
                 let job = saved.replay(&candidate)?;
                 if (self.service.dispatcher.is_some() || self.service.standalone_wake.is_some())
                     && matches!(
@@ -684,7 +744,7 @@ impl HostedUpload {
                     )
                 {
                     self.service
-                        .record_dispatch_hint(&self.scope, self.operation)
+                        .record_dispatch_hint(&self.scope, self.operation, attempt)
                         .await?;
                     self.service.try_dispatch(&self.scope, self.operation).await;
                 }
@@ -726,7 +786,7 @@ impl HostedUpload {
             return Err(error);
         }
         self.service
-            .record_dispatch_hint(&self.scope, self.operation)
+            .record_dispatch_hint(&self.scope, self.operation, candidate.attempt)
             .await?;
         let job = match store.put_control(&key, body.into(), condition).await {
             Ok(_) => Ok(candidate.job()),
@@ -738,10 +798,17 @@ impl HostedUpload {
                     .ok_or_else(|| {
                         Error::Busy("ingestion envelope changed during acceptance".into())
                     })?;
-                if saved.attempt != candidate.attempt
-                    && let Err(error) = store.delete(&input).await
-                {
-                    tracing::warn!(%error, operation = %self.operation, "could not delete losing upload attempt");
+                if saved.attempt != candidate.attempt {
+                    if let Err(error) = store.delete(&input).await {
+                        tracing::warn!(%error, operation = %self.operation, "could not delete losing upload attempt");
+                    }
+                    if let Err(error) = self
+                        .service
+                        .clear_upload_attempt_hint(&self.scope, self.operation, candidate.attempt)
+                        .await
+                    {
+                        tracing::warn!(%error, operation = %self.operation, "could not remove losing upload hint");
+                    }
                 }
                 saved.replay(&candidate)
             }

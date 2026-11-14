@@ -1,13 +1,13 @@
 use std::time::{Duration, SystemTime};
 
 use sanctum_core::{Error, Result, Scope, is_rtf};
-use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES, Object};
+use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES, Object, Version};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use super::{
-    AcceptanceFence, Envelope, ExpiredOperation, HostedCatalog, HostedJobState,
+    AcceptanceFence, Envelope, ExpiredOperation, HostedCatalog, HostedJobState, Operation,
     REGISTRATION_WINDOW, Stage, envelope_key, unix_seconds,
 };
 
@@ -165,8 +165,7 @@ impl HostedCatalog {
         }
         if record.is_pending() {
             if unix_seconds()? >= record.expires_at() {
-                self.settle_expired_upload(scope, operation, &record.stage)
-                    .await?;
+                self.settle_expired_upload(scope, &record).await?;
             }
             return Ok(false);
         }
@@ -189,7 +188,8 @@ impl HostedCatalog {
             }
             _ => return Ok(false),
         };
-        self.clear_dispatch_hint(scope, operation).await?;
+        self.clear_dispatch_hint(scope, operation, record.attempt)
+            .await?;
         let compact = ExpiredOperation {
             operation,
             expired_at: unix_seconds()?,
@@ -211,10 +211,10 @@ impl HostedCatalog {
     pub(super) async fn settle_expired_upload(
         &self,
         scope: &Scope,
-        operation: Uuid,
-        stage: &Stage,
+        record: &Operation,
     ) -> Result<()> {
-        let job = match stage {
+        let operation = record.operation;
+        let job = match &record.stage {
             Stage::PendingRegistration => {
                 let registered = self.register_upload(scope, operation).await?;
                 if matches!(registered.state, HostedJobState::Registered) {
@@ -229,13 +229,15 @@ impl HostedCatalog {
                 ..
             } => {
                 self.embed_upload(scope, operation, step.step).await?;
-                self.clear_dispatch_hint(scope, operation).await?;
+                self.clear_dispatch_hint(scope, operation, record.attempt)
+                    .await?;
                 return Ok(());
             }
             _ => return Ok(()),
         };
         if job.embedding_work.is_none() {
-            self.clear_dispatch_hint(scope, operation).await?;
+            self.clear_dispatch_hint(scope, operation, record.attempt)
+                .await?;
         }
         Ok(())
     }
@@ -259,25 +261,8 @@ impl HostedCatalog {
                         record.retained_attempt != Some(attempt)
                     }
                     existing => {
-                        let condition = existing
-                            .map_or(Condition::Create, |(_, version)| Condition::Match(version));
-                        // Compete with admission on the same key. If acceptance wins,
-                        // its reference must be checked afresh on a later pass.
-                        let fence = AcceptanceFence {
-                            operation,
-                            fence_id: Uuid::new_v4(),
-                        };
-                        let bytes = serde_json::to_vec(&fence)
-                            .map_err(|error| Error::Internal(Box::new(error)))?;
-                        match self
-                            .storage
-                            .put_control(&envelope_key(&prefix)?, bytes.into(), condition)
-                            .await
-                        {
-                            Ok(_) => true,
-                            Err(Error::Conflict(_)) => false,
-                            Err(error) => return Err(error),
-                        }
+                        self.fence_unaccepted_upload(&prefix, operation, existing)
+                            .await?
                     }
                 }
             }
@@ -300,6 +285,40 @@ impl HostedCatalog {
         }
         Ok(abandoned)
     }
+
+    pub(super) async fn fence_unaccepted_upload(
+        &self,
+        prefix: &Key,
+        operation: Uuid,
+        existing: Option<(Envelope, Version)>,
+    ) -> Result<bool> {
+        let condition = match existing {
+            None => Condition::Create,
+            Some((Envelope::Fence(_), version)) => Condition::Match(version),
+            _ => return Ok(false),
+        };
+        // Fence admission on the same key before removing an unaccepted input or hint.
+        let fence = AcceptanceFence {
+            operation,
+            fence_id: Uuid::new_v4(),
+        };
+        let bytes = serde_json::to_vec(&fence).map_err(|error| Error::Internal(Box::new(error)))?;
+        match self
+            .storage
+            .put_control(&envelope_key(prefix)?, bytes.into(), condition)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(Error::Conflict(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+pub(super) fn admission_grace_elapsed(object: &Object) -> bool {
+    SystemTime::now()
+        .duration_since(object.modified_at)
+        .is_ok_and(|age| age >= READER_GRACE)
 }
 
 fn old_enough(object: &Object, candidate: &Candidate, now: SystemTime) -> bool {

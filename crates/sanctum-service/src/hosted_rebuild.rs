@@ -175,7 +175,7 @@ impl HostedCatalog {
             not_before: None,
             dispatched_window: None,
         };
-        self.record_hint(scope, operation, true).await?;
+        self.record_rebuild_hint(scope, operation).await?;
         match self.write_rebuild_record(&key, &record, condition).await {
             Ok(_) => Ok(()),
             Err(Error::Conflict(_)) => {
@@ -204,11 +204,11 @@ impl HostedCatalog {
             return Ok(false);
         };
         let Some((key, mut record, version)) = self.current_rebuild(scope, operation).await? else {
-            self.clear_hint(scope, operation, true).await?;
+            self.clear_rebuild_hint(scope, operation).await?;
             return Ok(false);
         };
         let Some(step) = record.step else {
-            self.clear_hint(scope, operation, true).await?;
+            self.clear_rebuild_hint(scope, operation).await?;
             return Ok(false);
         };
         let now = unix_seconds()?;
@@ -252,11 +252,11 @@ impl HostedCatalog {
             return Ok(false);
         }
         let Some((_, record, _)) = self.current_rebuild(scope, operation).await? else {
-            self.clear_hint(scope, operation, true).await?;
+            self.clear_rebuild_hint(scope, operation).await?;
             return Ok(false);
         };
         let Some(step) = record.step else {
-            self.clear_hint(scope, operation, true).await?;
+            self.clear_rebuild_hint(scope, operation).await?;
             return Ok(false);
         };
         if let Some(not_before) = record.not_before

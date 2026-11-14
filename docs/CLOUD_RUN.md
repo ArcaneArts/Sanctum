@@ -218,6 +218,8 @@ same token with an HTTPS MCP client. Set the same embedding configuration
 on both roles to enable background embedding of new revisions. When
 updating Sanctum from a build that predates profile-bound tasks, update
 the worker before the API so the worker accepts the new payload field.
+When upgrading to attempt-scoped upload hints, bring the repair worker
+onto the new build before deploying API revisions that write those hints.
 [Cloud Run HTTP/2](https://docs.cloud.google.com/run/docs/configuring/http2),
 [MCP client setup](MCP.md#hosted-connection).
 The [storage guide](STORAGE.md) documents the worker stages, retry behavior,
