@@ -2066,6 +2066,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   It then delivered preparation and indexing and verified exact UTF-8
   retrieval through gRPC. This run used a loopback Cloud Tasks fixture.
 
+- Canceling the task future or losing its writer lease now signals blocking
+  SQLite snapshot work. Indexing checks between chunks, SQLite checks during
+  long statements, and snapshot copying, backup, hashing, and page-delta
+  processing stop at their next checkpoint. The blocking jobs own their
+  temporary files until they stop.
+- Filesystem and live MinIO regressions canceled preparation after a
+  transaction had written data, both by dropping the request future and by
+  withholding a lease renewal response. They verified that SQLite interrupted
+  a long statement, the manifest and command receipt stayed unchanged, and
+  a retry committed the operation once.
+- Hosted text and RTF preparation happens before SQLite publication. Its
+  blocking extraction pass still needs to observe the worker deadline.
+
 ## Concurrent reads on two 2 GiB FTS snapshots
 
 - The release server published 78 sources of 200 MiB to MinIO and

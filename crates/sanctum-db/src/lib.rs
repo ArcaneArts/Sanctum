@@ -11,11 +11,13 @@ use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES, Storage, Version};
 use serde::{Deserialize, Serialize};
 use tempfile::{NamedTempFile, TempDir};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 mod cache;
 mod generation;
 mod page_delta;
+mod snapshot_work;
 pub use cache::SnapshotCache;
 pub use generation::Generation;
 use generation::{DeltaChain, DeltaFile};
@@ -467,7 +469,7 @@ impl Publication {
             chain.validate(&generation)?;
             let base = &chain.base;
             downloaded_bytes = base.bytes;
-            let database = self
+            let mut database = self
                 .download_checked(
                     &unit.snapshot(base.id)?,
                     base.bytes,
@@ -485,25 +487,28 @@ impl Publication {
                     )
                     .await?;
                 downloaded_bytes = downloaded_bytes.saturating_add(delta.bytes);
-                let mut writer = database.reopen()?;
                 let bytes = delta.result_bytes;
-                tokio::task::spawn_blocking(move || {
-                    page_delta::apply(&mut writer, patch.reopen()?, bytes)
+                database = snapshot_work::run(move |cancellation| {
+                    page_delta::apply(
+                        &mut database.reopen()?,
+                        patch.reopen()?,
+                        bytes,
+                        cancellation,
+                    )?;
+                    Ok(database)
                 })
-                .await
-                .map_err(|error| Error::Internal(Box::new(error)))??;
+                .await?;
             }
-            let mut contents = database.reopen()?;
             let expected = generation.blake3.clone();
-            let actual = tokio::task::spawn_blocking(move || hash_file(&mut contents))
-                .await
-                .map_err(|error| Error::Internal(Box::new(error)))??;
-            if actual != expected {
-                return Err(corrupt(
-                    "reconstructed SQLite backup does not match its manifest",
-                ));
-            }
-            database
+            snapshot_work::run(move |cancellation| {
+                if snapshot_work::hash(&mut database.reopen()?, cancellation)? != expected {
+                    return Err(corrupt(
+                        "reconstructed SQLite backup does not match its manifest",
+                    ));
+                }
+                Ok(database)
+            })
+            .await?
         } else {
             self.download_checked(
                 &unit.snapshot(generation.id)?,
@@ -627,11 +632,27 @@ impl Lease {
         &mut self,
         stage: &'static str,
         commands: Vec<Command<T>>,
-        apply: F,
+        mut apply: F,
     ) -> Result<(Generation, Vec<Receipt>)>
     where
         T: Send + 'static,
         F: FnMut(&Transaction<'_>, T) -> Result<String> + Send + 'static,
+    {
+        self.apply_cancellable_stage(stage, commands, move |tx, payload, _| apply(tx, payload))
+            .await
+    }
+
+    /// Long-running commands should call the supplied checkpoint between units of work.
+    /// SQLite statements also observe cancellation through their connection's progress handler.
+    pub async fn apply_cancellable_stage<T, F>(
+        &mut self,
+        stage: &'static str,
+        commands: Vec<Command<T>>,
+        apply: F,
+    ) -> Result<(Generation, Vec<Receipt>)>
+    where
+        T: Send + 'static,
+        F: FnMut(&Transaction<'_>, T, &dyn Fn() -> Result<()>) -> Result<String> + Send + 'static,
     {
         self.ensure_live()?;
         if commands.is_empty() || commands.len() > MAX_BATCH {
@@ -670,19 +691,18 @@ impl Lease {
                     .page_deltas
                     .then(|| source.as_ref()?.generation.chain_bytes())
                     .flatten();
-                tokio::task::spawn_blocking(move || {
+                snapshot_work::run(move |cancellation| {
                     apply_snapshot(
                         directory,
                         source,
-                        shared || delta_bytes.is_some(),
+                        shared,
                         delta_bytes,
-                        stage,
-                        commands,
+                        Batch { stage, commands },
                         apply,
+                        cancellation,
                     )
                 })
                 .await
-                .map_err(|error| Error::Internal(Box::new(error)))?
             })
             .await?;
         let (staged, generation, receipts, delta) = match prepared {
@@ -962,28 +982,38 @@ fn read_receipt(connection: &Connection, id: &str) -> Result<Option<String>> {
         .map_err(sql_error)
 }
 
+struct Batch<T> {
+    stage: &'static str,
+    commands: Vec<Command<T>>,
+}
+
 fn apply_snapshot<T>(
     directory: TempDir,
     source: Option<Arc<Materialized>>,
     shared: bool,
     delta_bytes: Option<u64>,
-    stage: &str,
-    commands: Vec<Command<T>>,
-    mut apply: impl FnMut(&Transaction<'_>, T) -> Result<String>,
+    batch: Batch<T>,
+    mut apply: impl FnMut(&Transaction<'_>, T, &dyn Fn() -> Result<()>) -> Result<String>,
+    cancellation: &CancellationToken,
 ) -> Result<Prepared> {
     use rusqlite::params;
+    let checkpoint = || snapshot_work::check(cancellation);
     let working = directory.path().join("working.sqlite");
     let path = match source.as_deref() {
-        Some(source) if shared => {
+        Some(source) if shared || delta_bytes.is_some() => {
             // A cached file may still serve readers. Copy the closed, published
             // snapshot before opening it for a write transaction.
-            std::fs::copy(source.path(), &working)?;
+            snapshot_work::copy(source.path(), &working, cancellation)?;
             working.as_path()
         }
         Some(source) => source.path(),
         None => working.as_path(),
     };
+    checkpoint()?;
     let mut db = Connection::open(path).map_err(sql_error)?;
+    let progress = cancellation.clone();
+    db.progress_handler(1_000, Some(move || progress.is_cancelled()))
+        .map_err(sql_error)?;
     db.pragma_update(None, "foreign_keys", true)
         .map_err(sql_error)?;
     let tx = db
@@ -995,16 +1025,18 @@ fn apply_snapshot<T>(
     );",
     )
     .map_err(sql_error)?;
-    let mut receipts = Vec::with_capacity(commands.len());
+    let mut receipts = Vec::with_capacity(batch.commands.len());
     let mut changed = false;
     let now = (unix_ms()? / 1000) as i64;
-    for command in commands {
-        let id = receipt_id(command.operation, stage);
+    for command in batch.commands {
+        checkpoint()?;
+        let id = receipt_id(command.operation, batch.stage);
         let previous = read_receipt(&tx, &id)?;
         let outcome = match previous {
             Some(outcome) => outcome,
             None => {
-                let outcome = apply(&tx, command.payload)?;
+                let outcome = apply(&tx, command.payload, &checkpoint)?;
+                checkpoint()?;
                 changed = true;
                 if outcome.len() > 64 * 1024 {
                     return Err(Error::Invalid(
@@ -1024,6 +1056,7 @@ fn apply_snapshot<T>(
             outcome,
         });
     }
+    checkpoint()?;
     if !changed && let Some(source) = &source {
         return Ok(Prepared::Unchanged {
             generation: source.generation.clone(),
@@ -1038,19 +1071,19 @@ fn apply_snapshot<T>(
     tx.commit().map_err(sql_error)?;
     drop(db);
     let snapshot = NamedTempFile::new()?;
-    sanctum_db_sqlite::snapshot::backup(path, snapshot.path(), || false)?;
+    sanctum_db_sqlite::snapshot::backup(path, snapshot.path(), || cancellation.is_cancelled())?;
     let mut reader = snapshot.reopen()?;
     let bytes = reader.metadata()?.len();
     let mut generation = Generation {
         id: Uuid::new_v4(),
         bytes,
-        blake3: hash_file(&mut reader)?,
+        blake3: snapshot_work::hash(&mut reader, cancellation)?,
         chain: None,
     };
     let delta = match (delta_bytes, source) {
         (Some(chain_bytes), Some(before)) if bytes >= before.generation.bytes => {
             let limit = (bytes / 2).saturating_sub(chain_bytes);
-            prepare_delta(&before, &snapshot, limit, &mut generation)?
+            prepare_delta(&before, &snapshot, limit, &mut generation, cancellation)?
         }
         _ => None,
     };
@@ -1067,8 +1100,9 @@ fn prepare_delta(
     after: &NamedTempFile,
     limit: u64,
     generation: &mut Generation,
+    cancellation: &CancellationToken,
 ) -> Result<Option<NamedTempFile>> {
-    let Some(patch) = page_delta::encode(before.path(), after.path(), limit)? else {
+    let Some(patch) = page_delta::encode(before.path(), after.path(), limit, cancellation)? else {
         return Ok(None);
     };
     let mut file = patch.reopen()?;
@@ -1083,17 +1117,11 @@ fn prepare_delta(
     chain.deltas.push(DeltaFile {
         id: generation.id,
         bytes: file.metadata()?.len(),
-        blake3: hash_file(&mut file)?,
+        blake3: snapshot_work::hash(&mut file, cancellation)?,
         result_bytes: generation.bytes,
     });
     generation.chain = Some(chain);
     Ok(Some(patch))
-}
-
-fn hash_file(file: &mut std::fs::File) -> Result<String> {
-    let mut digest = blake3::Hasher::new();
-    digest.update_reader(file)?;
-    Ok(digest.finalize().to_hex().to_string())
 }
 
 fn encode(head: &Head) -> Result<bytes::Bytes> {
@@ -1133,7 +1161,8 @@ mod tests {
             Generation {
                 id: Uuid::new_v4(),
                 bytes: file.path().metadata().unwrap().len(),
-                blake3: hash_file(&mut file.reopen().unwrap()).unwrap(),
+                blake3: snapshot_work::hash(&mut file.reopen().unwrap(), &CancellationToken::new())
+                    .unwrap(),
                 chain: None,
             },
             file,
