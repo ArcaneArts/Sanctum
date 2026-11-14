@@ -331,6 +331,7 @@ Merged in [PR #18](https://github.com/ArcaneArts/Sanctum/pull/18).
 - gRPC verifies report-only behavior and explicit pruning for changed
   path types. It also verifies that pruning supersedes an already queued
   replacement and that native watch notifications apply the same rules.
+  The six import tests also passed in a Linux ARM64 container.
 - A generated Python gRPC client imported a file on the standalone macOS
   server and then replaced its path with a symlink. MCP returned the original
   excerpt after a report-only scan and stopped returning it after explicit
