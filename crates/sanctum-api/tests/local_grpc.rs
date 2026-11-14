@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use prost::Message;
 use sanctum_embedding::{EmbedError, Provider, Purpose};
 use sanctum_proto::v1::{self, sanctum_client::SanctumClient, upload_text_frame::Frame};
 use sanctum_service::{
@@ -2223,6 +2224,11 @@ async fn unfinished_oversized_and_invalid_uploads_leave_no_searchable_chunks() {
         .await
         .unwrap_err();
     assert_eq!(failure.code(), Code::InvalidArgument);
+    let detail = rpc_error_detail(&failure);
+    assert_eq!(detail.reason, "invalid_argument");
+    assert_eq!(detail.field.as_deref(), Some("frame"));
+    assert!(!detail.retryable);
+    assert!(detail.operation_id.is_none());
 
     let failure = running
         .client
@@ -2234,6 +2240,9 @@ async fn unfinished_oversized_and_invalid_uploads_leave_no_searchable_chunks() {
         .await
         .unwrap_err();
     assert_eq!(failure.code(), Code::ResourceExhausted);
+    let detail = rpc_error_detail(&failure);
+    assert_eq!(detail.reason, "source_too_large");
+    assert_eq!(detail.field.as_deref(), Some("data"));
 
     let mut bytes = b"unpublished ".repeat(600);
     bytes.push(0xff);
@@ -2243,6 +2252,24 @@ async fn unfinished_oversized_and_invalid_uploads_leave_no_searchable_chunks() {
         .await
         .unwrap_err();
     assert_eq!(failure.code(), Code::InvalidArgument);
+    let detail = rpc_error_detail(&failure);
+    assert_eq!(detail.reason, "invalid_source");
+    assert!(!detail.retryable);
+    let operation_id = detail.operation_id.unwrap();
+    let failed_job = running
+        .client
+        .get_ingestion_job(v1::IngestionJobRequest {
+            scope: Some(v1::Scope {
+                tenant: "default".into(),
+                collection: "notes".into(),
+            }),
+            operation_id: operation_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(failed_job.operation_id, operation_id);
+    assert_eq!(failed_job.state(), v1::IngestionState::Failed);
 
     assert!(
         search(&mut running.client, "default", "unfinished")
@@ -2273,6 +2300,15 @@ async fn unfinished_oversized_and_invalid_uploads_leave_no_searchable_chunks() {
         1
     );
     running.stop().await;
+}
+
+fn rpc_error_detail(status: &tonic::Status) -> v1::RpcError {
+    let envelope = tonic_types::Status::decode(status.details()).unwrap();
+    assert_eq!(envelope.code, status.code() as i32);
+    assert_eq!(envelope.message, status.message());
+    let detail = &envelope.details[0];
+    assert_eq!(detail.type_url, "type.googleapis.com/sanctum.v1.RpcError");
+    v1::RpcError::decode(detail.value.as_slice()).unwrap()
 }
 
 #[tokio::test]

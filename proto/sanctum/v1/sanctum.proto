@@ -49,6 +49,18 @@ service Sanctum {
 
 message Empty {}
 
+// Included in the google.rpc.Status details of application gRPC errors.
+message RpcError {
+  // Stable machine-readable reason, such as "invalid_argument" or "stale_revision".
+  string reason = 1;
+  // Whether a temporary failure or pending operation can be retried or polled.
+  bool retryable = 2;
+  // UUID of the relevant ingestion operation, if known.
+  optional string operation_id = 3;
+  // Protobuf field path for request validation failures, if known.
+  optional string field = 4;
+}
+
 // Effective settings exposed by the running process. Credentials and connection
 // details are excluded. Health describes the API process.
 message RuntimeInfo {
