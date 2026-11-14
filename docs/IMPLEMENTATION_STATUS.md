@@ -1660,3 +1660,22 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   resumed after a page timeout, recorded the per-hint failure, moved to
   the next page, and recovered the timed-out hint on the next pass.
   [Scheduler setup](CLOUD_RUN.md#schedule-dispatch-repair).
+
+## Batching hosted embedding publications
+
+- Up to 16 distinct chunk inputs share one fenced SQLite publication.
+  Requests still follow the provider's batch limit. The worker can publish
+  completed requests if preparation reaches its 120-second budget, and
+  leaves unprocessed inputs for the next step.
+- The hosted regression used three single-input provider calls and
+  verified one new snapshot. After a failed operation checkpoint, a
+  fresh worker reused the committed receipt with no provider calls
+  or additional snapshot. A separate regression stalled the second
+  provider request and verified that preparation returned the first result.
+- A generated Python client against live MinIO and Ollama verified
+  coverage for 18 inputs, grouped into 16 and two in separate worker
+  requests. Those requests published one SQLite snapshot each, of
+  258,048 and 270,336 bytes. An empty follow-up published nothing.
+  Semantic search and gRPC fetch returned the exact UTF-8 excerpt.
+  Live Vertex verification remains open.
+  [Embedding batches](STORAGE.md#hosted-embedding-batches).

@@ -3164,6 +3164,41 @@ async fn hosted_job_status_reports_a_persisted_embedding_delay() {
 
 #[tokio::test]
 async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishing() {
+    struct SingleInputProvider {
+        calls: AtomicUsize,
+        fail: AtomicU8,
+    }
+
+    #[async_trait::async_trait]
+    impl sanctum_embedding::Provider for SingleInputProvider {
+        fn profile_id(&self) -> &str {
+            "fixture-v1"
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+
+        fn max_batch_size(&self) -> u32 {
+            1
+        }
+
+        async fn embed(
+            &self,
+            _: sanctum_embedding::Purpose,
+            texts: &[String],
+        ) -> Result<Vec<Vec<f32>>, sanctum_embedding::EmbedError> {
+            assert_eq!(texts.len(), 1);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(
+                self.fail.load(Ordering::Relaxed),
+                0,
+                "receipt must prevent another request"
+            );
+            Ok(vec![vec![1.0, 0.0]])
+        }
+    }
+
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance {
         inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
@@ -3173,10 +3208,9 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
         fail: AtomicU8::new(0),
         delivered: std::sync::Mutex::new(Vec::new()),
     });
-    let provider = Arc::new(HostedEmbeddingFixture {
-        profile: "fixture-v1",
+    let provider = Arc::new(SingleInputProvider {
+        calls: AtomicUsize::new(0),
         fail: AtomicU8::new(0),
-        queries: AtomicUsize::new(0),
     });
     let service = HostedCatalog::new(storage.clone(), None, 1024)
         .unwrap()
@@ -3198,13 +3232,23 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
         request_id: Some(operation.to_string()),
         ..Default::default()
     };
-    server
-        .client
-        .submit_text(upload_frames(&header, [b"embed me".as_slice()]))
-        .await
-        .unwrap();
-    service.register_upload(&scope, operation).await.unwrap();
-    service.index_upload(&scope, operation).await.unwrap();
+    for (id, body) in [
+        (operation, b"embed me".as_slice()),
+        (uuid::Uuid::from_u128(102), b"another source".as_slice()),
+        (uuid::Uuid::from_u128(103), b"third source".as_slice()),
+    ] {
+        let header = v1::UploadTextHeader {
+            request_id: Some(id.to_string()),
+            ..header.clone()
+        };
+        server
+            .client
+            .submit_text(upload_frames(&header, [body]))
+            .await
+            .unwrap();
+        service.register_upload(&scope, id).await.unwrap();
+        service.index_upload(&scope, id).await.unwrap();
+    }
     let request = v1::IngestionJobRequest {
         scope: header.scope.clone(),
         operation_id: operation.to_string(),
@@ -3237,6 +3281,16 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
         Err(Error::Busy(_))
     ));
 
+    let snapshots = Key::parse("default/collections/notes/snapshots").unwrap();
+    let count_snapshots = || async {
+        storage
+            .list(Some(&snapshots), None, 100)
+            .await
+            .unwrap()
+            .objects
+            .len()
+    };
+    let before = count_snapshots().await;
     storage.interrupt.store(1, Ordering::Relaxed);
     assert!(matches!(
         service.embed_upload(&scope, operation, 0).await,
@@ -3249,8 +3303,10 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
             .unwrap()
             .coverage
             .embedded,
-        1
+        3
     );
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
+    assert_eq!(count_snapshots().await, before + 1);
     let executor =
         sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(15)).unwrap();
     let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
@@ -3261,7 +3317,7 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
     let restarted = HostedCatalog::new(storage.clone(), None, 1024)
         .unwrap()
         .with_dispatch(dispatch.clone())
-        .with_embedding(Some(provider));
+        .with_embedding(Some(provider.clone()));
     restarted.embed_upload(&scope, operation, 0).await.unwrap();
     let mut server = start(restarted.clone()).await;
     let resumed = server
@@ -3272,9 +3328,16 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
         .into_inner();
     assert_eq!(resumed.embedding_work.unwrap().next_batch, 1);
     assert_eq!(executor.generation(&unit).await.unwrap(), snapshot);
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
+    assert_eq!(count_snapshots().await, before + 1);
     restarted.reconcile_shard(0).await.unwrap();
     assert_eq!(
-        dispatch.delivered.lock().unwrap().last(),
+        dispatch
+            .delivered
+            .lock()
+            .unwrap()
+            .iter()
+            .rfind(|(id, _, _)| *id == operation),
         Some(&(
             operation,
             TaskStage::Embed { step: 1 },
