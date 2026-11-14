@@ -1374,3 +1374,17 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   handle reuses. A metadata write published a new generation and the next
   reader opened its own handle. The filesystem MCP HTTP and stdio smoke
   also passed. [Snapshot cache behavior](STORAGE.md#hosted-snapshot-reuse).
+
+## Shared range reads for hosted search excerpts
+
+- Hosted search reads touching excerpts from one immutable source in one
+  bounded range, then verifies and returns each excerpt in ranked order.
+  The read trace records individual requested bytes, transferred bytes,
+  and the number of excerpts served by the transfer.
+- `pnpm check` passed. A hosted gRPC regression test blocked a second range
+  read, compared every hit with its standalone fetch, and confirmed a
+  corrupted merged response fails fingerprint verification.
+- On live MinIO, a generated Python gRPC client retrieved six overlapping
+  UTF-8 chunks in one 3,240-byte range request. Six individual fetches
+  returned identical excerpts and would total 5,795 bytes. The test
+  removed its fixture prefix. [Range behavior](STORAGE.md#hosted-lexical-publication).

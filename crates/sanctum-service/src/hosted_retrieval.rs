@@ -14,7 +14,7 @@ use crate::embedding::{
 };
 use crate::{
     Chunk, ChunkEmbeddingState, ChunkRef, Hit, HostedCatalog, SearchMode, db,
-    hit_metadata::metadata_for_hit, metadata_filter::Filter, telemetry, verified_excerpt,
+    hit_metadata::metadata_for_hit, hosted_ranges::RankedHit, metadata_filter::Filter, telemetry,
 };
 
 impl HostedCatalog {
@@ -114,13 +114,27 @@ impl HostedCatalog {
         self.schedule_rebuild_on_access(&scope, profile.as_deref(), coverage)
             .await;
         let (chunks, actual_mode, degraded) = ranked?;
-        let mut hits = Vec::with_capacity(chunks.len());
-        for (located, score, fields, state) in chunks {
-            let mut hit = self.read_hit(&scope, located, state, generation).await?;
-            hit.score = score;
-            hit.metadata = fields;
-            hits.push(hit);
-        }
+        let ranked = chunks
+            .into_iter()
+            .map(|((chunk, key), score, metadata, state)| {
+                (
+                    key,
+                    RankedHit {
+                        scope: scope.clone(),
+                        chunk,
+                        generation,
+                        score,
+                        metadata,
+                        state,
+                    },
+                )
+            });
+        let hits: Vec<_> = self
+            .read_ranked_hits(ranked.collect())
+            .await?
+            .into_iter()
+            .map(|(_, hit)| hit)
+            .collect();
         telemetry::search(
             &scope.tenant,
             Some(&scope.collection),
@@ -203,15 +217,22 @@ impl HostedCatalog {
             });
         }
         let (mode, degraded) = prepared.strategy(requested, coverage)?;
-        let mut hits = Vec::with_capacity(limit as usize);
-        for (scope, chunk, (key, generation, fields, state), score) in merge(all, limit) {
-            let mut hit = self
-                .read_hit(&scope, (chunk, key), state, generation)
-                .await?;
-            hit.score = Some(score);
-            hit.metadata = fields;
-            hits.push((scope, hit));
-        }
+        let ranked = merge(all, limit).map(
+            |(scope, chunk, (key, generation, metadata, state), score)| {
+                (
+                    key,
+                    RankedHit {
+                        scope,
+                        chunk,
+                        generation,
+                        score: Some(score),
+                        metadata,
+                        state,
+                    },
+                )
+            },
+        );
+        let hits = self.read_ranked_hits(ranked.collect()).await?;
         telemetry::search(
             &tenant,
             None,
@@ -344,27 +365,6 @@ impl HostedCatalog {
         let mut hit = Hit::new(chunk, excerpt, state);
         hit.database_generation = Some(generation);
         Ok(hit)
-    }
-
-    pub(crate) async fn read_excerpt(
-        &self,
-        scope: &Scope,
-        chunk: &Chunk,
-        key: String,
-    ) -> Result<String> {
-        let key = self.checked_text_key(scope, key)?;
-        let start = Instant::now();
-        let bytes = self.storage.read_range(&key, chunk.range).await?;
-        let excerpt = verified_excerpt(chunk, &bytes)?;
-        tracing::trace!(
-            event = "source_range_read",
-            tenant = %scope.tenant,
-            collection = %scope.collection,
-            bytes = bytes.len(),
-            duration_ms = start.elapsed().as_secs_f64() * 1_000.0,
-            "read and verified a source range"
-        );
-        Ok(excerpt)
     }
 
     pub(crate) fn checked_text_key(&self, scope: &Scope, key: String) -> Result<Key> {

@@ -2030,6 +2030,98 @@ async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf()
 }
 
 #[tokio::test]
+async fn hosted_lexical_search_coalesces_overlapping_excerpts_in_rank_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        interrupt: AtomicU8::new(0),
+    });
+    let catalog = HostedCatalog::new(storage.clone(), None, 1024 * 1024)
+        .unwrap()
+        .with_chunking(sanctum_core::ChunkSettings {
+            window_bytes: 1024,
+            overlap_bytes: 512,
+        })
+        .unwrap();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let wire = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    catalog.create_collection(&scope, None).await.unwrap();
+    let mut server = start(catalog.clone()).await;
+    let header = v1::UploadTextHeader {
+        scope: Some(wire.clone()),
+        name: "overlap.txt".into(),
+        ..Default::default()
+    };
+    let text = "unique 🦀 café\n".repeat(180);
+    let job = server
+        .client
+        .submit_text(upload_frames(&header, text.as_bytes().chunks(97)))
+        .await
+        .unwrap()
+        .into_inner();
+    let operation = job.operation_id.parse().unwrap();
+    catalog.register_upload(&scope, operation).await.unwrap();
+    catalog.index_upload(&scope, operation).await.unwrap();
+    let search = || v1::SearchTextRequest {
+        scope: Some(wire.clone()),
+        query: "unique".into(),
+        limit: Some(20),
+        mode: v1::SearchMode::Lexical.into(),
+        ..Default::default()
+    };
+    storage
+        .interrupt
+        .store(REJECT_SECOND_RANGE, Ordering::Relaxed);
+    let result = server
+        .client
+        .search_text(search())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(storage.interrupt.load(Ordering::Relaxed), FIRST_RANGE_READ);
+    assert!(result.hits.len() > 2);
+    assert!(
+        result
+            .hits
+            .windows(2)
+            .any(|pair| pair[0].end_byte > pair[1].start_byte)
+    );
+    storage.interrupt.store(0, Ordering::Relaxed);
+    for hit in &result.hits {
+        assert_eq!(
+            hit.excerpt,
+            text[hit.start_byte as usize..hit.end_byte as usize]
+        );
+        let fetched = server
+            .client
+            .fetch_chunk(v1::FetchChunkRequest {
+                chunk: hit.chunk.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(hit, &fetched);
+    }
+    storage.interrupt.store(CORRUPT_RANGE, Ordering::Relaxed);
+    assert_eq!(
+        server
+            .client
+            .search_text(search())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Internal
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_indexing_publishes_searchable_text_and_fences_old_replacements() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance {
@@ -4752,6 +4844,9 @@ const BLOCK_SCAN_RANGE: u8 = 5;
 const SCAN_RANGE_BLOCKED: u8 = 6;
 const SCAN_RANGE_DROPPED: u8 = 7;
 const REJECT_ORIGINAL_READ: u8 = 8;
+const REJECT_SECOND_RANGE: u8 = 9;
+const FIRST_RANGE_READ: u8 = 10;
+const CORRUPT_RANGE: u8 = 11;
 
 struct InterruptedRead<'a>(&'a AtomicU8);
 
@@ -4786,6 +4881,16 @@ impl Storage for InterruptAcceptance {
             let _dropped = InterruptedRead(&self.interrupt);
             self.interrupt.store(SCAN_RANGE_BLOCKED, Ordering::Relaxed);
             std::future::pending::<()>().await;
+        }
+        match self.interrupt.load(Ordering::Relaxed) {
+            REJECT_SECOND_RANGE => self.interrupt.store(FIRST_RANGE_READ, Ordering::Relaxed),
+            FIRST_RANGE_READ => return Err(Error::Busy("test blocked an extra range read".into())),
+            CORRUPT_RANGE => {
+                let mut data = self.inner.read_range(key, range).await?.to_vec();
+                data[0] ^= 1;
+                return Ok(data.into());
+            }
+            _ => {}
         }
         self.inner.read_range(key, range).await
     }
