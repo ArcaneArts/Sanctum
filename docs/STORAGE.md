@@ -454,6 +454,11 @@ the active profile. Text-only RTF ingestion discards the original after
 committing its canonical revision.
 [Cloud Run schedule](CLOUD_RUN.md#schedule-dispatch-repair).
 
+The source sweep saves the unprocessed collection manifests along with
+the storage continuation token. Its `more` field covers both forms of
+remaining work. The next invocation drains the saved manifests before
+requesting another storage page.
+
 ### Scheduled snapshot reclamation
 
 The worker's snapshot sweep scans catalog and collection manifests and

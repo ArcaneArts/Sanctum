@@ -701,6 +701,21 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   objects, observed the retry delay after restart, and cleared the
   deferred object when its retry became due.
   [Hosted reclamation](STORAGE.md#hosted-source-deletion-and-reclamation).
+- Delivered in [PR #125](https://github.com/ArcaneArts/Sanctum/pull/125).
+
+### Hosted source sweep checkpoints
+
+- Source sweeps persist unprocessed collection manifests alongside the
+  storage continuation token. Each invocation attempts at most eight
+  collections and reserves time to write the checkpoint before returning
+  to Scheduler. Existing token-only checkpoints still load.
+- The filesystem fixture verified that an exhausted work budget preserves
+  the discovered manifest. A separate test lost the response to a saved
+  checkpoint, blocked rediscovery, and completed the two remaining
+  manifests in a fresh service.
+- With live MinIO, the worker endpoint attempted eight collections, then
+  a fresh worker advanced seven saved manifests before fetching the next
+  page. The pass visited all 20 collections. [Sweep budgets](CLOUD_RUN.md#schedule-dispatch-repair).
 
 ## Scheduled hosted snapshot reclamation
 
