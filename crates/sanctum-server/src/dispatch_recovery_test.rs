@@ -287,16 +287,39 @@ async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
             .json(&delivery)
             .send()
     };
-    let response = deliver(worker).await.unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let publication =
+        sanctum_db::Publication::new(storage.clone(), Duration::from_secs(60)).unwrap();
+    let unit = sanctum_db::Unit::collection(Some(&prefix), &internal_scope).unwrap();
+    let competing_writer = publication.acquire(&unit).await.unwrap();
+    let response = deliver(worker.clone()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(fault.lose_control_reply.lock().unwrap().is_none());
     assert_eq!(provider.documents.load(Ordering::Relaxed), 1);
-    let committed = collection_generation(storage.as_ref(), Some(&prefix)).await;
-    assert_ne!(before, committed);
     let batch_prefix = scoped_key(
         Some(&prefix),
         "default/collections/repair/prepared-embeddings",
     );
+    let batches = storage.list(Some(&batch_prefix), None, 10).await.unwrap();
+    assert_eq!(batches.objects.len(), 1);
+    let key = &batches.objects[0].key;
+    let (_, version) = read_control(storage.as_ref(), key).await;
+    storage
+        .put_control(
+            key,
+            b"truncated checkpoint".as_slice().into(),
+            Condition::Match(version),
+        )
+        .await
+        .unwrap();
+    competing_writer.release().await.unwrap();
+
+    assert_eq!(
+        deliver(worker).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(provider.documents.load(Ordering::Relaxed), 2);
+    let committed = collection_generation(storage.as_ref(), Some(&prefix)).await;
+    assert_ne!(before, committed);
     assert!(
         storage
             .list(Some(&batch_prefix), None, 10)
@@ -316,7 +339,7 @@ async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
         deliver(worker).await.unwrap().status(),
         StatusCode::NO_CONTENT
     );
-    assert_eq!(provider.documents.load(Ordering::Relaxed), 1);
+    assert_eq!(provider.documents.load(Ordering::Relaxed), 2);
     assert_eq!(
         collection_generation(storage.as_ref(), Some(&prefix)).await,
         committed
@@ -352,7 +375,7 @@ async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
         .excerpt,
         TEXT,
     );
-    assert_eq!(provider.documents.load(Ordering::Relaxed), 1);
+    assert_eq!(provider.documents.load(Ordering::Relaxed), 2);
 
     let rebuild_path = "_embedding/default/repair.json";
     let rebuild_key = scoped_key(Some(&prefix), rebuild_path);

@@ -2691,6 +2691,7 @@ dependencies = [
  "sanctum-api",
  "sanctum-config",
  "sanctum-core",
+ "sanctum-db",
  "sanctum-embedding",
  "sanctum-embedding-google",
  "sanctum-embedding-ollama",

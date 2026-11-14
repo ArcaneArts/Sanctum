@@ -4602,6 +4602,29 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
     assert_eq!(count_snapshots().await, before);
     let pending = storage.list(Some(&prepared), None, 10).await.unwrap();
     assert_eq!(pending.objects.len(), 1);
+    let saved = &pending.objects[0];
+    let valid = storage.get(&saved.key).await.unwrap();
+    let malformed = storage
+        .put_control(
+            &saved.key,
+            b"{".as_slice().into(),
+            Condition::Match(valid.object.version),
+        )
+        .await
+        .unwrap();
+    storage
+        .interrupt
+        .store(LOSE_PREPARED_EMBEDDING_RESPONSE, Ordering::Relaxed);
+    assert!(matches!(
+        service.embed_upload(&scope, operation, 0).await,
+        Err(Error::Busy(message)) if message.contains("owned by another writer")
+    ));
+    assert_eq!(storage.interrupt.load(Ordering::Relaxed), 0);
+    let repaired = storage.head(&saved.key).await.unwrap();
+    assert_ne!(repaired.version, malformed);
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 6);
+    assert_eq!(count_snapshots().await, before);
+
     competing_writer.release().await.unwrap();
     server.stop().await;
     drop(service);
@@ -4628,7 +4651,7 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
             .embedded,
         3
     );
-    assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 6);
     assert_eq!(count_snapshots().await, before + 1);
     assert!(matches!(
         storage.head(&pending.objects[0].key).await,
@@ -4647,7 +4670,7 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
         .into_inner();
     assert_eq!(resumed.embedding_work.unwrap().next_batch, 1);
     assert_eq!(executor.generation(&unit).await.unwrap(), snapshot);
-    assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 6);
     assert_eq!(count_snapshots().await, before + 1);
     restarted.reconcile_shard(0).await.unwrap();
     assert_eq!(
