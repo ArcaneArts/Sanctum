@@ -2,7 +2,7 @@ use rusqlite::{Transaction, params};
 use sanctum_core::{Error, ExternalSource, Result};
 use uuid::Uuid;
 
-use crate::{database_error, initialize_collection, lifecycle::find_source};
+use crate::{RevisionContent, database_error, initialize_collection, lifecycle::find_source};
 
 pub enum Target {
     Create(Uuid),
@@ -177,6 +177,14 @@ pub fn release_canceled_intent(
     Ok(())
 }
 
+pub fn published_revision(
+    tx: &Transaction<'_>,
+    source: Uuid,
+    revision: Uuid,
+) -> Result<Option<RevisionContent>> {
+    crate::revision_summary(tx, source, revision)
+}
+
 pub fn publish_revision<'tx>(
     tx: &'tx Transaction<'_>,
     revision: &crate::Revision,
@@ -285,12 +293,17 @@ impl crate::CollectionDb {
         ).map_err(database_error)
     }
 
-    pub fn has_hosted_text_object(&self, source: Uuid, revision: Uuid, key: &str) -> Result<bool> {
+    pub fn has_hosted_revision_object(
+        &self,
+        source: Uuid,
+        revision: Uuid,
+        key: &str,
+    ) -> Result<bool> {
         let referenced = self
             .0
             .query_row(
                 "SELECT EXISTS (SELECT 1 FROM hosted_revision_objects
-              WHERE source_id = ?1 AND revision_id = ?2 AND text_key = ?3)",
+              WHERE source_id = ?1 AND revision_id = ?2 AND (text_key = ?3 OR original_key = ?3))",
                 params![source.to_string(), revision.to_string(), key],
                 |row| row.get(0),
             )

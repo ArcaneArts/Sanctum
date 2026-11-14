@@ -539,5 +539,16 @@ The upload sweep compacts terminal envelopes after 45 days without an
 envelope update. A compact record reserves the old request UUID and
 keeps the input locator if that input serves published UTF-8 text or
 a retained original. Status and worker calls treat the old operation
-as absent. A new submission must use a new UUID. Pending registration,
-indexing, or embedding work remains available for recovery.
+as absent. A new submission must use a new UUID.
+
+Dispatch repair and the standalone worker settle pending uploads once
+their 30-day processing window ends. The upload sweep also handles pending
+envelopes left untouched for 30 days. They reuse registration and indexing
+receipts, or check the exact revision in the fenced collection database if
+the indexing receipt has aged out. Unpublished work becomes `FAILED` with
+code `expired`, releases any reserved external ID, and drops unreferenced
+input. Committed text remains searchable, including after an interrupted
+envelope checkpoint. An expired embedding step stops scheduling work for
+that upload, including a step awaiting provider backoff. Existing vectors
+and canonical source data remain available. Once the operation settles,
+the usual 45-day terminal retention applies.

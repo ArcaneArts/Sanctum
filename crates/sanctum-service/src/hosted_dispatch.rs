@@ -168,7 +168,7 @@ impl HostedCatalog {
         }
     }
 
-    /// Replays dispatch hints without opening any tenant or collection database.
+    /// Replays dispatch hints. Expired uploads may need to settle a committed database stage.
     async fn reconcile_dispatch(
         &self,
         shard: u8,

@@ -5084,6 +5084,283 @@ async fn hosted_upload_retention_rejects_old_work_and_preserves_published_bytes(
 }
 
 #[tokio::test]
+async fn hosted_expiration_settles_pending_stages_and_preserves_committed_text() {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        interrupt: AtomicU8::new(0),
+    });
+    let dispatch = Arc::new(TestDispatch {
+        fail: AtomicU8::new(0),
+        delivered: std::sync::Mutex::new(Vec::new()),
+    });
+    let catalog = || {
+        HostedCatalog::new(storage.clone(), None, 1024)
+            .unwrap()
+            .with_dispatch(dispatch.clone())
+            .with_embedding(Some(Arc::new(HostedEmbeddingFixture {
+                profile: "expiration-fixture",
+                fail: AtomicU8::new(0),
+                queries: AtomicUsize::new(0),
+            })))
+    };
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let base = "default/collections/notes";
+    let first = catalog();
+    first.create_collection(&scope, None).await.unwrap();
+
+    let submit = |service: HostedCatalog, name: &'static str, request_id| {
+        let scope = scope.clone();
+        async move {
+            let upload = sanctum_service::TextUpload {
+                name: format!("{name}.txt"),
+                external: Some(sanctum_core::ExternalSource {
+                    namespace: "expiration".into(),
+                    id: name.into(),
+                }),
+                replacement: None,
+                retain_original: false,
+                initial_metadata: Vec::new(),
+                initial_chunk_metadata: Vec::new(),
+            };
+            let staged = service
+                .stage_upload(scope, upload, request_id)
+                .await
+                .unwrap();
+            std::io::Write::write_all(
+                &mut staged.reopen().unwrap(),
+                format!("Café quartz {name}").as_bytes(),
+            )
+            .unwrap();
+            staged.enqueue().await
+        }
+    };
+    let redispatch = submit(first.clone(), "redispatch", None).await.unwrap();
+    let abandoned = submit(first.clone(), "abandoned", None).await.unwrap();
+    first
+        .register_upload(&scope, abandoned.operation)
+        .await
+        .unwrap();
+    let published = submit(first.clone(), "published", None).await.unwrap();
+    first
+        .register_upload(&scope, published.operation)
+        .await
+        .unwrap();
+    storage.interrupt.store(1, Ordering::Relaxed);
+    assert!(matches!(
+        first.index_upload(&scope, published.operation).await,
+        Err(Error::Busy(_))
+    ));
+    let embedding = submit(first.clone(), "embedding", None).await.unwrap();
+    first
+        .register_upload(&scope, embedding.operation)
+        .await
+        .unwrap();
+    first
+        .index_upload(&scope, embedding.operation)
+        .await
+        .unwrap();
+    let recent = submit(first.clone(), "recent", None).await.unwrap();
+    drop(first);
+
+    let executor = sanctum_db::Publication::new(storage.clone(), Duration::from_secs(30)).unwrap();
+    let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
+    let mut writer = executor.acquire(&unit).await.unwrap();
+    let missing_receipt = format!("{}:index", published.operation);
+    writer
+        .apply(
+            vec![sanctum_db::Command {
+                operation: uuid::Uuid::new_v4(),
+                payload: missing_receipt,
+            }],
+            |tx, receipt| {
+                assert_eq!(
+                    tx.execute("DELETE FROM applied_commands WHERE id = ?1", [receipt])
+                        .unwrap(),
+                    1
+                );
+                Ok("simulated receipt retention".into())
+            },
+        )
+        .await
+        .unwrap();
+    writer.release().await.unwrap();
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let age = |key: &Key, days| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.path().join(key.as_str()))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(days * 86_400))
+            .unwrap();
+    };
+    let envelope = |id| Key::parse(format!("{base}/operations/{id}/operation.json")).unwrap();
+    let inputs = |id| Key::parse(format!("{base}/operations/{id}/inputs")).unwrap();
+    let hints = Key::parse("_dispatch").unwrap();
+    for id in [
+        redispatch.operation,
+        abandoned.operation,
+        published.operation,
+        embedding.operation,
+    ] {
+        let key = envelope(id);
+        let mut download = storage.get(&key).await.unwrap();
+        let mut body = Vec::new();
+        download.reader.read_to_end(&mut body).await.unwrap();
+        let mut record: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        record["created_at"] = serde_json::json!(now - 31 * 86_400);
+        if id == embedding.operation {
+            record["embedding"]["not_before"] = serde_json::json!(now + 600);
+        }
+        storage
+            .put_control(
+                &key,
+                serde_json::to_vec(&record).unwrap().into(),
+                Condition::Match(download.object.version),
+            )
+            .await
+            .unwrap();
+        if id != redispatch.operation {
+            age(&key, 31_u64);
+        }
+    }
+    dispatch.delivered.lock().unwrap().clear();
+
+    let restarted = catalog();
+    let report = restarted
+        .reconcile_shard(redispatch.operation.as_bytes()[0] % 16)
+        .await
+        .unwrap();
+    assert_eq!(report.failed, 0);
+    assert!(
+        !dispatch
+            .delivered
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, _, _)| *id == redispatch.operation)
+    );
+
+    let report = restarted.sweep_abandoned_uploads().await.unwrap();
+    assert_eq!(report.failed, 0);
+    assert_eq!(report.expired, 0);
+    for job in [&redispatch, &abandoned] {
+        let status = restarted
+            .ingestion_job(&scope, job.operation)
+            .await
+            .unwrap();
+        assert!(
+            matches!(status.state, sanctum_service::HostedJobState::Failed { code, .. } if code == "expired")
+        );
+        assert!(
+            storage
+                .list(Some(&inputs(job.operation)), None, 10)
+                .await
+                .unwrap()
+                .objects
+                .is_empty()
+        );
+    }
+    for job in [&published, &embedding] {
+        let status = restarted
+            .ingestion_job(&scope, job.operation)
+            .await
+            .unwrap();
+        assert!(matches!(
+            status.state,
+            sanctum_service::HostedJobState::TextReady
+        ));
+        assert!(status.embedding_work.is_none());
+        let hit = restarted
+            .fetch(
+                &scope,
+                sanctum_service::ChunkRef {
+                    source: job.source.unwrap(),
+                    revision: job.revision,
+                    ordinal: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(hit.excerpt.starts_with("Café quartz "));
+    }
+    assert!(matches!(
+        restarted
+            .ingestion_job(&scope, recent.operation)
+            .await
+            .unwrap()
+            .state,
+        sanctum_service::HostedJobState::Accepted
+    ));
+
+    let pending = storage.list(Some(&hints), None, 100).await.unwrap().objects;
+    let ids: Vec<_> = pending
+        .iter()
+        .filter_map(|object| {
+            object
+                .key
+                .as_str()
+                .rsplit('/')
+                .next()?
+                .parse::<uuid::Uuid>()
+                .ok()
+        })
+        .collect();
+    assert_eq!(ids, vec![recent.operation]);
+
+    let replacement = submit(restarted.clone(), "abandoned", None).await.unwrap();
+    let registered = restarted
+        .register_upload(&scope, replacement.operation)
+        .await
+        .unwrap();
+    assert!(matches!(
+        registered.state,
+        sanctum_service::HostedJobState::Registered
+    ));
+
+    for id in [
+        redispatch.operation,
+        abandoned.operation,
+        published.operation,
+        embedding.operation,
+    ] {
+        age(&envelope(id), 46_u64);
+    }
+    let report = restarted.sweep_abandoned_uploads().await.unwrap();
+    assert_eq!(report.failed, 0);
+    assert_eq!(report.expired, 4);
+    assert!(matches!(
+        restarted.index_upload(&scope, abandoned.operation).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        submit(restarted.clone(), "published", Some(published.operation)).await,
+        Err(Error::Conflict(_))
+    ));
+    let hits = restarted
+        .retrieve(
+            scope,
+            "quartz".into(),
+            10,
+            None,
+            sanctum_service::SearchMode::Lexical,
+        )
+        .await
+        .unwrap()
+        .hits;
+    assert_eq!(hits.len(), 2);
+}
+
+#[tokio::test]
 async fn upload_sweep_fences_an_in_flight_acceptance_before_reclaiming() {
     use std::time::{Duration, SystemTime};
 

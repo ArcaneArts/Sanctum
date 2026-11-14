@@ -375,16 +375,7 @@ impl CollectionDb {
         source: Uuid,
         revision: Uuid,
     ) -> Result<Option<RevisionContent>> {
-        self.0
-            .query_row(
-                "SELECT content_hash, chunk_count, bytes, COALESCE(original_hash, content_hash),
-                    source_encoding, extractor, retain_original, url_provenance, git_provenance, chunker
-                 FROM revisions WHERE source_id = ?1 AND id = ?2",
-                params![source.to_string(), revision.to_string()],
-                |row| row_revision_content(row, 0),
-            )
-            .optional()
-            .map_err(database_error)
+        revision_summary(&self.0, source, revision)
     }
 
     pub fn write(&mut self) -> Result<RevisionWriter<'_>> {
@@ -691,6 +682,22 @@ fn query_all<T>(
         .map_err(database_error)?
         .collect::<rusqlite::Result<_>>()
         .map_err(database_error)
+}
+
+fn revision_summary(
+    db: &Connection,
+    source: Uuid,
+    revision: Uuid,
+) -> Result<Option<RevisionContent>> {
+    db.query_row(
+        "SELECT content_hash, chunk_count, bytes, COALESCE(original_hash, content_hash),
+            source_encoding, extractor, retain_original, url_provenance, git_provenance, chunker
+         FROM revisions WHERE source_id = ?1 AND id = ?2",
+        params![source.to_string(), revision.to_string()],
+        |row| row_revision_content(row, 0),
+    )
+    .optional()
+    .map_err(database_error)
 }
 
 fn row_revision_content(row: &Row<'_>, offset: usize) -> rusqlite::Result<RevisionContent> {

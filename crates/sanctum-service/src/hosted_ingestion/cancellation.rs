@@ -5,7 +5,7 @@ use sanctum_storage::{Key, Version};
 use uuid::Uuid;
 
 use super::{
-    HostedCatalog, HostedJob, Operation, REGISTRATION_WINDOW, RegistrationOutcome, Stage,
+    HostedCatalog, HostedJob, Operation, RegistrationOutcome, Stage,
     indexing::{INDEX_STAGE, Outcome, decode},
     unix_seconds,
 };
@@ -24,9 +24,7 @@ impl HostedCatalog {
             _ => return Err(finished()),
         }
         let unit = Unit::collection(self.prefix.as_ref(), scope)?;
-        let expires_at = record
-            .created_at
-            .saturating_add(REGISTRATION_WINDOW.as_secs());
+        let expires_at = record.expires_at();
         let mut writer = self.publication.acquire(&unit).await?;
         // Cancellation and indexing share the same receipt. Only the first
         // fenced publication chooses an outcome. The envelope follows it.

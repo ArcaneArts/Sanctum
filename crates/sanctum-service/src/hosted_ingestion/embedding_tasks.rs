@@ -3,7 +3,7 @@ use std::time::Instant;
 use sanctum_core::{Error, Result, Scope};
 use uuid::Uuid;
 
-use super::{EmbeddingStep, HostedCatalog, REGISTRATION_WINDOW, Stage, unix_seconds};
+use super::{EmbeddingStep, HostedCatalog, Stage, unix_seconds};
 
 impl HostedCatalog {
     pub async fn deliver_embedding_upload(
@@ -53,11 +53,13 @@ impl HostedCatalog {
         };
         let start = Instant::now();
         let now = unix_seconds()?;
-        if current.not_before.is_some_and(|earliest| now < earliest) {
+        let expires_at = record.expires_at();
+        let expired = now >= expires_at;
+        if !expired && current.not_before.is_some_and(|earliest| now < earliest) {
             return Err(Error::Busy("embedding task is scheduled for later".into()));
         }
         let next = if let Some(provider) = &self.embedding
-            && now.saturating_sub(record.created_at) < REGISTRATION_WINDOW.as_secs()
+            && !expired
         {
             let batch = embedding_batch_id(operation, step, provider.profile_id());
             let count = self.embed_collection_with_id(scope, batch).await?;
@@ -77,6 +79,11 @@ impl HostedCatalog {
                     not_before,
                 })
             }
+        } else {
+            None
+        };
+        let next = if unix_seconds()? < expires_at {
+            next
         } else {
             None
         };
