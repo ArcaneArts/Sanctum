@@ -1438,6 +1438,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   synchronous upload, retrieved exact UTF-8 through MCP, and rebuilt embeddings
   after the configured profile changed.
 - Delivered in [PR #70](https://github.com/ArcaneArts/Sanctum/pull/70).
+- The worker also responds to shutdown during an active stage. The filesystem
+  and MinIO regressions stopped it after SQLite published registration and
+  before the envelope checkpoint. A fresh worker reused the registration
+  sequence and published the same source and revision. On macOS, closing the
+  managed sidecar's stdin while a test endpoint stalled an embedding request
+  yielded a clean exit in 12.5 ms. After restart against the same MinIO
+  prefix, Ollama returned 768-dimensional vectors and semantic MCP search
+  returned the original 54-byte excerpt.
 
 ## Desktop object storage
 
