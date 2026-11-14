@@ -1569,3 +1569,17 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   searched both concurrently. The Linux ARM64 Docker API with tmpfs
   returned cold results in 5.96–6.23 s with a 2.41 GiB cgroup peak.
   [Measured results](CAPACITY.md#concurrent-grpc-search-on-1-gib-fts-snapshots).
+
+## GCS resumable transfer recovery
+
+- The native adapter retains a bounded upload part and probes the same
+  session after retryable failures. It resumes at the persisted byte
+  offset, verifies final object metadata, and stops after bounded retries
+  without progress.
+- The loopback JSON API fixture interrupted a part after an unaligned
+  offset, failed the first probe, and dropped the response after the final
+  commit. The next probe recovered the committed generation. The fixture
+  compared every resent byte and verified cancellation for invalid offsets
+  and exhaustion. The live test still requires an authorized GCS bucket
+  and Application Default Credentials.
+  [GCS storage contract](STORAGE.md#google-cloud-storage-adapter).
