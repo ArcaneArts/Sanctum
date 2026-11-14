@@ -1055,6 +1055,12 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   Python client found `café` at `[12, 17)` after the API restarted and before
   the indexing task ran.
   [PR #129](https://github.com/ArcaneArts/Sanctum/pull/129).
+- Local RTF moves out of extraction after the canonical file is saved.
+  A gRPC regression held the collection's SQLite writer lock and verified
+  the pending scan before publication, then released the lock and checked
+  ordinary search. The built server's MCP endpoint found `café` at
+  `[8, 13)` in the same pre-publication window.
+  [PR #130](https://github.com/ArcaneArts/Sanctum/pull/130).
 
 ## Source metadata on upload
 

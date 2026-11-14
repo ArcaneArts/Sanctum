@@ -257,11 +257,11 @@ impl Service {
                 "queued RTF no longer matches its accepted size",
             )));
         }
+        self.files
+            .publish_extracted(&job.scope, job.source, job.revision, text)?;
         if !self.queue.extracted(job.id)? {
             return Err(Error::Conflict("extraction canceled".into()));
         }
-        self.files
-            .publish_extracted(&job.scope, job.source, job.revision, text)?;
         Ok((reader.hash.finalize().to_hex().to_string(), encoding))
     }
 }
