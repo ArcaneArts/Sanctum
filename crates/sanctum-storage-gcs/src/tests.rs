@@ -972,6 +972,7 @@ struct RecoveryFixture {
 enum RecoveryScenario {
     Interrupted,
     InvalidOffset,
+    UnavailableSession { status: StatusCode, on_probe: bool },
     NoProgress,
     Dropped,
 }
@@ -1074,6 +1075,16 @@ async fn interrupted_part(
         fixture.part_stalled.notify_one();
         return std::future::pending().await;
     }
+    if let RecoveryScenario::UnavailableSession { status, on_probe } = fixture.scenario {
+        if attempt == 1 {
+            return incomplete(PART_BYTES);
+        }
+        if on_probe && attempt == 2 {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        assert_eq!(attempt, if on_probe { 3 } else { 2 });
+        return status.into_response();
+    }
     match attempt {
         // The upload request fails before the caller receives any indication
         // of how much of the first part reached the storage service.
@@ -1153,6 +1164,41 @@ async fn resumable_upload_rejects_an_offset_beyond_the_sent_part() {
     assert_eq!(fixture.calls.lock().unwrap().len(), 4);
     assert_eq!(fixture.calls.lock().unwrap().last().unwrap(), "cancel");
     server.abort();
+}
+
+#[tokio::test]
+async fn unavailable_resumable_sessions_return_a_retryable_error() {
+    for status in [StatusCode::NOT_FOUND, StatusCode::GONE] {
+        for on_probe in [false, true] {
+            let (storage, fixture, server) =
+                start_recovery(RecoveryScenario::UnavailableSession { status, on_probe }).await;
+            let key = Key::parse("default/notes/bulk").unwrap();
+            let result = storage
+                .put_stream(
+                    &key,
+                    Box::pin(std::io::Cursor::new(fixture.input.clone())),
+                    RECOVERY_LENGTH,
+                )
+                .await;
+            assert!(
+                matches!(&result, Err(Error::Busy(message)) if message.contains("restart with a new session")),
+                "expected a retryable error for HTTP {status}, on_probe={on_probe}: {result:?}"
+            );
+            let mut expected = vec![
+                format!("bytes 0-{}/{RECOVERY_LENGTH}", PART_BYTES - 1),
+                format!(
+                    "bytes {PART_BYTES}-{}/{RECOVERY_LENGTH}",
+                    2 * PART_BYTES - 1
+                ),
+            ];
+            if on_probe {
+                expected.push(format!("bytes */{RECOVERY_LENGTH}"));
+            }
+            expected.push("cancel".into());
+            assert_eq!(*fixture.calls.lock().unwrap(), expected);
+            server.abort();
+        }
+    }
 }
 
 #[tokio::test]

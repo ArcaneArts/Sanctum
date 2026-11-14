@@ -172,10 +172,13 @@ Bulk transfers use bounded 8 MiB parts in a GCS resumable upload
 session. After an interrupted request or retryable HTTP failure,
 the adapter asks GCS for its persisted offset and resumes from that byte.
 A status response can also confirm an upload whose final response was lost.
-The adapter bounds retries without progress. After receiving a session
-URI, it gives session cancellation up to five seconds on failure. If a
-caller drops the in-flight upload, the same cancellation runs on the
-worker's runtime. If the process exits first, an incomplete session
+The adapter bounds retries without progress. A part or status request
+that returns HTTP 404 or 410 ends the session with a retryable error.
+Hosted uploads can then verify a committed object by digest or replay
+from the beginning. After receiving a session URI, the adapter gives
+session cancellation up to five seconds on failure. If a caller drops
+the in-flight upload, the same cancellation runs on the worker's runtime.
+If the process exits first, an incomplete session
 can remain until GCS expires it. Retrying starts a fresh transfer and
 uses a new object key. [GCS resumable session lifetime](https://docs.cloud.google.com/storage/docs/resumable-uploads#session-uris), [GCS generation preconditions](https://docs.cloud.google.com/storage/docs/request-preconditions), [resumable uploads](https://docs.cloud.google.com/storage/docs/performing-resumable-uploads).
 
