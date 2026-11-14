@@ -208,3 +208,68 @@ Cloud Run roles write JSON logs to stderr. Use
 `RUST_LOG=info,sanctum_service=debug,sanctum_db=debug` on the API and
 worker to collect per-operation timings and transfer sizes during a
 measurement window. [Server diagnostics](LOCAL_API.md#server-diagnostics).
+
+### Repeatable ingestion and range check
+
+Generate the Python client as shown in the
+[Python example](../examples/python/README.md). Set `API_URL` and export
+`SANCTUM_GRPC_ID_TOKEN` as above, then run:
+
+```sh
+PYTHONPATH="$generated" python scripts/check-hosted-deployment.py \
+  --api-url "$API_URL" --expect-private
+```
+
+The check uses a new test tenant, streams a deterministic UTF-8 fixture
+through gRPC, waits for lexical publication, and compares the exact bytes
+returned by gRPC and MCP. It checks that both routes reject unauthenticated
+calls and writes a JSON report with the operation ID, byte count, and
+search timings. Use `--mib 200 --wait-seconds 600` to exercise the large
+upload. The report's first and repeated search times are client
+measurements. Correlate them with snapshot events and Cloud Run instance
+IDs before interpreting them as cold and warm timings.
+[Cloud Run request and system logs](https://docs.cloud.google.com/run/docs/logging).
+
+### Recovery after scaling to zero
+
+Run this exercise on a dedicated deployment with its own queue, scheduler
+jobs, and storage prefix. It pauses delivery and creates a task that
+arrives out of order.
+
+1. Set the API and worker minimum instances to zero. Pause the Cloud
+   Tasks queue and the deployment's scheduled worker invocations to allow
+   the services to become idle. Choose a request ID and submit with no
+   wait for indexing:
+
+   ```sh
+   operation="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+   PYTHONPATH="$generated" python scripts/check-hosted-deployment.py \
+     --api-url "$API_URL" --operation "$operation" --phase submit
+   ```
+
+2. Using an identity with worker invocation permission and a token for
+   `WORKER_URL`, POST the report's `tenant`, `collection`, and
+   `operation` as `operation_id` to `/internal/tasks/index-upload`
+   before registration.
+   Expect HTTP 503 and confirm the operation remains accepted. Then stop
+   sending requests to both services. Check Cloud Monitoring's
+   container instance count for both active and idle instances and
+   record the observed idle interval. If the platform does not show
+   the scale transition, record that separately from the application
+   recovery result. [Cloud Run monitoring](https://docs.cloud.google.com/run/docs/monitoring),
+   [Managing Cloud Tasks queues](https://docs.cloud.google.com/tasks/docs/manage-queues-and-tasks).
+3. Resume the queue and scheduled jobs. Refresh the caller ID token if
+   necessary and run the check with the same operation and size using
+   `--phase verify --wait-seconds 600`. Record Cloud Tasks and worker
+   request logs for registration and indexing, then check the operation
+   and source references in the report. Confirm Scheduler separately by
+   using `gcloud scheduler jobs run` on a dispatch job and observing
+   the authenticated repair request and response in the worker logs.
+   [Cloud Scheduler commands](https://docs.cloud.google.com/sdk/gcloud/reference/scheduler/jobs).
+4. POST the original registration and indexing task bodies again using
+   the authorized worker identity. Expect HTTP 204 and verify the same
+   revision and database generation are returned by another
+   `--phase verify` check. Save the relevant instance IDs and generation
+   from both runs. Cloud Run can choose a different instance for each
+   request. The isolated test data stays in its deployment prefix for
+   inspection.

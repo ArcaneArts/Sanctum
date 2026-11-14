@@ -1267,3 +1267,21 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   stale, legacy, and current profile deliveries across restart. It
   verified that only the matching payload advanced embedding progress
   and enabled semantic retrieval. Live Cloud Tasks delivery remains open.
+
+## Repeatable hosted deployment verification
+
+- The generated Python client check can submit and verify an operation
+  in separate invocations. It reports request and revision IDs, exact
+  retrieved bytes, and client timings. The runbook identifies which
+  platform observations are required to establish scaling to zero and
+  Cloud Scheduler delivery.
+- A release API and worker ran locally against live MinIO. A 200 MiB
+  upload survived a restart of both processes and an out-of-order
+  delivery. The generated client and MCP returned the same exact
+  3,652-byte range. Duplicate task deliveries preserved the published
+  generation. The test removed its object prefix.
+- A local TLS ingress fixture verified authorized gRPC/MCP requests and
+  both unauthenticated responses. This did not exercise Cloud Run IAM.
+  The local MCP check also passed with default logging and with logs
+  disabled after switching it to the server's managed startup output.
+  [Runbook](CLOUD_RUN.md#repeatable-ingestion-and-range-check).
