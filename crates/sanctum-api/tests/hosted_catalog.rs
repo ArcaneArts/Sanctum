@@ -4621,7 +4621,7 @@ async fn profile_change_requeues_an_embedding_batch_without_running_old_deliveri
 #[tokio::test]
 async fn idle_collections_rebuild_after_a_profile_change() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let dispatch = Arc::new(TestDispatch {
         fail: AtomicU8::new(0),
         delivered: std::sync::Mutex::new(Vec::new()),
@@ -4747,10 +4747,29 @@ async fn idle_collections_rebuild_after_a_profile_change() {
         second.run_profile_rebuild(&scope, operation, 1).await,
         Err(Error::Busy(_))
     ));
+    storage
+        .interrupt
+        .store(REJECT_REBUILD_CHECKPOINT, Ordering::Relaxed);
+    assert!(matches!(
+        second.run_profile_rebuild(&scope, operation, 0).await,
+        Err(Error::Busy(message)) if message == "profile rebuild checkpoint failed before commit"
+    ));
+    let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
+    let publication =
+        sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(15)).unwrap();
+    let published = publication.generation(&unit).await.unwrap();
+    assert!(matches!(
+        second.run_profile_rebuild(&scope, operation, 1).await,
+        Err(Error::Busy(_))
+    ));
+    storage
+        .interrupt
+        .store(LOSE_REBUILD_CHECKPOINT, Ordering::Relaxed);
     second
         .run_profile_rebuild(&scope, operation, 0)
         .await
         .unwrap();
+    assert_eq!(publication.generation(&unit).await.unwrap(), published);
     let coverage = second.embedding_status(&scope, None).await.unwrap();
     assert_eq!(coverage.profile.as_deref(), Some("fixture-v2"));
     assert_eq!(coverage.coverage.embedded, 1);
@@ -4774,10 +4793,14 @@ async fn idle_collections_rebuild_after_a_profile_change() {
         .run_profile_rebuild(&scope, operation, 0)
         .await
         .unwrap();
+    storage
+        .interrupt
+        .store(LOSE_REBUILD_CHECKPOINT, Ordering::Relaxed);
     second
         .run_profile_rebuild(&scope, operation, 1)
         .await
         .unwrap();
+    assert_eq!(storage.interrupt.load(Ordering::Relaxed), 0);
     second.try_dispatch_rebuild(&scope, operation).await;
     assert_eq!(
         second.discover_profile_rebuild().await.unwrap().discovered,
@@ -7229,6 +7252,8 @@ const REJECT_PROFILE_REBUILD: u8 = 17;
 const REJECT_UPLOAD_INPUT_DELETE: u8 = 18;
 const CORRUPT_ACCEPTANCE_INPUT: u8 = 19;
 const REJECT_PREPARED_EMBEDDING_WRITE: u8 = 20;
+const REJECT_REBUILD_CHECKPOINT: u8 = 21;
+const LOSE_REBUILD_CHECKPOINT: u8 = 22;
 const PARALLEL_RANGE_START: u8 = 40;
 const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
 const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
@@ -7354,6 +7379,22 @@ impl Storage for InterruptAcceptance {
         bytes: axum::body::Bytes,
         condition: Condition,
     ) -> StorageResult<Version> {
+        let rebuild_checkpoint = key.as_str() == "_embedding/default/notes.json";
+        if rebuild_checkpoint
+            && self
+                .interrupt
+                .compare_exchange(
+                    REJECT_REBUILD_CHECKPOINT,
+                    0,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            return Err(Error::Busy(
+                "profile rebuild checkpoint failed before commit".into(),
+            ));
+        }
         if key.as_str() == "_embedding/early/blocked.json"
             && self.interrupt.load(Ordering::Relaxed) == REJECT_PROFILE_REBUILD
         {
@@ -7397,6 +7438,21 @@ impl Storage for InterruptAcceptance {
         let version = self.inner.put_control(key, bytes, condition).await?;
         if interrupt == 2 {
             return Err(Error::Busy("envelope write response lost".into()));
+        }
+        if rebuild_checkpoint
+            && self
+                .interrupt
+                .compare_exchange(
+                    LOSE_REBUILD_CHECKPOINT,
+                    0,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            return Err(Error::Busy(
+                "profile rebuild checkpoint response lost".into(),
+            ));
         }
         if key.as_str() == "_maintenance/source-sweep.json"
             && self

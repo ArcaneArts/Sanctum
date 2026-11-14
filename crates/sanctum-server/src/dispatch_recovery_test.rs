@@ -78,22 +78,7 @@ async fn clear_prefix(storage: &dyn Storage, prefix: &Key) {
 async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
     let storage = minio_storage();
     let prefix = Key::parse(format!("embedding-recovery-{}", Uuid::new_v4())).unwrap();
-    let provider = Arc::new(CountingOllama {
-        inner: Ollama::new(OllamaConfig {
-            endpoint: std::env::var("SANCTUM_OLLAMA_ENDPOINT")
-                .unwrap_or_else(|_| "http://127.0.0.1:11434".into()),
-            profile: Profile {
-                model: "embeddinggemma-2:740m".into(),
-                revision: "prepared-batch-recovery".into(),
-                dimensions: 768,
-                document_prefix: String::new(),
-                query_prefix: String::new(),
-            },
-            timeout_seconds: 30,
-        })
-        .unwrap(),
-        documents: AtomicUsize::new(0),
-    });
+    let provider = Arc::new(CountingOllama::new("prepared-batch-recovery"));
     let make_catalog = |storage| {
         HostedCatalog::new(storage, Some(prefix.clone()), 1024)
             .unwrap()
@@ -206,7 +191,7 @@ async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
     assert_eq!(resumed.source_id, job.source_id);
     let results = api
         .search_text(v1::SearchTextRequest {
-            scope: Some(scope),
+            scope: Some(scope.clone()),
             query: "A record of an observation about rhodonite".into(),
             mode: v1::SearchMode::Semantic.into(),
             ..Default::default()
@@ -228,12 +213,119 @@ async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
         TEXT,
     );
     assert_eq!(provider.documents.load(Ordering::Relaxed), 1);
+
+    let new_profile = Arc::new(CountingOllama::new("profile-rebuild-recovery"));
+    let rebuild_path = "_embedding/default/repair.json";
+    let faults = Arc::new(StalledCheckpoint {
+        storage: storage.clone(),
+        checkpoint: Mutex::new(None),
+        after_dispatch: false,
+        lose_source_reply: None,
+        lose_control_reply: Mutex::new(None),
+    });
+    let rebuild = HostedCatalog::new(faults.clone(), Some(prefix.clone()), 1024)
+        .unwrap()
+        .with_embedding(Some(new_profile.clone()))
+        .with_standalone_worker(Arc::new(tokio::sync::Notify::new()));
+    assert_eq!(
+        rebuild
+            .embedding_status(&internal_scope, None)
+            .await
+            .unwrap()
+            .coverage
+            .embedded,
+        0,
+    );
+    let discovery = rebuild.discover_profile_rebuild().await.unwrap();
+    assert!(discovery.complete);
+    assert_eq!(discovery.discovered, 1);
+    let rebuild_key = scoped_key(Some(&prefix), rebuild_path);
+    let (record, _) = read_control(storage.as_ref(), &rebuild_key).await;
+    let (worker, _rebuild_server) = serve_http(crate::hosted_worker::router(rebuild.clone())).await;
+    let deliver_rebuild = |step| {
+        http.post(format!("{worker}/internal/tasks/rebuild-collection"))
+            .json(&json!({
+                "tenant": &scope.tenant,
+                "collection": &scope.collection,
+                "operation_id": record["operation"],
+                "profile": new_profile.profile_id(),
+                "step": step,
+            }))
+            .send()
+    };
+    *faults.lose_control_reply.lock().unwrap() = Some(rebuild_path);
+    assert_eq!(
+        deliver_rebuild(0).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(faults.lose_control_reply.lock().unwrap().is_none());
+    let (saved, _) = read_control(storage.as_ref(), &rebuild_key).await;
+    assert_eq!(saved["step"], 1);
+    let after_rebuild = collection_generation(storage.as_ref(), Some(&prefix)).await;
+    assert_ne!(after_rebuild, committed);
+    assert_eq!(
+        deliver_rebuild(0).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(new_profile.documents.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        collection_generation(storage.as_ref(), Some(&prefix)).await,
+        after_rebuild
+    );
+
+    *faults.lose_control_reply.lock().unwrap() = Some(rebuild_path);
+    assert_eq!(
+        deliver_rebuild(1).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(faults.lose_control_reply.lock().unwrap().is_none());
+    let (completed, _) = read_control(storage.as_ref(), &rebuild_key).await;
+    assert!(completed["step"].is_null());
+    let (mut api, _rebuild_api) = serve_api(rebuild).await;
+    let result = api
+        .search_text(v1::SearchTextRequest {
+            scope: Some(scope),
+            query: "Rhodonite observation".into(),
+            mode: v1::SearchMode::Semantic.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let coverage = result.embedding_coverage.unwrap();
+    assert_eq!(
+        coverage.profile_id.as_deref(),
+        Some(new_profile.profile_id())
+    );
+    assert_eq!(coverage.embedded_chunks, 1);
+    assert_eq!(result.hits[0].excerpt, TEXT);
     clear_prefix(storage.as_ref(), &prefix).await;
 }
 
 struct CountingOllama {
     inner: Ollama,
     documents: AtomicUsize,
+}
+
+impl CountingOllama {
+    fn new(revision: &str) -> Self {
+        Self {
+            inner: Ollama::new(OllamaConfig {
+                endpoint: std::env::var("SANCTUM_OLLAMA_ENDPOINT")
+                    .unwrap_or_else(|_| "http://127.0.0.1:11434".into()),
+                profile: Profile {
+                    model: "embeddinggemma-2:740m".into(),
+                    revision: revision.into(),
+                    dimensions: 768,
+                    document_prefix: String::new(),
+                    query_prefix: String::new(),
+                },
+                timeout_seconds: 30,
+            })
+            .unwrap(),
+            documents: AtomicUsize::new(0),
+        }
+    }
 }
 
 #[async_trait::async_trait]

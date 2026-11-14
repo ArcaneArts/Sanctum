@@ -450,9 +450,26 @@ impl HostedCatalog {
             None
         };
         record.dispatched_window = None;
-        self.write_rebuild_record(&key, &record, Condition::Match(version))
-            .await?;
-        Ok(())
+        match self
+            .write_rebuild_record(&key, &record, Condition::Match(version))
+            .await
+        {
+            Ok(_) => Ok(()),
+            // Local I/O errors can leave readable bytes after a failed sync.
+            Err(error @ (Error::Invalid(_) | Error::Io(_))) => Err(error),
+            Err(error) => {
+                let saved = self.read_rebuild_record::<Rebuild>(&key).await?;
+                if saved.is_some_and(|(saved, _)| {
+                    saved.run == record.run
+                        && saved.operation == operation
+                        && saved.step.is_none_or(|saved_step| saved_step > step)
+                }) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     pub async fn try_dispatch_rebuild(&self, scope: &Scope, operation: Uuid) {
