@@ -252,3 +252,201 @@ async fn native_downloads_are_generation_fenced_and_ranges_are_exact() {
     );
     server.abort();
 }
+
+const RECOVERY_LENGTH: u64 = 2 * PART_BYTES + 7;
+const FIRST_ACK: u64 = PART_BYTES / 2 + 17;
+
+struct RecoveryFixture {
+    calls: Mutex<Vec<String>>,
+    input: Bytes,
+    scenario: RecoveryScenario,
+}
+
+#[derive(PartialEq)]
+enum RecoveryScenario {
+    Interrupted,
+    InvalidOffset,
+    NoProgress,
+}
+
+async fn start_recovery(
+    scenario: RecoveryScenario,
+) -> (
+    GcsStorage,
+    Arc<RecoveryFixture>,
+    tokio::task::JoinHandle<()>,
+) {
+    let fixture = Arc::new(RecoveryFixture {
+        calls: Mutex::new(Vec::new()),
+        input: (0..RECOVERY_LENGTH)
+            .map(|offset| (offset % 251) as u8)
+            .collect(),
+        scenario,
+    });
+    let router = Router::new()
+        .route("/upload/storage/v1/b/sanctum-test/o", post(start_session))
+        .route("/session", put(interrupted_part).delete(cancel_session))
+        .with_state(fixture.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let storage =
+        GcsStorage::with_endpoint("sanctum-test".into(), url, Arc::new(TestCredential)).unwrap();
+    (storage, fixture, server)
+}
+
+async fn start_session(
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    assert_credentials(&headers);
+    assert_eq!(query["ifGenerationMatch"], "0");
+    assert_eq!(query["name"], "default/notes/bulk");
+    assert_eq!(query["uploadType"], "resumable");
+    assert_eq!(
+        headers["x-upload-content-length"],
+        RECOVERY_LENGTH.to_string()
+    );
+    (
+        StatusCode::OK,
+        [(header::LOCATION, "/session?upload_id=local-fixture")],
+    )
+}
+
+async fn interrupted_part(
+    State(fixture): State<Arc<RecoveryFixture>>,
+    headers: HeaderMap,
+    body: Body,
+) -> axum::response::Response {
+    assert!(headers.get(header::AUTHORIZATION).is_none());
+    let range = headers[header::CONTENT_RANGE].to_str().unwrap();
+    let bytes = axum::body::to_bytes(body, PART_BYTES as usize)
+        .await
+        .unwrap();
+    assert_eq!(headers[header::CONTENT_LENGTH], bytes.len().to_string());
+    let mut calls = fixture.calls.lock().unwrap();
+    calls.push(range.into());
+    if range == format!("bytes */{RECOVERY_LENGTH}") {
+        assert!(bytes.is_empty());
+    } else {
+        let (interval, length) = range
+            .strip_prefix("bytes ")
+            .unwrap()
+            .split_once('/')
+            .unwrap();
+        let (start, end) = interval.split_once('-').unwrap();
+        let start: usize = start.parse().unwrap();
+        let end: usize = end.parse().unwrap();
+        assert_eq!(length, RECOVERY_LENGTH.to_string());
+        assert_eq!(&bytes[..], &fixture.input[start..=end]);
+        if end + 1 < RECOVERY_LENGTH as usize {
+            assert_eq!(bytes.len(), PART_BYTES as usize);
+        }
+    }
+    let incomplete = |offset: u64| {
+        (
+            StatusCode::PERMANENT_REDIRECT,
+            [(header::RANGE, format!("bytes=0-{}", offset - 1))],
+        )
+            .into_response()
+    };
+    if fixture.scenario == RecoveryScenario::NoProgress {
+        return StatusCode::PERMANENT_REDIRECT.into_response();
+    }
+    match calls.len() {
+        // The upload request fails before the caller receives any indication
+        // of how much of the first part reached the storage service.
+        1 | 2 => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        3 if fixture.scenario == RecoveryScenario::InvalidOffset => incomplete(PART_BYTES + 1),
+        3 => incomplete(FIRST_ACK),
+        4 => incomplete(FIRST_ACK + PART_BYTES),
+        5 => {
+            // The object is now committed, but the metadata response is lost.
+            let lost = futures::stream::iter([Err::<Bytes, _>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "fixture dropped the response",
+            ))]);
+            (StatusCode::OK, Body::from_stream(lost)).into_response()
+        }
+        6 => Json(metadata("default/notes/bulk", RECOVERY_LENGTH, 14)).into_response(),
+        _ => panic!("unexpected resumable request"),
+    }
+}
+
+async fn cancel_session(
+    State(fixture): State<Arc<RecoveryFixture>>,
+    headers: HeaderMap,
+) -> StatusCode {
+    assert!(headers.get(header::AUTHORIZATION).is_none());
+    assert_eq!(headers[header::CONTENT_LENGTH], "0");
+    fixture.calls.lock().unwrap().push("cancel".into());
+    StatusCode::from_u16(499).unwrap()
+}
+
+#[tokio::test]
+async fn resumable_upload_recovers_partial_part_and_lost_completion() {
+    let (storage, fixture, server) = start_recovery(RecoveryScenario::Interrupted).await;
+    let key = Key::parse("default/notes/bulk").unwrap();
+    let version = storage
+        .put_stream(
+            &key,
+            Box::pin(std::io::Cursor::new(fixture.input.clone())),
+            RECOVERY_LENGTH,
+        )
+        .await
+        .unwrap();
+    assert_eq!(version.generation.as_deref(), Some("14"));
+    let probe = format!("bytes */{RECOVERY_LENGTH}");
+    assert_eq!(
+        *fixture.calls.lock().unwrap(),
+        [
+            format!("bytes 0-{}/{RECOVERY_LENGTH}", PART_BYTES - 1),
+            probe.clone(),
+            probe.clone(),
+            format!(
+                "bytes {FIRST_ACK}-{}/{RECOVERY_LENGTH}",
+                FIRST_ACK + PART_BYTES - 1
+            ),
+            format!(
+                "bytes {}-{}/{RECOVERY_LENGTH}",
+                FIRST_ACK + PART_BYTES,
+                RECOVERY_LENGTH - 1
+            ),
+            probe,
+        ]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn resumable_upload_rejects_an_offset_beyond_the_sent_part() {
+    let (storage, fixture, server) = start_recovery(RecoveryScenario::InvalidOffset).await;
+    let key = Key::parse("default/notes/bulk").unwrap();
+    assert!(matches!(
+        storage.put_stream(&key, Box::pin(std::io::Cursor::new(fixture.input.clone())), RECOVERY_LENGTH).await,
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
+    ));
+    assert_eq!(fixture.calls.lock().unwrap().len(), 4);
+    assert_eq!(fixture.calls.lock().unwrap().last().unwrap(), "cancel");
+    server.abort();
+}
+
+#[tokio::test]
+async fn resumable_upload_stops_after_bounded_attempts_without_progress() {
+    let (storage, fixture, server) = start_recovery(RecoveryScenario::NoProgress).await;
+    let key = Key::parse("default/notes/bulk").unwrap();
+    assert!(matches!(
+        storage.put_stream(
+            &key,
+            Box::pin(std::io::Cursor::new(fixture.input.clone())),
+            RECOVERY_LENGTH,
+        ).await,
+        Err(Error::Busy(message)) if message.contains("no progress")
+    ));
+    let calls = fixture.calls.lock().unwrap();
+    let requests = calls.split_last().unwrap();
+    assert_eq!(requests.0, "cancel");
+    assert_eq!(requests.1.len(), MAX_UPLOAD_RETRIES as usize + 1);
+    assert!(requests.1.iter().all(|range| range == &calls[0]));
+    server.abort();
+}

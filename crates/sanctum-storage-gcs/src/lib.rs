@@ -3,7 +3,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::TryStreamExt;
 
 #[cfg(test)]
@@ -25,6 +25,7 @@ use tokio_util::io::StreamReader;
 const ENDPOINT: &str = "https://storage.googleapis.com/";
 const CLOUD_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 const PART_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_UPLOAD_RETRIES: u32 = 4;
 
 #[async_trait::async_trait]
 trait Credential: Send + Sync {
@@ -203,19 +204,25 @@ impl GcsStorage {
         object.version()
     }
 
-    async fn upload_part(&self, session: &Url, range: String, bytes: Vec<u8>) -> Result<Response> {
+    async fn upload_part(&self, session: &Url, range: String, bytes: Bytes) -> Result<Response> {
         // A resumable upload URI grants access to that session. Keep it out of errors.
-        self.client
+        let response = self
+            .client
             .put(session.clone())
             .header(header::CONTENT_RANGE, range)
             .header(header::CONTENT_LENGTH, bytes.len())
             .body(bytes)
             .send()
             .await
-            .map_err(transfer_error)
+            .map_err(transfer_error)?;
+        match response.status() {
+            StatusCode::OK | StatusCode::CREATED | StatusCode::PERMANENT_REDIRECT => Ok(response),
+            StatusCode::REQUEST_TIMEOUT => Err(Error::Busy("GCS upload request timed out".into())),
+            status => Err(http_error(status)),
+        }
     }
 
-    async fn put_resumable(&self, key: &Key, mut reader: Reader, length: u64) -> Result<Version> {
+    async fn put_resumable(&self, key: &Key, reader: Reader, length: u64) -> Result<Version> {
         let mut url = self.objects_url(true, None);
         url.query_pairs_mut()
             .append_pair("name", key.as_str())
@@ -239,59 +246,139 @@ impl GcsStorage {
                     && url.password().is_none()
             })
             .ok_or_else(|| invalid_response("GCS resumable upload omitted its session URL"))?;
-        let mut offset = 0;
-        let result = async {
-            while offset < length {
-                let size = (length - offset).min(PART_BYTES);
-                let end = offset + size;
-                let mut buffer = vec![0; size as usize];
-                reader.read_exact(&mut buffer).await?;
-                if end == length && reader.read(&mut [0]).await? != 0 {
-                    return Err(Error::Invalid(
-                        "object body is longer than its declared length".into(),
-                    ));
-                }
-                let response = self
-                    .upload_part(
-                        &session,
-                        format!("bytes {offset}-{}/{length}", end - 1),
-                        buffer,
-                    )
-                    .await?;
-                if end == length {
-                    check(response.status())?;
-                    let uploaded: ObjectMetadata = response.json().await.map_err(transfer_error)?;
-                    if uploaded.size()? != length || uploaded.name != key.as_str() {
-                        return Err(invalid_response(
-                            "GCS uploaded object differs from its request",
-                        ));
-                    }
-                    return uploaded.version();
-                }
-                if response.status().as_u16() != 308 {
-                    return Err(if response.status().is_success() {
-                        invalid_response("GCS completed a resumable upload early")
-                    } else {
-                        http_error(response.status())
-                    });
-                }
-                if header_value(response.headers(), header::RANGE)
-                    != Some(format!("bytes=0-{}", end - 1).as_str())
-                {
-                    return Err(invalid_response(
-                        "GCS acknowledged a different upload offset",
-                    ));
-                }
-                offset = end;
-            }
-            Err(invalid_response("GCS resumable upload did not finish"))
-        }
-        .await;
+        let result = self.upload_contents(&session, key, reader, length).await;
         if result.is_err() {
-            let _ = self.client.delete(session).send().await;
+            let _ = self
+                .client
+                .delete(session)
+                .header(header::CONTENT_LENGTH, 0)
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await;
         }
         result
     }
+
+    async fn upload_contents(
+        &self,
+        session: &Url,
+        key: &Key,
+        mut reader: Reader,
+        length: u64,
+    ) -> Result<Version> {
+        let mut buffer = Bytes::new();
+        let mut committed = 0;
+        let mut sent_until = 0;
+        let mut probing = false;
+        let mut retries = 0;
+        loop {
+            let response = if probing {
+                self.upload_part(session, format!("bytes */{length}"), Bytes::new())
+                    .await
+            } else {
+                let size = (length - committed).min(PART_BYTES) as usize;
+                let end = committed + size as u64;
+                if buffer.len() < size {
+                    // Keep bytes after the acknowledged offset. Refill so the next
+                    // non-final part is still a multiple of 256 KiB.
+                    let mut part = buffer
+                        .try_into_mut()
+                        .unwrap_or_else(|remaining| BytesMut::from(remaining.as_ref()));
+                    let buffered = part.len();
+                    part.resize(size, 0);
+                    reader.read_exact(&mut part[buffered..]).await?;
+                    if end == length && reader.read(&mut [0]).await? != 0 {
+                        return Err(Error::Invalid(
+                            "object body is longer than its declared length".into(),
+                        ));
+                    }
+                    buffer = part.freeze();
+                }
+                sent_until = end;
+                self.upload_part(
+                    session,
+                    format!("bytes {committed}-{}/{length}", end - 1),
+                    buffer.clone(),
+                )
+                .await
+            };
+            let outcome = match response {
+                Ok(response) if response.status() == StatusCode::PERMANENT_REDIRECT => {
+                    upload_offset(response.headers()).map(UploadOutcome::Incomplete)
+                }
+                Ok(response) if sent_until == length => upload_version(response, key, length)
+                    .await
+                    .map(UploadOutcome::Complete),
+                Ok(_) => return Err(invalid_response("GCS completed a resumable upload early")),
+                Err(error) => Err(error),
+            };
+            match outcome {
+                Ok(UploadOutcome::Complete(version)) => return Ok(version),
+                Ok(UploadOutcome::Incomplete(offset)) => {
+                    if offset < committed || offset > sent_until || offset == length {
+                        return Err(invalid_response(
+                            "GCS acknowledged an invalid upload offset",
+                        ));
+                    }
+                    probing = false;
+                    if offset > committed {
+                        buffer.advance((offset - committed) as usize);
+                        committed = offset;
+                        retries = 0;
+                        continue;
+                    }
+                    if retries == MAX_UPLOAD_RETRIES {
+                        return Err(Error::Busy("GCS resumable upload made no progress".into()));
+                    }
+                }
+                Err(Error::Busy(_)) if retries < MAX_UPLOAD_RETRIES => probing = true,
+                Err(error) => return Err(error),
+            }
+            tokio::time::sleep(Duration::from_millis(100 << retries)).await;
+            retries += 1;
+        }
+    }
+}
+
+enum UploadOutcome {
+    Incomplete(u64),
+    Complete(Version),
+}
+
+fn upload_offset(headers: &HeaderMap) -> Result<u64> {
+    let Some(range) = headers.get(header::RANGE) else {
+        return Ok(0);
+    };
+    range
+        .to_str()
+        .ok()
+        .and_then(|range| range.strip_prefix("bytes=0-"))
+        .and_then(|end| end.parse::<u64>().ok())
+        .and_then(|end| end.checked_add(1))
+        .ok_or_else(|| invalid_response("GCS returned an invalid upload range"))
+}
+
+async fn upload_version(response: Response, key: &Key, length: u64) -> Result<Version> {
+    let mut bytes = BytesMut::new();
+    let mut body = response.bytes_stream();
+    while let Some(chunk) = body
+        .try_next()
+        .await
+        .map_err(|_| Error::Busy("GCS resumable upload response was interrupted".into()))?
+    {
+        if chunk.len() > MAX_CONTROL_BYTES - bytes.len() {
+            return Err(invalid_response("GCS returned oversized upload metadata"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let uploaded: ObjectMetadata = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid_response("GCS returned invalid upload metadata"))?;
+    if uploaded.size()? != length || uploaded.name != key.as_str() {
+        return Err(invalid_response(
+            "GCS uploaded object differs from its request",
+        ));
+    }
+    uploaded.version()
 }
 
 #[async_trait::async_trait]

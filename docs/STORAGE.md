@@ -103,8 +103,12 @@ and replaces them using the returned generation. Full downloads fence
 the media request to the generation from the metadata response. Range
 reads require a 206 response and verify the exact interval and length.
 Bulk transfers use bounded 8 MiB parts in a GCS resumable upload
-session. If a transfer fails, the caller receives the error and can
-start another attempt with a fresh object key. [GCS generation preconditions](https://docs.cloud.google.com/storage/docs/request-preconditions), [resumable uploads](https://docs.cloud.google.com/storage/docs/performing-resumable-uploads).
+session. After an interrupted request or retryable HTTP failure,
+the adapter asks GCS for its persisted offset and resumes from that byte.
+A status response can also confirm an upload whose final response was lost.
+The adapter bounds retries without progress and attempts to cancel the
+session on failure. The caller can then start a new transfer with a fresh
+object key. [GCS generation preconditions](https://docs.cloud.google.com/storage/docs/request-preconditions), [resumable uploads](https://docs.cloud.google.com/storage/docs/performing-resumable-uploads).
 
 Run the live contract against an authorized test bucket with ADC that
 can create, read, list, replace, and delete objects. Use a bucket without
@@ -116,7 +120,8 @@ cargo test --locked -p sanctum-storage-gcs --test live -- --ignored
 ```
 
 The regular test suite checks the JSON API contract with a loopback HTTP
-fixture. Live bucket verification remains open.
+fixture, including partial part acknowledgments and lost responses. Live
+bucket verification remains open.
 
 ## Hosted server configuration
 
