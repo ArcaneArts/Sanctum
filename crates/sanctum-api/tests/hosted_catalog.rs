@@ -3123,7 +3123,8 @@ async fn hosted_collection_search_uses_one_query_vector_and_keeps_hits_scoped() 
     });
     let service = HostedCatalog::new(storage.clone(), None, 1024)
         .unwrap()
-        .with_embedding(Some(provider.clone()));
+        .with_embedding(Some(provider.clone()))
+        .with_snapshot_cache_bytes(0);
     let mut server = start(service.clone()).await;
     for (tenant, collection, text) in [
         ("default", "first", "shared first 🦀"),
@@ -3152,7 +3153,7 @@ async fn hosted_collection_search_uses_one_query_vector_and_keeps_hits_scoped() 
         let operation = accepted.operation_id.parse().unwrap();
         service.register_upload(&scope, operation).await.unwrap();
         service.index_upload(&scope, operation).await.unwrap();
-        if collection == "first" {
+        if collection == "second" {
             assert_eq!(service.embed_collection(&scope).await.unwrap(), 1);
         }
     }
@@ -3164,6 +3165,8 @@ async fn hosted_collection_search_uses_one_query_vector_and_keeps_hits_scoped() 
         ..Default::default()
     };
     storage.catalog_reads.store(0, Ordering::Relaxed);
+    storage.collection_reads.store(0, Ordering::Relaxed);
+    storage.collection_downloads.store(0, Ordering::Relaxed);
     let result = server
         .client
         .search_collections(query.clone())
@@ -3171,6 +3174,8 @@ async fn hosted_collection_search_uses_one_query_vector_and_keeps_hits_scoped() 
         .unwrap()
         .into_inner();
     assert_eq!(storage.catalog_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(storage.collection_reads.load(Ordering::Relaxed), 2);
+    assert_eq!(storage.collection_downloads.load(Ordering::Relaxed), 2);
     assert_eq!(provider.queries.load(Ordering::Relaxed), 1);
     assert_eq!(result.mode(), v1::SearchMode::Hybrid);
     assert_eq!(
@@ -3183,11 +3188,11 @@ async fn hosted_collection_search_uses_one_query_vector_and_keeps_hits_scoped() 
     assert_eq!(hits, ["shared first 🦀", "shared second café"]);
     assert_eq!(
         result.hits[0].embedding_state(),
-        v1::ChunkEmbeddingState::Ready
+        v1::ChunkEmbeddingState::Pending
     );
     assert_eq!(
         result.hits[1].embedding_state(),
-        v1::ChunkEmbeddingState::Pending
+        v1::ChunkEmbeddingState::Ready
     );
     for hit in result.hits {
         let reference = hit.chunk.unwrap();
@@ -3287,6 +3292,131 @@ async fn hosted_collection_search_uses_one_query_vector_and_keeps_hits_scoped() 
             .code(),
         Code::InvalidArgument
     );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn hosted_search_ranks_the_same_snapshot_when_publication_advances_during_embedding() {
+    use sanctum_embedding::{EmbedError, Provider, Purpose};
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    struct PausedQuery {
+        started: Notify,
+        resume: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for PausedQuery {
+        fn profile_id(&self) -> &str {
+            "paused-query"
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+
+        async fn embed(
+            &self,
+            purpose: Purpose,
+            texts: &[String],
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            if matches!(purpose, Purpose::Query) {
+                self.started.notify_one();
+                self.resume.notified().await;
+            }
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
+    let provider = Arc::new(PausedQuery::default());
+    let catalog = HostedCatalog::new(storage.clone(), None, 1024)
+        .unwrap()
+        .with_embedding(Some(provider.clone()))
+        .with_snapshot_cache_bytes(0);
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    catalog.create_collection(&scope, None).await.unwrap();
+    let mut server = start(catalog.clone()).await;
+    let wire_scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    let header = v1::UploadTextHeader {
+        scope: Some(wire_scope.clone()),
+        name: "sample.txt".into(),
+        ..Default::default()
+    };
+    let accepted = server
+        .client
+        .submit_text(upload_frames(&header, ["amber crab 🦀".as_bytes()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let operation = accepted.operation_id.parse().unwrap();
+    catalog.register_upload(&scope, operation).await.unwrap();
+    let indexed = catalog.index_upload(&scope, operation).await.unwrap();
+    assert_eq!(catalog.embed_collection(&scope).await.unwrap(), 1);
+    let lexical = v1::SearchTextRequest {
+        scope: Some(wire_scope.clone()),
+        query: "crab".into(),
+        ..Default::default()
+    };
+    let earlier = server
+        .client
+        .search_text(lexical.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let generation = earlier.hits[0].database_generation.clone();
+
+    storage.collection_reads.store(0, Ordering::Relaxed);
+    storage.collection_downloads.store(0, Ordering::Relaxed);
+    let mut client = server.client.clone();
+    let request = v1::SearchTextRequest {
+        mode: v1::SearchMode::Semantic.into(),
+        ..lexical.clone()
+    };
+    let search = tokio::spawn(async move { client.search_text(request).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.started.notified(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(storage.collection_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(storage.collection_downloads.load(Ordering::Relaxed), 1);
+    catalog
+        .delete_source(&scope, indexed.source.unwrap(), None, None)
+        .await
+        .unwrap();
+    let reads_after_delete = storage.collection_reads.load(Ordering::Relaxed);
+    let downloads_after_delete = storage.collection_downloads.load(Ordering::Relaxed);
+    provider.resume.notify_one();
+
+    let result = search.await.unwrap().unwrap().into_inner();
+    assert_eq!(result.mode(), v1::SearchMode::Semantic);
+    assert_eq!(result.hits[0].excerpt, "amber crab 🦀");
+    assert_eq!(result.hits[0].database_generation, generation);
+    assert_eq!(
+        storage.collection_reads.load(Ordering::Relaxed),
+        reads_after_delete
+    );
+    assert_eq!(
+        storage.collection_downloads.load(Ordering::Relaxed),
+        downloads_after_delete
+    );
+    let current = server
+        .client
+        .search_text(lexical)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(current.hits.is_empty());
     server.stop().await;
 }
 
@@ -6534,6 +6664,8 @@ struct InterruptAcceptance {
     inner: sanctum_storage_fs::FileStorage,
     interrupt: AtomicU8,
     catalog_reads: AtomicUsize,
+    collection_reads: AtomicUsize,
+    collection_downloads: AtomicUsize,
 }
 
 impl InterruptAcceptance {
@@ -6542,6 +6674,8 @@ impl InterruptAcceptance {
             inner: sanctum_storage_fs::FileStorage::open(path).unwrap(),
             interrupt: AtomicU8::new(interrupt),
             catalog_reads: AtomicUsize::new(0),
+            collection_reads: AtomicUsize::new(0),
+            collection_downloads: AtomicUsize::new(0),
         }
     }
 }
@@ -6555,6 +6689,10 @@ impl Storage for InterruptAcceptance {
     async fn get(&self, key: &Key) -> StorageResult<Download> {
         if key.as_str().ends_with("/catalog/HEAD.json") {
             self.catalog_reads.fetch_add(1, Ordering::Relaxed);
+        } else if key.as_str().ends_with("/HEAD.json") {
+            self.collection_reads.fetch_add(1, Ordering::Relaxed);
+        } else if key.as_str().ends_with("/meta.db") {
+            self.collection_downloads.fetch_add(1, Ordering::Relaxed);
         }
         if self.interrupt.load(Ordering::Relaxed) == REJECT_ORIGINAL_READ
             && key.as_str().contains("/inputs/")

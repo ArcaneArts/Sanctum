@@ -723,6 +723,21 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   two collections that matched the filter. The hosted MCP smoke also passed.
   [PR #144](https://github.com/ArcaneArts/Sanctum/pull/144).
 
+### Reusing a collection generation within search
+
+- A hosted search uses the same collection snapshot to check compatible
+  vectors and rank hits. The multi-collection path opens collections in order
+  and requests a shared query embedding at the first collection with vectors.
+- The gRPC integration tests count manifest reads and downloads with retention
+  disabled. A paused query embedding lets a concurrent deletion publish a
+  new generation. The in-flight reply cites the verified old generation, and
+  a new lexical request sees the deletion.
+- A generated Python gRPC client, live MinIO, and real Ollama verified one
+  manifest read and one download per collection. Hybrid search spanned two
+  collections where only the second had vectors. It reported partial coverage
+  and returned both exact excerpts. A single-collection semantic search used
+  the same generation and made one query prediction of its own.
+
 ## Hosted embedding profile rebuilds
 
 - Scheduled discovery detects a changed server profile and scans object

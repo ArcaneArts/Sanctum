@@ -52,60 +52,56 @@ impl HostedCatalog {
             .await?
             .pop()
             .expect("catalog metadata was resolved for one collection");
-        self.prepare_hosted_vector(scopes, query, mode, &mut prepared)
+        let snapshot = self.collection_snapshot(&scope).await?;
+        self.prepare_hosted_vector(&snapshot, &query, mode, &mut prepared, scopes)
             .await?;
         let profile = prepared.profile.clone();
-        let ((coverage, ranked), generation) = self
-            .read_collection_snapshot(&scope, move |database| {
-                let coverage = database.embedding_coverage(prepared.profile.as_deref())?;
-                let (actual_mode, degraded) = match prepared.strategy(mode, coverage) {
-                    Ok(strategy) => strategy,
-                    Err(error) => return Ok((coverage, Err(error))),
-                };
-                let candidate_limit = candidate_budget(limit);
-                let semantic = match (&prepared.vector, &prepared.profile) {
-                    (Some(query), Some(profile)) if actual_mode != SearchMode::Lexical => database
-                        .search_vector(
-                            profile,
-                            query.clone(),
-                            candidate_limit,
-                            filter.as_ref(),
-                            &metadata,
-                        )?,
-                    _ => Vec::new(),
-                };
-                let lexical = prepared.lexical(
-                    database,
-                    mode,
-                    semantic.is_empty(),
-                    candidate_limit,
-                    filter.as_ref(),
-                    &metadata,
-                )?;
-                let ranked = match actual_mode {
-                    SearchMode::Lexical => lexical.into_iter().map(|chunk| (chunk, None)).collect(),
-                    SearchMode::Semantic => semantic
-                        .into_iter()
-                        .map(|hit| (hit.chunk, Some(hit.score)))
-                        .collect(),
-                    SearchMode::Hybrid => fuse(lexical, semantic),
-                };
-                let chunks = limit_hits(ranked, limit)
-                    .map(|(chunk, score)| {
-                        let fields = metadata_for_hit(
-                            database,
-                            &chunk.reference,
-                            filter.as_ref(),
-                            &metadata,
-                        )?;
-                        let state = database
-                            .chunk_embedding_state(prepared.profile.as_deref(), &chunk.hash)?;
-                        Ok((locate(database, chunk)?, score, fields, state))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok((coverage, Ok((chunks, actual_mode, degraded))))
-            })
-            .await?;
+        let ((coverage, ranked), generation) = query_snapshot(snapshot, move |database| {
+            let coverage = database.embedding_coverage(prepared.profile.as_deref())?;
+            let (actual_mode, degraded) = match prepared.strategy(mode, coverage) {
+                Ok(strategy) => strategy,
+                Err(error) => return Ok((coverage, Err(error))),
+            };
+            let candidate_limit = candidate_budget(limit);
+            let semantic = match (&prepared.vector, &prepared.profile) {
+                (Some(query), Some(profile)) if actual_mode != SearchMode::Lexical => database
+                    .search_vector(
+                        profile,
+                        query.clone(),
+                        candidate_limit,
+                        filter.as_ref(),
+                        &metadata,
+                    )?,
+                _ => Vec::new(),
+            };
+            let lexical = prepared.lexical(
+                database,
+                mode,
+                semantic.is_empty(),
+                candidate_limit,
+                filter.as_ref(),
+                &metadata,
+            )?;
+            let ranked = match actual_mode {
+                SearchMode::Lexical => lexical.into_iter().map(|chunk| (chunk, None)).collect(),
+                SearchMode::Semantic => semantic
+                    .into_iter()
+                    .map(|hit| (hit.chunk, Some(hit.score)))
+                    .collect(),
+                SearchMode::Hybrid => fuse(lexical, semantic),
+            };
+            let chunks = limit_hits(ranked, limit)
+                .map(|(chunk, score)| {
+                    let fields =
+                        metadata_for_hit(database, &chunk.reference, filter.as_ref(), &metadata)?;
+                    let state =
+                        database.chunk_embedding_state(prepared.profile.as_deref(), &chunk.hash)?;
+                    Ok((locate(database, chunk)?, score, fields, state))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((coverage, Ok((chunks, actual_mode, degraded))))
+        })
+        .await?;
         self.schedule_rebuild_on_access(&scope, profile.as_deref(), coverage)
             .await;
         let (chunks, actual_mode, degraded) = ranked?;
@@ -163,49 +159,49 @@ impl HostedCatalog {
         let catalog = self
             .search_catalog(&tenant, &scopes, filter.as_ref())
             .await?;
-        self.prepare_hosted_vector(&scopes, query, requested, &mut prepared)
-            .await?;
         let candidate_limit = candidate_budget(limit);
         let filter = filter.map(Arc::new);
         let mut all = Vec::with_capacity(scopes.len());
         let mut coverage = Coverage::default();
-        for (scope, metadata) in scopes.into_iter().zip(catalog) {
+        for (scope, metadata) in scopes.iter().zip(catalog) {
+            let snapshot = self.collection_snapshot(scope).await?;
+            self.prepare_hosted_vector(&snapshot, &query, requested, &mut prepared, &scopes)
+                .await?;
             let filter = filter.clone();
             let query = prepared.clone();
-            let ((ranked, current), generation) = self
-                .read_collection_snapshot(&scope, move |database| {
-                    let (ranked, current) = rank_collection(
-                        database,
-                        &query,
-                        candidate_limit,
-                        filter.as_deref(),
-                        &metadata,
-                        requested,
-                    )?;
-                    let located = ranked
-                        .into_iter()
-                        .map(|chunk| {
-                            let fields = metadata_for_hit(
-                                database,
-                                &chunk.reference,
-                                filter.as_deref(),
-                                &metadata,
-                            )?;
-                            let state = database
-                                .chunk_embedding_state(query.profile.as_deref(), &chunk.hash)?;
-                            Ok((locate(database, chunk)?, fields, state))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok((located, current))
-                })
-                .await?;
-            self.schedule_rebuild_on_access(&scope, prepared.profile.as_deref(), current)
+            let ((ranked, current), generation) = query_snapshot(snapshot, move |database| {
+                let (ranked, current) = rank_collection(
+                    database,
+                    &query,
+                    candidate_limit,
+                    filter.as_deref(),
+                    &metadata,
+                    requested,
+                )?;
+                let located = ranked
+                    .into_iter()
+                    .map(|chunk| {
+                        let fields = metadata_for_hit(
+                            database,
+                            &chunk.reference,
+                            filter.as_deref(),
+                            &metadata,
+                        )?;
+                        let state = database
+                            .chunk_embedding_state(query.profile.as_deref(), &chunk.hash)?;
+                        Ok((locate(database, chunk)?, fields, state))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((located, current))
+            })
+            .await?;
+            self.schedule_rebuild_on_access(scope, prepared.profile.as_deref(), current)
                 .await;
             coverage.total += current.total;
             coverage.embedded += current.embedded;
             coverage.failed += current.failed;
             all.push(Candidates {
-                scope,
+                scope: scope.clone(),
                 coverage: current,
                 ranked: ranked
                     .into_iter()
@@ -264,45 +260,38 @@ impl HostedCatalog {
 
     async fn prepare_hosted_vector(
         &self,
-        scopes: &[Scope],
-        query: String,
+        snapshot: &Arc<Materialized>,
+        query: &str,
         mode: SearchMode,
         prepared: &mut PreparedQuery,
+        scopes: &[Scope],
     ) -> Result<()> {
-        if mode != SearchMode::Lexical {
-            if let Some(provider) = &self.embedding {
-                let profile = provider.profile_id().to_owned();
-                let mut available = false;
-                for scope in scopes {
-                    let profile = profile.clone();
-                    let (has_embeddings, _) = self
-                        .read_collection_snapshot(scope, move |db| db.has_embeddings(&profile))
-                        .await?;
-                    if has_embeddings {
-                        available = true;
-                        break;
-                    }
+        if mode == SearchMode::Lexical || prepared.vector.is_some() || prepared.degraded.is_some() {
+            return Ok(());
+        }
+        let Some(provider) = &self.embedding else {
+            prepared.degraded = Some("embedding_disabled");
+            return Ok(());
+        };
+        let profile = provider.profile_id().to_owned();
+        let (available, _) =
+            query_snapshot(snapshot.clone(), move |db| db.has_embeddings(&profile)).await?;
+        if available {
+            let (tenant, collection) = query_scope(scopes);
+            match telemetry::embed(
+                &tenant,
+                collection.as_ref(),
+                provider.as_ref(),
+                Purpose::Query,
+                &[query.to_owned()],
+            )
+            .await
+            {
+                Ok(mut vectors) => prepared.vector = vectors.pop().map(Arc::from),
+                Err(error) => {
+                    tracing::warn!(%error, "hosted query embedding unavailable");
+                    prepared.degraded = Some("embedding_provider_unavailable");
                 }
-                if available {
-                    let (tenant, collection) = query_scope(scopes);
-                    match telemetry::embed(
-                        &tenant,
-                        collection.as_ref(),
-                        provider.as_ref(),
-                        Purpose::Query,
-                        &[query],
-                    )
-                    .await
-                    {
-                        Ok(mut vectors) => prepared.vector = vectors.pop().map(Arc::from),
-                        Err(error) => {
-                            tracing::warn!(%error, "hosted query embedding unavailable");
-                            prepared.degraded = Some("embedding_provider_unavailable");
-                        }
-                    }
-                }
-            } else {
-                prepared.degraded = Some("embedding_disabled");
             }
         }
         Ok(())
@@ -340,12 +329,7 @@ impl HostedCatalog {
         scope: &Scope,
         read: impl FnOnce(&db::CollectionDb) -> Result<T> + Send + 'static,
     ) -> Result<(T, Uuid)> {
-        let database = self.collection_snapshot(scope).await?;
-        tokio::task::spawn_blocking(move || {
-            Ok((database.read_collection(read)?, database.generation.id))
-        })
-        .await
-        .map_err(|error| Error::Internal(Box::new(error)))?
+        query_snapshot(self.collection_snapshot(scope).await?, read).await
     }
 
     pub(crate) async fn with_owned_collection<T: Send + 'static>(
@@ -398,6 +382,17 @@ impl HostedCatalog {
         }
         Ok(key)
     }
+}
+
+async fn query_snapshot<T: Send + 'static>(
+    snapshot: Arc<Materialized>,
+    read: impl FnOnce(&db::CollectionDb) -> Result<T> + Send + 'static,
+) -> Result<(T, Uuid)> {
+    tokio::task::spawn_blocking(move || {
+        Ok((snapshot.read_collection(read)?, snapshot.generation.id))
+    })
+    .await
+    .map_err(|error| Error::Internal(Box::new(error)))?
 }
 
 pub(crate) fn locate(database: &db::CollectionDb, chunk: Chunk) -> Result<(Chunk, String)> {
