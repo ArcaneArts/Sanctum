@@ -4699,7 +4699,7 @@ async fn dispatch_reconciliation_recovers_a_failed_handoff_and_advances_its_curs
 }
 
 #[tokio::test]
-async fn hosted_acceptance_replays_while_dispatch_hint_writes_are_unavailable() {
+async fn hosted_upload_recovers_while_dispatch_hint_writes_are_unavailable() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let dispatch = Arc::new(TestDispatch {
@@ -4710,6 +4710,11 @@ async fn hosted_acceptance_replays_while_dispatch_hint_writes_are_unavailable() 
         HostedCatalog::new(storage.clone(), None, 1024)
             .unwrap()
             .with_dispatch(dispatch.clone())
+            .with_embedding(Some(Arc::new(HostedEmbeddingFixture {
+                profile: "hint-recovery",
+                fail: AtomicU8::new(0),
+                queries: AtomicUsize::new(0),
+            })))
     };
     let scope = v1::Scope {
         tenant: "default".into(),
@@ -4797,11 +4802,42 @@ async fn hosted_acceptance_replays_while_dispatch_hint_writes_are_unavailable() 
         .await
         .unwrap();
     worker.index_upload(&collection, operation).await.unwrap();
+    let published = server
+        .client
+        .get_ingestion_job(v1::IngestionJobRequest {
+            scope: Some(scope.clone()),
+            operation_id: operation.to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(published.state(), v1::IngestionState::TextReady);
+    assert_eq!(published.embedding_work.unwrap().next_batch, 0);
+    let restarted = catalog();
+    let report = restarted.reconcile_shard(0).await.unwrap();
+    assert_eq!((report.dispatched, report.failed), (1, 0));
+    assert_eq!(
+        dispatch.delivered.lock().unwrap().last(),
+        Some(&(
+            operation,
+            TaskStage::Embed { step: 0 },
+            Some("hint-recovery".into())
+        ))
+    );
+    for step in 0..=1 {
+        restarted
+            .deliver_embedding_upload(&collection, operation, step, Some("hint-recovery"))
+            .await
+            .unwrap();
+    }
+    restarted.try_dispatch(&collection, operation).await;
+    assert!(!has_upload_hint(storage.as_ref(), operation).await);
     let hits = server
         .client
         .search_text(v1::SearchTextRequest {
             scope: Some(scope),
             query: "quartz".into(),
+            mode: v1::SearchMode::Semantic.into(),
             ..Default::default()
         })
         .await

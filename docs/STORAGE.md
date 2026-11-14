@@ -442,6 +442,9 @@ UUID. Repair keeps a fresh hint while admission writes its envelope. After
 15 minutes, repair can fence an unaccepted envelope and remove that attempt's
 hint. If another attempt already won, repair removes only the losing attempt's
 hint. It also removes hints left by terminal or compacted operations.
+After a retryable storage error while creating a hint, the worker can use the
+existing hint if object metadata confirms the exact key. When that key is
+absent, the stage retries from its committed receipt once a hint can be saved.
 Operation-only hints from older servers still dispatch accepted work and
 remain discoverable while their envelope is absent. Upgrade repair workers
 before enabling new writers that create attempt-scoped hints.
