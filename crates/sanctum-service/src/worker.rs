@@ -7,7 +7,12 @@ use crate::Service;
 pub async fn run_local_worker(service: Service, mut stop: watch::Receiver<bool>) {
     while !*stop.borrow_and_update() {
         let service = service.clone();
-        match tokio::task::spawn_blocking(move || service.process_next()).await {
+        let shutdown = stop.clone();
+        match tokio::task::spawn_blocking(move || {
+            service.process_next_until_shutdown(|| *shutdown.borrow())
+        })
+        .await
+        {
             Ok(Ok(true)) => continue,
             Ok(Ok(false)) => {}
             Ok(Err(error)) => tracing::error!(%error, "local ingestion job failed"),

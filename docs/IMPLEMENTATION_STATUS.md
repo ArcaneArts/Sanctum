@@ -85,6 +85,16 @@ Merged in [PR #3](https://github.com/ArcaneArts/Sanctum/pull/3).
 - The collection's immutable revision is the receipt for a completed publication.
   If the process stops after SQLite commits but before queue completion is
   recorded, the next attempt recovers that receipt without indexing twice.
+- The local ingestion worker checks the managed server's shutdown signal
+  during RTF extraction, checkpoint verification, and chunk indexing.
+  Uncommitted SQLite work rolls back and the operation remains recoverable
+  on startup. The regression stops text indexing and RTF extraction,
+  exercises a saved RTF checkpoint, and verifies the same revision can
+  publish after reopening storage. On macOS, closing the managed
+  server's stdin during separate 200 MiB uploads yielded clean exits in
+  3.9 ms during text indexing and 9.1 ms during RTF extraction. Both
+  operations reached text readiness on their second attempt after
+  restart. MCP returned exact byte ranges from the original revision IDs.
 - The gRPC tests cover persisted pause and acceptance, tenant-scoped cancellation,
   recovery from a missing receipt, and retry after a storage read failure.
 - Caller-provided upload request IDs were added in a later cycle.

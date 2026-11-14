@@ -141,6 +141,13 @@ bytes and search results follow the independent revision lifecycle.
 `sanctum-cli jobs [COLLECTION]` lists local activity newest first. Pass
 `--before OPERATION_ID` with the cursor shown for the next page.
 
+On server shutdown, local workers stop claiming work and interrupt RTF
+extraction or text indexing at a read or chunk boundary. The accepted
+operation and source files survive the stop. The next server start
+requeues the claim with the same operation and revision IDs. If
+publication has already started, the worker finishes the commit or
+reconciles its result on restart.
+
 The local RTF worker saves the canonical UTF-8 file and its digest before
 indexing. After a restart or retry, the worker verifies the saved file and
 can resume indexing without rerunning extraction. If the saved text is
