@@ -122,13 +122,13 @@ async fn failed_upload(
     stage: TaskStage,
     error: Error,
 ) -> StatusCode {
-    match service.discard_retired_upload_task(scope, operation).await {
+    match service.discard_obsolete_upload_task(scope, operation).await {
         Ok(true) => return StatusCode::NO_CONTENT,
         Ok(false) if matches!(error, Error::NotFound(_)) => return StatusCode::NOT_FOUND,
         Ok(false) => {}
         Err(cleanup) => {
             tracing::warn!(%cleanup, tenant = %scope.tenant, collection = %scope.collection, %operation,
-                "could not check whether the hosted task was retired");
+                "could not confirm the hosted task was obsolete");
         }
     }
     tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection, %operation,

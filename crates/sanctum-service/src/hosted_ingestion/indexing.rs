@@ -76,6 +76,10 @@ impl HostedCatalog {
             } => registration,
             _ => return Ok(record.job()),
         };
+        let unit = Unit::collection(self.prefix.as_ref(), scope)?;
+        if self.publication.is_retired(&unit).await? {
+            return Err(Error::NotFound("collection is retired".into()));
+        }
         let start = Instant::now();
         if unix_seconds()? >= record.expires_at() {
             return self.index_upload(scope, operation).await;
@@ -87,7 +91,6 @@ impl HostedCatalog {
             Ok((_, canonical)) => Preparation::Ready(Box::new(canonical)),
             Err(Error::Invalid(message)) => Preparation::Invalid(message),
             Err(Error::NotFound(_)) => {
-                let unit = Unit::collection(self.prefix.as_ref(), scope)?;
                 if self
                     .publication
                     .stage_receipt(&unit, operation, INDEX_STAGE)

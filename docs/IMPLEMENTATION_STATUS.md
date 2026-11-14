@@ -2233,6 +2233,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   live Cloud Tasks and Scheduler checks remain open.
   [Hosted operation retention](STORAGE.md#hosted-operation-retention).
 
+## Late hosted upload deliveries
+
+- The HTTP worker acknowledges duplicate registration, preparation,
+  indexing, and embedding deliveries for uploads with a compact expiry
+  record. A missing operation or an admission fence remains retryable.
+  Job status still returns gRPC `NOT_FOUND` for a compacted upload.
+- Filesystem and live MinIO tests replayed all four routes against a
+  compact record and checked the unchanged database generation and exact
+  gRPC retrieval. The filesystem retention test also exercised the
+  actual compaction sweep. The worker test delivered preparation to a
+  retired collection whose input and envelope still existed, and
+  verified that it acknowledged delivery without advancing preparation.
+  [Hosted operation retention](STORAGE.md#hosted-operation-retention).
+
 ## Dispatch hints for individual upload attempts
 
 - A durable upload hint names its staging attempt. Repair keeps recent

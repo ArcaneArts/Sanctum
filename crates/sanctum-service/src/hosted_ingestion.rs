@@ -413,6 +413,20 @@ impl HostedCatalog {
         }
     }
 
+    /// A late task can be acknowledged once retirement or compaction is durable.
+    pub async fn discard_obsolete_upload_task(
+        &self,
+        scope: &Scope,
+        operation: Uuid,
+    ) -> Result<bool> {
+        if self.clear_retired_dispatch(scope, operation, false).await? {
+            return Ok(true);
+        }
+        let prefix = self.operation_prefix(scope, operation)?;
+        let envelope = self.read_envelope(&prefix, operation).await?;
+        Ok(matches!(envelope, Some((Envelope::Expired(_), _))))
+    }
+
     pub(super) async fn dispatch_pending(
         &self,
         scope: &Scope,

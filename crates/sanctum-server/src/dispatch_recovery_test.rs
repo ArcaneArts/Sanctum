@@ -13,7 +13,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::post,
 };
-use sanctum_core::{ByteRange, Error};
+use sanctum_core::{ByteRange, Error, Scope};
 use sanctum_proto::v1::{self, sanctum_client::SanctumClient, upload_text_frame::Frame};
 use sanctum_service::HostedCatalog;
 use sanctum_storage::{Condition, Download, Key, ListPage, Object, Reader, Storage, Version};
@@ -453,6 +453,84 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
     );
     assert_eq!(before.hits[0].chunk, after.hits[0].chunk);
 
+    let key = scoped_key(
+        prefix.as_ref(),
+        &format!("default/collections/repair/operations/{operation}/operation.json"),
+    );
+    let (_, version) = read_control(storage.as_ref(), &key).await;
+    let expired_at = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Simulate the upload sweep's durable compact record while the fixture
+    // still has all three original Cloud Tasks deliveries.
+    storage
+        .put_control(
+            &key,
+            serde_json::to_vec(&json!({ "operation": operation, "expired_at": expired_at }))
+                .unwrap()
+                .into(),
+            Condition::Match(version),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        api.get_ingestion_job(job.clone()).await.unwrap_err().code(),
+        tonic::Code::NotFound,
+    );
+    let unknown = Uuid::new_v4();
+    let fenced = Uuid::new_v4();
+    let fence = scoped_key(
+        prefix.as_ref(),
+        &format!("default/collections/repair/operations/{fenced}/operation.json"),
+    );
+    storage
+        .put_control(
+            &fence,
+            serde_json::to_vec(&json!({ "operation": fenced, "fence_id": Uuid::new_v4() }))
+                .unwrap()
+                .into(),
+            Condition::Create,
+        )
+        .await
+        .unwrap();
+    let committed = collection_generation(storage.as_ref(), prefix.as_ref()).await;
+    let (fresh_worker, _fresh_server) =
+        serve_http(crate::hosted_worker::router(make_catalog())).await;
+    for stage in stages.into_iter().chain(["embed-upload"]) {
+        for (id, expected) in [
+            (operation, StatusCode::NO_CONTENT),
+            (unknown, StatusCode::NOT_FOUND),
+            (fenced, StatusCode::NOT_FOUND),
+        ] {
+            let mut body = payload.clone();
+            body["operation_id"] = json!(id);
+            if stage == "embed-upload" {
+                body["step"] = json!(0);
+            }
+            let response = http
+                .post(format!("{fresh_worker}/internal/tasks/{stage}"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{stage} for {id}");
+        }
+    }
+    assert_eq!(queue.accepted.lock().unwrap().len(), stages.len());
+    assert_eq!(
+        collection_generation(storage.as_ref(), prefix.as_ref()).await,
+        committed,
+    );
+    let retained = api
+        .fetch_chunk(v1::FetchChunkRequest {
+            chunk: hit.chunk.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retained.excerpt, TEXT);
+
     verify_retirement(
         storage.clone(),
         prefix.as_ref(),
@@ -503,6 +581,14 @@ async fn verify_retirement(
             v1::IngestionState::Accepted,
         );
     }
+    let retired_scope = Scope {
+        tenant: retired.tenant.parse().unwrap(),
+        collection: retired.collection.parse().unwrap(),
+    };
+    make_catalog()
+        .register_upload(&retired_scope, second)
+        .await
+        .unwrap();
     api.delete_collection(v1::DeleteCollectionRequest {
         scope: Some(retired),
         ..Default::default()
@@ -555,6 +641,19 @@ async fn verify_retirement(
     );
     storage.head(&first_hint).await.unwrap();
     storage.head(&second_hint).await.unwrap();
+
+    let (early_worker, _early_server) =
+        serve_http(crate::hosted_worker::router(make_catalog())).await;
+    let response = http
+        .post(format!("{early_worker}/internal/tasks/prepare-upload"))
+        .json(&json!({ "tenant": "default", "collection": "retired", "operation_id": second }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (record, _) = read_control(storage.as_ref(), &operation_key).await;
+    assert_eq!(record["stage"], "pending_indexing");
+    assert!(record["preparation"].is_null());
 
     let standalone = HostedCatalog::new(storage.clone(), prefix.cloned(), 1024)
         .unwrap()
