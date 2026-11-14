@@ -112,9 +112,12 @@ The native adapter uses the GCS JSON API and Application Default
 Credentials. It creates control objects with `ifGenerationMatch=0`
 and replaces them using the returned generation. Full downloads fence
 the media request to the generation from the metadata response. When a
-writer replaces or removes that generation between the requests, the
-adapter reads fresh metadata before retrying the media request. It returns
-a retryable error if the generation keeps changing across four attempts.
+writer replaces or removes that generation between the requests, or a
+transient error interrupts either request, the adapter opens the download
+again from fresh metadata. It uses up to four attempts, with 20 seconds per
+attempt and exponential backoff. Authorization errors and invalid response
+metadata end the request. [Google Cloud retry strategy](https://docs.cloud.google.com/storage/docs/retry-strategy).
+
 Once a full download starts, the adapter can resume an interrupted body
 at the next undelivered byte using a range request pinned to the original
 generation. It checks the resumed interval and object length and attempts

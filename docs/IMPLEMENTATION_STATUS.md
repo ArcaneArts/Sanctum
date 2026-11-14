@@ -1969,6 +1969,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   Each attempt has five seconds, with three attempts and a 15-second
   overall budget. [PR #136](https://github.com/ArcaneArts/Sanctum/pull/136).
 
+### GCS retries before opening a download
+
+- The adapter retries transient metadata and media request failures before
+  handing a reader to the caller. Each attempt starts with fresh metadata
+  and requests media for that generation. The adapter also checks the
+  object name returned by the metadata request.
+- The loopback GCS JSON API returned a metadata rate limit and a media
+  service error before serving a new generation. The full stream matched
+  its reported generation and exact bytes. Tests also covered a stalled
+  request, four failed attempts, denied access, and metadata for a different
+  object. Live GCS verification remains open.
+  [Download behavior](STORAGE.md#google-cloud-storage-adapter).
+
 ## Dispatch repair after collection deletion
 
 - The worker uses the collection manifest's durable tombstone to remove

@@ -28,6 +28,7 @@ const CLOUD_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write
 const PART_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_UPLOAD_RETRIES: u32 = 4;
 const MAX_DOWNLOAD_ATTEMPTS: u32 = 4;
+const DOWNLOAD_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_DOWNLOAD_RESUMES: u32 = 4;
 const MAX_RANGE_ATTEMPTS: u32 = 3;
 const RANGE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -169,8 +170,6 @@ impl GcsStorage {
         if response.status() != expected {
             return Err(if response.status().is_success() {
                 invalid_response("GCS returned an unexpected status for the requested byte range")
-            } else if response.status() == StatusCode::REQUEST_TIMEOUT {
-                Error::Busy("GCS download request timed out".into())
             } else {
                 http_error(response.status())
             });
@@ -429,35 +428,19 @@ impl Storage for GcsStorage {
             .await
             .map_err(transfer_error)?;
         check(response.status())?;
-        response
+        let object = response
             .json::<ObjectMetadata>()
             .await
             .map_err(transfer_error)?
-            .object()
+            .object()?;
+        if &object.key != key {
+            return Err(invalid_response("GCS metadata returned a different object"));
+        }
+        Ok(object)
     }
 
     async fn get(&self, key: &Key) -> Result<Download> {
-        // The metadata response reliably carries the version even on media
-        // endpoints that omit x-goog-generation. During replacement, retry
-        // both requests before exposing any bytes to the caller.
-        for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
-            let object = self.head(key).await?;
-            match self
-                .media(key, None, object.version.generation.as_deref())
-                .await
-            {
-                Ok(response) => return self.download(object, response),
-                Err(Error::Conflict(_) | Error::NotFound(_)) => {
-                    if attempt < MAX_DOWNLOAD_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_millis(10 << (attempt - 1))).await;
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(Error::Busy(
-            "GCS object changed repeatedly during download".into(),
-        ))
+        self.open_download(key, DOWNLOAD_OPEN_TIMEOUT).await
     }
 
     async fn read_range(&self, key: &Key, range: ByteRange) -> Result<Bytes> {
@@ -579,6 +562,38 @@ impl Storage for GcsStorage {
 }
 
 impl GcsStorage {
+    async fn open_download(&self, key: &Key, attempt_timeout: Duration) -> Result<Download> {
+        let mut attempt = 1;
+        loop {
+            // A retry starts with fresh metadata. Once media headers have been
+            // accepted, body retries stay pinned to the chosen generation.
+            let opened = tokio::time::timeout(attempt_timeout, async {
+                let object = self.head(key).await?;
+                let response = match self
+                    .media(key, None, object.version.generation.as_deref())
+                    .await
+                {
+                    Err(Error::Conflict(_) | Error::NotFound(_)) => {
+                        return Err(Error::Busy(
+                            "GCS object changed during download open".into(),
+                        ));
+                    }
+                    result => result?,
+                };
+                self.download(object, response)
+            })
+            .await
+            .unwrap_or_else(|_| Err(Error::Busy("GCS download open timed out".into())));
+            match opened {
+                Err(Error::Busy(_)) if attempt < MAX_DOWNLOAD_ATTEMPTS => {
+                    tokio::time::sleep(Duration::from_millis(100 << (attempt - 1))).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
     fn download(&self, object: Object, response: Response) -> Result<Download> {
         check_download_length(&response, object.length)?;
         let generation = object.version.generation.clone().ok_or_else(|| {
@@ -775,6 +790,7 @@ fn http_error(status: StatusCode) -> Error {
         StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => {
             Error::Conflict("GCS object precondition failed".into())
         }
+        StatusCode::REQUEST_TIMEOUT => Error::Busy("GCS request timed out".into()),
         StatusCode::TOO_MANY_REQUESTS => Error::Busy("GCS rate limit reached".into()),
         status if status.is_server_error() => {
             Error::Busy(format!("GCS request returned HTTP {status}"))
