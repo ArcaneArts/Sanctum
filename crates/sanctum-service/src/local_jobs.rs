@@ -158,6 +158,7 @@ impl Service {
             // The collection commit survived a stop before the queue receipt.
             return Ok(revision_for(job, content));
         }
+        self.require_latest_update(job)?;
         if !self.queue.progress(job.id, job.processed_bytes)? {
             return Err(Error::Conflict("indexing canceled".into()));
         }
@@ -178,7 +179,6 @@ impl Service {
         stopping: &impl Fn() -> bool,
     ) -> Result<Revision> {
         IngestionShutdown::check(stopping)?;
-        let input = self.files.open_text(&job.scope, job.source, job.revision)?;
         let writer = database.write()?;
         if job.replacement {
             writer
@@ -190,11 +190,8 @@ impl Service {
                     error => error,
                 })?;
         }
-        if !self.queue.is_latest_replacement(job)? {
-            return Err(Error::Conflict(
-                "a newer operation superseded this import or replacement".into(),
-            ));
-        }
+        self.require_latest_update(job)?;
+        let input = self.files.open_text(&job.scope, job.source, job.revision)?;
         let mut ordinal = 0;
         let mut last_progress = 0;
         let indexed = index_utf8_with_settings(input, job.chunking, |range, text| {
@@ -278,6 +275,15 @@ impl Service {
             telemetry::vector_reuse(&job.scope, job.id, revision.content.chunks, reused);
         }
         Ok(revision)
+    }
+
+    fn require_latest_update(&self, job: &Job) -> Result<()> {
+        if !self.queue.is_latest_replacement(job)? {
+            return Err(Error::Conflict(
+                "a newer operation superseded this import or replacement".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn prepare_rtf(&self, job: &Job, stopping: &impl Fn() -> bool) -> Result<RtfPreparation> {

@@ -198,6 +198,14 @@ impl Service {
             .retrieval
             .read()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
+        let superseded = self.queue.settle_superseded_failures()?;
+        if superseded > 0 {
+            tracing::debug!(
+                event = "local_superseded_failures",
+                jobs = superseded,
+                "scheduled cleanup for superseded ingestion inputs"
+            );
+        }
         for pending in self.queue.pending_cleanup()? {
             if let Err(error) = self.reclaim_staged_input(&pending) {
                 tracing::warn!(%error, operation = %pending.operation, "could not record staged input cleanup");

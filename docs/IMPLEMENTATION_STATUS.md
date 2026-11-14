@@ -156,6 +156,15 @@ Merged in [PR #4](https://github.com/ArcaneArts/Sanctum/pull/4).
   of old index rows and files. A v1 fixture verifies migration and orphan cleanup.
 - Retirement now also waits for the configured embedding profile's readiness
   when embeddings are enabled.
+- The local worker checks whether a revision was superseded before
+  reading staged input and again under the collection writer. Startup
+  and periodic maintenance also settle superseded retryable failures
+  that never started publication. The gRPC tests cover missing staged
+  input and recovery of an older revision that committed before its
+  queue receipt was recorded. A generated Python client verified the
+  runtime migration, staged file cleanup with the queue paused, upload
+  request replay, and exact retrieval of the newer revision after restart.
+  [Ingestion and retry](LOCAL_API.md#text-uploads).
 - Failed local revision deletions stay in the durable cleanup queue and
   retry after at least one minute. The same pass continues through other
   due revisions. The gRPC regression reproduced a failure that previously

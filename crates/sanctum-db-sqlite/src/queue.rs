@@ -127,6 +127,7 @@ impl LocalQueue {
                 include_str!("runtime_v15.sql"),
                 include_str!("runtime_v16.sql"),
                 include_str!("runtime_v17.sql"),
+                include_str!("runtime_v18.sql"),
             ],
         )?;
         // The previous worker may have stopped after recording a cancellation.
@@ -195,6 +196,29 @@ impl LocalQueue {
         }
         transaction.commit().map_err(database_error)?;
         Ok(expired.len())
+    }
+
+    /// Makes failed, unpublished updates eligible for staged file cleanup.
+    pub fn settle_superseded_failures(&self) -> Result<usize> {
+        self.connect()?
+            .execute(
+                "UPDATE ingestion_jobs SET error_code = 'conflict',
+                    error_message = 'a newer operation superseded this import or replacement',
+                    extracting = 0, rtf_preparation = NULL, initial_metadata = NULL,
+                    initial_chunk_metadata = NULL, cleanup_after = unixepoch(),
+                    finished_at = unixepoch()
+                 WHERE operation_id IN (
+                     SELECT j.operation_id FROM ingestion_jobs j
+                     JOIN replacement_sequences s
+                       ON (s.tenant, s.collection, s.source_id) = (j.tenant, j.collection, j.source_id)
+                     WHERE j.status = 'failed' AND j.error_code = 'retryable'
+                       AND j.publication_started = 0 AND j.update_sequence > 0
+                       AND s.sequence > j.update_sequence
+                     LIMIT 128
+                 )",
+                [],
+            )
+            .map_err(database_error)
     }
 
     pub fn pending_cleanup(&self) -> Result<Vec<StagedCleanup>> {

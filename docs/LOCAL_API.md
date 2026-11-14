@@ -141,7 +141,11 @@ until the worker starts publication. A repeated cancellation returns the
 same canceled job and retries any pending file cleanup. At startup, Sanctum
 settles recorded cancellations even when the queue is paused. It also
 retries cleanup of unpublished files from canceled or permanently failed
-jobs during periodic maintenance. Retry applies to failures marked
+jobs during periodic maintenance. After a newer intent supersedes a
+retryable failure that occurred before publication, maintenance marks
+the older job as a conflict and queues its staged files for deletion.
+A job that started publication can still recover its committed revision.
+Retry applies to failures marked
 `retryable` and preserves the operation and revision IDs.
 Local maintenance removes completed, canceled, and permanently failed job
 records after 45 days once their staged cleanup has finished. Pending and
