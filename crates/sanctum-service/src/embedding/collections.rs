@@ -130,17 +130,13 @@ pub(crate) fn rank_collection(
     mode: SearchMode,
 ) -> Result<(Vec<Chunk>, Coverage)> {
     let coverage = database.embedding_coverage(prepared.profile.as_deref())?;
-    let lexical = if mode != SearchMode::Semantic {
-        database.search(&prepared.expression, limit, filter, metadata)?
-    } else {
-        Vec::new()
-    };
     let semantic = match (&prepared.vector, &prepared.profile) {
         (Some(vector), Some(profile)) if coverage.embedded > 0 => {
             database.search_vector(profile, vector.clone(), limit, filter, metadata)?
         }
         _ => Vec::new(),
     };
+    let lexical = prepared.lexical(database, mode, semantic.is_empty(), limit, filter, metadata)?;
     let ranked = match mode {
         SearchMode::Hybrid if !semantic.is_empty() => fuse(lexical, semantic)
             .into_iter()

@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use sanctum_core::{ByteRange, Error, Result, Scope};
 use sanctum_db_sqlite::vector_index::{ScoredChunk, VectorIndex};
@@ -28,13 +32,46 @@ pub struct SearchResult {
 
 #[derive(Clone)]
 pub(crate) struct PreparedQuery {
-    pub(crate) expression: String,
+    expression: LexicalQuery,
     pub(crate) profile: Option<String>,
     pub(crate) vector: Option<Arc<[f32]>>,
     pub(crate) degraded: Option<&'static str>,
 }
 
 impl PreparedQuery {
+    pub(crate) fn new(query: &str, limit: u32, profile: Option<String>) -> Result<Self> {
+        Ok(Self {
+            expression: LexicalQuery::new(query, limit)?,
+            profile,
+            vector: None,
+            degraded: None,
+        })
+    }
+
+    pub(crate) fn lexical(
+        &self,
+        database: &crate::db::CollectionDb,
+        requested: SearchMode,
+        no_semantic_hits: bool,
+        limit: u32,
+        filter: Option<&Filter>,
+        metadata: &[crate::db::metadata::Entry],
+    ) -> Result<Vec<Chunk>> {
+        match requested {
+            SearchMode::Semantic => Ok(Vec::new()),
+            SearchMode::Hybrid if no_semantic_hits => {
+                let strict = database.search(&self.expression.all, limit, filter, metadata)?;
+                match &self.expression.any {
+                    Some(expression) if strict.is_empty() => {
+                        database.search(expression, limit, filter, metadata)
+                    }
+                    _ => Ok(strict),
+                }
+            }
+            _ => database.search(&self.expression.all, limit, filter, metadata),
+        }
+    }
+
     pub(crate) fn strategy(
         &self,
         requested: SearchMode,
@@ -118,16 +155,14 @@ impl Service {
                         )?,
                     _ => Vec::new(),
                 };
-                let lexical = if actual_mode == SearchMode::Semantic {
-                    Vec::new()
-                } else {
-                    db.search(
-                        &prepared.expression,
-                        candidate_limit,
-                        filter.as_ref(),
-                        &metadata,
-                    )?
-                };
+                let lexical = prepared.lexical(
+                    db,
+                    mode,
+                    semantic.is_empty(),
+                    candidate_limit,
+                    filter.as_ref(),
+                    &metadata,
+                )?;
                 let ranked = match actual_mode {
                     SearchMode::Lexical => lexical.into_iter().map(|chunk| (chunk, None)).collect(),
                     SearchMode::Semantic => semantic
@@ -173,16 +208,11 @@ impl Service {
         filter: Option<&Filter>,
         mode: SearchMode,
     ) -> Result<PreparedQuery> {
-        let expression = lexical_expression(&query, limit)?;
+        let mut prepared =
+            PreparedQuery::new(&query, limit, self.embedding_profile().map(str::to_owned))?;
         if let Some(filter) = filter {
             filter.validate()?;
         }
-        let mut prepared = PreparedQuery {
-            expression,
-            profile: self.embedding_profile().map(str::to_owned),
-            vector: None,
-            degraded: None,
-        };
         if mode == SearchMode::Lexical {
             return Ok(prepared);
         }
@@ -354,22 +384,35 @@ pub(crate) async fn embed_batch(provider: &dyn Provider, batch: Batch) -> Vec<Ba
     outcomes
 }
 
-pub(crate) fn lexical_expression(query: &str, limit: u32) -> Result<String> {
-    if query.trim().is_empty() || query.len() > 4096 || query.as_bytes().contains(&0) {
-        return Err(Error::Invalid(
-            "search requires a text query of at most 4096 bytes".into(),
-        ));
+#[derive(Clone)]
+struct LexicalQuery {
+    all: String,
+    any: Option<String>,
+}
+
+impl LexicalQuery {
+    fn new(query: &str, limit: u32) -> Result<Self> {
+        if query.trim().is_empty() || query.len() > 4096 || query.as_bytes().contains(&0) {
+            return Err(Error::Invalid(
+                "search requires a text query of at most 4096 bytes".into(),
+            ));
+        }
+        if !(1..=100).contains(&limit) {
+            return Err(Error::Invalid(
+                "search limit must be between 1 and 100".into(),
+            ));
+        }
+        let mut seen = HashSet::new();
+        let terms: Vec<_> = query
+            .split_whitespace()
+            .filter(|term| seen.insert(*term))
+            .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
+            .collect();
+        Ok(Self {
+            all: terms.join(" AND "),
+            any: (terms.len() > 1).then(|| terms.join(" OR ")),
+        })
     }
-    if !(1..=100).contains(&limit) {
-        return Err(Error::Invalid(
-            "search limit must be between 1 and 100".into(),
-        ));
-    }
-    Ok(query
-        .split_whitespace()
-        .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" AND "))
 }
 
 async fn blocking<T: Send + 'static>(

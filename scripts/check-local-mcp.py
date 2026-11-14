@@ -188,7 +188,10 @@ def check(bin_dir):
                 predicate = {"kind": "test", "level": "collection", "namespace": "field",
                              "key": "classification", "path": ["tags"], "operator": "contains",
                              "operand_json": "null"}
-                result = stdio.tool("search", collection="notes", query="quartz", metadata_filter=predicate)
+                query = "quartz nonmatchingword"
+                strict = http.tool("search", collection="notes", query=query, mode="lexical", metadata_filter=predicate)
+                assert not strict["hits"], strict
+                result = stdio.tool("search", collection="notes", query=query, metadata_filter=predicate)
                 assert result["mode"] == "lexical" and result["degraded_reason"] == "embedding_disabled"
                 hit, = result["hits"]
                 assert hit["representation"] == "canonical_utf8"

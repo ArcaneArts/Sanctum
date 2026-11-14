@@ -3,7 +3,7 @@
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import csv
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -168,7 +168,7 @@ def wait_for_embeddings(client, scope, chunks, timeout):
         time.sleep(0.5)
 
 
-def ingest(client, corpus, workers, timeout):
+def ingest(client, corpus, workers, timeout, embeddings):
     client.CreateCollection(pb.CreateCollectionRequest(scope=SCOPE), timeout=15)
 
     def document(item):
@@ -184,7 +184,8 @@ def ingest(client, corpus, workers, timeout):
             if count % 1000 == 0:
                 print(f"Published {count}/{len(corpus)} documents", flush=True)
     lexical_ready = time.monotonic()
-    wait_for_embeddings(client, SCOPE, chunks, timeout)
+    if embeddings:
+        wait_for_embeddings(client, SCOPE, chunks, timeout)
     return chunks, round(lexical_ready - started, 3), round(time.monotonic() - started, 3)
 
 
@@ -195,19 +196,23 @@ def query_text(text):
     return raw[:4096].decode(errors="ignore").rsplit(maxsplit=1)[0]
 
 
-def evaluate(client, queries, qrels, chunks):
-    scores = {name: [] for name in MODES}
-    latency = {name: [] for name in MODES}
+def evaluate(client, queries, qrels, chunks, lexical_fallback):
+    modes = {"hybrid_without_embeddings": pb.SEARCH_MODE_HYBRID} if lexical_fallback else MODES
+    scores = {name: [] for name in modes}
+    latency = {name: [] for name in modes}
     for number, (qid, row) in enumerate(queries.items(), start=1):
         query = query_text(row["text"])
-        for name, mode in MODES.items():
+        for name, mode in modes.items():
             started = time.monotonic()
             response = client.SearchText(pb.SearchTextRequest(
                 scope=SCOPE, mode=mode, query=query, limit=30,
             ), timeout=45)
             latency[name].append((time.monotonic() - started) * 1000)
-            if (response.mode != mode or response.HasField("degraded_reason")
-                    or response.embedding_coverage.embedded_chunks != chunks):
+            expected_mode = pb.SEARCH_MODE_LEXICAL if lexical_fallback else mode
+            reason = "embedding_disabled" if lexical_fallback else ""
+            expected_embedded = 0 if lexical_fallback else chunks
+            if (response.mode != expected_mode or response.degraded_reason != reason
+                    or response.embedding_coverage.embedded_chunks != expected_embedded):
                 raise RuntimeError(f"Incomplete {name} result for {qid}")
             ranked = list(dict.fromkeys(hit.external.id for hit in response.hits if hit.external.id != qid))
             top = ranked[:K]
@@ -264,6 +269,7 @@ def reuse(client, counts, timeout):
 
 
 def benchmark(args, root, corpus, queries, qrels, endpoint, counts):
+    embeddings = not args.lexical_fallback
     config = {
         "version": 1,
         "storage_root": str(root),
@@ -279,6 +285,8 @@ def benchmark(args, root, corpus, queries, qrels, endpoint, counts):
             },
         },
     }
+    if args.lexical_fallback:
+        del config["embedding"]
     env = os.environ | {
         "SANCTUM_CONFIG_JSON": json.dumps(config), "SANCTUM_MANAGED_STDIO": "1", "NO_COLOR": "1",
     }
@@ -287,24 +295,29 @@ def benchmark(args, root, corpus, queries, qrels, endpoint, counts):
         addresses = json.loads(server.stdout.readline())
         with grpc.insecure_channel(addresses["grpc"]) as channel:
             client = rpc.SanctumStub(channel)
-            chunks, lexical_seconds, embedding_seconds = ingest(client, corpus, args.workers, args.timeout)
+            chunks, lexical_seconds, embedding_seconds = ingest(
+                client, corpus, args.workers, args.timeout, embeddings,
+            )
             corpus_provider = counts()
             print(f"{chunks} current chunks in {embedding_seconds} s: {dict(corpus_provider)}", flush=True)
-            reuse_result = reuse(client, counts, args.timeout)
-            print(f"Replacement: {reuse_result}", flush=True)
-            retrieval = evaluate(client, queries, qrels, chunks)
+            reuse_result = reuse(client, counts, args.timeout) if embeddings else None
+            if reuse_result:
+                print(f"Replacement: {reuse_result}", flush=True)
+            retrieval = evaluate(client, queries, qrels, chunks, args.lexical_fallback)
         server.stdin.close()
         if server.wait(timeout=30) != 0:
             raise RuntimeError("Sanctum did not shut down cleanly")
     database = root / SCOPE.tenant / SCOPE.collection / "meta.db"
     return {
-        "model": args.model, "revision": args.revision, "dimensions": args.dimensions,
+        "model": args.model if embeddings else None,
+        "revision": args.revision if embeddings else None,
+        "dimensions": args.dimensions if embeddings else None,
         "documents": len(corpus), "queries": len(queries),
         "queries_missing_judged_document": sum(qrels[qid] not in corpus for qid in queries),
         "truncated_queries": sum(len(row["text"].encode()) > 4096 for row in queries.values()),
         "chunks": chunks, "meta_db_bytes_after_shutdown": database.stat().st_size,
         "lexical_index_seconds": lexical_seconds,
-        "fully_embedded_seconds": embedding_seconds,
+        "fully_embedded_seconds": embedding_seconds if embeddings else None,
         "corpus_provider_inputs": corpus_provider["document"],
         "corpus_provider_requests": corpus_provider["requests"],
         "retrieval": retrieval, "replacement": reuse_result,
@@ -317,7 +330,8 @@ def main():
     parser.add_argument("--bin-dir", default=Path("target/release"), type=Path)
     parser.add_argument("--ollama", default="http://127.0.0.1:11434")
     parser.add_argument("--model", default="embeddinggemma-2:740m")
-    parser.add_argument("--revision", required=True, help="installed Ollama model revision or digest")
+    parser.add_argument("--revision", help="installed Ollama model revision or digest")
+    parser.add_argument("--lexical-fallback", action="store_true", help="measure hybrid with embeddings disabled")
     parser.add_argument("--dimensions", type=int, default=768)
     parser.add_argument("--workers", type=int, choices=range(1, 33), default=8, metavar="1-32")
     parser.add_argument("--queries", type=int, help="optional first N queries for a smoke run")
@@ -326,11 +340,15 @@ def main():
     args = parser.parse_args()
     if args.queries is not None and args.queries < 1:
         parser.error("--queries must be positive")
+    if not args.lexical_fallback and not args.revision:
+        parser.error("--revision is required when embeddings are enabled")
     corpus, queries, qrels = read_dataset(args.dataset)
     if args.queries is not None:
         queries = {qid: queries[qid] for qid in list(queries)[:args.queries]}
     with tempfile.TemporaryDirectory(prefix="sanctum-retrieval-benchmark-") as tmp:
-        with count_provider(args.ollama.rstrip("/"), timeout=28) as (endpoint, counts):
+        proxy = (nullcontext((None, Counter)) if args.lexical_fallback
+                 else count_provider(args.ollama.rstrip("/"), timeout=28))
+        with proxy as (endpoint, counts):
             result = benchmark(args, Path(tmp), corpus, queries, qrels, endpoint, counts)
     result["query_provider_inputs"] = counts()["query"]
     result["query_ids_sha256"] = hashlib.sha256("\n".join(queries).encode()).hexdigest()

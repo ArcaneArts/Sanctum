@@ -378,3 +378,27 @@ final HEAD required one 630,095,872-byte base and four deltas for cold
 replay. The source upload still transferred the complete 200 MiB file.
 The runs cover lexical indexing. Live Cloud Run memory and latency
 measurements remain open.
+
+## Partial lexical matches for prose queries
+
+Hybrid tries partial-term FTS5 when both the all-term search and
+semantic ranking have zero eligible hits in a collection. This includes
+queries without an available embedding provider. Explicit lexical
+requests continue to require all terms.
+
+Run the same ArguAna benchmark with `--lexical-fallback` to disable the
+provider and measure this path. The release filesystem server returned
+results for 662 of 1,406 queries, with 0.31437 Recall@10 and 0.19465
+nDCG@10. The original strict lexical run returned results for 63 queries
+and reached 0.00071 on both measures. Query IDs matching a document ID
+are excluded from the rankings. Some prose queries match only their own
+document in the strict pass, so fallback is not triggered for those.
+The two benchmarks used separate SQLite databases, with the same
+8,695 current chunks in each.
+
+The experiment also tested fusing partial matches with live Ollama
+results when the all-term pass was empty. That variant reached 0.88549
+Recall@10 and 0.61493 nDCG@10. The same run's semantic mode reached
+0.91038 and 0.63994. The shipped rule uses partial terms only when
+semantic ranking has no eligible hits, keeping the original ranking
+path for collections with semantic results.
