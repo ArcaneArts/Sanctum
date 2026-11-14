@@ -1615,6 +1615,12 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   reused the existing revision. Range fetch returned exact UTF-8 and the
   original retention choice was honored.
   [PR #145](https://github.com/ArcaneArts/Sanctum/pull/145).
+- Hosted indexing verifies retained RTF originals even when the saved UTF-8
+  extraction is intact. A restarted worker backed by live MinIO rejected
+  missing and same-size altered originals. Restoring the exact bytes allowed
+  both revisions to publish using their existing extraction objects. The
+  smoke checked original bytes, canonical ranges, and duplicate deliveries.
+  [PR #146](https://github.com/ArcaneArts/Sanctum/pull/146).
 
 ## Two simultaneous GiB-scale snapshot reads
 

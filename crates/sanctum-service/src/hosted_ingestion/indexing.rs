@@ -436,6 +436,7 @@ impl HostedCatalog {
         preparation: Option<&Preparation>,
     ) -> Result<Prepared> {
         let input = record.input_key(prefix)?;
+        let retain = is_rtf(&record.upload.name) && record.upload.retain_original;
         let (file, content, text) = match preparation {
             Some(Preparation::Ready(canonical)) => {
                 let (file, text) = if canonical.extracted.is_some() {
@@ -479,8 +480,7 @@ impl HostedCatalog {
             },
             objects: RevisionObjects {
                 text_key: text.to_string(),
-                original_key: (is_rtf(&record.upload.name) && record.upload.retain_original)
-                    .then(|| input.to_string()),
+                original_key: retain.then(|| input.to_string()),
             },
         })
     }
@@ -505,7 +505,13 @@ impl HostedCatalog {
             )
             .await
         {
-            Ok(file) => return Ok((file, key)),
+            Ok(file) => {
+                if record.upload.retain_original {
+                    self.verify_retained_original(record, &record.input_key(prefix)?)
+                        .await?;
+                }
+                return Ok((file, key));
+            }
             Err(Error::NotFound(_)) => {}
             Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidData => {}
             Err(error) => return Err(error),
@@ -533,6 +539,12 @@ impl HostedCatalog {
             "rebuilt a saved RTF extraction from its accepted input"
         );
         Ok((file, replacement))
+    }
+
+    async fn verify_retained_original(&self, record: &Operation, key: &Key) -> Result<()> {
+        let reader = self.open_source(key, record.bytes).await?;
+        copy_verified(reader, tokio::io::sink(), record.bytes, &record.blake3).await?;
+        Ok(())
     }
 
     pub(super) fn prepared_rtf_text(
@@ -572,50 +584,64 @@ impl HostedCatalog {
         digest: Option<&str>,
     ) -> Result<NamedTempFile> {
         let download_started = Instant::now();
-        let input = self.storage.get(key).await?;
-        if input.object.length != bytes {
-            return Err(invalid_input());
-        }
+        let mut reader = self.open_source(key, bytes).await?;
         let staged = NamedTempFile::new()?;
         let mut output = tokio::fs::File::from_std(staged.reopen()?);
-        let mut reader = input.reader.take(bytes.saturating_add(1));
-        let copied = if let Some(digest) = digest {
-            let mut hash = blake3::Hasher::new();
-            let mut buffer = vec![0; 64 * 1024];
-            let mut copied = 0;
-            loop {
-                let read = reader.read(&mut buffer).await?;
-                if read == 0 {
-                    break;
-                }
-                hash.update(&buffer[..read]);
-                output.write_all(&buffer[..read]).await?;
-                copied += read as u64;
-            }
-            if hash.finalize().to_hex().as_str() != digest {
-                return Err(invalid_input());
-            }
-            copied
-        } else {
-            tokio::io::copy(&mut reader, &mut output).await?
-        };
-        output.flush().await?;
-        drop(output);
-        if copied != bytes {
+        if let Some(digest) = digest {
+            copy_verified(reader, &mut output, bytes, digest).await?;
+        } else if tokio::io::copy(&mut reader, &mut output).await? != bytes {
             return Err(invalid_input());
         }
+        output.flush().await?;
+        drop(output);
         tracing::debug!(
             event = "hosted_input_transfer",
             tenant = %scope.tenant,
             collection = %scope.collection,
             %operation,
             direction = "download",
-            bytes = copied,
+            bytes,
             duration_ms = download_started.elapsed().as_secs_f64() * 1_000.0,
             "downloaded a staged source"
         );
         Ok(staged)
     }
+
+    async fn open_source(
+        &self,
+        key: &Key,
+        bytes: u64,
+    ) -> Result<tokio::io::Take<sanctum_storage::Reader>> {
+        let input = self.storage.get(key).await?;
+        if input.object.length != bytes {
+            return Err(invalid_input());
+        }
+        Ok(input.reader.take(bytes.saturating_add(1)))
+    }
+}
+
+async fn copy_verified(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    mut output: impl tokio::io::AsyncWrite + Unpin,
+    bytes: u64,
+    digest: &str,
+) -> Result<()> {
+    let mut hash = blake3::Hasher::new();
+    let mut buffer = vec![0; 64 * 1024];
+    let mut copied = 0;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        copied += read as u64;
+        hash.update(&buffer[..read]);
+        output.write_all(&buffer[..read]).await?;
+    }
+    if copied != bytes || hash.finalize().to_hex().as_str() != digest {
+        return Err(invalid_input());
+    }
+    Ok(())
 }
 
 fn prepare_text(
