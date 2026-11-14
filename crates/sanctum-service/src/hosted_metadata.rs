@@ -91,8 +91,7 @@ impl HostedCatalog {
     ) -> Result<metadata_query::Page> {
         match (query.level, collection) {
             (Level::Collection, None) => {
-                let unit = Unit::catalog(self.prefix.as_ref(), tenant)?;
-                let snapshot = self.snapshots.read(&self.publication, &unit).await?;
+                let snapshot = self.tenant_catalog_snapshot(tenant).await?;
                 tokio::task::spawn_blocking(move || {
                     metadata_query::read_catalog(snapshot.as_ref().map(|db| db.path()), query)
                 })
@@ -104,13 +103,23 @@ impl HostedCatalog {
                     tenant: tenant.clone(),
                     collection,
                 };
-                let values = self.metadata(&scope, None).await?;
+                let values = if query.uses_collection_metadata() {
+                    self.metadata(&scope, None).await?
+                } else {
+                    self.require_collection(&scope).await?;
+                    Vec::new()
+                };
+                let snapshot = self.collection_snapshot(&scope).await?;
                 let collection = scope.collection.to_string();
-                self.with_owned_collection(&scope, move |database| {
-                    database.query_metadata(&collection, query, &values)
+                tokio::task::spawn_blocking(move || {
+                    db::CollectionDb::open_read_only(snapshot.path())?.query_metadata(
+                        &collection,
+                        query,
+                        &values,
+                    )
                 })
                 .await
-                .map(|(page, _)| page)
+                .map_err(|error| Error::Internal(Box::new(error)))?
             }
             _ => Err(Error::Invalid(
                 "collection is required only for source or chunk metadata queries".into(),

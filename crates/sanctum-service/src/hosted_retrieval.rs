@@ -332,22 +332,7 @@ impl HostedCatalog {
         query_snapshot(self.collection_snapshot(scope).await?, read).await
     }
 
-    pub(crate) async fn with_owned_collection<T: Send + 'static>(
-        &self,
-        scope: &Scope,
-        read: impl FnOnce(db::CollectionDb) -> Result<T> + Send + 'static,
-    ) -> Result<(T, Uuid)> {
-        self.require_collection(scope).await?;
-        let database = self.collection_snapshot(scope).await?;
-        tokio::task::spawn_blocking(move || {
-            let value = read(db::CollectionDb::open_read_only(database.path())?)?;
-            Ok((value, database.generation.id))
-        })
-        .await
-        .map_err(|error| Error::Internal(Box::new(error)))?
-    }
-
-    async fn collection_snapshot(&self, scope: &Scope) -> Result<Arc<Materialized>> {
+    pub(crate) async fn collection_snapshot(&self, scope: &Scope) -> Result<Arc<Materialized>> {
         let unit = Unit::collection(self.prefix.as_ref(), scope)?;
         self.snapshots
             .read(&self.publication, &unit)

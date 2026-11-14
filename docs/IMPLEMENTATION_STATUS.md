@@ -898,6 +898,18 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   smoke verifies collection and chunk writes across API instances
   and search filtered by published catalog metadata.
 - Delivered in [PR #41](https://github.com/ArcaneArts/Sanctum/pull/41).
+- Hosted source and chunk metadata queries use one tenant catalog generation
+  for membership and any collection-level metadata. Queries scoped to source
+  and chunk fields only check membership in that catalog.
+- The gRPC regression counts one catalog manifest request and one catalog
+  download per query with retention disabled. It verifies grouped JSON null
+  results with an ancestor filter and source sorting by a collection field
+  without a filter.
+- A generated Python gRPC client against live MinIO observed one catalog
+  and one collection download for each of five queries. It verified nested
+  collection metadata in sorting and filtering, chunk-only aggregation,
+  and visibility of a new catalog value. After deletion the query returned
+  `NOT_FOUND` without reading the collection manifest or snapshot.
 
 ## Hosted change cursors and streams
 
