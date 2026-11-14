@@ -215,6 +215,16 @@ Merged in [PR #4](https://github.com/ArcaneArts/Sanctum/pull/4).
   recovery removes the abandoned input without executing it again.
   The committed-revision regression restores a missing queue receipt
   without another worker attempt.
+- If saving the receipt itself fails, maintenance also checks jobs left
+  in `PUBLISHING`. Startup checks jobs requeued after an interrupted
+  publication. Recovery matches the attempt and verifies the committed
+  revision before completing either job. The gRPC regressions force a
+  queue write failure during normal operation and recover after an
+  interrupted publication with the queue paused. Both preserve the
+  original attempt count. A generated Python client exercised the
+  standalone server after SIGKILL and a runtime schema 21 to 22 migration.
+  It replayed the same request and fetched the exact UTF-8 excerpt.
+  [Ingestion recovery](LOCAL_API.md#text-uploads).
 - A managed server and generated Python gRPC client verified the version
   19 to 20 runtime migration, both recovery outcomes with ingestion
   paused, cleanup of the recovered RTF original, and exact UTF-8 retrieval.
