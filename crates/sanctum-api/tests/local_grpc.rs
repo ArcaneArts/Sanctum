@@ -3886,6 +3886,90 @@ async fn replacement_preserves_identity_and_the_latest_intent_wins() {
 }
 
 #[tokio::test]
+async fn failed_revision_cleanup_does_not_hold_up_other_files() {
+    let dir = TempDir::new().unwrap();
+    let mut api = Running::start(&dir).await;
+    create(&mut api.client, "default").await;
+    let old = upload(&mut api.client, header("default"), b"old fluorite").await;
+    let middle = upload(
+        &mut api.client,
+        replacement(Some(&old.source_id), Some(&old.revision_id)),
+        b"middle garnet",
+    )
+    .await;
+    let current = upload(
+        &mut api.client,
+        replacement(Some(&old.source_id), Some(&middle.revision_id)),
+        b"current peridot",
+    )
+    .await;
+    let blocked = text_path(&dir, &old.source_id, &old.revision_id);
+    std::fs::remove_file(&blocked).unwrap();
+    std::fs::create_dir(&blocked).unwrap();
+    let other = text_path(&dir, &middle.source_id, &middle.revision_id);
+    let db_path = dir.path().join("default/notes/meta.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute(
+        "UPDATE revisions SET retire_at = CASE WHEN id = ?1 THEN 0 ELSE 1 END
+         WHERE retire_at IS NOT NULL",
+        [&old.revision_id],
+    )
+    .unwrap();
+    drop(db);
+    let target = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let first_pass = api.service.reclaim_retired(&target);
+    assert!(
+        !other.exists(),
+        "a failed deletion kept another revision on disk"
+    );
+    first_pass.unwrap();
+    assert!(blocked.is_dir());
+
+    let inspect = v1::GetSourceRequest {
+        scope: scope("default"),
+        source_id: old.source_id.clone(),
+        expected_revision_id: Some(current.revision_id),
+    };
+    let found = api
+        .client
+        .get_source(inspect.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let processing = found.processing.unwrap();
+    assert_eq!(processing.retained_revisions, 0);
+    assert_eq!(processing.pending_revision_cleanup, 1);
+    api.stop().await;
+
+    // Resolve the filesystem error before restart. The retry deadline still
+    // applies while startup reclaims files that have no database or queue entry.
+    std::fs::remove_dir(&blocked).unwrap();
+    std::fs::write(&blocked, b"old fluorite").unwrap();
+    let orphan = text_path(&dir, &old.source_id, &uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    std::fs::write(&orphan, b"interrupted before acceptance").unwrap();
+    let mut api = Running::start(&dir).await;
+    assert!(!orphan.exists());
+    api.service.reclaim_retired(&target).unwrap();
+    assert!(blocked.exists());
+
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute("UPDATE revision_garbage SET cleanup_after = 0", [])
+        .unwrap();
+    api.service.reclaim_retired(&target).unwrap();
+    assert!(!blocked.exists());
+    let found = api.client.get_source(inspect).await.unwrap().into_inner();
+    assert_eq!(found.processing.unwrap().pending_revision_cleanup, 0);
+    let hits = search(&mut api.client, "default", "peridot").await;
+    assert_eq!(hits[0].excerpt, "current peridot");
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn deletion_blocks_queued_replacement_and_reclaims_all_revisions() {
     let dir = TempDir::new().unwrap();
     let mut running = Running::start(&dir).await;

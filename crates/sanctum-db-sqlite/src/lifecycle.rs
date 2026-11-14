@@ -6,6 +6,7 @@ use super::{CollectionDb, Revision, RevisionWrite, database_error, query_all, re
 
 pub const RETIRE_GRACE_SECONDS: i64 = 300;
 const DELETION_RECEIPT_SECONDS: i64 = 24 * 60 * 60;
+const CLEANUP_RETRY_SECONDS: i64 = 60;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RevisionKey {
@@ -32,10 +33,11 @@ impl CollectionDb {
         find_source(&self.0, id, external)
     }
 
-    pub fn garbage(&self) -> Result<Vec<RevisionKey>> {
+    pub fn due_revision_garbage(&self) -> Result<Vec<RevisionKey>> {
         query_all(
             &self.0,
-            "SELECT source_id, revision_id FROM revision_garbage LIMIT 256",
+            "SELECT source_id, revision_id FROM revision_garbage WHERE cleanup_after <= unixepoch()
+             ORDER BY cleanup_after, source_id, revision_id LIMIT 256",
             [],
             key,
         )
@@ -51,10 +53,32 @@ impl CollectionDb {
         Ok(())
     }
 
-    pub fn contains_revision(&self, revision: RevisionKey) -> Result<bool> {
-        Ok(self
-            .revision_summary(revision.source, revision.revision)?
-            .is_some())
+    pub fn defer_revision_cleanup(&self, revision: RevisionKey) -> Result<()> {
+        self.0
+            .execute(
+                "UPDATE revision_garbage SET cleanup_after = unixepoch() + ?3
+                 WHERE source_id = ?1 AND revision_id = ?2",
+                params![
+                    revision.source.to_string(),
+                    revision.revision.to_string(),
+                    CLEANUP_RETRY_SECONDS
+                ],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn tracks_revision_files(&self, revision: RevisionKey) -> Result<bool> {
+        self.0
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM revisions WHERE source_id = ?1 AND id = ?2)
+                 OR EXISTS(
+                     SELECT 1 FROM revision_garbage WHERE source_id = ?1 AND revision_id = ?2
+                 )",
+                params![revision.source.to_string(), revision.revision.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
     }
 
     pub fn has_retirement_work(&self, profile: Option<&str>) -> Result<bool> {
@@ -70,7 +94,6 @@ impl CollectionDb {
                         WHERE c.source_id = s.id AND c.revision_id = s.current_revision AND e.input_hash IS NULL
                       ))
                  )
-                 OR EXISTS(SELECT 1 FROM revision_garbage)
                  OR EXISTS(SELECT 1 FROM deleted_sources d WHERE d.expires_at <= unixepoch()
                      AND NOT EXISTS(SELECT 1 FROM sources WHERE id = d.id))",
                 [profile],
@@ -272,7 +295,8 @@ impl<T: std::ops::Deref<Target = rusqlite::Connection>> RevisionWrite<T> {
         }
         self.0
             .execute(
-                "INSERT INTO revision_garbage (source_id, revision_id) VALUES (?1, ?2)
+                "INSERT INTO revision_garbage (source_id, revision_id, cleanup_after)
+                VALUES (?1, ?2, unixepoch())
                 ON CONFLICT DO NOTHING",
                 params![source, rev],
             )

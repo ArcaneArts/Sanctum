@@ -156,6 +156,15 @@ Merged in [PR #4](https://github.com/ArcaneArts/Sanctum/pull/4).
   of old index rows and files. A v1 fixture verifies migration and orphan cleanup.
 - Retirement now also waits for the configured embedding profile's readiness
   when embeddings are enabled.
+- Failed local revision deletions stay in the durable cleanup queue and
+  retry after at least one minute. The same pass continues through other
+  due revisions. The gRPC regression reproduced a failure that previously
+  kept another superseded file on disk. After the fix it verified cleanup
+  counts, retry across restart, and exact retrieval of the current revision.
+  A managed server run with a generated Python client migrated a version 12
+  collection, drained its pre-existing cleanup row, and verified that a
+  failed deletion retained its retry deadline across restart.
+  [Source processing status](LOCAL_API.md#source-inspection).
 
 ## Local file and directory imports
 
