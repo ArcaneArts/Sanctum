@@ -27,6 +27,8 @@ struct UnitCursor {
     #[serde(rename = "manifest")]
     key: String,
     next: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    retired: bool,
 }
 
 pub struct SnapshotSweep {
@@ -99,6 +101,7 @@ impl HostedCatalog {
                     cursor.pending.push_back(UnitCursor {
                         key: item.key.to_string(),
                         next: None,
+                        retired: false,
                     });
                 }
             }
@@ -139,7 +142,7 @@ impl HostedCatalog {
                 continue;
             };
             let Some(result) = budget
-                .attempt(self.sweep_snapshot_unit(&manifest, &unit, pending.next.as_deref()))
+                .attempt(self.sweep_snapshot_unit(&manifest, &unit, pending))
                 .await
                 .transpose()
             else {
@@ -150,17 +153,18 @@ impl HostedCatalog {
                 .pop_front()
                 .expect("attempt used the front of the queue");
             match result {
-                Ok(page) => {
+                Ok((page, retired)) => {
                     report.units += 1;
                     report.deleted += page.deleted;
                     report.failed_deletions += page.failed_deletions;
                     if page.next_cursor.is_some() {
-                        if page.next_cursor == pending.next {
+                        if pending.retired == retired && page.next_cursor == pending.next {
                             return Err(Error::Internal(
                                 "snapshot list cursor did not advance".into(),
                             ));
                         }
                         pending.next = page.next_cursor;
+                        pending.retired = retired;
                         cursor.pending.push_back(pending);
                     }
                 }
@@ -194,15 +198,26 @@ impl HostedCatalog {
         &self,
         manifest: &Key,
         unit: &Unit,
-        cursor: Option<&str>,
-    ) -> Result<sanctum_db::CleanupPage> {
-        if let Some(scope) = collection_manifest(self.prefix.as_ref(), manifest)
-            && self.collection_retired(&scope).await?
-        {
+        pending: &UnitCursor,
+    ) -> Result<(sanctum_db::CleanupPage, bool)> {
+        let retired = match collection_manifest(self.prefix.as_ref(), manifest) {
+            Some(scope) => self.collection_retired(&scope).await?,
+            None => false,
+        };
+        // Active and retired sweeps list different prefixes.
+        let cursor = pending
+            .next
+            .as_deref()
+            .filter(|_| pending.retired == retired);
+        let page = if retired {
             self.publication.fence_deletion(unit).await?;
-            return self.publication.reclaim_retired(unit, GRACE, cursor).await;
-        }
-        self.publication.reclaim(unit, GRACE, cursor).await
+            self.publication
+                .reclaim_retired(unit, GRACE, cursor)
+                .await?
+        } else {
+            self.publication.reclaim(unit, GRACE, cursor).await?
+        };
+        Ok((page, retired))
     }
 }
 
@@ -228,9 +243,13 @@ fn unit_from_manifest(prefix: Option<&Key>, key: &Key) -> Result<Option<Unit>> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use sanctum_core::Scope;
+    use sanctum_storage::Storage;
 
     use super::*;
 
@@ -260,5 +279,71 @@ mod tests {
         let resumed = catalog().sweep_hosted_snapshots().await.unwrap();
         assert_eq!((resumed.units, resumed.failed), (2, 0));
         assert!(!resumed.more);
+    }
+
+    #[tokio::test]
+    async fn retired_collection_restarts_listing_from_the_collection_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+        let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+        let scope = Scope {
+            tenant: "default".parse().unwrap(),
+            collection: "notes".parse().unwrap(),
+        };
+        let prefix = Key::parse("default/collections/notes").unwrap();
+        let head = Key::parse(format!("{prefix}/HEAD.json")).unwrap();
+        let input = Key::parse(format!("{prefix}/operations/pending/input")).unwrap();
+        let service = catalog();
+        service.create_collection(&scope, None).await.unwrap();
+        storage
+            .put_control(&input, b"source".as_slice().into(), Condition::Create)
+            .await
+            .unwrap();
+        // Save a continuation inside the snapshot prefix before retiring the collection.
+        for n in 0..70 {
+            let object = Key::parse(format!("{prefix}/snapshots/test/{n:02}")).unwrap();
+            storage
+                .put_control(&object, b"snapshot".as_slice().into(), Condition::Create)
+                .await
+                .unwrap();
+        }
+        let active = service.sweep_hosted_snapshots().await.unwrap();
+        assert_eq!((active.units, active.deleted, active.failed), (2, 0, 0));
+        assert!(active.more);
+
+        service.delete_collection(&scope, None).await.unwrap();
+        let mut download = storage.get(&head).await.unwrap();
+        let mut body = Vec::new();
+        download.reader.read_to_end(&mut body).await.unwrap();
+        let mut retired: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        retired["deleted_at_ms"] = serde_json::json!(
+            (SystemTime::now() - GRACE - Duration::from_secs(1))
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+        storage
+            .put_control(
+                &head,
+                serde_json::to_vec(&retired).unwrap().into(),
+                Condition::Match(download.object.version),
+            )
+            .await
+            .unwrap();
+        drop(service);
+
+        let first = catalog().sweep_hosted_snapshots().await.unwrap();
+        assert!(matches!(
+            storage.head(&input).await,
+            Err(Error::NotFound(_))
+        ));
+        assert_eq!((first.units, first.deleted, first.failed), (1, 63, 0));
+        assert!(first.more);
+        let second = catalog().sweep_hosted_snapshots().await.unwrap();
+        assert_eq!((second.units, second.deleted, second.failed), (1, 9, 0));
+        assert!(!second.more);
+        let remaining = storage.list(Some(&prefix), None, 1).await.unwrap();
+        assert_eq!(remaining.objects[0].key, head);
+        assert!(remaining.next_cursor.is_none());
     }
 }

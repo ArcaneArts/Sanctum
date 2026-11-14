@@ -1078,6 +1078,12 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   verifies that a persistent failure on one page leaves later pages
   reachable and that a fresh scan can reclaim the remaining object.
   [Scheduled reclamation behavior](STORAGE.md#scheduled-snapshot-reclamation).
+- A filesystem regression verified that a collection retired during a
+  paginated snapshot scan reclaims an operation input on the first
+  eligible retirement page and resumes the collection-wide listing
+  after restart. On live MinIO, separate worker processes resumed an older
+  checkpoint, reclaimed 72 objects across two pages, and kept the
+  collection's tombstone and retired ID.
 
 ## Hosted MCP ingress
 
