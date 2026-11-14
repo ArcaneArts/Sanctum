@@ -9,7 +9,7 @@ which parts have working implementations and where to find the evidence.
 | 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, URL and Git imports, and a Windows x64 installer build | Live hosted provider checks, Windows installation and tray verification, distribution signing |
 | 3. Object storage and publication | Shared storage contract, filesystem and MinIO-tested S3, native GCS adapter, and fenced SQLite snapshot publication for hosted catalog, source, and metadata operations | Live GCS verification and cloud recovery scenarios |
 | 4. Cloud Run and Cloud Tasks | Linux API and worker containers, durable staged uploads, dispatch and repair, scheduled maintenance, and hosted gRPC and MCP | Live IAM, Cloud Run ingress, and Tasks and Scheduler delivery |
-| 5. Capacity | [200 MiB lexical ingestion and 1–2 GiB snapshot measurements](CAPACITY.md) | Cold/warm Cloud Run performance, broader retrieval workloads, and production rollout limits |
+| 5. Capacity | [200 MiB ingestion, GiB-scale snapshots, 10,000 MinIO tenants, and real embedding benchmarks](CAPACITY.md) | Cold/warm Cloud Run performance and production rollout limits |
 
 ## Local text ingestion and retrieval
 
@@ -1310,3 +1310,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   automatic joins and ordinary SQLite reads pending hosted memory
   and concurrency measurements.
   [Method and results](CAPACITY.md#query-plan-and-read-only-memory-mapping).
+
+## Concurrent hosted retrieval with real embeddings
+
+- A release API published 1,026 chunks across two collections against
+  live MinIO and real Ollama. After API restart, a generated Python
+  client queried both collections concurrently and checked the bytes and
+  collection provenance of every excerpt. The first searches took
+  230.62 and 185.06 ms. Snapshot download and replay accounted for
+  56.47 and 59.63 ms respectively.
+- Warm semantic p95 rose from 138.14 ms with serial requests to
+  187.43 ms with two concurrent collections. Warm concurrent hybrid p95
+  was 197.08 ms. All four passes found the judged document in the first
+  ten unique sources for 79 of 80 queries. These collections used about
+  4.3 MB of SQLite storage each. Cloud Run performance with simultaneous
+  GiB-scale databases remains open.
+  [Method and results](CAPACITY.md#concurrent-hosted-retrieval-with-real-embeddings).
