@@ -385,6 +385,14 @@ impl HostedCatalog {
             .await
         {
             Ok(_) | Err(Error::Conflict(_)) => Ok(()),
+            Err(error @ (Error::Busy(_) | Error::Internal(_))) => {
+                // An accepted operation may already have this immutable hint.
+                // Confirm it before checkpointing work for dispatch repair.
+                match self.storage.head(key).await {
+                    Ok(hint) if hint.key == *key => Ok(()),
+                    _ => Err(error),
+                }
+            }
             Err(error) => Err(error),
         }
     }

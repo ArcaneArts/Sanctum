@@ -835,6 +835,15 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   post-commit dispatch attempt reaches 15 seconds. A gRPC regression
   stalls the dispatch checkpoint after task creation, then verifies a
   fresh repair worker repeats the same stage and retry identity.
+- When a hint write fails with a retryable storage error, a successful
+  metadata read of the exact hint allows the worker to publish its next
+  checkpoint. The gRPC regression confirms text readiness, embedding
+  dispatch after restart, and rejection of a new upload with no hint.
+  With live MinIO behind a proxy that rejects hint writes, the hosted worker
+  returned HTTP 204 for indexing with an existing hint. A restarted worker
+  embedded the original revision using Ollama. An absent hint returned
+  HTTP 503, then retry restored the hint and returned the already committed
+  SQLite generation. [Dispatch behavior](STORAGE.md#cloud-tasks-dispatch).
 - The private maintenance endpoint scans a bounded page of a single shard
   and persists its cursor in object storage. It reads operation envelopes
   directly and can retry after an API or worker restart.
