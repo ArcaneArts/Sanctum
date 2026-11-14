@@ -137,6 +137,8 @@ struct Operation {
     created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dispatched_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dispatched_embedding_profile: Option<String>,
     #[serde(default, skip_serializing_if = "is_zero")]
     dispatch_retry: u32,
     #[serde(flatten)]
@@ -396,9 +398,19 @@ impl HostedCatalog {
         let now = unix_seconds()?;
         let window =
             not_before.unwrap_or(now).max(now) / crate::hosted_dispatch::DISPATCH_WINDOW_SECONDS;
-        if record.dispatched_at.is_some_and(|dispatched| {
-            dispatched / crate::hosted_dispatch::DISPATCH_WINDOW_SECONDS >= window
-        }) {
+        let profile = match stage {
+            TaskStage::Embed { .. } => match self.embedding_profile() {
+                Some(profile) => Some(profile),
+                // Keep the durable hint for a worker with embeddings enabled.
+                None => return Ok(false),
+            },
+            _ => None,
+        };
+        if record.dispatched_embedding_profile.as_deref() == profile
+            && record.dispatched_at.is_some_and(|dispatched| {
+                dispatched / crate::hosted_dispatch::DISPATCH_WINDOW_SECONDS >= window
+            })
+        {
             return Ok(false);
         }
         dispatcher
@@ -406,12 +418,14 @@ impl HostedCatalog {
                 scope,
                 operation,
                 stage,
+                profile,
                 window,
                 retry: record.dispatch_retry,
                 not_before,
             })
             .await?;
         record.dispatched_at = Some(not_before.unwrap_or(now).max(now));
+        record.dispatched_embedding_profile = profile.map(str::to_owned);
         let key = envelope_key(&prefix)?;
         let body = serde_json::to_vec(&record).map_err(|error| Error::Internal(Box::new(error)))?;
         match self
@@ -600,6 +614,7 @@ impl HostedUpload {
             chunking: self.service.chunking,
             created_at: unix_seconds()?,
             dispatched_at: None,
+            dispatched_embedding_profile: None,
             dispatch_retry: 0,
             stage: Stage::PendingRegistration,
         };

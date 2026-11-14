@@ -135,6 +135,7 @@ struct EmbedUpload {
     collection: String,
     operation_id: Uuid,
     step: u32,
+    profile: Option<String>,
 }
 
 async fn embed_upload(
@@ -149,7 +150,12 @@ async fn embed_upload(
     }
     let scope = Scope { tenant, collection };
     match service
-        .embed_upload(&scope, task.operation_id, task.step)
+        .deliver_embedding_upload(
+            &scope,
+            task.operation_id,
+            task.step,
+            task.profile.as_deref(),
+        )
         .await
     {
         Ok(()) => {
@@ -191,7 +197,12 @@ async fn rebuild_collection(
     }
     let scope = Scope { tenant, collection };
     match service
-        .run_profile_rebuild(&scope, task.operation_id, task.step)
+        .deliver_profile_rebuild(
+            &scope,
+            task.operation_id,
+            task.step,
+            task.profile.as_deref(),
+        )
         .await
     {
         Ok(()) => {

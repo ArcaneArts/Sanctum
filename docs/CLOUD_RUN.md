@@ -195,7 +195,9 @@ The CLI adds the ID token only on HTTPS connections. The gRPC service
 and stateless MCP endpoint share the API listener. Cloud Run forwards
 requests to it over cleartext HTTP/2. Authorized callers can use the
 same token with an HTTPS MCP client. Set the same embedding configuration
-on both roles to enable background embedding of new revisions.
+on both roles to enable background embedding of new revisions. When
+updating Sanctum from a build that predates profile-bound tasks, update
+the worker before the API so the worker accepts the new payload field.
 [Cloud Run HTTP/2](https://docs.cloud.google.com/run/docs/configuring/http2),
 [MCP client setup](MCP.md#hosted-connection).
 The [storage guide](STORAGE.md) documents the worker stages, retry behavior,

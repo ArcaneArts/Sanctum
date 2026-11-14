@@ -221,6 +221,7 @@ impl HostedCatalog {
                 scope,
                 operation,
                 stage: TaskStage::Rebuild { step },
+                profile: self.embedding_profile(),
                 window,
                 retry: 0,
                 not_before: record.not_before,
@@ -259,6 +260,19 @@ impl HostedCatalog {
         }
         self.run_profile_rebuild(scope, operation, step).await?;
         Ok(true)
+    }
+
+    pub async fn deliver_profile_rebuild(
+        &self,
+        scope: &Scope,
+        operation: Uuid,
+        step: u32,
+        target_profile: Option<&str>,
+    ) -> Result<()> {
+        if target_profile.is_some() && target_profile != self.embedding_profile() {
+            return Ok(());
+        }
+        self.run_profile_rebuild(scope, operation, step).await
     }
 
     pub async fn run_profile_rebuild(

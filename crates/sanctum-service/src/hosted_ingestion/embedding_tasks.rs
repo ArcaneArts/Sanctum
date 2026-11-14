@@ -6,6 +6,28 @@ use uuid::Uuid;
 use super::{EmbeddingStep, HostedCatalog, REGISTRATION_WINDOW, Stage, unix_seconds};
 
 impl HostedCatalog {
+    pub async fn deliver_embedding_upload(
+        &self,
+        scope: &Scope,
+        operation: Uuid,
+        step: u32,
+        target_profile: Option<&str>,
+    ) -> Result<()> {
+        let configured = self.embedding_profile();
+        // A legacy Cloud Tasks delivery has no profile. The worker's
+        // post-delivery dispatch can hand it off under the current profile.
+        match target_profile {
+            Some(target) if Some(target) != configured => return Ok(()),
+            None if self.dispatcher.is_some() => {
+                self.require_operation(&self.operation_prefix(scope, operation)?, operation)
+                    .await?;
+                return Ok(());
+            }
+            _ => {}
+        }
+        self.embed_upload(scope, operation, step).await
+    }
+
     pub async fn embed_upload(&self, scope: &Scope, operation: Uuid, step: u32) -> Result<()> {
         let prefix = self.operation_prefix(scope, operation)?;
         let (mut record, version) = self.require_operation(&prefix, operation).await?;

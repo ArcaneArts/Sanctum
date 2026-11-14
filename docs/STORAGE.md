@@ -328,7 +328,14 @@ unavailable.
 With Cloud Tasks configured, lexical publication schedules bounded
 embedding steps automatically. The worker checkpoints each step and
 schedules retryable provider work at its recorded retry time. The
-reconciler can recover a missing delivery. The scheduled embedding
+reconciler can recover a missing delivery. Embedding and rebuild task
+payloads include the target profile ID, which also participates in the
+Cloud Tasks name. A delivery for a different profile leaves the current
+batch alone. Dispatch repair can enqueue the pending upload batch under
+the new profile in the same dispatch window. An old upload task without
+a profile ID is handed back to dispatch on a Cloud Tasks worker. The
+manual worker endpoint can omit the profile when Cloud Tasks is absent.
+The scheduled embedding
 profile endpoint scans one page of object keys after a profile change
 and queues collections from their manifests. A persisted cursor resumes
 discovery on the next invocation. Once a worker starts discovery for the
