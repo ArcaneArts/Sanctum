@@ -1238,3 +1238,17 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - `pnpm check` passed on rerun. Two local polling tests timed out on the
   first run and passed on the rerun. All 11 publication tests passed with
   the live MinIO cases enabled.
+
+## Profile rebuilds on collection access
+
+- After a worker activates a new embedding profile, hosted searches can
+  queue a collection before scheduled discovery reaches its manifest.
+  The API uses the existing rebuild record and repair hint. Discovery
+  and concurrent reads can safely converge on the same operation.
+- The gRPC test paused discovery before the collection, verified strict
+  semantic unavailability and hybrid lexical fallback, and recovered
+  the read-triggered work through reconciliation on a fresh worker.
+- A real MinIO and Ollama run held discovery on page one, checked the
+  persisted hint and rebuild record, restarted the server, and ran the
+  worker's HTTP task handler to restore semantic retrieval. Live Cloud
+  Tasks delivery was not exercised. `pnpm check` passed.

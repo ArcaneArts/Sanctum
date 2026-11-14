@@ -3020,9 +3020,36 @@ async fn idle_collections_rebuild_after_a_profile_change() {
     assert!(!second.discover_profile_rebuild().await.unwrap().complete);
     drop(second);
     let second = catalog("fixture-v2");
-    assert!(second.discover_profile_rebuild().await.unwrap().complete);
+    let mut server = start(second.clone()).await;
+    let mut search = v1::SearchTextRequest {
+        scope: header.scope,
+        query: "unicorn".into(),
+        mode: v1::SearchMode::Semantic.into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        server
+            .client
+            .search_text(search.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable,
+    );
+    search.mode = v1::SearchMode::Hybrid.into();
+    let fallback = server
+        .client
+        .search_text(search.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fallback.hits[0].excerpt, "idle unicorn");
+    assert_eq!(fallback.mode(), v1::SearchMode::Lexical);
+    // The discovery cursor still points to the page before this collection.
+    // A restarted worker can dispatch the hint written by the API search.
+    let worker = catalog("fixture-v2");
     for shard in 0..16 {
-        second.reconcile_shard(shard).await.unwrap();
+        worker.reconcile_shard(shard).await.unwrap();
     }
     let operation = dispatch
         .delivered
@@ -3033,6 +3060,7 @@ async fn idle_collections_rebuild_after_a_profile_change() {
             matches!(stage, TaskStage::Rebuild { step: 0 }).then_some(operation)
         })
         .unwrap();
+    assert!(worker.discover_profile_rebuild().await.unwrap().complete);
     assert!(matches!(
         first.run_profile_rebuild(&scope, operation, 0).await,
         Err(Error::Busy(_))
@@ -3048,6 +3076,16 @@ async fn idle_collections_rebuild_after_a_profile_change() {
     let coverage = second.embedding_status(&scope, None).await.unwrap();
     assert_eq!(coverage.profile.as_deref(), Some("fixture-v2"));
     assert_eq!(coverage.coverage.embedded, 1);
+    search.mode = v1::SearchMode::Semantic.into();
+    let semantic = server
+        .client
+        .search_text(search)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(semantic.hits[0].excerpt, "idle unicorn");
+    assert_eq!(semantic.mode(), v1::SearchMode::Semantic);
+    server.stop().await;
     second.try_dispatch_rebuild(&scope, operation).await;
     assert!(
         dispatch
