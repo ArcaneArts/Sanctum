@@ -437,6 +437,97 @@ async fn local_pending_rtf_scan_uses_saved_utf8_while_the_index_writer_waits() {
 }
 
 #[tokio::test]
+async fn local_rtf_checkpoint_is_reused_or_rebuilt_after_restart() {
+    for damage in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let mut api = Running::start_with_workers(&dir, None, false).await;
+        create(&mut api.client, "default").await;
+        let rtf = br"{\rtf1\ansi Prepared caf\'e9}";
+        let queued = api
+            .client
+            .submit_text(tokio_stream::iter([
+                rtf_header(false, "prepared-restart"),
+                data(rtf),
+                end(),
+            ]))
+            .await
+            .unwrap()
+            .into_inner();
+        let id = job_request(queued.operation_id);
+        let text = text_path(&dir, &queued.source_id, &queued.revision_id);
+        let canonical = "Prepared café";
+        let lock = rusqlite::Connection::open(dir.path().join("default/notes/meta.db")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let service = api.service.clone();
+        let worker = tokio::task::spawn_blocking(move || service.process_next());
+        let prepared = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = api
+                    .client
+                    .get_ingestion_job(id.clone())
+                    .await
+                    .unwrap()
+                    .into_inner();
+                if state.state() == v1::IngestionState::Indexing {
+                    break state;
+                }
+                assert!(!worker.is_finished(), "{state:?}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(prepared.processed_bytes, rtf.len() as u64);
+        assert_eq!(std::fs::read_to_string(&text).unwrap(), canonical);
+        assert!(search(&mut api.client, "default", "café").await.is_empty());
+        // Make the transaction fail after extraction, then restore the
+        // uncommitted attempt's active state to model process loss.
+        lock.execute_batch(
+            "CREATE TRIGGER block_publication BEFORE INSERT ON revisions
+             BEGIN SELECT RAISE(ABORT, 'interrupted publication'); END;
+             COMMIT",
+        )
+        .unwrap();
+        assert!(worker.await.unwrap().is_err());
+        lock.execute_batch("DROP TRIGGER block_publication")
+            .unwrap();
+        drop(lock);
+        api.stop().await;
+        let queue = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
+        assert_eq!(
+            queue
+                .execute(
+                    "UPDATE ingestion_jobs SET status = 'indexing'
+                     WHERE operation_id = ?1 AND error_code = 'retryable' AND rtf_preparation IS NOT NULL",
+                    [&id.operation_id],
+                )
+                .unwrap(),
+            1
+        );
+        drop(queue);
+        let original = text.with_file_name("original");
+        if damage {
+            // The same length still requires the BLAKE3 check.
+            std::fs::write(&text, "Replaced café").unwrap();
+        } else {
+            // If recovery rereads the original, the retry cannot succeed.
+            std::fs::remove_file(&original).unwrap();
+        }
+        let mut api = Running::start(&dir).await;
+        let ready = await_ready(&mut api.client, id).await;
+        assert_eq!(ready.attempts, 2);
+        assert_eq!(std::fs::read_to_string(&text).unwrap(), canonical);
+        assert_eq!(ready.text_revision.unwrap().source_encoding, "windows-1252");
+        assert_eq!(
+            search(&mut api.client, "default", "café").await[0].excerpt,
+            canonical
+        );
+        assert!(!original.exists());
+        api.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn local_upload_keeps_accepted_chunk_settings_across_restart() {
     let dir = TempDir::new().unwrap();
     let configured = Service::open(dir.path(), 32_768)

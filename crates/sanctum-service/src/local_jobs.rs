@@ -1,10 +1,11 @@
 use std::{
-    io::{BufReader, BufWriter, Read},
+    io::{self, BufReader, BufWriter, Read, Write},
     time::Instant,
 };
 
 use sanctum_chunk::index_utf8_with_settings;
 use sanctum_core::{Error, ExternalSource, Result, Scope, is_rtf};
+use sanctum_db_sqlite::queue::RtfPreparation;
 use sanctum_extract::{RTF_EXTRACTOR, rtf_to_utf8};
 use uuid::Uuid;
 
@@ -118,10 +119,10 @@ impl Service {
             // The collection commit survived a stop before the queue receipt.
             return Ok(revision_for(job, content));
         }
-        if !self.queue.progress(job.id, 0)? {
+        if !self.queue.progress(job.id, job.processed_bytes)? {
             return Err(Error::Conflict("indexing canceled".into()));
         }
-        let extracted = job.extract_rtf.then(|| self.extract_rtf(job)).transpose()?;
+        let extracted = job.extract_rtf.then(|| self.prepare_rtf(job)).transpose()?;
         self.local_writes.run(&job.scope, || {
             self.publish_index(job, extracted, &mut database)
         })
@@ -130,7 +131,7 @@ impl Service {
     fn publish_index(
         &self,
         job: &Job,
-        extracted: Option<(String, &'static str)>,
+        extracted: Option<RtfPreparation>,
         database: &mut crate::db::CollectionDb,
     ) -> Result<Revision> {
         let input = self.files.open_text(&job.scope, job.source, job.revision)?;
@@ -179,7 +180,18 @@ impl Service {
                 "queued input no longer matches its accepted size",
             )));
         }
-        let original_hash = extracted.as_ref().map_or(&indexed.hash, |input| &input.0);
+        if extracted.as_ref().is_some_and(|input| {
+            input.canonical_hash != indexed.hash || input.canonical_bytes != indexed.bytes
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "saved RTF text changed during indexing",
+            )
+            .into());
+        }
+        let original_hash = extracted
+            .as_ref()
+            .map_or(&indexed.hash, |input| &input.original_hash);
         if job
             .import_hash
             .as_ref()
@@ -196,7 +208,7 @@ impl Service {
             bytes: indexed.bytes,
             chunks: indexed.chunks,
             chunker: job.chunking.identifier(),
-            encoding: extracted.map_or_else(|| "UTF-8".into(), |input| input.1.into()),
+            encoding: extracted.map_or_else(|| "UTF-8".into(), |input| input.encoding),
             extractor: job.extract_rtf.then(|| RTF_EXTRACTOR.into()),
             retain_original: job.retain_original,
             url: job.url.clone(),
@@ -231,7 +243,37 @@ impl Service {
         Ok(revision)
     }
 
-    fn extract_rtf(&self, job: &Job) -> Result<(String, &'static str)> {
+    fn prepare_rtf(&self, job: &Job) -> Result<RtfPreparation> {
+        if let Some(prepared) = &job.rtf_preparation {
+            if prepared.extractor == RTF_EXTRACTOR && self.matches_saved_text(job, prepared)? {
+                if job.retain_original {
+                    self.files
+                        .open_original(&job.scope, job.source, job.revision)?;
+                }
+                if job.extracting && !self.queue.extracted(job.id, prepared)? {
+                    return Err(Error::Conflict("extraction canceled".into()));
+                }
+                return Ok(prepared.clone());
+            }
+            if !self.queue.extract_again(job.id)? {
+                return Err(Error::Conflict("extraction canceled".into()));
+            }
+        }
+        self.extract_rtf(job)
+    }
+
+    fn matches_saved_text(&self, job: &Job, prepared: &RtfPreparation) -> Result<bool> {
+        let file = match self.files.open_text(&job.scope, job.source, job.revision) {
+            Ok(file) => file,
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let mut hash = blake3::Hasher::new();
+        hash.update_reader(file.take(prepared.canonical_bytes.saturating_add(1)))?;
+        Ok(hash.finalize().to_hex().as_str() == prepared.canonical_hash)
+    }
+
+    fn extract_rtf(&self, job: &Job) -> Result<RtfPreparation> {
         let original = self
             .files
             .open_original(&job.scope, job.source, job.revision)?;
@@ -244,25 +286,49 @@ impl Service {
             job,
             service: self,
         };
-        let result = rtf_to_utf8(BufReader::new(&mut reader), BufWriter::new(text.as_file()));
-        let encoding = match result {
-            Err(Error::Io(ref error)) if error.kind() == std::io::ErrorKind::ConnectionAborted => {
+        let mut output = HashingWriter {
+            inner: text.as_file(),
+            hash: blake3::Hasher::new(),
+        };
+        let encoding = match rtf_to_utf8(BufReader::new(&mut reader), BufWriter::new(&mut output)) {
+            Err(Error::Io(ref error)) if error.kind() == io::ErrorKind::ConnectionAborted => {
                 return Err(Error::Conflict("extraction canceled".into()));
             }
             result => result?,
         };
+        let original_hash = reader.hash.finalize().to_hex().to_string();
         if reader.bytes != job.bytes {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
                 "queued RTF no longer matches its accepted size",
-            )));
+            )
+            .into());
         }
+        let previously_verified = job
+            .rtf_preparation
+            .as_ref()
+            .map(|prepared| prepared.original_hash.as_str())
+            .or(job.import_hash.as_deref());
+        if previously_verified.is_some_and(|expected| expected != original_hash) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "staged RTF no longer matches its recorded digest",
+            )
+            .into());
+        }
+        let preparation = RtfPreparation {
+            original_hash,
+            canonical_hash: output.hash.finalize().to_hex().to_string(),
+            canonical_bytes: text.as_file().metadata()?.len(),
+            encoding: encoding.into(),
+            extractor: RTF_EXTRACTOR.into(),
+        };
         self.files
             .publish_extracted(&job.scope, job.source, job.revision, text)?;
-        if !self.queue.extracted(job.id)? {
+        if !self.queue.extracted(job.id, &preparation)? {
             return Err(Error::Conflict("extraction canceled".into()));
         }
-        Ok((reader.hash.finalize().to_hex().to_string(), encoding))
+        Ok(preparation)
     }
 }
 
@@ -437,6 +503,7 @@ pub(crate) fn new_job(
         chunking: Default::default(),
         initial_metadata: Vec::new(),
         initial_chunk_metadata: Vec::new(),
+        rtf_preparation: None,
     }
 }
 
@@ -466,5 +533,22 @@ impl Read for HashingReader<'_> {
             }
         }
         Ok(read)
+    }
+}
+
+struct HashingWriter<W> {
+    inner: W,
+    hash: blake3::Hasher,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.hash.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }

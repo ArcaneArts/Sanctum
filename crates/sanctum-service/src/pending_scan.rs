@@ -98,12 +98,16 @@ impl Service {
             ));
         }
         let (input, total_bytes) =
-            if job.extract_rtf && (job.extracting || job.state == JobState::Accepted) {
+            if job.extract_rtf && (job.extracting || job.rtf_preparation.is_none()) {
                 (ScanSource::RtfOriginal, job.bytes)
             } else {
                 let file = self.files.open_text(scope, job.source, job.revision)?;
                 let length = file.metadata()?.len();
-                if !job.extract_rtf && length != job.bytes {
+                let expected = job
+                    .rtf_preparation
+                    .as_ref()
+                    .map_or(job.bytes, |prepared| prepared.canonical_bytes);
+                if length != expected {
                     return Err(Error::Internal(
                         "staged upload size differs from its receipt".into(),
                     ));
