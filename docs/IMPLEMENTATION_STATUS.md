@@ -1809,3 +1809,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   Python client saw the persisted 32 input bytes, 17 canonical bytes, and
   one chunk after restarting the API. After indexing, the job exposed
   the published text revision and cleared the preparation field.
+- Delivered in [PR #121](https://github.com/ArcaneArts/Sanctum/pull/121).
+
+## Desktop ingestion activity pages
+
+- Desktop activity follows the server's local or hosted continuation
+  cursor. A hosted page with no jobs can still advance. The current page
+  refreshes in place, and changing the collection or restarting the
+  managed server opens the first page.
+- A Chromium check against the production React build with a controlled
+  Tauri IPC fixture exercised local and hosted navigation, empty hosted
+  pages, an expired cursor, a scoped cancel action, collection changes,
+  and managed server restart.
+- The native macOS app launched with `pnpm devtop` and live MinIO.
+  A generated gRPC client confirmed an empty first page with a
+  continuation. In desktop activity, **Next page** showed the completed
+  upload and **Previous page** restored the empty page.
+  [Desktop activity](DESKTOP.md#first-use).

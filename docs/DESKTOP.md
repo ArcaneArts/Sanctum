@@ -25,7 +25,9 @@ frontend edits. [Tauri development file watching](https://v2.tauri.app/develop/)
    model revision, and dimensions. Use the digest shown by `ollama list` as
    the revision for a local model. Save and restart the server.
 3. In **Activity**, create and select a collection, then import a file or
-   folder. Track accepted jobs and current embedding coverage. Select
+   folder. Track accepted jobs and current embedding coverage. Use **Next
+   page** and **Previous page** to browse retained jobs. **First page**
+   returns to the start of the current collection filter. Select
    **Refresh** under Storage to measure the selected collection or the
    entire local store. Larger scans show how many files or objects have
    been counted. The last completed total shows its measurement time.
@@ -64,7 +66,9 @@ Save the configuration and select **Restart server to apply**. The sidecar
 runs the standalone object worker and serves gRPC and MCP on the same port.
 The **Connect** page shows that active address. In **Activity**, use
 **Upload file** to stream a selected text or RTF file and track indexing and
-embedding. Storage refresh measures the selected collection or the configured
+embedding. Object-backed activity follows storage order. An empty page
+can still have a **Next page** if the scan has more objects to check.
+Storage refresh measures the selected collection or the configured
 object store. The filesystem backend retains directory imports and queue pause
 controls. [Standalone worker settings](STORAGE.md#hosted-server-configuration).
 
