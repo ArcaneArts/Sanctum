@@ -127,12 +127,15 @@ cargo run --locked -p sanctum-cli -- retry notes OPERATION_ID
 ```
 
 Pause prevents new claims and lets active jobs finish. Cancellation can win
-until the worker starts publication. At startup, Sanctum settles any
-recorded cancellation that the worker did not finish and reclaims its
-unpublished input, even while the queue is paused. Retry applies to
-failures marked `retryable` and preserves the operation and revision IDs.
-Local maintenance removes completed, canceled, and permanently failed job records 45 days
-after they finish. Pending and retryable jobs remain available. A cursor
+until the worker starts publication. A repeated cancellation returns the
+same canceled job and retries any pending file cleanup. At startup, Sanctum
+settles recorded cancellations even when the queue is paused. It also
+retries cleanup of unpublished files from canceled or permanently failed
+jobs during periodic maintenance. Retry applies to failures marked
+`retryable` and preserves the operation and revision IDs.
+Local maintenance removes completed, canceled, and permanently failed job
+records after 45 days once their staged cleanup has finished. Pending and
+retryable jobs remain available. A cursor
 whose job has expired must restart from the newest page. Published source
 bytes and search results follow the independent revision lifecycle.
 `sanctum-cli jobs [COLLECTION]` lists local activity newest first. Pass

@@ -3090,6 +3090,118 @@ async fn startup_finishes_interrupted_cancellation_while_the_queue_is_paused() {
 }
 
 #[tokio::test]
+async fn local_maintenance_retries_cleanup_of_canceled_and_invalid_inputs() {
+    let dir = TempDir::new().unwrap();
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    create(&mut api.client, "default").await;
+    let mut jobs = Vec::new();
+    for content in [b"canceled quartz".as_slice(), &[0xff]] {
+        let job = api
+            .client
+            .submit_text(tokio_stream::iter([
+                header("default"),
+                data(content),
+                end(),
+            ]))
+            .await
+            .unwrap()
+            .into_inner();
+        let text = text_path(&dir, &job.source_id, &job.revision_id);
+        let obstacle = text.with_file_name("cleanup-obstacle");
+        std::fs::create_dir(&obstacle).unwrap();
+        jobs.push((job_request(job.operation_id), obstacle));
+    }
+    let (canceled, _) = &jobs[0];
+    let (invalid, _) = &jobs[1];
+    let reply = api
+        .client
+        .cancel_ingestion_job(canceled.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.state(), v1::IngestionState::Canceled);
+    assert!(api.service.process_next().unwrap());
+    let failed = await_failure(&mut api.client, invalid.clone()).await;
+    assert_eq!(failed.error_code.as_deref(), Some("invalid_source"));
+    let runtime = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
+    let pending = || {
+        runtime
+            .query_row(
+                "SELECT count(*) FROM ingestion_jobs WHERE cleanup_after IS NOT NULL",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(pending(), 2);
+    runtime
+        .execute("UPDATE ingestion_jobs SET finished_at = 0", [])
+        .unwrap();
+    api.stop().await;
+    {
+        let files = sanctum_storage_fs::LocalFiles::open(dir.path()).unwrap();
+        let queue = sanctum_db_sqlite::queue::LocalQueue::open(files.runtime_path()).unwrap();
+        assert_eq!(queue.prune_finished().unwrap(), 0);
+    }
+
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    assert_eq!(pending(), 2);
+    let wrong_scope = v1::IngestionJobRequest {
+        scope: scope("other"),
+        ..canceled.clone()
+    };
+    assert_eq!(
+        api.client
+            .cancel_ingestion_job(wrong_scope)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    std::fs::remove_dir(&jobs[0].1).unwrap();
+    let replay = api
+        .client
+        .cancel_ingestion_job(canceled.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply, replay);
+    assert!(!jobs[0].1.parent().unwrap().exists());
+    assert_eq!(pending(), 1);
+
+    std::fs::remove_dir(&jobs[1].1).unwrap();
+    runtime
+        .execute(
+            "UPDATE ingestion_jobs SET cleanup_after = 0 WHERE cleanup_after IS NOT NULL",
+            [],
+        )
+        .unwrap();
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let maintenance = tokio::spawn(run_local_maintenance(api.service.clone(), shutdown));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pending() != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    maintenance.await.unwrap();
+    assert!(!jobs[1].1.parent().unwrap().exists());
+    for (request, _) in jobs {
+        assert_eq!(
+            api.client
+                .get_ingestion_job(request)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::NotFound
+        );
+    }
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn recovery_reuses_a_collection_commit_with_a_missing_queue_receipt() {
     let dir = TempDir::new().unwrap();
     let mut first = Running::start(&dir).await;

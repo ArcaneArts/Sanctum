@@ -38,6 +38,9 @@ pub async fn run_local_maintenance(service: Service, mut stop: watch::Receiver<b
                     if let Err(error) = service.reclaim_deleted_collections() {
                         tracing::warn!(%error, "deleted collection cleanup failed");
                     }
+                    if let Err(error) = service.reclaim_staged_inputs() {
+                        tracing::warn!(%error, "staged input cleanup failed");
+                    }
                     if let Err(error) = service.queue.prune_finished() {
                         tracing::warn!(%error, "local job retention cleanup failed");
                     }

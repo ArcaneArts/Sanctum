@@ -90,6 +90,13 @@ pub struct Job {
 #[derive(Clone, Debug)]
 pub struct LocalQueue(PathBuf);
 
+pub struct StagedCleanup {
+    pub operation: Uuid,
+    pub scope: Scope,
+    pub source: Uuid,
+    pub revision: Uuid,
+}
+
 const COLUMNS: &str = "operation_id, tenant, collection, source_id, revision_id,
     name, external_namespace, external_id, total_bytes, processed_bytes,
     attempts, status, error_code, error_message, content_hash, chunks,
@@ -119,6 +126,7 @@ impl LocalQueue {
                 include_str!("runtime_v14.sql"),
                 include_str!("runtime_v15.sql"),
                 include_str!("runtime_v16.sql"),
+                include_str!("runtime_v17.sql"),
             ],
         )?;
         // The previous worker may have stopped after recording a cancellation.
@@ -127,7 +135,7 @@ impl LocalQueue {
             .execute(
                 "UPDATE ingestion_jobs SET status = 'canceled', extracting = 0,
                  finished_at = unixepoch(), initial_metadata = NULL, initial_chunk_metadata = NULL,
-                 rtf_preparation = NULL
+                 rtf_preparation = NULL, cleanup_after = unixepoch()
              WHERE status IN ('accepted', 'indexing')
                AND cancel_requested = 1 AND publication_started = 0",
                 [],
@@ -162,7 +170,7 @@ impl LocalQueue {
                 .prepare(
                     "DELETE FROM ingestion_jobs WHERE operation_id IN (
                     SELECT operation_id FROM ingestion_jobs
-                    WHERE finished_at <= unixepoch() - ?1 AND (
+                    WHERE finished_at <= unixepoch() - ?1 AND cleanup_after IS NULL AND (
                         status IN ('text_ready', 'canceled')
                         OR (status = 'failed' AND error_code IS NOT 'retryable')
                     )
@@ -187,6 +195,39 @@ impl LocalQueue {
         }
         transaction.commit().map_err(database_error)?;
         Ok(expired.len())
+    }
+
+    pub fn pending_cleanup(&self) -> Result<Vec<StagedCleanup>> {
+        super::query_all(
+            &self.connect()?,
+            "SELECT operation_id, tenant, collection, source_id, revision_id
+             FROM ingestion_jobs WHERE cleanup_after <= unixepoch()
+             ORDER BY cleanup_after, operation_id LIMIT 128",
+            [],
+            |row| {
+                Ok(StagedCleanup {
+                    operation: uuid(row, 0)?,
+                    scope: Scope {
+                        tenant: scope_id(row, 1)?,
+                        collection: scope_id(row, 2)?,
+                    },
+                    source: uuid(row, 3)?,
+                    revision: uuid(row, 4)?,
+                })
+            },
+        )
+    }
+
+    pub fn record_cleanup(&self, operation: Uuid, complete: bool) -> Result<()> {
+        self.connect()?
+            .execute(
+                "UPDATE ingestion_jobs
+                 SET cleanup_after = CASE WHEN ?2 THEN NULL ELSE unixepoch() + 60 END
+                 WHERE operation_id = ?1 AND cleanup_after IS NOT NULL",
+                params![operation.to_string(), complete],
+            )
+            .map_err(database_error)?;
+        Ok(())
     }
 
     pub fn purge_collection(&self, scope: &Scope) -> Result<()> {
@@ -401,7 +442,8 @@ impl LocalQueue {
                 "SELECT EXISTS(SELECT 1 FROM ingestion_jobs
              WHERE tenant = ?1 AND collection = ?2 AND source_id = ?3 AND revision_id = ?4
                AND (status IN ('accepted', 'indexing', 'publishing')
-                    OR (status = 'failed' AND error_code = 'retryable')))",
+                    OR (status = 'failed' AND error_code = 'retryable')
+                    OR cleanup_after IS NOT NULL))",
                 params![
                     scope.tenant.as_str(),
                     scope.collection.as_str(),
@@ -602,6 +644,8 @@ impl LocalQueue {
                                                THEN initial_chunk_metadata END,
                  rtf_preparation = CASE WHEN cancel_requested = 0 AND ?2 = 'retryable'
                                         THEN rtf_preparation END,
+                 cleanup_after = CASE WHEN cancel_requested = 1 OR ?2 <> 'retryable'
+                                      THEN unixepoch() END,
                  finished_at = unixepoch()
              WHERE operation_id = ?1 AND status IN ('indexing', 'publishing')",
                 params![id.to_string(), code, message],
@@ -616,11 +660,14 @@ impl LocalQueue {
             id,
             "SET cancel_requested = 1,
                  status = CASE WHEN status = 'accepted' THEN 'canceled' ELSE status END,
-                 finished_at = CASE WHEN status = 'accepted' THEN unixepoch() END,
+                 extracting = CASE WHEN status = 'indexing' THEN extracting ELSE 0 END,
+                 finished_at = CASE WHEN status = 'accepted' THEN unixepoch() ELSE finished_at END,
+                 cleanup_after = CASE WHEN status = 'accepted' THEN unixepoch() ELSE cleanup_after END,
                  initial_metadata = CASE WHEN status = 'indexing' THEN initial_metadata END,
                  initial_chunk_metadata = CASE WHEN status = 'indexing' THEN initial_chunk_metadata END,
                  rtf_preparation = CASE WHEN status = 'indexing' THEN rtf_preparation END",
-            "status IN ('accepted', 'indexing') AND publication_started = 0",
+            "(status IN ('accepted', 'indexing') AND publication_started = 0)
+             OR status = 'canceled'",
             "only queued or indexing operations can be canceled",
         )
     }
@@ -675,7 +722,7 @@ impl LocalQueue {
             .query_row(
                 &format!(
                     "UPDATE ingestion_jobs {set}
-                WHERE tenant = ?1 AND collection = ?2 AND operation_id = ?3 AND {condition}
+                WHERE tenant = ?1 AND collection = ?2 AND operation_id = ?3 AND ({condition})
                 RETURNING {COLUMNS}"
                 ),
                 params![

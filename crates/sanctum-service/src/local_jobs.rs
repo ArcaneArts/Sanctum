@@ -5,7 +5,7 @@ use std::{
 
 use sanctum_chunk::index_utf8_with_settings;
 use sanctum_core::{Error, ExternalSource, Result, Scope, is_rtf};
-use sanctum_db_sqlite::queue::RtfPreparation;
+use sanctum_db_sqlite::queue::{RtfPreparation, StagedCleanup};
 use sanctum_extract::{RTF_EXTRACTOR, rtf_to_utf8};
 use uuid::Uuid;
 
@@ -31,11 +31,40 @@ impl Service {
     }
 
     pub fn cancel_job(&self, scope: &Scope, id: Uuid) -> Result<Job> {
+        let _reader = self
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         let job = self.queue.cancel(scope, id)?;
         if job.state == JobState::Canceled {
-            self.files.discard_text(scope, job.source, job.revision)?;
+            self.reclaim_terminal_input(&job)?;
         }
         Ok(job)
+    }
+
+    fn reclaim_terminal_input(&self, job: &Job) -> Result<()> {
+        self.reclaim_staged_input(&StagedCleanup {
+            operation: job.id,
+            scope: job.scope.clone(),
+            source: job.source,
+            revision: job.revision,
+        })
+    }
+
+    pub(crate) fn reclaim_staged_input(&self, pending: &StagedCleanup) -> Result<()> {
+        let result = self
+            .files
+            .discard_text(&pending.scope, pending.source, pending.revision);
+        if let Err(error) = &result {
+            tracing::warn!(
+                %error,
+                tenant = %pending.scope.tenant,
+                collection = %pending.scope.collection,
+                operation = %pending.operation,
+                "could not reclaim unpublished local input"
+            );
+        }
+        self.queue.record_cleanup(pending.operation, result.is_ok())
     }
 
     /// Runs at most one job. The database claim is atomic across local workers.
@@ -99,8 +128,7 @@ impl Service {
                 self.queue.fail(job.id, code, message)?;
                 let state = self.queue.get(&job.scope, job.id)?.state;
                 if code != "retryable" || state == JobState::Canceled {
-                    self.files
-                        .discard_text(&job.scope, job.source, job.revision)?;
+                    self.reclaim_terminal_input(job)?;
                 }
                 if state == JobState::Canceled {
                     Ok("canceled")
