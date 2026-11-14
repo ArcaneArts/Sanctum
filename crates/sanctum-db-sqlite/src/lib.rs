@@ -282,15 +282,31 @@ pub fn require_collection(path: &Path, collection: &str) -> Result<()> {
         .ok_or_else(|| missing_collection(collection))
 }
 
+/// Returns one membership flag per requested collection.
+pub fn catalog_membership<'a>(
+    path: &Path,
+    collections: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<bool>> {
+    let mut collections = collections.into_iter();
+    let membership = read_initialized_catalog(path, |catalog, _| {
+        collections
+            .by_ref()
+            .map(|collection| contains_collection(catalog, collection))
+            .collect()
+    })?;
+    Ok(membership.unwrap_or_else(|| collections.map(|_| false).collect()))
+}
+
+fn contains_collection(catalog: &Connection, collection: &str) -> Result<bool> {
+    catalog
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?1)")
+        .map_err(database_error)?
+        .query_row([collection], |row| row.get(0))
+        .map_err(database_error)
+}
+
 fn confirm_collection(catalog: &Connection, collection: &str) -> Result<()> {
-    let exists = catalog
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?1)",
-            [collection],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(database_error)?;
-    if exists {
+    if contains_collection(catalog, collection)? {
         Ok(())
     } else {
         Err(missing_collection(collection))

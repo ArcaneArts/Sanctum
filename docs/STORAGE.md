@@ -564,8 +564,10 @@ operations in a tenant or one of its collections. Hosted activity follows
 object-key order and reads current job records. Pass `next_page_token` back
 as `page_token` with the same scope. Continue when a short or empty page
 still has a token. The server bounds object listing per request, and skips
-expired operations and deleted collections. The page is a live view of
-storage, so concurrent submissions or cleanup can change later pages.
+expired operations and deleted collections. Each tenant-wide request uses one
+published catalog generation to determine which collections are visible. Job
+records are read from live storage, so concurrent submissions or cleanup can
+change later pages.
 
 ### Hosted upload cancellation
 
