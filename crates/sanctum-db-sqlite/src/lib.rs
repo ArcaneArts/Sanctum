@@ -1,4 +1,4 @@
-use std::{fs, ops::Deref, path::Path, time::Duration};
+use std::{ops::Deref, path::Path, time::Duration};
 
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
@@ -9,6 +9,7 @@ use uuid::Uuid;
 pub mod embedding;
 pub mod hosted;
 mod lifecycle;
+pub mod local_collections;
 pub mod metadata;
 pub mod metadata_filter;
 pub mod metadata_indexes;
@@ -29,6 +30,7 @@ const CATALOG_MIGRATIONS: &[&str] = &[
     include_str!("catalog_v4.sql"),
     include_str!("catalog_v5.sql"),
     include_str!("metadata_indexes.sql"),
+    include_str!("catalog_v7.sql"),
 ];
 const COLLECTION_SCHEMA: &str = include_str!("collection.sql");
 const COLLECTION_MIGRATIONS: &[&str] = &[
@@ -88,24 +90,6 @@ pub struct Chunk {
     pub external: Option<ExternalSource>,
     pub range: ByteRange,
     pub hash: String,
-}
-
-pub fn create_collection(catalog_path: &Path, db_path: &Path, collection: &str) -> Result<()> {
-    fs::create_dir_all(catalog_path.parent().expect("catalog has a parent"))?;
-    let mut catalog = open(catalog_path, true)?;
-    migrate(&mut catalog, CATALOG_MIGRATIONS)?;
-    let transaction = catalog
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(database_error)?;
-    if !activate_collection(&transaction, collection)? {
-        return Err(Error::Conflict(format!(
-            "collection {collection} already exists"
-        )));
-    }
-
-    fs::create_dir_all(db_path.parent().expect("database has a parent"))?;
-    migrate(&mut open(db_path, true)?, COLLECTION_MIGRATIONS)?;
-    transaction.commit().map_err(database_error)
 }
 
 pub fn initialize_catalog(transaction: &Transaction<'_>) -> Result<()> {

@@ -568,6 +568,144 @@ async fn local_upload_keeps_accepted_chunk_settings_across_restart() {
 }
 
 #[tokio::test]
+async fn local_collection_creation_recovers_before_and_after_database_initialization() {
+    let dir = TempDir::new().unwrap();
+    let mut api = Running::start(&dir).await;
+    create(&mut api.client, "default").await;
+    let catalog_path = dir.path().join("default/root.db");
+    let mut pending = Vec::new();
+    for initialized in [false, true] {
+        let collection = if initialized {
+            "initialized"
+        } else {
+            "reserved"
+        };
+        let request = v1::CreateCollectionRequest {
+            scope: Some(v1::Scope {
+                tenant: "default".into(),
+                collection: collection.into(),
+            }),
+            request_id: Some(uuid::Uuid::new_v4().to_string()),
+        };
+        let path = dir.path().join("default").join(collection).join("meta.db");
+        std::fs::create_dir_all(&path).unwrap();
+        // The directory at meta.db makes initialization fail after admission.
+        let failed = api
+            .client
+            .create_collection(request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(failed.code(), Code::Internal);
+        std::fs::remove_dir(&path).unwrap();
+        let catalog = rusqlite::Connection::open(&catalog_path).unwrap();
+        if initialized {
+            let mut database = rusqlite::Connection::open(&path).unwrap();
+            let transaction = database.transaction().unwrap();
+            sanctum_db_sqlite::initialize_collection(&transaction).unwrap();
+            transaction.commit().unwrap();
+        }
+        let saved: (String, Option<i64>) = catalog
+            .query_row(
+                "SELECT request_id, finished_at FROM local_collection_creations WHERE collection = ?1",
+                [collection],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((Some(saved.0), saved.1), (request.request_id.clone(), None));
+        pending.push(request);
+    }
+    let list = v1::ListCollectionsRequest {
+        tenant: "default".into(),
+        ..Default::default()
+    };
+    let ids = |reply: v1::ListCollectionsResponse| {
+        reply
+            .collections
+            .into_iter()
+            .map(|row| row.scope.unwrap().collection)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(api
+            .client
+            .list_collections(list.clone())
+            .await
+            .unwrap()
+            .into_inner()),
+        ["notes"]
+    );
+    api.stop().await;
+    let mut api = Running::start(&dir).await;
+    assert_eq!(
+        ids(api
+            .client
+            .list_collections(list)
+            .await
+            .unwrap()
+            .into_inner()),
+        ["initialized", "notes", "reserved"]
+    );
+    for request in pending {
+        let scope = request.scope.clone().unwrap();
+        assert_eq!(
+            api.client
+                .create_collection(request.clone())
+                .await
+                .unwrap()
+                .into_inner()
+                .scope,
+            Some(scope.clone())
+        );
+        assert_eq!(
+            api.client
+                .create_collection(v1::CreateCollectionRequest {
+                    scope: Some(v1::Scope {
+                        collection: "distinct".into(),
+                        ..scope.clone()
+                    }),
+                    ..request.clone()
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            Code::AlreadyExists
+        );
+        assert_eq!(
+            api.client
+                .create_collection(v1::CreateCollectionRequest {
+                    scope: Some(scope.clone()),
+                    request_id: Some(uuid::Uuid::new_v4().to_string()),
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            Code::AlreadyExists
+        );
+        api.client
+            .delete_collection(v1::DeleteCollectionRequest {
+                scope: Some(scope),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        api.client.create_collection(request).await.unwrap();
+    }
+    assert_eq!(
+        ids(api
+            .client
+            .list_collections(v1::ListCollectionsRequest {
+                tenant: "default".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()),
+        ["notes"]
+    );
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn local_collection_deletion_purges_jobs_and_recovers_from_a_tombstone() {
     let dir = TempDir::new().unwrap();
     let mut api = Running::start(&dir).await;

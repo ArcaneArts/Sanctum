@@ -1926,6 +1926,21 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   begin writing the new hint format.
   [Dispatch repair](STORAGE.md#cloud-tasks-dispatch).
 
+## Local collection creation recovery
+
+- The filesystem-backed service records a creation intent in the tenant
+  catalog before making the collection visible. The catalog activates the
+  collection and records the result together after initializing `meta.db`.
+  Startup resumes pending creations. Explicit request IDs replay a completed
+  creation without recreating a deleted collection.
+- The local gRPC regression exercised restart with a missing database and
+  with an initialized database whose catalog activation had not committed.
+  It checked visibility, request-ID conflicts, and replay after deletion.
+- A standalone server test interrupted the catalog update after SQLite had
+  initialized the collection. After restart, the CLI replayed the original
+  UUID and MCP listed the recovered collection.
+  [PR #137](https://github.com/ArcaneArts/Sanctum/pull/137).
+
 ## Maintenance recovery for hosted collection creation
 
 - Hosted creation first records a tenant-scoped intent. Scheduled

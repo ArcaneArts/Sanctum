@@ -599,7 +599,7 @@ impl Sanctum for Grpc {
         } else {
             let service = self.local()?.clone();
             let target = scope.clone();
-            work(move || service.create_collection(&target)).await?;
+            work(move || service.create_collection_with_request(&target, operation)).await?;
         }
         Ok(Response::new(v1::Collection {
             scope: Some(wire_scope(&scope)),
