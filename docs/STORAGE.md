@@ -241,11 +241,16 @@ cargo run --locked -p sanctum-cli -- job notes OPERATION_ID
 The server spools the stream to a temporary file and honors
 `max_source_bytes`. It streams the original bytes to a unique input key under
 `<tenant>/collections/<collection>/operations/<operation>/inputs/`.
-The sibling `operation.json` is created conditionally or replaces an
-abandoned-input fence by version. An accepted envelope records the input's length and BLAKE3 digest, ingestion options, and
-pending registration stage. A failed conditional write with an uncertain
-outcome preserves its input for recovery. Concurrent requests with the same
-ID adopt the winning operation and discard their losing input when possible.
+If the upload returns an error, the server can recover by streaming the
+object back and confirming its byte length and BLAKE3 digest before
+acceptance. The same verification applies when uploading canonical RTF
+text before a preparation checkpoint. The sibling `operation.json` is
+created conditionally or replaces an abandoned-input fence by version.
+An accepted envelope records the input's length and BLAKE3 digest,
+ingestion options, and pending registration stage. A failed conditional
+write with an uncertain outcome preserves its input for recovery. Concurrent
+requests with the same ID adopt the winning operation and discard their
+losing input when possible.
 
 The `ACCEPTED` status can be queried after restart through `GetIngestionJob`.
 A replacement targeting an external reference has an empty `source_id` until

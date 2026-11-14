@@ -80,6 +80,7 @@ struct StalledCheckpoint {
     storage: Arc<dyn Storage>,
     checkpoint: Mutex<Option<oneshot::Sender<oneshot::Receiver<()>>>>,
     after_dispatch: bool,
+    lose_source_reply: Option<&'static str>,
 }
 
 #[async_trait::async_trait]
@@ -97,7 +98,14 @@ impl Storage for StalledCheckpoint {
     }
 
     async fn put_stream(&self, key: &Key, reader: Reader, length: u64) -> Result<Version> {
-        self.storage.put_stream(key, reader, length).await
+        let version = self.storage.put_stream(key, reader, length).await?;
+        if self
+            .lose_source_reply
+            .is_some_and(|part| key.as_str().contains(part))
+        {
+            return Err(Error::Busy("source upload response lost".into()));
+        }
+        Ok(version)
     }
 
     async fn put_control(&self, key: &Key, bytes: Bytes, condition: Condition) -> Result<Version> {
@@ -222,7 +230,13 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         scope: Some(scope.clone()),
         operation_id: operation.to_string(),
     };
-    let (mut api, api_server) = serve_api(make_catalog()).await;
+    let api_storage = Arc::new(StalledCheckpoint {
+        storage: storage.clone(),
+        checkpoint: Mutex::new(None),
+        after_dispatch: false,
+        lose_source_reply: Some("/inputs/"),
+    });
+    let (mut api, api_server) = serve_api(catalog_with_storage(api_storage)).await;
     api.create_collection(v1::CreateCollectionRequest {
         scope: Some(scope.clone()),
         ..Default::default()
@@ -284,6 +298,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         storage: storage.clone(),
         checkpoint: Mutex::new(Some(checkpoint)),
         after_dispatch: false,
+        lose_source_reply: None,
     }));
     let (deadline_worker, deadline_server) =
         serve_http(crate::hosted_worker::router_with_task_budgets(
@@ -327,6 +342,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         storage: storage.clone(),
         checkpoint: Mutex::new(Some(checkpoint)),
         after_dispatch: true,
+        lose_source_reply: None,
     }));
     let (handoff_worker, handoff_server) =
         serve_http(crate::hosted_worker::router_with_task_budgets(
@@ -396,6 +412,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
                 storage: storage.clone(),
                 checkpoint: Mutex::new(Some(checkpoint)),
                 after_dispatch: false,
+                lose_source_reply: None,
             }));
             let (slow_worker, _slow_server) =
                 serve_http(crate::hosted_worker::router_with_task_budgets(
@@ -431,8 +448,21 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
             assert!(pending.preparation.is_none());
             assert_eq!(queue.accepted.lock().unwrap().len(), 2);
         }
+        let (delivery_worker, _delivery_server) = if index == 1 {
+            let storage = Arc::new(StalledCheckpoint {
+                storage: storage.clone(),
+                checkpoint: Mutex::new(None),
+                after_dispatch: false,
+                lose_source_reply: Some("/objects/"),
+            });
+            let (worker, server) =
+                serve_http(crate::hosted_worker::router(catalog_with_storage(storage))).await;
+            (worker, Some(server))
+        } else {
+            (worker.clone(), None)
+        };
         let response = http
-            .post(format!("{worker}{path}"))
+            .post(format!("{delivery_worker}{path}"))
             .header("content-type", "application/json")
             .body(body)
             .send()
