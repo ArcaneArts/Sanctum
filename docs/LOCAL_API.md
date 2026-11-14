@@ -854,7 +854,7 @@ timings and counts for an existing log pipeline:
 | `search` | Served search mode, elapsed time, hits, embedding coverage, and degradation reason when present |
 | `hosted_input_transfer` | Direction, staged source bytes, and duration |
 | `snapshot_publish`, `snapshot_download` | Snapshot size, actual transferred database bytes, and duration |
-| `snapshot_cache` | Generation and whether it was already materialized at lookup |
+| `snapshot_cache` | Generation, whether it was already materialized at lookup, and whether the reader joined a concurrent transfer |
 | `collection_sqlite_handle` | Generation, whether the read reused an idle SQLite handle, and time to open or select that handle |
 | `cleanup_pass` | Reclaimed entries, failures and further work when available |
 

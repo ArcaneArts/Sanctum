@@ -272,6 +272,26 @@ still needed nearly the same peak memory. These measurements cover the
 local API container after publication. Cloud Run still needs its own
 network, memory, and publication measurements.
 
+### Concurrent reads of one oversized SQLite snapshot
+
+The release benchmark publishes 2,048 MiB of synthetic SQLite payload and
+starts two reads of the same collection with the default 2 GiB cache budget.
+The resulting snapshot is 2,150,313,984 bytes. Both readers verify the marker
+in the same materialized file. The benchmark releases both readers, checks
+that the temporary file was removed, then reads the collection again.
+
+```sh
+SANCTUM_CONCURRENT_SNAPSHOT_MIB=2048 \
+  cargo test --release --locked -p sanctum-db --test snapshot_capacity \
+  minio_shared_oversized_snapshot_capacity -- --ignored --exact --nocapture
+```
+
+With loopback MinIO on the Apple M4 Max, the two concurrent reads completed
+in 11.93 s and used one 2,150,313,984-byte temporary file. A later request
+materialized a fresh copy in 10.26 s. These are single-sample snapshot
+resolution timings. Cloud Run ingress and instance memory remain unmeasured
+for this workload. [Snapshot cache behavior](STORAGE.md#hosted-snapshot-reuse).
+
 ## Exact vector ranking in SQLite
 
 The release comparison uses one SQLite database for chunk identity, metadata,
