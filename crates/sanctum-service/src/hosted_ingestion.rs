@@ -407,7 +407,7 @@ impl HostedCatalog {
                 current.dispatch_retry < retry
             })
             .await?;
-        self.try_dispatch(scope, operation).await;
+        self.dispatch_saved_upload(scope, operation, None).await;
         Ok(saved.job())
     }
 
@@ -838,7 +838,7 @@ impl HostedUpload {
                     )
                 {
                     self.service
-                        .restore_replay_dispatch(&self.scope, self.operation, attempt)
+                        .dispatch_saved_upload(&self.scope, self.operation, Some(attempt))
                         .await;
                 }
                 return Ok(job);
@@ -917,7 +917,9 @@ impl HostedUpload {
                 saved.replay(&candidate)
             }
         }?;
-        self.service.try_dispatch(&self.scope, self.operation).await;
+        self.service
+            .dispatch_saved_upload(&self.scope, self.operation, None)
+            .await;
         Ok(job)
     }
 }
