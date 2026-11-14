@@ -278,21 +278,27 @@ fn row_collection_details(row: &Row<'_>) -> rusqlite::Result<CollectionDetails> 
 }
 
 pub fn require_collection(path: &Path, collection: &str) -> Result<()> {
-    let exists = read_initialized_catalog(path, |catalog, _| {
-        catalog
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?1)",
-                [collection],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(database_error)
-    })?;
-    if exists == Some(true) {
-        return Ok(());
+    read_initialized_catalog(path, |catalog, _| confirm_collection(catalog, collection))?
+        .ok_or_else(|| missing_collection(collection))
+}
+
+fn confirm_collection(catalog: &Connection, collection: &str) -> Result<()> {
+    let exists = catalog
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?1)",
+            [collection],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(database_error)?;
+    if exists {
+        Ok(())
+    } else {
+        Err(missing_collection(collection))
     }
-    Err(Error::NotFound(format!(
-        "collection {collection} was not found"
-    )))
+}
+
+fn missing_collection(collection: &str) -> Error {
+    Error::NotFound(format!("collection {collection} was not found"))
 }
 
 fn read_initialized_catalog<T>(
