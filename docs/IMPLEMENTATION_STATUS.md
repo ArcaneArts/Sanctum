@@ -143,6 +143,15 @@ Merged in [PR #5](https://github.com/ArcaneArts/Sanctum/pull/5).
 - The default scan reports missing files. Explicit pruning deletes selected
   missing sources and supersedes their pending imports. The gRPC tests cover
   selection, repeated imports, edits, pending work, and deletion.
+- A local import checks for gRPC disconnect or shutdown between directory
+  entries and copy buffers. It discards an incomplete file and preserves
+  accepted queue entries. A focused test stopped a copy after the first
+  64 KiB and checked staged-file cleanup. A standalone server with a
+  generated Python client interrupted two 384 MiB file imports during
+  staging, once by disconnect and once by closing the managed control
+  pipe. The server shut down cleanly and reported `UNAVAILABLE` for the
+  active shutdown stream. After restart the previously accepted operation
+  replayed with the same ID and returned exact UTF-8 in search.
 
 ## Streaming RTF and original retention
 

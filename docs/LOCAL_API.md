@@ -554,6 +554,11 @@ unchanged file using its content digest. An edit keeps the source ID and
 queues a replacement. Each queued event includes an operation ID for
 `sanctum-cli job` or `GetIngestionJob`.
 
+A disconnected gRPC client or server shutdown stops the scan between copy
+buffers. A file still being copied is discarded. Work already accepted by
+the durable queue remains available. Server shutdown returns `UNAVAILABLE`
+to an active stream. Repeat the import to resume scanning.
+
 Missing files are reported and kept in search by default. A previously
 imported path also counts as missing if it becomes a directory or
 symbolic link, or if a parent is replaced by a symlink or regular file.

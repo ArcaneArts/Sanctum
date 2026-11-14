@@ -127,7 +127,9 @@ impl Service {
         self.import_local_until(scope, path, options, || false, emit)
     }
 
-    pub(crate) fn import_local_until(
+    /// Stops walking and copying when `stopped` returns true.
+    /// Work already accepted by the durable queue is preserved.
+    pub fn import_local_until(
         &self,
         scope: &Scope,
         path: &Path,
@@ -160,25 +162,14 @@ impl Service {
             root.parent()
                 .ok_or_else(|| Error::Invalid("file path has no parent".into()))?
         };
-        let walk = WalkDir::new(&root)
+        let mut walk = WalkDir::new(&root)
             .follow_links(false)
             .follow_root_links(false)
-            .into_iter()
-            .filter_entry(|entry| {
-                let relative = entry
-                    .path()
-                    .strip_prefix(base)
-                    .expect("entry is under base");
-                let excluded_directory = entry.depth() > 0
-                    && entry.file_type().is_dir()
-                    && select.directory_excluded(relative);
-                !(entry.path().starts_with(self.files.root()) || excluded_directory)
-            });
+            .into_iter();
         let mut had_errors = false;
-        for entry in walk {
-            if stopped() {
-                return Ok(());
-            }
+        while !stopped()
+            && let Some(entry) = walk.next()
+        {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -194,6 +185,13 @@ impl Service {
                 .path()
                 .strip_prefix(base)
                 .expect("entry is under base");
+            if entry.file_type().is_dir()
+                && (entry.path().starts_with(self.files.root())
+                    || (entry.depth() > 0 && select.directory_excluded(relative)))
+            {
+                walk.skip_current_dir();
+                continue;
+            }
             if !entry.file_type().is_file() || !select.file_selected(relative) {
                 continue;
             }
@@ -221,7 +219,7 @@ impl Service {
                     ImportEvent::failed(&id, &error)
                 }
             };
-            if !emit(event) {
+            if stopped() || !emit(event) {
                 return Ok(());
             }
         }
@@ -266,6 +264,9 @@ impl Service {
             return Err(Error::Busy(
                 "source changed while it was being imported".into(),
             ));
+        }
+        if stopped() {
+            return Err(Error::Busy("import scan stopped".into()));
         }
         staged.enqueue_import(bytes, digest, None)
     }
@@ -720,4 +721,74 @@ pub(crate) fn default_text(path: &Path) -> bool {
                     | "hcl"
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stopping_a_local_import_drops_its_partially_copied_file() {
+        let store = tempfile::tempdir().unwrap();
+        let input = tempfile::tempdir().unwrap();
+        let service = Service::open(store.path(), 1024 * 1024).unwrap();
+        let scope = Scope {
+            tenant: "default".parse().unwrap(),
+            collection: "notes".parse().unwrap(),
+        };
+        service.create_collection(&scope).unwrap();
+        let small = input.path().join("accepted.txt");
+        fs::write(&small, "durable text").unwrap();
+        let options = ImportOptions::default();
+        let mut accepted = None;
+        service
+            .import_local(&scope, &small, &options, |event| {
+                accepted = event.operation;
+                true
+            })
+            .unwrap();
+        let operation = accepted.unwrap();
+
+        let large = input.path().join("interrupted.txt");
+        fs::write(&large, vec![b'x'; 256 * 1024]).unwrap();
+        let staging = store.path().join("default/notes/staging");
+        let canceled = std::cell::Cell::new(false);
+        let stopped = || {
+            if !canceled.get() {
+                canceled.set(
+                    fs::read_dir(&staging)
+                        .unwrap()
+                        .any(|entry| entry.unwrap().metadata().unwrap().len() >= 64 * 1024),
+                );
+            }
+            canceled.get()
+        };
+        service
+            .import_local_until(&scope, &large, &options, stopped, |_| {
+                panic!("stopping mid-copy must not emit a queued or failed file event");
+            })
+            .unwrap();
+        assert!(fs::read_dir(&staging).unwrap().next().is_none());
+        assert!(service.queue.get(&scope, operation).is_ok());
+        assert!(canceled.get());
+        assert!(
+            service
+                .queue
+                .pending_external(
+                    &scope,
+                    &ExternalSource {
+                        namespace: format!(
+                            "local-fs:{}",
+                            blake3::hash(
+                                large.canonicalize().unwrap().as_os_str().as_encoded_bytes()
+                            )
+                            .to_hex()
+                        ),
+                        id: "interrupted.txt".into()
+                    }
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
 }
