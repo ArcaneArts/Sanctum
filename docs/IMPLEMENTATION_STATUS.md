@@ -2357,6 +2357,21 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   a successful retry with the same request ID after rejecting corrupt input.
   [Hosted uploads](STORAGE.md#hosted-uploads).
 
+## Hosted manifest writes with lost responses
+
+- The database executor verifies an ambiguous conditional write by reading
+  back the exact attempted HEAD and its storage version within the
+  original deadline. It uses that version for subsequent conditional
+  writes. A different manifest or an expired deadline still fences the
+  writer, and operation replay can recover a committed receipt. A
+  filesystem regression verifies that readable bytes do not mask a sync
+  error.
+- Filesystem and MinIO tests cover acquisition, renewal, publication,
+  and release after a lost response or retry conflict. They also verify
+  that an uncommitted renewal cannot extend the lease. Separate deadline
+  tests verify a timed-out writer cannot resume, and that a new writer
+  replays a committed receipt. [Database publication](STORAGE.md#object-backed-database-publication).
+
 ## SQLite snapshot uploads with lost responses
 
 - A writer can publish a snapshot or page delta whose upload reply was

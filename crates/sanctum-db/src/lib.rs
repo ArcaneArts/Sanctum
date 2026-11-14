@@ -301,7 +301,7 @@ impl Publication {
             expires_at_ms: now + self.ttl.as_millis() as u64,
         });
         let deadline = Instant::now() + self.ttl;
-        let write = self.storage.put_control(&key, encode(&head)?, condition);
+        let write = self.write_head(&key, encode(&head)?, condition);
         let version = tokio::time::timeout_at(deadline.into(), write)
             .await
             .map_err(|_| Error::Busy("database writer acquisition timed out".into()))?
@@ -419,7 +419,29 @@ impl Publication {
 
     async fn read_head(&self, unit: &Unit) -> Result<Option<(Head, Version)>> {
         let key = unit.head()?;
-        let response = match self.storage.get(&key).await {
+        let Some((bytes, version)) = self.read_head_bytes(&key).await? else {
+            return Ok(None);
+        };
+        let head: Head =
+            serde_json::from_slice(&bytes).map_err(|error| Error::Internal(Box::new(error)))?;
+        if !matches!(head.format, FORMAT | DELTA_FORMAT) {
+            return Err(corrupt("unsupported database manifest version"));
+        }
+        if let Some(generation) = &head.generation
+            && let Some(chain) = &generation.chain
+        {
+            if head.format != DELTA_FORMAT {
+                return Err(corrupt(
+                    "snapshot deltas require database manifest format 2",
+                ));
+            }
+            chain.validate(generation)?;
+        }
+        Ok(Some((head, version)))
+    }
+
+    async fn read_head_bytes(&self, key: &Key) -> Result<Option<(Vec<u8>, Version)>> {
+        let response = match self.storage.get(key).await {
             Ok(response) => response,
             Err(Error::NotFound(_)) => return Ok(None),
             Err(error) => return Err(error),
@@ -438,22 +460,35 @@ impl Publication {
                 "database manifest length differs from its metadata",
             ));
         }
-        let head: Head =
-            serde_json::from_slice(&bytes).map_err(|error| Error::Internal(Box::new(error)))?;
-        if !matches!(head.format, FORMAT | DELTA_FORMAT) {
-            return Err(corrupt("unsupported database manifest version"));
-        }
-        if let Some(generation) = &head.generation
-            && let Some(chain) = &generation.chain
+        Ok(Some((bytes, response.object.version)))
+    }
+
+    async fn write_head(
+        &self,
+        key: &Key,
+        bytes: bytes::Bytes,
+        condition: Condition,
+    ) -> Result<Version> {
+        let error = match self
+            .storage
+            .put_control(key, bytes.clone(), condition)
+            .await
         {
-            if head.format != DELTA_FORMAT {
-                return Err(corrupt(
-                    "snapshot deltas require database manifest format 2",
-                ));
-            }
-            chain.validate(generation)?;
+            Ok(version) => return Ok(version),
+            // A filesystem sync error can leave readable bytes that have not
+            // been made durable. Readback cannot resolve that failure.
+            Err(error @ (Error::Invalid(_) | Error::Io(_))) => return Err(error),
+            Err(error) => error,
+        };
+        // A transport retry of an already-committed CAS can also report a
+        // precondition conflict. Each write contains its own unique update ID.
+        if let Ok(Some((current, version))) = self.read_head_bytes(key).await
+            && current.as_slice() == bytes.as_ref()
+        {
+            tracing::debug!(%key, %error, "confirmed database manifest write after response error");
+            return Ok(version);
         }
-        Ok(Some((head, response.object.version)))
+        Err(error)
     }
 
     async fn materialize(
@@ -966,11 +1001,9 @@ impl Lease {
         self.ensure_live()?;
         // Dropping a pending CAS can hide a successful HEAD update.
         self.lost = true;
-        let write = self.publication.storage.put_control(
-            &key,
-            bytes,
-            Condition::Match(self.version.clone()),
-        );
+        let write =
+            self.publication
+                .write_head(&key, bytes, Condition::Match(self.version.clone()));
         let result = tokio::time::timeout_at(self.deadline.into(), write).await;
         match result {
             Ok(Ok(version)) if Instant::now() < self.deadline => {
