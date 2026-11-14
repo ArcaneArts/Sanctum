@@ -37,6 +37,9 @@ frontend edits. [Tauri development file watching](https://v2.tauri.app/develop/)
 
 Sanctum saves settings as `config.json` in the OS application configuration
 directory. A storage-folder change opens the selected location after restart.
+If the sidecar exits before you apply saved changes, the desktop host retries
+with the settings already in use. Select **Restart server to apply**, or quit
+and reopen Sanctum, to start with the saved settings.
 The Rust host serializes the active configuration into the child process's
 `SANCTUM_CONFIG_JSON`. Choose port zero to assign an ephemeral loopback port.
 The Connect page always shows the active MCP address.

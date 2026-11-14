@@ -99,8 +99,9 @@ pub(crate) async fn save_settings(host: State<'_, Host>, settings: Settings) -> 
 }
 
 #[tauri::command]
-pub(crate) fn apply_settings(host: State<'_, Host>) {
-    host.apply_settings();
+pub(crate) async fn apply_settings(host: State<'_, Host>) -> Reply<()> {
+    host.apply_settings().await;
+    Ok(())
 }
 
 #[tauri::command]

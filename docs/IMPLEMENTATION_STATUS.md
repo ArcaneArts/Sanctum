@@ -279,6 +279,19 @@ Merged in [PR #13](https://github.com/ArcaneArts/Sanctum/pull/13).
 - A model-driven client workflow, Windows and Linux tray behavior, and
   release signing and installers remain unverified.
 
+### Desktop settings during sidecar recovery
+
+- Saving settings persists them for the next desktop launch. During the
+  current session, automatic sidecar restart uses the last applied settings.
+  The restart action applies the saved settings as they existed when clicked.
+- On macOS, `pnpm devtop` ran the native app with a disposable store.
+  After saving a new gRPC port in Settings, killing the sidecar caused it to
+  recover on the original port and the window still showed the pending change.
+  Selecting **Restart server to apply** moved the listener to the new port
+  and preserved the collection. The Rust host regression also covered
+  saving a newer configuration while an earlier change was being applied.
+  [PR #141](https://github.com/ArcaneArts/Sanctum/pull/141).
+
 ## Search across collections
 
 Merged in [PR #14](https://github.com/ArcaneArts/Sanctum/pull/14).

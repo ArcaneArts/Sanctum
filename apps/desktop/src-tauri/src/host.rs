@@ -37,10 +37,16 @@ struct Inner {
 }
 
 struct Desired {
-    settings: Settings,
-    generation: u64,
+    saved: Configuration,
+    applied: Configuration,
     quitting: bool,
     quit: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Clone)]
+struct Configuration {
+    settings: Settings,
+    generation: u64,
 }
 
 struct State {
@@ -209,30 +215,45 @@ impl Host {
         let binary = std::env::current_exe()?;
         let sibling =
             |name: &str| binary.with_file_name(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        Ok(Self {
+        Ok(Self::new(
+            settings_path,
+            settings,
+            sibling("sanctum-server"),
+            sibling("sanctum-cli"),
+        ))
+    }
+
+    fn new(settings_path: PathBuf, settings: Settings, server: PathBuf, cli: PathBuf) -> Self {
+        Self {
             inner: Arc::new(Inner {
                 settings_path,
-                server: sibling("sanctum-server"),
-                cli: sibling("sanctum-cli"),
+                server,
+                cli,
                 state: RwLock::new(State {
                     phase: "starting",
                     error: None,
                     ready: None,
-                    generation: 0,
+                    generation: 1,
                 }),
                 desired: Mutex::new(Desired {
-                    settings,
-                    generation: 1,
+                    saved: Configuration {
+                        settings: settings.clone(),
+                        generation: 1,
+                    },
+                    applied: Configuration {
+                        settings,
+                        generation: 1,
+                    },
                     quitting: false,
                     quit: None,
                 }),
                 wake: Notify::new(),
             }),
-        })
+        }
     }
 
     pub(crate) async fn settings(&self) -> Settings {
-        self.inner.desired.lock().await.settings.clone()
+        self.inner.desired.lock().await.saved.settings.clone()
     }
 
     pub(crate) async fn save_settings(&self, settings: Settings) -> Result<()> {
@@ -243,13 +264,17 @@ impl Host {
         let path = self.inner.settings_path.clone();
         let persisted = settings.clone();
         tokio::task::spawn_blocking(move || write_settings(&path, &persisted)).await??;
-        desired.settings = settings;
-        desired.generation += 1;
+        desired.saved.settings = settings;
+        desired.saved.generation += 1;
         Ok(())
     }
 
-    pub(crate) fn apply_settings(&self) {
-        self.inner.wake.notify_one();
+    pub(crate) async fn apply_settings(&self) {
+        let mut desired = self.inner.desired.lock().await;
+        if desired.applied.generation != desired.saved.generation {
+            desired.applied = desired.saved.clone();
+            self.inner.wake.notify_one();
+        }
     }
 
     pub(crate) async fn quit(&self) -> bool {
@@ -267,7 +292,7 @@ impl Host {
     }
 
     pub(crate) async fn snapshot(&self) -> (RuntimeStatus, Option<SanctumClient<Channel>>) {
-        let generation = self.inner.desired.lock().await.generation;
+        let generation = self.inner.desired.lock().await.saved.generation;
         let state = self.inner.state.read().await;
         let mcp_url = state
             .ready
@@ -285,7 +310,7 @@ impl Host {
             storage_backend: state.ready.as_ref().map(|ready| ready.storage_backend),
             generation: state.generation,
             stdio,
-            restart_pending: state.generation != 0 && state.generation != generation,
+            restart_pending: state.generation != generation,
         };
         (
             status,
@@ -307,13 +332,16 @@ impl Host {
     pub(crate) async fn run(self, tray_status: MenuItem<tauri::Wry>) {
         let mut backoff = Duration::from_secs(1);
         loop {
-            let (settings, generation) = {
+            let Configuration {
+                settings,
+                generation,
+            } = {
                 let mut desired = self.inner.desired.lock().await;
                 if let Some(quit) = desired.quit.take() {
                     let _ = quit.send(());
                     return;
                 }
-                (desired.settings.clone(), desired.generation)
+                desired.applied.clone()
             };
             self.transition(&tray_status, "starting", None, None, generation)
                 .await;
@@ -336,7 +364,7 @@ impl Host {
                                 Err(error) => format!("Could not wait for server: {error}"),
                             }
                         },
-                        _ = self.inner.wake.notified() => {
+                        _ = self.wait_for_change(generation) => {
                             self.transition(&tray_status, "stopping", None, None, generation).await;
                             drop(control);
                             stop_child(&mut child).await;
@@ -351,8 +379,21 @@ impl Host {
                 .await;
             tokio::select! {
                 _ = tokio::time::sleep(backoff) => backoff = (backoff * 2).min(Duration::from_secs(30)),
-                _ = self.inner.wake.notified() => backoff = Duration::from_secs(1),
+                _ = self.wait_for_change(generation) => backoff = Duration::from_secs(1),
             }
+        }
+    }
+
+    async fn wait_for_change(&self, generation: u64) {
+        loop {
+            let changed = self.inner.wake.notified();
+            {
+                let desired = self.inner.desired.lock().await;
+                if desired.quitting || desired.applied.generation != generation {
+                    return;
+                }
+            }
+            changed.await;
         }
     }
 
@@ -501,6 +542,76 @@ fn write_settings(path: &Path, settings: &Settings) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_applied_settings_are_used_for_server_recovery() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let root = tempfile::tempdir().unwrap();
+                let initial = Settings {
+                    storage_root: root.path().join("initial").to_string_lossy().into_owned(),
+                    object_storage: None,
+                    grpc_port: 0,
+                    mcp_port: 0,
+                    local_worker_concurrency: 1,
+                    embedding: None,
+                };
+                let path = root.path().join("config.json");
+                let host = Host::new(
+                    path.clone(),
+                    initial.clone(),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                );
+                let old = host.inner.desired.lock().await.applied.generation;
+                let mut saved = initial.clone();
+                saved.grpc_port = 48001;
+                host.save_settings(saved.clone()).await.unwrap();
+                assert!(host.snapshot().await.0.restart_pending);
+                assert_eq!(host.settings().await.grpc_port, 48001);
+                assert_eq!(
+                    host.inner.desired.lock().await.applied.settings.grpc_port,
+                    0
+                );
+                assert_no_restart(&host, old).await;
+
+                host.apply_settings().await;
+                tokio::time::timeout(Duration::from_secs(1), host.wait_for_change(old))
+                    .await
+                    .unwrap();
+                let applied = host.inner.desired.lock().await.applied.clone();
+                assert_eq!(applied.settings.grpc_port, 48001);
+                saved.grpc_port = 48002;
+                host.save_settings(saved).await.unwrap();
+                assert_eq!(
+                    host.inner.desired.lock().await.applied.settings.grpc_port,
+                    48001
+                );
+                assert_no_restart(&host, applied.generation).await;
+                host.inner.state.write().await.generation = applied.generation;
+                assert!(host.snapshot().await.0.restart_pending);
+                let disk: Settings = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                assert_eq!(disk.grpc_port, 48002);
+
+                host.apply_settings().await;
+                let applied = host.inner.desired.lock().await.applied.generation;
+                host.inner.state.write().await.generation = applied;
+                assert!(!host.snapshot().await.0.restart_pending);
+                host.apply_settings().await;
+                assert_no_restart(&host, applied).await;
+            });
+    }
+
+    async fn assert_no_restart(host: &Host, generation: u64) {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), host.wait_for_change(generation))
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn storage_settings_preserve_filesystem_and_enable_the_managed_object_worker() {
