@@ -1955,6 +1955,8 @@ async fn hosted_registration_replays_after_checkpoint_failure_and_orders_replace
 
 #[tokio::test]
 async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf() {
+    use v1::{PendingTextScanStop as Stop, pending_text_scan_event::Event};
+
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance {
         inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
@@ -2004,6 +2006,11 @@ async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf()
         scope: Some(wire.clone()),
         operation_id: id.to_string(),
     };
+    let scan = v1::ScanPendingTextRequest {
+        job: Some(request.clone()),
+        literal: "café".into(),
+        ..Default::default()
+    };
     let registered = server
         .client
         .get_ingestion_job(request.clone())
@@ -2013,6 +2020,25 @@ async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf()
     assert_eq!(registered.state(), v1::IngestionState::Registered);
     assert_eq!(registered.processed_bytes, 0);
     assert!(registered.preparation.is_none());
+    let mut events = server
+        .client
+        .scan_pending_text(scan.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(
+        events.message().await.unwrap().unwrap().event,
+        Some(Event::Source(source)) if source.total_bytes == rtf.len() as u64
+    ));
+    assert!(matches!(
+        events.message().await.unwrap().unwrap().event,
+        Some(Event::Progress(progress))
+            if progress.stop() == Stop::ExtractionPending
+                && progress.scanned_bytes == 0
+                && progress.read_bytes == 0
+                && progress.matches.is_empty()
+    ));
+    assert!(events.message().await.unwrap().is_none());
     storage.interrupt.store(2, Ordering::Relaxed);
     assert!(matches!(
         catalog.prepare_upload(&scope, id).await,
@@ -2081,6 +2107,34 @@ async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf()
     storage
         .interrupt
         .store(REJECT_ORIGINAL_READ, Ordering::Relaxed);
+    let mut events = server
+        .client
+        .scan_pending_text(scan)
+        .await
+        .unwrap()
+        .into_inner();
+    let canonical = "durably prepared café";
+    let start = canonical.find("café").unwrap();
+    assert!(matches!(
+        events.message().await.unwrap().unwrap().event,
+        Some(Event::Source(source))
+            if source.revision_id == accepted.revision_id
+                && source.total_bytes == canonical.len() as u64
+    ));
+    let Some(Event::Progress(progress)) = events.message().await.unwrap().unwrap().event else {
+        panic!("missing scan progress");
+    };
+    assert_eq!(progress.stop(), Stop::Complete);
+    assert_eq!(progress.scanned_bytes, canonical.len() as u64);
+    assert_eq!(progress.read_bytes, canonical.len() as u64);
+    assert_eq!(
+        progress.matches,
+        [v1::PendingTextMatch {
+            start_byte: start as u64,
+            end_byte: canonical.len() as u64,
+        }]
+    );
+    assert!(events.message().await.unwrap().is_none());
     assert!(matches!(
         restarted.prepare_upload(&scope, id).await.unwrap().state,
         sanctum_service::HostedJobState::Registered
@@ -2106,7 +2160,7 @@ async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf()
         .into_inner()
         .hits;
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].excerpt, "durably prepared café");
+    assert_eq!(hits[0].excerpt, canonical);
     assert_eq!(
         hits[0].chunk.as_ref().unwrap().revision_id,
         accepted.revision_id
@@ -6110,6 +6164,11 @@ impl Storage for InterruptAcceptance {
             std::future::pending::<()>().await;
         }
         match self.interrupt.load(Ordering::Relaxed) {
+            REJECT_ORIGINAL_READ if key.as_str().contains("/inputs/") => {
+                return Err(Error::Busy(
+                    "test blocked original input range reads".into(),
+                ));
+            }
             REJECT_SECOND_RANGE => self.interrupt.store(FIRST_RANGE_READ, Ordering::Relaxed),
             FIRST_RANGE_READ => return Err(Error::Busy("test blocked an extra range read".into())),
             CORRUPT_RANGE => {

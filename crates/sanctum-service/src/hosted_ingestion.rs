@@ -232,13 +232,32 @@ impl HostedCatalog {
                 "literal scan requires pending text ingestion".into(),
             ));
         }
-        let input = if sanctum_core::is_rtf(&record.upload.name) {
-            ScanSource::RtfOriginal
-        } else {
-            ScanSource::Hosted {
-                storage: self.storage.clone(),
-                key: record.input_key(&prefix)?,
+        let (input, total_bytes) = if sanctum_core::is_rtf(&record.upload.name) {
+            match &record.stage {
+                Stage::PendingIndexing {
+                    registration,
+                    preparation: Some(indexing::Preparation::Ready(canonical)),
+                } => {
+                    let (key, bytes) =
+                        self.prepared_rtf_text(scope, &record, registration, canonical)?;
+                    (
+                        ScanSource::Hosted {
+                            storage: self.storage.clone(),
+                            key,
+                        },
+                        bytes,
+                    )
+                }
+                _ => (ScanSource::RtfOriginal, record.bytes),
             }
+        } else {
+            (
+                ScanSource::Hosted {
+                    storage: self.storage.clone(),
+                    key: record.input_key(&prefix)?,
+                },
+                record.bytes,
+            )
         };
         let job = record.job();
         Ok(crate::PendingText {
@@ -246,7 +265,7 @@ impl HostedCatalog {
             revision: job.revision,
             name: job.name,
             external: job.external,
-            total_bytes: job.bytes,
+            total_bytes,
             input,
         })
     }

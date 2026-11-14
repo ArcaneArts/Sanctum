@@ -1047,6 +1047,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - The hosted MCP smoke on live MinIO returns the exact UTF-8 byte range
   of a literal before any indexing task has run.
 - Delivered in [PR #62](https://github.com/ArcaneArts/Sanctum/pull/62).
+- Hosted RTF scans use exact byte ranges from the saved UTF-8 preparation
+  object before FTS publication. The filesystem gRPC test recovered that
+  object after a lost checkpoint response with original reads blocked.
+  Against live MinIO, MCP verified both extraction-pending and byte-budget
+  stops, including a limit inside a multibyte character. The generated
+  Python client found `café` at `[12, 17)` after the API restarted and before
+  the indexing task ran.
+  [PR #129](https://github.com/ArcaneArts/Sanctum/pull/129).
 
 ## Source metadata on upload
 
