@@ -546,13 +546,14 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         .into_inner();
     assert_eq!(after_timeout.state(), v1::IngestionState::Accepted);
     let (checkpoint, mut dispatch_reached) = oneshot::channel();
-    let stalled = catalog_with_storage(Arc::new(StalledCheckpoint {
+    let checkpoint_fault = Arc::new(StalledCheckpoint {
         storage: storage.clone(),
         checkpoint: Mutex::new(Some(checkpoint)),
         after_dispatch: true,
         lose_source_reply: None,
-        lose_control_reply: Mutex::new(None),
-    }));
+        lose_control_reply: Mutex::new(Some("/operation.json")),
+    });
+    let stalled = catalog_with_storage(checkpoint_fault.clone());
     let (handoff_worker, handoff_server) =
         serve_http(crate::hosted_worker::router_with_task_budgets(
             stalled,
@@ -567,6 +568,13 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         .await
         .unwrap();
     assert_eq!(acknowledged.status(), StatusCode::NO_CONTENT);
+    assert!(
+        checkpoint_fault
+            .lose_control_reply
+            .lock()
+            .unwrap()
+            .is_none()
+    );
     let mut canceled = dispatch_reached
         .try_recv()
         .expect("dispatch checkpoint reached");
@@ -658,19 +666,21 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
             assert!(pending.preparation.is_none());
             assert_eq!(queue.accepted.lock().unwrap().len(), 2);
         }
-        let (delivery_worker, _delivery_server) = if index == 1 {
-            let storage = Arc::new(StalledCheckpoint {
+        let (delivery_worker, _delivery_server, dropped_reply) = if index != 0 {
+            let fault = Arc::new(StalledCheckpoint {
                 storage: storage.clone(),
                 checkpoint: Mutex::new(None),
                 after_dispatch: false,
-                lose_source_reply: Some("/objects/"),
-                lose_control_reply: Mutex::new(None),
+                lose_source_reply: (index == 1).then_some("/objects/"),
+                lose_control_reply: Mutex::new(Some("/operation.json")),
             });
-            let (worker, server) =
-                serve_http(crate::hosted_worker::router(catalog_with_storage(storage))).await;
-            (worker, Some(server))
+            let (worker, server) = serve_http(crate::hosted_worker::router(catalog_with_storage(
+                fault.clone(),
+            )))
+            .await;
+            (worker, Some(server), Some(fault))
         } else {
-            (worker.clone(), None)
+            (worker.clone(), None, None)
         };
         let response = http
             .post(format!("{delivery_worker}{path}"))
@@ -680,6 +690,9 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        if let Some(fault) = dropped_reply {
+            assert!(fault.lose_control_reply.lock().unwrap().is_none());
+        }
         if index == 0 {
             assert_eq!(
                 collection_generation(storage.as_ref(), prefix.as_ref()).await,

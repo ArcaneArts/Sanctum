@@ -2386,6 +2386,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   refused task handoff after restart and fetched the exact extracted text.
   [Hosted uploads](STORAGE.md#hosted-uploads).
 
+## Hosted stage checkpoints with lost responses
+
+- The worker reads the upload envelope after an ambiguous checkpoint
+  write. It acknowledges the delivery when the same attempt has saved
+  or passed the requested stage. A pre-commit failure keeps the stage
+  retryable and preserves any SQLite receipt for the next delivery.
+- Filesystem tests cover cancellation and RTF preparation. Filesystem
+  and live MinIO worker tests drop checkpoint replies after registration,
+  preparation, and indexing, then verify HTTP 204, subsequent handoffs,
+  and exact UTF-8 retrieval. The worker deadline tests still verify
+  that a stalled pre-commit write returns HTTP 503.
+  [Hosted revision registration](STORAGE.md#hosted-revision-registration).
+
 ## Hosted manifest writes with lost responses
 
 - The database executor verifies an ambiguous conditional write by reading

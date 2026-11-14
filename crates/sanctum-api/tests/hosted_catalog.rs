@@ -1863,7 +1863,7 @@ async fn hosted_cancellation_recovers_from_lost_checkpoints_without_publishing()
         ..Default::default()
     };
     let payload = [b"quartz".as_slice()];
-    for registered in [false, true] {
+    for (registered, interrupt) in [(false, 1), (true, 1), (true, 2)] {
         let accepted = server
             .client
             .submit_text(upload_frames(&header, payload))
@@ -1901,16 +1901,16 @@ async fn hosted_cancellation_recovers_from_lost_checkpoints_without_publishing()
                 1
             );
         }
-        storage.interrupt.store(1, Ordering::Relaxed);
-        assert_eq!(
-            server
-                .client
-                .cancel_ingestion_job(request.clone())
-                .await
-                .unwrap_err()
-                .code(),
-            Code::Unavailable
-        );
+        storage.interrupt.store(interrupt, Ordering::Relaxed);
+        let canceled = server.client.cancel_ingestion_job(request.clone()).await;
+        if interrupt == 1 {
+            assert_eq!(canceled.unwrap_err().code(), Code::Unavailable);
+        } else {
+            assert_eq!(
+                canceled.unwrap().into_inner().state(),
+                v1::IngestionState::Canceled
+            );
+        }
         server.stop().await;
         let recovered = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
         if registered {
@@ -2277,10 +2277,8 @@ async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf()
     ));
     assert!(events.message().await.unwrap().is_none());
     storage.interrupt.store(2, Ordering::Relaxed);
-    assert!(matches!(
-        catalog.prepare_upload(&scope, id).await,
-        Err(Error::Busy(_))
-    ));
+    let prepared_job = catalog.prepare_upload(&scope, id).await.unwrap();
+    assert!(prepared_job.preparation.is_some());
     server.stop().await;
     drop(catalog);
 

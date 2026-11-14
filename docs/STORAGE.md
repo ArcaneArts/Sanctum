@@ -290,10 +290,13 @@ curl --fail-with-body http://127.0.0.1:47552/internal/tasks/register-upload \
 
 The task applies a revision intent under the collection writer lease. The
 published database contains the resulting update sequence and operation
-receipt. The worker then conditionally advances the envelope. If it stops
-between these steps, redelivery reuses the database receipt and checkpoints
-the same result. Duplicate or conflicting deliveries cannot advance the
-sequence twice for one operation.
+receipt. The worker then conditionally advances the envelope. If storage
+loses that reply, the worker checks the saved envelope for progress on the
+same upload attempt before acknowledging the task. This also applies to
+preparation, indexing, embedding, and cancellation. If a checkpoint
+fails before it is saved, redelivery can reuse the database receipt and
+checkpoint the same result. Duplicate or conflicting deliveries cannot
+advance the sequence twice for one operation.
 
 After registration, `GetIngestionJob` reports `REGISTERED` and the assigned
 update sequence. Existing revisions stay current until indexing publishes a

@@ -360,16 +360,25 @@ impl HostedCatalog {
             .await
         {
             Ok(_) => Ok(record),
-            Err(Error::Conflict(_)) => {
-                let (current, _) = self.require_operation(prefix, record.operation).await?;
-                if still_pending(&current.stage) {
-                    return Err(Error::Busy(
+            // A local sync error can leave the new envelope readable before
+            // it is durable.
+            Err(error @ (Error::Invalid(_) | Error::Io(_))) => Err(error),
+            Err(error) => {
+                let conflict = matches!(error, Error::Conflict(_));
+                match self.require_operation(prefix, record.operation).await {
+                    Ok((current, _))
+                        if current.attempt == record.attempt && !still_pending(&current.stage) =>
+                    {
+                        Ok(current)
+                    }
+                    Ok(_) if conflict => Err(Error::Busy(
                         "ingestion envelope changed during checkpoint".into(),
-                    ));
+                    )),
+                    Ok(_) => Err(error),
+                    Err(Error::NotFound(_)) if !conflict => Err(error),
+                    Err(read_error) => Err(read_error),
                 }
-                Ok(current)
             }
-            Err(error) => Err(error),
         }
     }
 
