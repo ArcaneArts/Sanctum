@@ -93,6 +93,49 @@ The one-row result establishes the cost of full snapshot publication at
 the target size. The multi-GiB source workload below measures real indexing and publication.
 Embedding batches still need separate measurements.
 
+### Two simultaneous cold snapshot reads
+
+Run the concurrent benchmark with the same MinIO environment and a fresh
+prefix. `SANCTUM_CONCURRENT_SNAPSHOT_MIB` sets the size of each database
+and defaults to 1024. This command leaves one snapshot per collection in
+the supplied prefix.
+
+```sh
+cargo test --release --locked -p sanctum-db --test snapshot_capacity \
+  minio_concurrent_snapshot_capacity -- --ignored --exact --nocapture
+```
+
+Both collections publish a synthetic SQLite payload with a distinct
+marker. Three samples start with an empty snapshot cache and issue both
+reads concurrently. Each sample then repeats both reads against the same
+cache and checks that they share the verified files from the cold reads.
+The test times opening SQLite and reading the marker separately.
+
+The last pass sets a budget one byte below the combined database sizes.
+It keeps a reader open for each collection, reloads the evicted snapshot,
+and measures the temporary file lengths. The held copies can consume
+space beyond the configured retention budget. The synthetic data measures
+snapshot I/O. Query scoring and source range retrieval are measured below.
+
+| Measurement | Two 1 GiB snapshots | Two 2 GiB snapshots |
+| --- | ---: | ---: |
+| Database length per collection | 1,075,167,232 bytes | 2,150,313,984 bytes |
+| Cache budget for both | 2,150,334,464 bytes | 4,300,627,968 bytes |
+| Cold resolution, six samples | 6.09–6.71 s | 12.85–20.04 s |
+| Warm resolution, six samples | 1.12–1.82 ms | 1.26–1.96 ms |
+| SQLite open and marker lookup | 182–257 µs | 182–264 µs |
+| Reload after eviction | 3.93 s | 7.11 s |
+| Three materialized files held by readers | 3,225,501,696 bytes | 6,450,941,952 bytes |
+| Peak sampled benchmark process RSS | 37,961,728 bytes | 40,042,496 bytes |
+
+Both runs used the Apple M4 Max and loopback MinIO. RSS was sampled every
+200 ms and excludes temporary files and MinIO. At either size the default
+2 GiB cache budget was too small to retain both databases. The two 2 GiB
+snapshots exceeded the ten-second target on every cold sample. The same
+cache budget cannot serve as a Cloud Run memory limit, where the retained
+copies and in-flight files also use instance memory. Live Cloud Run sizing
+and ingress timing remain open.
+
 ## Exact vector ranking in SQLite
 
 The release comparison uses one SQLite database for chunk identity, metadata,
