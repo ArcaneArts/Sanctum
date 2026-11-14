@@ -66,9 +66,9 @@ failed publication follow the same cleanup process. Command receipts
 are retained for 45 days. The dispatch layer must reject expired
 operation envelopes when it invokes this executor.
 
-The executor runs against the filesystem and MinIO in its contract
-tests. Hosted catalog operations use it to publish initial collection
-databases and activate them in the tenant catalog.
+The executor has a shared publication contract for the filesystem,
+MinIO, and GCS. Hosted catalog operations use it to publish initial
+collection databases and activate them in the tenant catalog.
 
 ### Optional SQLite page deltas
 
@@ -100,7 +100,10 @@ before rolling back to a server without delta support.
 The native adapter uses the GCS JSON API and Application Default
 Credentials. It creates control objects with `ifGenerationMatch=0`
 and replaces them using the returned generation. Full downloads fence
-the media request to the generation from the metadata response. Range
+the media request to the generation from the metadata response. When a
+writer replaces or removes that generation between the requests, the
+adapter reads fresh metadata before retrying the media request. It returns
+a retryable error if the generation keeps changing across four attempts. Range
 reads require a 206 response and verify the exact interval and length.
 Bulk transfers use bounded 8 MiB parts in a GCS resumable upload
 session. After an interrupted request or retryable HTTP failure,
@@ -117,11 +120,14 @@ a retention rule that prevents test cleanup.
 ```sh
 export SANCTUM_GCS_BUCKET=YOUR_TEST_BUCKET
 cargo test --locked -p sanctum-storage-gcs --test live -- --ignored
+cargo test --locked -p sanctum-db --test publication gcs_ -- --ignored
 ```
 
-The regular test suite checks the JSON API contract with a loopback HTTP
-fixture, including partial part acknowledgments and lost responses. Live
-bucket verification remains open.
+The publication tests use unique prefixes and remove their test objects
+on success. They verify fenced takeover, replay, and snapshot reads,
+including reconstruction from page deltas. The regular test suite checks
+the JSON API with a loopback HTTP fixture. Live bucket verification remains
+open.
 
 ## Hosted server configuration
 

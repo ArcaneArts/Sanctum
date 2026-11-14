@@ -2454,6 +2454,7 @@ dependencies = [
  "sanctum-db-sqlite",
  "sanctum-storage",
  "sanctum-storage-fs",
+ "sanctum-storage-gcs",
  "sanctum-storage-s3",
  "serde",
  "serde_json",

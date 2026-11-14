@@ -6,11 +6,19 @@ use sanctum_db::{Command, Publication, Unit};
 use sanctum_storage::{Key, Storage};
 use uuid::Uuid;
 
+const LOCAL_TAKEOVER_LEASE: Duration = Duration::from_millis(650);
+
 #[tokio::test]
 async fn filesystem_publication_contract() {
     let directory = tempfile::tempdir().unwrap();
     let storage = sanctum_storage_fs::FileStorage::open(directory.path()).unwrap();
-    verify(Arc::new(storage), "publication", Some(directory.path())).await;
+    verify(
+        Arc::new(storage),
+        "publication",
+        Some(directory.path()),
+        LOCAL_TAKEOVER_LEASE,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -18,7 +26,16 @@ async fn filesystem_publication_contract() {
 async fn minio_publication_contract() {
     let storage = minio_storage();
     let prefix = format!("publication-{}", Uuid::new_v4());
-    verify(storage, &prefix, None).await;
+    verify(storage, &prefix, None, LOCAL_TAKEOVER_LEASE).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an authorized GCS test bucket and Application Default Credentials"]
+async fn gcs_publication_contract() {
+    let bucket = std::env::var("SANCTUM_GCS_BUCKET").expect("SANCTUM_GCS_BUCKET");
+    let storage = sanctum_storage_gcs::GcsStorage::new(bucket).unwrap();
+    let prefix = format!("publication-{}", Uuid::new_v4());
+    verify(Arc::new(storage), &prefix, None, Duration::from_secs(5)).await;
 }
 
 fn minio_storage() -> Arc<dyn Storage> {
@@ -160,6 +177,15 @@ async fn filesystem_snapshot_delta_contract() {
 async fn minio_snapshot_delta_contract() {
     let prefix = format!("delta-publication-{}", Uuid::new_v4());
     verify_deltas(minio_storage(), &prefix, None).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an authorized GCS test bucket and Application Default Credentials"]
+async fn gcs_snapshot_delta_contract() {
+    let bucket = std::env::var("SANCTUM_GCS_BUCKET").expect("SANCTUM_GCS_BUCKET");
+    let storage = sanctum_storage_gcs::GcsStorage::new(bucket).unwrap();
+    let prefix = format!("delta-publication-{}", Uuid::new_v4());
+    verify_deltas(Arc::new(storage), &prefix, None).await;
 }
 
 async fn verify_deltas(
@@ -590,7 +616,12 @@ impl Storage for PublicationStorage {
     }
 }
 
-async fn verify(storage: Arc<dyn Storage>, prefix: &str, local_root: Option<&std::path::Path>) {
+async fn verify(
+    storage: Arc<dyn Storage>,
+    prefix: &str,
+    local_root: Option<&std::path::Path>,
+    takeover_lease: Duration,
+) {
     let prefix = Key::parse(prefix).unwrap();
     let scratch = tempfile::tempdir().unwrap();
     let scope = Scope {
@@ -599,7 +630,7 @@ async fn verify(storage: Arc<dyn Storage>, prefix: &str, local_root: Option<&std
     };
     let unit = Unit::collection(Some(&prefix), &scope).unwrap();
     let catalog = Unit::catalog(Some(&prefix), &scope.tenant).unwrap();
-    let short = Publication::new(storage.clone(), Duration::from_millis(650)).unwrap();
+    let short = Publication::new(storage.clone(), takeover_lease).unwrap();
     let long = Publication::new(storage.clone(), Duration::from_secs(15)).unwrap();
 
     assert!(long.read(&unit, scratch.path()).await.unwrap().is_none());
@@ -642,7 +673,7 @@ async fn verify(storage: Arc<dyn Storage>, prefix: &str, local_root: Option<&std
         started = prepare_started => started.unwrap(),
     }
     // Stop polling the owner, including its renewal timer, before taking over.
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    tokio::time::sleep(takeover_lease + Duration::from_millis(50)).await;
     let mut winner = long.acquire(&unit).await.unwrap();
     assert_eq!(winner.epoch(), 3);
     let next_id = Uuid::new_v4();

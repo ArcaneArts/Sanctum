@@ -1583,3 +1583,17 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   and exhaustion. The live test still requires an authorized GCS bucket
   and Application Default Credentials.
   [GCS storage contract](STORAGE.md#google-cloud-storage-adapter).
+
+## Consistent reads during GCS manifest replacement
+
+- Full reads restart with fresh metadata when a concurrent write changes
+  the generation targeted by the media request. Four unsuccessful attempts
+  return a retryable busy error. Deletion observed on the metadata read
+  returns not found.
+- The loopback JSON API tests reproduced a failed read after concurrent
+  replacement. They now verify that the returned bytes, length, and
+  generation come from the same version, and cover deletion and repeated
+  churn. The same publication and page-delta contracts used with MinIO can
+  now be run against an authorized GCS bucket. `pnpm check` and the live
+  MinIO publication, renewal, and page-delta tests passed.
+  [GCS contract commands](STORAGE.md#google-cloud-storage-adapter).

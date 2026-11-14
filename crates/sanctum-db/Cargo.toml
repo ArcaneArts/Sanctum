@@ -21,4 +21,5 @@ uuid = { workspace = true, features = ["serde"] }
 [dev-dependencies]
 async-trait.workspace = true
 sanctum-storage-fs = { path = "../sanctum-storage-fs" }
+sanctum-storage-gcs = { path = "../sanctum-storage-gcs" }
 sanctum-storage-s3 = { path = "../sanctum-storage-s3" }
