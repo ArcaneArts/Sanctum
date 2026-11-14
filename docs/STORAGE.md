@@ -377,7 +377,10 @@ requests in one fenced SQLite publication. Its preparation budget is
 budget expires after some requests finish, the worker publishes those
 results and leaves the remaining inputs pending. A committed step's
 receipt prevents reissuing its provider calls after an envelope write
-fails. The reconciler can recover a missing delivery. Embedding and rebuild
+fails. When workers complete the same input concurrently, the first
+committed valid vector is kept for that input and profile. A failure
+only updates the retry state the worker observed when it selected the
+input. The reconciler can recover a missing delivery. Embedding and rebuild
 task payloads include the target profile ID, which also participates in the
 Cloud Tasks name. A delivery for a different profile leaves the current
 batch alone. Dispatch repair can enqueue the pending upload batch under

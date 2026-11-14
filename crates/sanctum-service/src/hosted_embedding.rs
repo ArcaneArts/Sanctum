@@ -2,14 +2,16 @@ use std::time::Duration;
 
 use sanctum_core::{Error, Result, Scope};
 use sanctum_db::{Command, Unit};
-use sanctum_db_sqlite::embedding::{EmbeddingStatus, apply_hosted_embeddings};
+use sanctum_db_sqlite::embedding::{
+    EmbeddingRetry, EmbeddingStatus, PendingEmbedding, apply_hosted_embeddings,
+};
 use sanctum_embedding::EmbedError;
 use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 use crate::{
     Chunk, HostedCatalog,
-    embedding::{Batch, BatchOutcome, embed_batch},
+    embedding::{Batch, BatchInput, BatchOutcome, embed_batch},
     hosted_retrieval::locate,
 };
 
@@ -69,7 +71,7 @@ impl HostedCatalog {
             .with_collection(scope, move |db| {
                 db.pending_embeddings(&selected, PUBLICATION_INPUT_LIMIT)?
                     .into_iter()
-                    .map(|chunk| locate(db, chunk))
+                    .map(|pending| locate_pending(db, pending))
                     .collect::<Result<Vec<_>>>()
             })
             .await?;
@@ -84,7 +86,7 @@ impl HostedCatalog {
                 Instant::now() + PROVIDER_WINDOW,
             )
             .await?;
-        let count: usize = outcomes.iter().map(|outcome| outcome.hashes.len()).sum();
+        let count: usize = outcomes.iter().map(|outcome| outcome.inputs.len()).sum();
         if count == 0 {
             return Err(Error::Busy("hosted embedding preparation timed out".into()));
         }
@@ -101,16 +103,21 @@ impl HostedCatalog {
                         for outcome in outcomes {
                             match outcome.result {
                                 Ok(vectors) => {
-                                    for (hash, vector) in outcome.hashes.iter().zip(vectors) {
-                                        writer.store_embedding(&profile, hash, &vector)?;
+                                    for (input, vector) in outcome.inputs.iter().zip(vectors) {
+                                        writer.store_embedding(&profile, &input.hash, &vector)?;
                                     }
                                 }
                                 Err(error) => {
                                     let retry = matches!(error, EmbedError::Transient(_));
                                     let message = error.to_string();
-                                    for hash in outcome.hashes {
-                                        writer
-                                            .embedding_failure(&profile, &hash, &message, retry)?;
+                                    for input in outcome.inputs {
+                                        writer.embedding_failure(
+                                            &profile,
+                                            &input.hash,
+                                            input.retry,
+                                            &message,
+                                            retry,
+                                        )?;
                                     }
                                 }
                             }
@@ -131,7 +138,7 @@ impl HostedCatalog {
         &self,
         scope: &Scope,
         provider: &dyn sanctum_embedding::Provider,
-        chunks: Vec<(Chunk, String)>,
+        chunks: Vec<(Chunk, String, Option<EmbeddingRetry>)>,
         deadline: Instant,
     ) -> Result<Vec<BatchOutcome>> {
         let request_limit = provider.max_batch_size().clamp(1, PUBLICATION_INPUT_LIMIT) as usize;
@@ -140,14 +147,17 @@ impl HostedCatalog {
         while chunks.len() != 0 && Instant::now() < deadline {
             let next = timeout_at(deadline, async {
                 let mut batch = Batch {
-                    hashes: Vec::with_capacity(request_limit),
+                    inputs: Vec::with_capacity(request_limit),
                     texts: Vec::with_capacity(request_limit),
                 };
-                for (chunk, key) in chunks.by_ref().take(request_limit) {
+                for (chunk, key, retry) in chunks.by_ref().take(request_limit) {
                     batch
                         .texts
                         .push(self.read_excerpt(scope, &chunk, key).await?);
-                    batch.hashes.push(chunk.hash);
+                    batch.inputs.push(BatchInput {
+                        hash: chunk.hash,
+                        retry,
+                    });
                 }
                 Ok::<_, Error>(embed_batch(scope, provider, batch).await)
             })
@@ -175,6 +185,14 @@ impl HostedCatalog {
         }
         Ok(outcomes)
     }
+}
+
+fn locate_pending(
+    database: &sanctum_db_sqlite::CollectionDb,
+    PendingEmbedding { chunk, retry }: PendingEmbedding,
+) -> Result<(Chunk, String, Option<EmbeddingRetry>)> {
+    let (chunk, key) = locate(database, chunk)?;
+    Ok((chunk, key, retry))
 }
 
 fn parse_count(receipt: &str) -> Result<usize> {
@@ -263,7 +281,7 @@ mod tests {
             .with_collection(&scope, |db| {
                 db.pending_embeddings("stalled-provider", 16)?
                     .into_iter()
-                    .map(|chunk| locate(db, chunk))
+                    .map(|pending| locate_pending(db, pending))
                     .collect::<Result<Vec<_>>>()
             })
             .await
@@ -281,7 +299,8 @@ mod tests {
             .unwrap();
         assert_eq!(provider.0.load(Ordering::Relaxed), 2);
         assert_eq!(prepared.len(), 1);
-        assert_eq!(prepared[0].hashes, [expected]);
+        assert_eq!(prepared[0].inputs.len(), 1);
+        assert_eq!(prepared[0].inputs[0].hash, expected);
         assert!(prepared[0].result.is_ok());
     }
 }

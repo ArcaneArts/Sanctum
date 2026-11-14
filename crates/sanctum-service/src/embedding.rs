@@ -5,6 +5,7 @@ use std::{
 };
 
 use sanctum_core::{ByteRange, Error, Result, Scope};
+use sanctum_db_sqlite::embedding::{EmbeddingRetry, PendingEmbedding};
 use sanctum_db_sqlite::vector_index::{ScoredChunk, VectorIndex};
 use sanctum_embedding::{EmbedError, Provider, Purpose};
 use tokio::sync::watch;
@@ -95,12 +96,18 @@ impl PreparedQuery {
 }
 
 pub(crate) struct Batch {
-    pub(crate) hashes: Vec<String>,
+    pub(crate) inputs: Vec<BatchInput>,
     pub(crate) texts: Vec<String>,
 }
 
+#[derive(Clone)]
+pub(crate) struct BatchInput {
+    pub(crate) hash: String,
+    pub(crate) retry: Option<EmbeddingRetry>,
+}
+
 pub(crate) struct BatchOutcome {
-    pub(crate) hashes: Vec<String>,
+    pub(crate) inputs: Vec<BatchInput>,
     pub(crate) result: std::result::Result<Vec<Vec<f32>>, EmbedError>,
 }
 
@@ -273,12 +280,15 @@ impl Service {
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         let chunks = self.database(scope)?.pending_embeddings(profile, limit)?;
         let mut batch = Batch {
-            hashes: Vec::new(),
+            inputs: Vec::new(),
             texts: Vec::new(),
         };
-        for chunk in chunks {
+        for PendingEmbedding { chunk, retry } in chunks {
             batch.texts.push(self.read_excerpt(scope, &chunk)?);
-            batch.hashes.push(chunk.hash);
+            batch.inputs.push(BatchInput {
+                hash: chunk.hash,
+                retry,
+            });
         }
         Ok(batch)
     }
@@ -310,16 +320,22 @@ impl Service {
         for outcome in outcomes {
             match outcome.result {
                 Ok(vectors) => {
-                    for (hash, vector) in outcome.hashes.iter().zip(vectors) {
-                        writer.store_embedding(profile, hash, &vector)?;
+                    for (input, vector) in outcome.inputs.iter().zip(vectors) {
+                        writer.store_embedding(profile, &input.hash, &vector)?;
                     }
                     published = true;
                 }
                 Err(error) => {
                     let retry = matches!(error, EmbedError::Transient(_));
                     let message = error.to_string();
-                    for hash in outcome.hashes {
-                        writer.embedding_failure(profile, &hash, &message, retry)?;
+                    for input in outcome.inputs {
+                        writer.embedding_failure(
+                            profile,
+                            &input.hash,
+                            input.retry,
+                            &message,
+                            retry,
+                        )?;
                     }
                 }
             }
@@ -417,7 +433,7 @@ pub(crate) async fn embed_batch(
             pending.push(range.start..mid);
         } else {
             outcomes.push(BatchOutcome {
-                hashes: batch.hashes[range].to_vec(),
+                inputs: batch.inputs[range].to_vec(),
                 result,
             });
         }
