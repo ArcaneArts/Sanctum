@@ -318,6 +318,25 @@ Merged in [PR #18](https://github.com/ArcaneArts/Sanctum/pull/18).
   rescan flag. On macOS, a generated Python client registered the watch and
   MCP recovered the live replacement and an offline edit with the original
   source ID. [Watched folder behavior](LOCAL_API.md#watched-folders).
+- Delivered in [PR #123](https://github.com/ArcaneArts/Sanctum/pull/123).
+
+## Local import reconciliation for path type changes
+
+- Directory imports and watched folders treat a previously imported path
+  as missing if a directory, symbolic link, or other nonregular entry
+  replaces the file. An ancestor replaced by a file or symlink also
+  makes the descendant missing. Reconciliation checks each path component
+  without traversing a symlink and preserves sources when the scan root
+  is unavailable.
+- gRPC verifies report-only behavior and explicit pruning for changed
+  path types. It also verifies that pruning supersedes an already queued
+  replacement and that native watch notifications apply the same rules.
+  The six import tests also passed in a Linux ARM64 container.
+- A generated Python gRPC client imported a file on the standalone macOS
+  server and then replaced its path with a symlink. MCP returned the original
+  excerpt after a report-only scan and stopped returning it after explicit
+  pruning. Repeating the prune produced no further events.
+  [Local import cleanup](LOCAL_API.md#local-file-and-directory-imports).
 
 ## URL imports
 

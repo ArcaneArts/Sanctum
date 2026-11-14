@@ -470,6 +470,12 @@ impl Service {
     ) -> Result<()> {
         let mut cursor = String::new();
         loop {
+            if stopped() {
+                return Ok(());
+            }
+            if !fs::symlink_metadata(root)?.is_dir() {
+                return Err(Error::Busy("import root is no longer a directory".into()));
+            }
             let active = self.database(scope)?.imported_sources(namespace, &cursor)?;
             let pending = self.queue.pending_import_paths(scope, namespace, &cursor)?;
             let mut paths: Vec<_> = active.into_iter().chain(pending).collect();
@@ -487,9 +493,9 @@ impl Service {
                 if relative_id(&relative).is_ok_and(|valid| valid == id)
                     && select.file_selected(&relative)
                 {
-                    match fs::symlink_metadata(root.join(&relative)) {
-                        Ok(_) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match regular_import_path(root, &relative) {
+                        Ok(true) => {}
+                        Ok(false) => {
                             let event = match self.missing_import(
                                 scope,
                                 namespace,
@@ -580,6 +586,33 @@ impl Service {
         }
         Ok(Some(event))
     }
+}
+
+fn regular_import_path(root: &Path, relative: &Path) -> std::io::Result<bool> {
+    let mut path = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        path.push(component);
+        let kind = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata.file_type(),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if components.peek().is_none() {
+            return Ok(kind.is_file());
+        }
+        if !kind.is_dir() {
+            return Ok(false);
+        }
+    }
+    Ok(false)
 }
 
 fn relative_id(path: &Path) -> Result<String> {
