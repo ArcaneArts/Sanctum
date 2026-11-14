@@ -17,7 +17,7 @@ which parts have working implementations and where to find the evidence.
   exercised configuration, imports, and tray lifecycle. The
   [Codex CLI check](#codex-mcp-retrieval) used real Ollama vectors and retrieved
   exact citations across a source edit and server restart. The Ubuntu ARM64
-  package passed the [X11 tray workflow](#native-desktop-package-verification).
+  and x64 packages passed the [X11 tray workflow](#native-desktop-package-verification).
   The [Windows x64 installer](#windows-x64-installer-build) needs installation,
   WebView2 startup, and tray lifecycle verification on a licensed Windows
   machine or an authorized evaluation guest. Windows distribution signing
@@ -1741,9 +1741,23 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   a second launch kept one server child, and **Quit Sanctum** released both
   listeners. The collection survived relaunch. The tray actions were
   exercised through the session's D-Bus menu.
-- The Linux package evidence covers Ubuntu ARM64 and this X11 tray host.
-  Windows, other Linux desktop environments, and signed distribution remain
-  open. [Native package commands](DESKTOP.md#native-packages).
+- A follow-up run against the ARM64 Debian package used the native picker to
+  import a text file, then observed **Text ready** in the rendered Activity
+  view. **Copy URL** copied the active loopback MCP address. MCP fetched the
+  exact UTF-8 bytes with the window hidden and again after relaunch.
+- Tauri built the 26.69 MiB `Sanctum_0.1.0_amd64.deb` from `087fb7a` in an
+  Ubuntu 24.04.5 x64 container running under emulation on Apple Silicon.
+  The installed desktop executable and both sidecars were x64 ELF files.
+  `apt-get install --no-install-recommends` resolved the package's declared
+  dependencies in a fresh Ubuntu x64 image without build tools.
+  WebKitGTK 4.1, Openbox, and the Xfce 4.18 status tray ran in an isolated
+  X11 session. The desktop created a collection, imported `fixture.custom`
+  through the native picker, showed **Text ready**, and copied the active MCP
+  URL. Closing the window kept the indexed text available. **Open Sanctum**
+  restored the window, a second launch kept one server child, and **Quit
+  Sanctum** released both listeners. MCP retrieved the same 48 UTF-8 bytes
+  after relaunch. The x64 sidecars also passed the HTTP, stdio, and gRPC smoke
+  test. [Native package commands](DESKTOP.md#native-packages).
 
 ## Mostly idle tenant capacity
 

@@ -6,7 +6,7 @@ retrieval with source references and namespaced integration metadata. Agents
 can connect to the local server through MCP HTTP or stdio.
 
 The desktop tray and its managed MCP server have been exercised on macOS
-and Ubuntu with an X11 tray host.
+and on Ubuntu ARM64 and x64 with an X11 tray host.
 The object-backed server has been tested against MinIO. Live Google Cloud
 verification and Windows tray testing are still open.
 [Implementation status and acceptance evidence](docs/IMPLEMENTATION_STATUS.md).
