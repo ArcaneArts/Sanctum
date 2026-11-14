@@ -79,11 +79,25 @@ async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
     let storage = minio_storage();
     let prefix = Key::parse(format!("embedding-recovery-{}", Uuid::new_v4())).unwrap();
     let provider = Arc::new(CountingOllama::new("prepared-batch-recovery"));
+    let new_profile = Arc::new(CountingOllama::new("profile-rebuild-recovery"));
     let make_catalog = |storage| {
         HostedCatalog::new(storage, Some(prefix.clone()), 1024)
             .unwrap()
             .with_embedding(Some(provider.clone()))
     };
+    let rebuild_catalog = |storage| {
+        HostedCatalog::new(storage, Some(prefix.clone()), 1024)
+            .unwrap()
+            .with_embedding(Some(new_profile.clone()))
+            .with_standalone_worker(Arc::new(tokio::sync::Notify::new()))
+    };
+    let discovery = rebuild_catalog(storage.clone())
+        .discover_profile_rebuild()
+        .await
+        .unwrap();
+    assert!(discovery.complete);
+    assert_eq!(discovery.discovered, 0);
+
     let scope = v1::Scope {
         tenant: "default".into(),
         collection: "repair".into(),
@@ -214,8 +228,28 @@ async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
     );
     assert_eq!(provider.documents.load(Ordering::Relaxed), 1);
 
-    let new_profile = Arc::new(CountingOllama::new("profile-rebuild-recovery"));
     let rebuild_path = "_embedding/default/repair.json";
+    let rebuild_key = scoped_key(Some(&prefix), rebuild_path);
+    assert!(matches!(
+        storage.head(&rebuild_key).await,
+        Err(Error::NotFound(_))
+    ));
+    let (mut api, access_server) = serve_api(rebuild_catalog(storage.clone())).await;
+    let fallback = api
+        .search_text(v1::SearchTextRequest {
+            scope: Some(scope.clone()),
+            query: "rhodonite".into(),
+            mode: v1::SearchMode::Hybrid.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fallback.mode(), v1::SearchMode::Lexical);
+    assert_eq!(fallback.hits[0].excerpt, TEXT);
+    assert_eq!(fallback.embedding_coverage.unwrap().embedded_chunks, 0);
+    drop(access_server);
+
     let faults = Arc::new(StalledCheckpoint {
         storage: storage.clone(),
         checkpoint: Mutex::new(None),
@@ -223,23 +257,7 @@ async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
         lose_source_reply: None,
         lose_control_reply: Mutex::new(None),
     });
-    let rebuild = HostedCatalog::new(faults.clone(), Some(prefix.clone()), 1024)
-        .unwrap()
-        .with_embedding(Some(new_profile.clone()))
-        .with_standalone_worker(Arc::new(tokio::sync::Notify::new()));
-    assert_eq!(
-        rebuild
-            .embedding_status(&internal_scope, None)
-            .await
-            .unwrap()
-            .coverage
-            .embedded,
-        0,
-    );
-    let discovery = rebuild.discover_profile_rebuild().await.unwrap();
-    assert!(discovery.complete);
-    assert_eq!(discovery.discovered, 1);
-    let rebuild_key = scoped_key(Some(&prefix), rebuild_path);
+    let rebuild = rebuild_catalog(faults.clone());
     let (record, _) = read_control(storage.as_ref(), &rebuild_key).await;
     let (worker, _rebuild_server) = serve_http(crate::hosted_worker::router(rebuild.clone())).await;
     let deliver_rebuild = |step| {

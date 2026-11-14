@@ -1680,6 +1680,15 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   persisted hint and rebuild record, restarted the server, and ran the
   worker's HTTP task handler to restore semantic retrieval. Live Cloud
   Tasks delivery was not exercised. `pnpm check` passed.
+- Searches can also queue an unvisited collection after the active
+  profile's discovery scan has finished. The gRPC regression creates
+  and indexes a collection after discovery, checks lexical fallback on
+  repeated searches, and verifies that a fresh worker dispatches one
+  rebuild. The new profile then returns the original excerpt in strict
+  semantic search. The MinIO and Ollama test also creates its collection
+  after discovery. It opens a fresh API and worker, then verifies lexical
+  fallback, the persisted rebuild, and strict semantic retrieval through
+  the new profile.
 
 ## Profile-bound hosted task delivery
 

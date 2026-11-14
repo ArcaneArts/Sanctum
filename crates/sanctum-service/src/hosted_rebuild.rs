@@ -245,10 +245,10 @@ impl HostedCatalog {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
-                "profile rebuild will be retried by discovery")
+                    "could not schedule a hosted profile rebuild on search")
             }
             Err(_) => tracing::debug!(tenant = %scope.tenant, collection = %scope.collection,
-                "profile rebuild scheduling deferred to discovery"),
+                "hosted profile rebuild scheduling on search timed out"),
         }
     }
 
@@ -261,7 +261,7 @@ impl HostedCatalog {
         };
         // Only the worker selects the deployment's active profile. An older
         // API process can still serve lexical retrieval during a rollout.
-        if discovery.complete || discovery.profile.as_deref() != Some(profile) {
+        if discovery.profile.as_deref() != Some(profile) {
             return Ok(());
         }
         self.ensure_rebuild(scope, discovery.run).await?;

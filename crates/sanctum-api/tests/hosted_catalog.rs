@@ -4840,6 +4840,94 @@ async fn idle_collections_rebuild_after_a_profile_change() {
 }
 
 #[tokio::test]
+async fn hosted_search_queues_an_unvisited_collection_after_profile_discovery_finishes() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let dispatch = Arc::new(TestDispatch {
+        fail: AtomicU8::new(0),
+        delivered: std::sync::Mutex::new(Vec::new()),
+    });
+    let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let current = || {
+        catalog()
+            .with_dispatch(dispatch.clone())
+            .with_embedding(Some(Arc::new(HostedEmbeddingFixture {
+                profile: "fixture-v2",
+                fail: AtomicU8::new(0),
+                queries: AtomicUsize::new(0),
+            })))
+    };
+    let discovery = current().discover_profile_rebuild().await.unwrap();
+    assert!(discovery.complete);
+    assert_eq!(discovery.discovered, 0);
+
+    // An older worker can publish text while the new profile is rolling out.
+    let old = catalog();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "late".parse().unwrap(),
+    };
+    old.create_collection(&scope, None).await.unwrap();
+    let mut old_api = start(old.clone()).await;
+    let header = v1::UploadTextHeader {
+        scope: Some(v1::Scope {
+            tenant: "default".into(),
+            collection: "late".into(),
+        }),
+        name: "late.txt".into(),
+        ..Default::default()
+    };
+    let accepted = old_api
+        .client
+        .submit_text(upload_frames(&header, [b"amethyst cave".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let upload = accepted.operation_id.parse().unwrap();
+    old.register_upload(&scope, upload).await.unwrap();
+    old.index_upload(&scope, upload).await.unwrap();
+    old_api.stop().await;
+
+    let mut api = start(current()).await;
+    let mut search = v1::SearchTextRequest {
+        scope: header.scope,
+        query: "amethyst".into(),
+        mode: v1::SearchMode::Hybrid.into(),
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        let result = api
+            .client
+            .search_text(search.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.mode(), v1::SearchMode::Lexical);
+        assert_eq!(result.hits[0].excerpt, "amethyst cave");
+        assert_eq!(result.embedding_coverage.unwrap().embedded_chunks, 0);
+    }
+    let worker = current();
+    for shard in 0..sanctum_service::DISPATCH_SHARDS {
+        worker.reconcile_shard(shard).await.unwrap();
+    }
+    let deliveries = dispatch.delivered.lock().unwrap().clone();
+    let [(operation, TaskStage::Rebuild { step: 0 }, Some(profile))] = deliveries.as_slice() else {
+        panic!("expected one rebuild delivery, got {deliveries:?}");
+    };
+    assert_eq!(profile, "fixture-v2");
+    worker
+        .deliver_profile_rebuild(&scope, *operation, 0, Some(profile))
+        .await
+        .unwrap();
+    search.mode = v1::SearchMode::Semantic.into();
+    let result = api.client.search_text(search).await.unwrap().into_inner();
+    assert_eq!(result.mode(), v1::SearchMode::Semantic);
+    assert_eq!(result.hits[0].excerpt, "amethyst cave");
+    assert_eq!(result.embedding_coverage.unwrap().embedded_chunks, 1);
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn profile_discovery_keeps_failed_collections_pending_without_blocking_later_pages() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
