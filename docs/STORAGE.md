@@ -442,11 +442,17 @@ The scheduled source sweep removes retired locators and records their
 object keys in the same SQLite publication. Physical deletion waits
 another 15 minutes so requests holding an older snapshot can finish.
 Hosted gRPC requests have a 10-minute server deadline.
-A failed object deletion stays in the durable cleanup table. An obsolete
-replacement is eligible once its successor has coverage for the active
-profile. Text-only RTF ingestion discards the original after committing
-its canonical revision. The [Cloud Run guide](CLOUD_RUN.md#schedule-dispatch-repair)
-shows the scheduler configuration.
+Each collection sweep attempts up to 64 due deletions, with up to four
+requests in flight and a ten-second limit per request. The worker
+acknowledges successful deletions and delays failed objects for at least
+five minutes in the same SQLite publication. Other due objects can still
+make progress. An already absent object is safe to acknowledge after
+a restart or a lost delete response.
+
+An obsolete replacement is eligible once its successor has coverage for
+the active profile. Text-only RTF ingestion discards the original after
+committing its canonical revision.
+[Cloud Run schedule](CLOUD_RUN.md#schedule-dispatch-repair).
 
 ### Scheduled snapshot reclamation
 
