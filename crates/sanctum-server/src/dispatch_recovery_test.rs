@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -14,6 +14,8 @@ use axum::{
     routing::post,
 };
 use sanctum_core::{ByteRange, Error, Scope};
+use sanctum_embedding::{EmbedError, Profile, Provider, Purpose};
+use sanctum_embedding_ollama::{Ollama, OllamaConfig};
 use sanctum_proto::v1::{self, sanctum_client::SanctumClient, upload_text_frame::Frame};
 use sanctum_service::HostedCatalog;
 use sanctum_storage::{Condition, Download, Key, ListPage, Object, Reader, Storage, Version};
@@ -40,6 +42,14 @@ async fn filesystem_dispatch_recovers_missing_task_after_restart() {
 #[tokio::test]
 #[ignore = "requires a live MinIO bucket and S3 credentials"]
 async fn minio_dispatch_recovers_missing_task_after_restart() {
+    let storage = minio_storage();
+    let prefix = Key::parse(format!("dispatch-recovery-{}", Uuid::new_v4())).unwrap();
+    eprintln!("MinIO test prefix {prefix}");
+    verify_recovery(storage.clone(), Some(prefix.clone())).await;
+    clear_prefix(storage.as_ref(), &prefix).await;
+}
+
+fn minio_storage() -> Arc<dyn Storage> {
     let storage = S3Storage::new(S3Config {
         bucket: std::env::var("SANCTUM_MINIO_BUCKET").expect("SANCTUM_MINIO_BUCKET"),
         region: "us-east-1".into(),
@@ -48,22 +58,203 @@ async fn minio_dispatch_recovers_missing_task_after_restart() {
         virtual_hosted_style: false,
     })
     .unwrap();
-    let storage = Arc::new(storage);
-    let prefix = Key::parse(format!("dispatch-recovery-{}", Uuid::new_v4())).unwrap();
-    eprintln!("MinIO test prefix {prefix}");
-    verify_recovery(storage.clone(), Some(prefix.clone())).await;
+    Arc::new(storage)
+}
+
+async fn clear_prefix(storage: &dyn Storage, prefix: &Key) {
     loop {
-        let objects = storage
-            .list(Some(&prefix), None, 100)
-            .await
-            .unwrap()
-            .objects;
+        let objects = storage.list(Some(prefix), None, 100).await.unwrap().objects;
         if objects.is_empty() {
             break;
         }
         for object in objects {
             storage.delete(&object.key).await.unwrap();
         }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a live MinIO bucket and Ollama embedding model"]
+async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
+    let storage = minio_storage();
+    let prefix = Key::parse(format!("embedding-recovery-{}", Uuid::new_v4())).unwrap();
+    let provider = Arc::new(CountingOllama {
+        inner: Ollama::new(OllamaConfig {
+            endpoint: std::env::var("SANCTUM_OLLAMA_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:11434".into()),
+            profile: Profile {
+                model: "embeddinggemma-2:740m".into(),
+                revision: "prepared-batch-recovery".into(),
+                dimensions: 768,
+                document_prefix: String::new(),
+                query_prefix: String::new(),
+            },
+            timeout_seconds: 30,
+        })
+        .unwrap(),
+        documents: AtomicUsize::new(0),
+    });
+    let make_catalog = |storage| {
+        HostedCatalog::new(storage, Some(prefix.clone()), 1024)
+            .unwrap()
+            .with_embedding(Some(provider.clone()))
+    };
+    let scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "repair".into(),
+    };
+    let operation = Uuid::new_v4();
+    let job_request = v1::IngestionJobRequest {
+        scope: Some(scope.clone()),
+        operation_id: operation.to_string(),
+    };
+    let catalog = make_catalog(storage.clone());
+    let (mut api, api_server) = serve_api(catalog.clone()).await;
+    api.create_collection(v1::CreateCollectionRequest {
+        scope: Some(scope.clone()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let job = submit_source(&mut api, &scope, operation, "recovery.txt", TEXT.as_bytes()).await;
+    let internal_scope = Scope {
+        tenant: scope.tenant.parse().unwrap(),
+        collection: scope.collection.parse().unwrap(),
+    };
+    catalog
+        .register_upload(&internal_scope, operation)
+        .await
+        .unwrap();
+    catalog
+        .index_upload(&internal_scope, operation)
+        .await
+        .unwrap();
+    let pending = api
+        .get_ingestion_job(job_request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(pending.embedding_work.unwrap().next_batch, 0);
+    let before = collection_generation(storage.as_ref(), Some(&prefix)).await;
+
+    let fault = Arc::new(StalledCheckpoint {
+        storage: storage.clone(),
+        checkpoint: Mutex::new(None),
+        after_dispatch: false,
+        lose_source_reply: None,
+        lose_embedding_reply: AtomicBool::new(true),
+    });
+    let (worker, worker_server) =
+        serve_http(crate::hosted_worker::router(make_catalog(fault.clone()))).await;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(35))
+        .build()
+        .unwrap();
+    let delivery = json!({
+        "tenant": &scope.tenant,
+        "collection": &scope.collection,
+        "operation_id": operation,
+        "step": 0,
+        "profile": provider.profile_id(),
+    });
+    let deliver = |worker: String| {
+        http.post(format!("{worker}/internal/tasks/embed-upload"))
+            .json(&delivery)
+            .send()
+    };
+    let response = deliver(worker).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(!fault.lose_embedding_reply.load(Ordering::Relaxed));
+    assert_eq!(provider.documents.load(Ordering::Relaxed), 1);
+    let committed = collection_generation(storage.as_ref(), Some(&prefix)).await;
+    assert_ne!(before, committed);
+    let batch_prefix = scoped_key(
+        Some(&prefix),
+        "default/collections/repair/prepared-embeddings",
+    );
+    assert!(
+        storage
+            .list(Some(&batch_prefix), None, 10)
+            .await
+            .unwrap()
+            .objects
+            .is_empty()
+    );
+    drop(worker_server);
+    drop(api_server);
+    drop(catalog);
+
+    let restarted = make_catalog(storage.clone());
+    let (worker, _worker_server) =
+        serve_http(crate::hosted_worker::router(restarted.clone())).await;
+    assert_eq!(
+        deliver(worker).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(provider.documents.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        collection_generation(storage.as_ref(), Some(&prefix)).await,
+        committed
+    );
+    let (mut api, _api_server) = serve_api(restarted).await;
+    let resumed = api
+        .get_ingestion_job(job_request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resumed.embedding_work.unwrap().next_batch, 1);
+    assert_eq!(resumed.source_id, job.source_id);
+    let results = api
+        .search_text(v1::SearchTextRequest {
+            scope: Some(scope),
+            query: "A record of an observation about rhodonite".into(),
+            mode: v1::SearchMode::Semantic.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(results.mode(), v1::SearchMode::Semantic);
+    assert_eq!(results.embedding_coverage.unwrap().embedded_chunks, 1);
+    assert_eq!(results.hits.len(), 1);
+    assert_eq!(
+        api.fetch_chunk(v1::FetchChunkRequest {
+            chunk: results.hits[0].chunk.clone()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .excerpt,
+        TEXT,
+    );
+    assert_eq!(provider.documents.load(Ordering::Relaxed), 1);
+    clear_prefix(storage.as_ref(), &prefix).await;
+}
+
+struct CountingOllama {
+    inner: Ollama,
+    documents: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Provider for CountingOllama {
+    fn profile_id(&self) -> &str {
+        self.inner.profile_id()
+    }
+
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+
+    async fn embed(
+        &self,
+        purpose: Purpose,
+        texts: &[String],
+    ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+        if matches!(purpose, Purpose::Document) {
+            self.documents.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.embed(purpose, texts).await
     }
 }
 
@@ -81,6 +272,7 @@ struct StalledCheckpoint {
     checkpoint: Mutex<Option<oneshot::Sender<oneshot::Receiver<()>>>>,
     after_dispatch: bool,
     lose_source_reply: Option<&'static str>,
+    lose_embedding_reply: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -123,7 +315,13 @@ impl Storage for StalledCheckpoint {
                 }
             }
         }
-        self.storage.put_control(key, bytes, condition).await
+        let version = self.storage.put_control(key, bytes, condition).await?;
+        if key.as_str().contains("/prepared-embeddings/")
+            && self.lose_embedding_reply.swap(false, Ordering::Relaxed)
+        {
+            return Err(Error::Busy("prepared embedding write response lost".into()));
+        }
+        Ok(version)
     }
 
     async fn list(
@@ -235,6 +433,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         checkpoint: Mutex::new(None),
         after_dispatch: false,
         lose_source_reply: Some("/inputs/"),
+        lose_embedding_reply: AtomicBool::new(false),
     });
     let (mut api, api_server) = serve_api(catalog_with_storage(api_storage)).await;
     api.create_collection(v1::CreateCollectionRequest {
@@ -299,6 +498,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         checkpoint: Mutex::new(Some(checkpoint)),
         after_dispatch: false,
         lose_source_reply: None,
+        lose_embedding_reply: AtomicBool::new(false),
     }));
     let (deadline_worker, deadline_server) =
         serve_http(crate::hosted_worker::router_with_task_budgets(
@@ -343,6 +543,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         checkpoint: Mutex::new(Some(checkpoint)),
         after_dispatch: true,
         lose_source_reply: None,
+        lose_embedding_reply: AtomicBool::new(false),
     }));
     let (handoff_worker, handoff_server) =
         serve_http(crate::hosted_worker::router_with_task_budgets(
@@ -413,6 +614,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
                 checkpoint: Mutex::new(Some(checkpoint)),
                 after_dispatch: false,
                 lose_source_reply: None,
+                lose_embedding_reply: AtomicBool::new(false),
             }));
             let (slow_worker, _slow_server) =
                 serve_http(crate::hosted_worker::router_with_task_budgets(
@@ -454,6 +656,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
                 checkpoint: Mutex::new(None),
                 after_dispatch: false,
                 lose_source_reply: Some("/objects/"),
+                lose_embedding_reply: AtomicBool::new(false),
             });
             let (worker, server) =
                 serve_http(crate::hosted_worker::router(catalog_with_storage(storage))).await;

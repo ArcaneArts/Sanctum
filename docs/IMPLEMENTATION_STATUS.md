@@ -2237,6 +2237,21 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   and fetched the exact cited UTF-8 bytes from semantic search.
   [Embedding batches](STORAGE.md#hosted-embedding-batches).
 
+## Prepared embeddings with a lost staging response
+
+- A worker can publish the saved batch in the same delivery after it
+  loses the object-store response. It validates the staged payload
+  before acquiring the writer lease. The filesystem regression verifies
+  that a failed write with no saved batch leaves the SQLite generation
+  unchanged, and that another writer's lease still blocks publication.
+- The worker's HTTP test used live MinIO and Ollama's 768-dimensional
+  EmbeddingGemma model. After writing the prepared batch, the storage
+  fixture dropped the reply. The task returned HTTP 204, advanced the
+  batch checkpoint, and removed staging. A fresh worker replayed the
+  delivery without another document embedding request or SQLite
+  publication. Semantic search and exact UTF-8 fetch passed over gRPC.
+  [Embedding batches](STORAGE.md#hosted-embedding-batches).
+
 ## Hosted uploads past the processing window
 
 - Dispatch repair hands off expired stages to the regular task worker so

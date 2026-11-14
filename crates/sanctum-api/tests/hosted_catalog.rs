@@ -4395,20 +4395,35 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
         sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(30)).unwrap();
     let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
     let competing_writer = executor.acquire(&unit).await.unwrap();
+    let prepared = Key::parse("default/collections/notes/prepared-embeddings").unwrap();
+    storage
+        .interrupt
+        .store(REJECT_PREPARED_EMBEDDING_WRITE, Ordering::Relaxed);
+    assert!(matches!(
+        service.embed_upload(&scope, operation, 0).await,
+        Err(Error::Busy(message)) if message == "prepared embedding write failed before commit"
+    ));
+    assert!(
+        storage
+            .list(Some(&prepared), None, 10)
+            .await
+            .unwrap()
+            .objects
+            .is_empty()
+    );
+    assert_eq!(count_snapshots().await, before);
+    assert_eq!(provider.calls.swap(0, Ordering::Relaxed), 3);
+
     storage
         .interrupt
         .store(LOSE_PREPARED_EMBEDDING_RESPONSE, Ordering::Relaxed);
     assert!(matches!(
         service.embed_upload(&scope, operation, 0).await,
-        Err(Error::Busy(message)) if message == "prepared embedding write response lost"
-    ));
-    assert!(matches!(
-        service.embed_upload(&scope, operation, 0).await,
         Err(Error::Busy(message)) if message.contains("owned by another writer")
     ));
+    assert_eq!(storage.interrupt.load(Ordering::Relaxed), 0);
     assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
     assert_eq!(count_snapshots().await, before);
-    let prepared = Key::parse("default/collections/notes/prepared-embeddings").unwrap();
     let pending = storage.list(Some(&prepared), None, 10).await.unwrap();
     assert_eq!(pending.objects.len(), 1);
     competing_writer.release().await.unwrap();
@@ -7209,6 +7224,7 @@ const REJECT_SOURCE_SWEEP_RELIST: u8 = 16;
 const REJECT_PROFILE_REBUILD: u8 = 17;
 const REJECT_UPLOAD_INPUT_DELETE: u8 = 18;
 const CORRUPT_ACCEPTANCE_INPUT: u8 = 19;
+const REJECT_PREPARED_EMBEDDING_WRITE: u8 = 20;
 const PARALLEL_RANGE_START: u8 = 40;
 const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
 const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
@@ -7358,6 +7374,21 @@ impl Storage for InterruptAcceptance {
         };
         if interrupt == 1 {
             return Err(Error::Busy("interrupted before envelope write".into()));
+        }
+        if key.as_str().contains("/prepared-embeddings/")
+            && self
+                .interrupt
+                .compare_exchange(
+                    REJECT_PREPARED_EMBEDDING_WRITE,
+                    0,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            return Err(Error::Busy(
+                "prepared embedding write failed before commit".into(),
+            ));
         }
         let version = self.inner.put_control(key, bytes, condition).await?;
         if interrupt == 2 {
