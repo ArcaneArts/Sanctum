@@ -11,7 +11,7 @@ use futures::{TryStreamExt, stream};
 mod tests;
 use google_cloud_auth::credentials::{AccessTokenCredentials, Builder};
 use reqwest::{
-    Client, Method, Response, StatusCode, Url,
+    Client, Method, RequestBuilder, Response, StatusCode, Url,
     header::{self, HeaderMap, HeaderName},
 };
 use sanctum_core::{ByteRange, Error, Result};
@@ -20,13 +20,14 @@ use sanctum_storage::{
     list_limit, range_len,
 };
 use serde::Deserialize;
-use tokio::{io::AsyncReadExt, sync::OnceCell};
+use tokio::{io::AsyncReadExt, runtime::Handle, sync::OnceCell, task::JoinHandle};
 use tokio_util::io::StreamReader;
 
 const ENDPOINT: &str = "https://storage.googleapis.com/";
 const CLOUD_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 const PART_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_UPLOAD_RETRIES: u32 = 4;
+const UPLOAD_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DOWNLOAD_ATTEMPTS: u32 = 4;
 const DOWNLOAD_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_DOWNLOAD_RESUMES: u32 = 4;
@@ -287,15 +288,21 @@ impl GcsStorage {
                     && url.password().is_none()
             })
             .ok_or_else(|| invalid_response("GCS resumable upload omitted its session URL"))?;
+        let mut cancellation = UploadCancellation {
+            // Capture the runtime before the upload can be dropped by its caller.
+            runtime: Handle::current(),
+            request: Some(
+                self.client
+                    .delete(session.clone())
+                    .header(header::CONTENT_LENGTH, 0)
+                    .timeout(UPLOAD_CANCEL_TIMEOUT),
+            ),
+        };
         let result = self.upload_contents(&session, key, reader, length).await;
-        if result.is_err() {
-            let _ = self
-                .client
-                .delete(session)
-                .header(header::CONTENT_LENGTH, 0)
-                .timeout(Duration::from_secs(5))
-                .send()
-                .await;
+        if result.is_ok() {
+            cancellation.request = None;
+        } else if let Some(cleanup) = cancellation.start() {
+            let _ = cleanup.await;
         }
         result
     }
@@ -378,6 +385,36 @@ impl GcsStorage {
             tokio::time::sleep(Duration::from_millis(100 << retries)).await;
             retries += 1;
         }
+    }
+}
+
+struct UploadCancellation {
+    runtime: Handle,
+    request: Option<RequestBuilder>,
+}
+
+impl UploadCancellation {
+    fn start(&mut self) -> Option<JoinHandle<()>> {
+        let request = self.request.take()?;
+        Some(self.runtime.spawn(async move {
+            // The session URI grants upload access. Log only the outcome.
+            match request.send().await {
+                // GCS reports a canceled JSON API session as HTTP 499.
+                Ok(response) if matches!(response.status().as_u16(), 499 | 404 | 410) => {}
+                Ok(response) => tracing::debug!(
+                    status = response.status().as_u16(),
+                    "GCS did not confirm resumable upload cancellation"
+                ),
+                Err(_) => tracing::debug!("GCS resumable upload cancellation did not complete"),
+            }
+        }))
+    }
+}
+
+impl Drop for UploadCancellation {
+    fn drop(&mut self) {
+        // Dropping a Tokio JoinHandle detaches the bounded cleanup request.
+        drop(self.start());
     }
 }
 

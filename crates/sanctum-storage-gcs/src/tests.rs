@@ -845,6 +845,8 @@ struct RecoveryFixture {
     calls: Mutex<Vec<String>>,
     input: Bytes,
     scenario: RecoveryScenario,
+    part_stalled: Notify,
+    canceled: Notify,
 }
 
 #[derive(PartialEq)]
@@ -852,6 +854,7 @@ enum RecoveryScenario {
     Interrupted,
     InvalidOffset,
     NoProgress,
+    Dropped,
 }
 
 async fn start_recovery(
@@ -867,6 +870,8 @@ async fn start_recovery(
             .map(|offset| (offset % 251) as u8)
             .collect(),
         scenario,
+        part_stalled: Notify::new(),
+        canceled: Notify::new(),
     });
     let router = Router::new()
         .route("/upload/storage/v1/b/sanctum-test/o", post(start_session))
@@ -910,8 +915,11 @@ async fn interrupted_part(
         .await
         .unwrap();
     assert_eq!(headers[header::CONTENT_LENGTH], bytes.len().to_string());
-    let mut calls = fixture.calls.lock().unwrap();
-    calls.push(range.into());
+    let attempt = {
+        let mut calls = fixture.calls.lock().unwrap();
+        calls.push(range.into());
+        calls.len()
+    };
     if range == format!("bytes */{RECOVERY_LENGTH}") {
         assert!(bytes.is_empty());
     } else {
@@ -939,7 +947,15 @@ async fn interrupted_part(
     if fixture.scenario == RecoveryScenario::NoProgress {
         return StatusCode::PERMANENT_REDIRECT.into_response();
     }
-    match calls.len() {
+    if fixture.scenario == RecoveryScenario::Dropped {
+        if attempt == 1 {
+            return incomplete(PART_BYTES);
+        }
+        assert_eq!(attempt, 2);
+        fixture.part_stalled.notify_one();
+        return std::future::pending().await;
+    }
+    match attempt {
         // The upload request fails before the caller receives any indication
         // of how much of the first part reached the storage service.
         1 | 2 => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -961,11 +977,14 @@ async fn interrupted_part(
 
 async fn cancel_session(
     State(fixture): State<Arc<RecoveryFixture>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
 ) -> StatusCode {
+    assert_eq!(query["upload_id"], "local-fixture");
     assert!(headers.get(header::AUTHORIZATION).is_none());
     assert_eq!(headers[header::CONTENT_LENGTH], "0");
     fixture.calls.lock().unwrap().push("cancel".into());
+    fixture.canceled.notify_one();
     StatusCode::from_u16(499).unwrap()
 }
 
@@ -1034,5 +1053,38 @@ async fn resumable_upload_stops_after_bounded_attempts_without_progress() {
     assert_eq!(requests.0, "cancel");
     assert_eq!(requests.1.len(), MAX_UPLOAD_RETRIES as usize + 1);
     assert!(requests.1.iter().all(|range| range == &calls[0]));
+    server.abort();
+}
+
+#[tokio::test]
+async fn dropping_an_in_flight_resumable_upload_cancels_its_session() {
+    let (storage, fixture, server) = start_recovery(RecoveryScenario::Dropped).await;
+    let key = Key::parse("default/notes/bulk").unwrap();
+    let mut upload = Box::pin(storage.put_stream(
+        &key,
+        Box::pin(std::io::Cursor::new(fixture.input.clone())),
+        RECOVERY_LENGTH,
+    ));
+    tokio::select! {
+        result = &mut upload => panic!("upload completed before cancellation: {result:?}"),
+        reached = tokio::time::timeout(Duration::from_secs(5), fixture.part_stalled.notified()) => {
+            reached.expect("the first part was stored and the second request reached the server");
+        }
+    }
+    drop(upload);
+    tokio::time::timeout(Duration::from_secs(5), fixture.canceled.notified())
+        .await
+        .expect("dropping the upload canceled the session");
+    assert_eq!(
+        *fixture.calls.lock().unwrap(),
+        [
+            format!("bytes 0-{}/{RECOVERY_LENGTH}", PART_BYTES - 1),
+            format!(
+                "bytes {PART_BYTES}-{}/{RECOVERY_LENGTH}",
+                2 * PART_BYTES - 1
+            ),
+            "cancel".into(),
+        ],
+    );
     server.abort();
 }
