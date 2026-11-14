@@ -248,8 +248,9 @@ stays reserved. Use a fresh UUID for new work.
 `SubmitText` and `UploadText` accept `source_metadata` and `chunk_metadata`
 on the upload header. Each entry contains `namespace`, `key`, and `value_json`.
 Use unique namespace/key pairs within each target, up to 32 entries across
-all targets, 64 KiB per JSON value, and 512 KiB of values in total. The queue
-stores the entries at acceptance. The same transaction that makes
+all targets. The upload ceilings are 64 KiB per JSON value and 512 KiB of
+values in total. [Server settings](#metadata-and-changes) can tighten both.
+The queue stores the entries at acceptance. The same transaction that makes
 text searchable attaches them to the new revision. On replacement, readers
 see the previous revision and its metadata until the replacement commits.
 The new revision starts with the metadata supplied for that upload.
@@ -633,8 +634,37 @@ Each value has a namespace and key, with a UTF-8 JSON value. A mutation
 batch applies in order and commits atomically. Set replaces the value,
 merge patch recursively merges objects and removes properties whose patch
 value is null, and remove deletes the entire entry. Set can store JSON
-null as a value. Batches allow up to 32 edits and values up to 64 KiB.
-Each target allows up to 64 entries and 512 KiB of serialized values.
+null as a value. Batches allow up to 32 edits. Each target allows up to 64
+entries and 512 KiB of serialized values.
+
+Set `metadata_limits` in `SANCTUM_CONFIG_JSON` to tighten the admission limits
+for local or hosted gRPC and MCP requests. This local configuration sets an
+8 KiB value limit and a 32 KiB request limit.
+
+```json
+{
+  "version": 1,
+  "storage_root": "./local-data",
+  "metadata_limits": {
+    "max_value_bytes": 8192,
+    "max_request_bytes": 32768
+  }
+}
+```
+
+Both settings count compact JSON UTF-8 bytes. `max_value_bytes` caps each
+submitted value or patch and each resulting value. `max_request_bytes` caps
+the sum of values and patches in one mutation batch or the source and chunk
+metadata in one upload. Removes use zero value bytes. The defaults and
+maximums are 65,536 and 2,097,152 bytes, respectively. The existing 512 KiB
+upload and stored target ceilings also apply.
+
+Violations return `INVALID_ARGUMENT` on gRPC or a tool error on MCP, with
+the applicable limit. A patch that would produce an oversized value rolls
+back its entire mutation batch. Both older stored values and previously
+accepted uploads remain readable after tightening the limits, and upload
+request IDs can still replay accepted work. Read the active values with
+`GetRuntimeInfo` or `sanctum-cli info`.
 
 Source and chunk metadata starts empty on replacement. Collection metadata
 persists across source changes. Requests for a superseded revision receive

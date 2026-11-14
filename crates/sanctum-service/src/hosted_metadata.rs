@@ -44,6 +44,8 @@ impl HostedCatalog {
         target: Option<RevisionTarget>,
         edits: Vec<MetadataMutation>,
     ) -> Result<Vec<MetadataEntry>> {
+        let limits = self.metadata_limits;
+        metadata::validate_input_limits(limits, edits.iter())?;
         let unit = match target {
             Some(_) => {
                 self.require_collection(scope).await?;
@@ -65,8 +67,10 @@ impl HostedCatalog {
                 }],
                 move |tx, edits| {
                     let entries = match target {
-                        Some(target) => metadata::mutate_revision_metadata(tx, target, &edits)?,
-                        None => metadata::mutate_catalog_metadata(tx, &collection, &edits)?,
+                        Some(target) => {
+                            metadata::mutate_revision_metadata(tx, target, &edits, limits)?
+                        }
+                        None => metadata::mutate_catalog_metadata(tx, &collection, &edits, limits)?,
                     };
                     result_tx
                         .send(entries)

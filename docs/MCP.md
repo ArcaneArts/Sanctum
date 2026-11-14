@@ -81,6 +81,9 @@ bridge.
 | `get_metadata` | Supply `collection` for collection metadata, both `source_id` and `revision_id` for the current source, or those IDs and `ordinal` for a chunk. Returns up to 64 namespaced entries, subject to the shared 512 KiB value limit. |
 | `mutate_metadata` | Supply the same target as `get_metadata` plus up to 32 `edits`. Each edit uses `namespace`, `key`, and `operation` (`set`, `patch`, or `remove`). Set and patch also take `value`. |
 
+Metadata uploads and mutations use the server's configured byte limits.
+[Metadata limit configuration](LOCAL_API.md#metadata-and-changes).
+
 Collection, source, and chunk metadata tools work on both storage modes.
 Hosted results include the SQLite snapshot generation on each hit. A hosted upload reports `accepted`, then
 `registered`, then `text_ready` as worker stages publish its text.

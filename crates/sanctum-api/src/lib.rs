@@ -1,7 +1,7 @@
 use futures::stream::{BoxStream, unfold};
 use sanctum_core::{
-    ByteRange, Error, ExternalSource, GitProvenance, Result, Scope, UPLOAD_FRAME_BYTES,
-    UrlProvenance, UsageMeasurement, UsageScope,
+    ByteRange, Error, ExternalSource, GitProvenance, MetadataLimits, Result, Scope,
+    UPLOAD_FRAME_BYTES, UrlProvenance, UsageMeasurement, UsageScope,
 };
 use sanctum_proto::v1::{
     self,
@@ -108,6 +108,14 @@ impl Grpc {
 impl Sanctum for Grpc {
     async fn get_runtime_info(&self, _: Request<v1::Empty>) -> Reply<v1::RuntimeInfo> {
         let mut info = self.2.clone();
+        let limits = match &self.0 {
+            Backend::Local(service) => service.metadata_limits(),
+            Backend::Hosted(catalog) => catalog.metadata_limits(),
+        };
+        info.metadata_limits = Some(v1::MetadataLimits {
+            max_value_bytes: limits.max_value_bytes,
+            max_request_bytes: limits.max_request_bytes,
+        });
         info.version = env!("CARGO_PKG_VERSION").into();
         info.status = if self.1.is_cancelled() {
             "stopping"
@@ -2274,7 +2282,7 @@ fn metadata_edits(
 
 #[allow(clippy::result_large_err)]
 fn parse_metadata_json(json: &str) -> std::result::Result<serde_json::Value, Status> {
-    if json.len() > 64 * 1024 {
+    if json.len() > MetadataLimits::MAX_VALUE_BYTES as usize {
         return Err(Status::invalid_argument("metadata value exceeds 64 KiB"));
     }
     serde_json::from_str(json)

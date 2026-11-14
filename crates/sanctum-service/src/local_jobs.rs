@@ -499,6 +499,7 @@ impl StagedUpload {
                 return Ok(job);
             }
         }
+        self.upload.check_metadata_limits(service.metadata_limits)?;
         if self.upload.replacement.is_none() {
             return self.accept_upload(bytes, digest, receipt);
         }

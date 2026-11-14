@@ -5151,6 +5151,151 @@ async fn local_upload_metadata_publishes_with_replacement_after_restart() {
 }
 
 #[tokio::test]
+async fn local_metadata_limits_preserve_accepted_uploads_and_roll_back_oversized_merges() {
+    use v1::metadata_mutation::Edit;
+
+    let dir = TempDir::new().unwrap();
+    let mut first = Running::start_with_workers(&dir, None, false).await;
+    create(&mut first.client, "default").await;
+    let entry = |key: &str, json: &str| v1::MetadataEntry {
+        namespace: "demo.integration".into(),
+        key: key.into(),
+        value_json: json.into(),
+    };
+    let mut upload_header = v1::UploadTextHeader {
+        scope: scope("default"),
+        name: "notes.txt".into(),
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+        source_metadata: vec![entry("existing", r#"{"memo":"persisted before restart"}"#)],
+        ..Default::default()
+    };
+    let frames = |header| {
+        tokio_stream::iter([
+            v1::UploadTextFrame {
+                frame: Some(Frame::Header(header)),
+            },
+            data(b"metadata quartz"),
+            end(),
+        ])
+    };
+    let accepted = first
+        .client
+        .submit_text(frames(upload_header.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    first.stop().await;
+
+    let limits = sanctum_core::MetadataLimits {
+        max_value_bytes: 24,
+        max_request_bytes: 32,
+    };
+    let service = Service::open(dir.path(), 32768)
+        .unwrap()
+        .with_metadata_limits(limits)
+        .unwrap();
+    let mut running = Running::with_service(service, true).await;
+    let info = running
+        .client
+        .get_runtime_info(v1::Empty {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        info.metadata_limits.unwrap(),
+        v1::MetadataLimits {
+            max_value_bytes: 24,
+            max_request_bytes: 32
+        }
+    );
+    let replay = running
+        .client
+        .upload_text(frames(upload_header.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(replay.revision_id, accepted.revision_id);
+
+    upload_header.request_id = Some(uuid::Uuid::new_v4().to_string());
+    let rejected = running
+        .client
+        .submit_text(frames(upload_header.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(rejected.code(), Code::InvalidArgument);
+    assert!(rejected.message().contains("24 byte limit"));
+    let value = r#""123456789012345""#;
+    assert_eq!(value.len(), 17);
+    upload_header.source_metadata = vec![entry("source", value)];
+    upload_header.chunk_metadata = vec![v1::UploadChunkMetadata {
+        ordinal: 0,
+        entries: vec![entry("chunk", value)],
+    }];
+    let rejected = running
+        .client
+        .submit_text(frames(upload_header))
+        .await
+        .unwrap_err();
+    assert_eq!(rejected.code(), Code::InvalidArgument);
+    assert!(rejected.message().contains("32 byte limit"));
+
+    let source = v1::MetadataTarget {
+        scope: scope("default"),
+        source_id: Some(replay.source_id),
+        revision_id: Some(replay.revision_id),
+        ..Default::default()
+    };
+    let existing = running
+        .client
+        .get_metadata(source.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        existing.entries,
+        [entry("existing", r#"{"memo":"persisted before restart"}"#)]
+    );
+    let request = |edit| v1::MutateMetadataRequest {
+        target: Some(source.clone()),
+        edits: vec![
+            metadata_edit("added", Edit::SetJson("true".into())),
+            metadata_edit("existing", edit),
+        ],
+    };
+    let failed = running
+        .client
+        .mutate_metadata(request(Edit::MergePatchJson(r#"{"new":true}"#.into())))
+        .await
+        .unwrap_err();
+    assert_eq!(failed.code(), Code::InvalidArgument);
+    assert!(failed.message().contains("24 byte limit"));
+    assert_eq!(
+        running
+            .client
+            .get_metadata(source.clone())
+            .await
+            .unwrap()
+            .into_inner(),
+        existing
+    );
+    let result = running
+        .client
+        .mutate_metadata(request(Edit::MergePatchJson(r#"{"memo":null}"#.into())))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        result
+            .entries
+            .iter()
+            .map(|entry| entry.value_json.as_str())
+            .collect::<Vec<_>>(),
+        ["true", "{}"]
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn metadata_is_atomic_and_scoped_to_the_current_revision() {
     use v1::metadata_mutation::Edit;
     let dir = TempDir::new().unwrap();

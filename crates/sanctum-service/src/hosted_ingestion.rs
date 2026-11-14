@@ -853,6 +853,9 @@ impl HostedUpload {
             None => Condition::Create,
         };
         self.service.require_collection(&self.scope).await?;
+        candidate
+            .upload
+            .check_metadata_limits(self.service.metadata_limits)?;
         let key = envelope_key(&prefix)?;
         let input = candidate.input_key(&prefix)?;
         let body =

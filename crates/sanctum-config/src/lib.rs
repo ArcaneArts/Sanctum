@@ -1,6 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
-use sanctum_core::{ChunkSettings, Error, ImportCredential, Result};
+use sanctum_core::{ChunkSettings, Error, ImportCredential, MetadataLimits, Result};
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_ENV: &str = "SANCTUM_CONFIG_JSON";
@@ -30,6 +30,8 @@ pub struct Config {
     pub local_worker_concurrency: usize,
     #[serde(default)]
     pub chunking: ChunkSettings,
+    #[serde(default)]
+    pub metadata_limits: MetadataLimits,
     pub embedding: Option<EmbeddingConfig>,
     pub url_import_origins: Option<HashMap<String, Option<ImportCredential>>>,
 }
@@ -102,6 +104,7 @@ impl Config {
             return Err(Error::Invalid("expected configuration version 1".into()));
         }
         config.chunking.validate()?;
+        config.metadata_limits.validate()?;
         if config.max_source_bytes == 0 {
             return Err(Error::Invalid("max_source_bytes must be positive".into()));
         }
@@ -166,4 +169,40 @@ fn default_max_source() -> u64 {
 
 fn default_worker_concurrency() -> usize {
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_limits_default_and_validate_startup_settings() {
+        let config = |metadata_limits: serde_json::Value| {
+            Config::from_json(
+                &serde_json::json!({
+                    "version": 1,
+                    "storage_root": "store",
+                    "metadata_limits": metadata_limits,
+                })
+                .to_string(),
+            )
+        };
+        assert_eq!(
+            config(serde_json::json!({})).unwrap().metadata_limits,
+            MetadataLimits::default()
+        );
+        let limits = config(serde_json::json!({"max_value_bytes": 128}))
+            .unwrap()
+            .metadata_limits;
+        assert_eq!(limits.max_value_bytes, 128);
+        assert_eq!(limits.max_request_bytes, MetadataLimits::MAX_REQUEST_BYTES);
+        for invalid in [
+            serde_json::json!({"max_value_bytes": 0}),
+            serde_json::json!({"max_value_bytes": 65_537}),
+            serde_json::json!({"max_request_bytes": 0}),
+            serde_json::json!({"max_request_bytes": 2_097_153}),
+        ] {
+            assert!(matches!(config(invalid), Err(Error::Invalid(_))));
+        }
+    }
 }

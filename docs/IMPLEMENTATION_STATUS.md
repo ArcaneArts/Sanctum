@@ -562,6 +562,21 @@ Merged in [PR #22](https://github.com/ArcaneArts/Sanctum/pull/22).
   owner drops. A regression test exercises restart with a duplicate
   descriptor still open, as can happen during a concurrent process launch.
 
+### Configurable metadata limits
+
+- Local and hosted gRPC and MCP use the same startup limits for compact
+  JSON values and the total value bytes in uploads and edits. The active
+  limits appear in runtime information and the CLI.
+- Local and hosted gRPC regressions tighten the limits after accepting an
+  upload. Replay keeps its revision ID and publication attaches the
+  metadata accepted earlier. New requests that exceed the configured
+  limits fail, and a merge that would exceed the value limit rolls back
+  the entire mutation.
+- The compiled server verified configured limits through MCP HTTP and a
+  generated Python gRPC client on both filesystem storage and live
+  MinIO. CLI runtime information reported the same effective limits.
+  [API configuration](LOCAL_API.md#metadata-and-changes).
+
 ## Read-only SQL sessions and snapshot export
 
 Merged in [PR #23](https://github.com/ArcaneArts/Sanctum/pull/23).

@@ -5611,6 +5611,131 @@ async fn hosted_change_stream_resumes_committed_events_across_instances() {
 }
 
 #[tokio::test]
+async fn hosted_metadata_limits_apply_to_new_requests_after_restart() {
+    use v1::metadata_mutation::Edit;
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let initial = catalog();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let collection = v1::MetadataTarget {
+        scope: Some(v1::Scope {
+            tenant: "default".into(),
+            collection: "notes".into(),
+        }),
+        ..Default::default()
+    };
+    initial.create_collection(&scope, None).await.unwrap();
+    let mut first = start(initial).await;
+    let header = v1::UploadTextHeader {
+        scope: collection.scope.clone(),
+        name: "notes.txt".into(),
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+        chunk_metadata: vec![v1::UploadChunkMetadata {
+            ordinal: 0,
+            entries: vec![v1::MetadataEntry {
+                namespace: "integration".into(),
+                key: "previous".into(),
+                value_json: r#""accepted under the old value limit""#.into(),
+            }],
+        }],
+        ..Default::default()
+    };
+    let frames =
+        |header: &v1::UploadTextHeader| upload_frames(header, [b"notes on jasper".as_slice()]);
+    let accepted = first
+        .client
+        .submit_text(frames(&header))
+        .await
+        .unwrap()
+        .into_inner();
+    first.stop().await;
+
+    let catalog = catalog()
+        .with_metadata_limits(sanctum_core::MetadataLimits {
+            max_value_bytes: 8,
+            max_request_bytes: 10,
+        })
+        .unwrap();
+    let mut server = start(catalog.clone()).await;
+    let replayed = server
+        .client
+        .submit_text(frames(&header))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(replayed, accepted);
+    let next = v1::UploadTextHeader {
+        request_id: None,
+        ..header.clone()
+    };
+    let rejected = server.client.submit_text(frames(&next)).await.unwrap_err();
+    assert_eq!(rejected.code(), Code::InvalidArgument);
+    assert!(rejected.message().contains("8 byte limit"));
+    let operation = accepted.operation_id.parse().unwrap();
+    catalog.register_upload(&scope, operation).await.unwrap();
+    catalog.prepare_upload(&scope, operation).await.unwrap();
+    catalog.index_upload(&scope, operation).await.unwrap();
+    let chunk = v1::MetadataTarget {
+        source_id: Some(accepted.source_id),
+        revision_id: Some(accepted.revision_id),
+        chunk_ordinal: Some(0),
+        ..collection.clone()
+    };
+    let chunk_values = server
+        .client
+        .get_metadata(chunk)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(chunk_values.entries, header.chunk_metadata[0].entries);
+    let edit = |key: &str, value: &str| v1::MetadataMutation {
+        namespace: "integration".into(),
+        key: key.into(),
+        edit: Some(Edit::SetJson(value.into())),
+    };
+    let request = |edits| v1::MutateMetadataRequest {
+        target: Some(collection.clone()),
+        edits,
+    };
+    let rejected = server
+        .client
+        .mutate_metadata(request(vec![
+            edit("alpha", r#""abcdef""#),
+            edit("beta", "true"),
+        ]))
+        .await
+        .unwrap_err();
+    assert_eq!(rejected.code(), Code::InvalidArgument);
+    assert!(rejected.message().contains("10 byte limit"));
+    assert!(
+        server
+            .client
+            .get_metadata(collection.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .entries
+            .is_empty()
+    );
+    let saved = server
+        .client
+        .mutate_metadata(request(vec![
+            edit("alpha", r#""abc""#),
+            edit("beta", "false"),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(saved.entries.len(), 2);
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_metadata_is_atomic_and_filters_published_revisions() {
     use v1::{
         MetadataLevel, MetadataOperator, metadata_filter::Expression, metadata_mutation::Edit,
