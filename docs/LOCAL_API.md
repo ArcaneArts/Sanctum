@@ -32,6 +32,15 @@ the subcommand to change the scope or address. Optional `--namespace` and
 `--external-id` on uploads provide an opaque reference returned in matching
 results.
 
+For retryable collection creation, pass a nonzero UUID as the
+`CreateCollection` request ID or use `sanctum-cli create notes --request-id UUID`.
+Within a tenant, replaying the same ID and collection returns the original
+success receipt. Reusing the ID for a different collection returns a conflict.
+The local catalog keeps the intent before initializing the collection database.
+Startup resumes pending intents, and the collection becomes visible only after
+initialization commits. Local success receipts become eligible for cleanup
+after 45 days. Generate a fresh ID for each new operation.
+
 Each `UploadText` stream starts with one header containing the tenant,
 collection, and source name. It follows with data frames of up to 256 KiB and
 an explicit end frame. Close the sending side of the stream after the end

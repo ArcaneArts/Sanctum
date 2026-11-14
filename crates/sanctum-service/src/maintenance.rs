@@ -5,6 +5,36 @@ use uuid::Uuid;
 use crate::{Service, db};
 
 impl Service {
+    pub(crate) fn recover_local_collections(&self) -> Result<()> {
+        for tenant in self.files.tenants()? {
+            let catalog = self.files.catalog_path(&tenant);
+            let pending = match db::local_collections::pending(&catalog) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    tracing::warn!(%error, %tenant, "could not enumerate pending collection creations");
+                    continue;
+                }
+            };
+            for collection in pending {
+                let recover = || {
+                    let scope = Scope {
+                        tenant: tenant.clone(),
+                        collection: collection.parse()?,
+                    };
+                    db::local_collections::recover(
+                        &catalog,
+                        &self.files.database_path(&scope),
+                        &collection,
+                    )
+                };
+                if let Err(error) = recover() {
+                    tracing::warn!(%error, %tenant, %collection, "could not recover local collection creation");
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn delete_collection(&self, scope: &Scope) -> Result<()> {
         let _exclusive = self
             .retrieval

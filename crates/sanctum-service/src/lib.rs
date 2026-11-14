@@ -314,6 +314,9 @@ impl Service {
         if let Err(error) = service.reclaim_deleted_collections() {
             tracing::warn!(%error, "could not reclaim all deleted local collections");
         }
+        if let Err(error) = service.recover_local_collections() {
+            tracing::warn!(%error, "could not recover all local collection creations");
+        }
         if let Err(error) = service.reclaim_startup_orphans() {
             tracing::warn!(%error, "could not reclaim all unreferenced local uploads");
         }
@@ -331,15 +334,29 @@ impl Service {
     }
 
     pub fn create_collection(&self, scope: &Scope) -> Result<()> {
+        self.create_collection_with_request(scope, None)
+    }
+
+    pub fn create_collection_with_request(
+        &self,
+        scope: &Scope,
+        request: Option<Uuid>,
+    ) -> Result<()> {
+        if request.is_some_and(|id| id.is_nil()) {
+            return Err(Error::Invalid("request ID must be a nonzero UUID".into()));
+        }
         let _reader = self
             .retrieval
             .read()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
-        db::create_collection(
-            &self.files.catalog_path(&scope.tenant),
-            &self.files.database_path(scope),
-            scope.collection.as_str(),
-        )
+        self.local_writes.run(scope, || {
+            db::local_collections::create(
+                &self.files.catalog_path(&scope.tenant),
+                &self.files.database_path(scope),
+                scope.collection.as_str(),
+                request,
+            )
+        })
     }
 
     pub fn list_collections(&self, tenant: &ScopeId) -> Result<Vec<String>> {

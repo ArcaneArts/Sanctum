@@ -399,7 +399,7 @@ message Scope {
 
 message CreateCollectionRequest {
   Scope scope = 1;
-  // Hosted storage replays a matching request ID after an ambiguous failure.
+  // Replay a matching request ID after an ambiguous failure.
   optional string request_id = 2;
 }
 
