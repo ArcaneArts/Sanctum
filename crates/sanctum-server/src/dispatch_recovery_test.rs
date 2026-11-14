@@ -49,6 +49,132 @@ async fn minio_dispatch_recovers_missing_task_after_restart() {
     clear_prefix(storage.as_ref(), &prefix).await;
 }
 
+#[tokio::test]
+async fn filesystem_standalone_worker_stops_and_resumes_a_stalled_checkpoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    verify_standalone_shutdown(storage, None).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live MinIO bucket and S3 credentials"]
+async fn minio_standalone_worker_stops_and_resumes_a_stalled_checkpoint() {
+    let storage = minio_storage();
+    let prefix = Key::parse(format!("standalone-shutdown-{}", Uuid::new_v4())).unwrap();
+    verify_standalone_shutdown(storage.clone(), Some(prefix.clone())).await;
+    clear_prefix(storage.as_ref(), &prefix).await;
+}
+
+async fn verify_standalone_shutdown(storage: Arc<dyn Storage>, prefix: Option<Key>) {
+    let (checkpoint, reached) = oneshot::channel();
+    let fault = Arc::new(StalledCheckpoint {
+        storage: storage.clone(),
+        checkpoint: Mutex::new(Some(checkpoint)),
+        after_dispatch: false,
+        lose_source_reply: None,
+        lose_control_reply: Mutex::new(None),
+    });
+    let scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "repair".into(),
+    };
+    let operation = Uuid::new_v4();
+    let job = v1::IngestionJobRequest {
+        scope: Some(scope.clone()),
+        operation_id: operation.to_string(),
+    };
+    let first_wake = Arc::new(tokio::sync::Notify::new());
+    let first = HostedCatalog::new(fault, prefix.clone(), 1024)
+        .unwrap()
+        .with_standalone_worker(first_wake.clone());
+    let (mut api, api_server) = serve_api(first.clone()).await;
+    api.create_collection(v1::CreateCollectionRequest {
+        scope: Some(scope.clone()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let initial_generation = collection_generation(storage.as_ref(), prefix.as_ref()).await;
+    let accepted = submit_source(&mut api, &scope, operation, "shutdown.rtf", RTF).await;
+    assert_eq!(accepted.state(), v1::IngestionState::Accepted);
+    let stop = CancellationToken::new();
+    let mut worker = AbortOnDropHandle::new(tokio::spawn(crate::standalone_worker::run(
+        first,
+        first_wake,
+        stop.clone(),
+    )));
+    let canceled = tokio::time::timeout(Duration::from_secs(10), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    let registered_generation = collection_generation(storage.as_ref(), prefix.as_ref()).await;
+    assert_ne!(registered_generation, initial_generation);
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(2), &mut worker)
+        .await
+        .expect("the standalone worker must stop while its storage request is pending")
+        .unwrap();
+    assert!(canceled.await.is_err());
+    assert_eq!(
+        api.get_ingestion_job(job.clone())
+            .await
+            .unwrap()
+            .into_inner(),
+        accepted
+    );
+    drop(api_server);
+
+    let restart_wake = Arc::new(tokio::sync::Notify::new());
+    let restarted = HostedCatalog::new(storage, prefix, 1024)
+        .unwrap()
+        .with_standalone_worker(restart_wake.clone());
+    let (mut api, _api_server) = serve_api(restarted.clone()).await;
+    let stop = CancellationToken::new();
+    let worker = AbortOnDropHandle::new(tokio::spawn(crate::standalone_worker::run(
+        restarted,
+        restart_wake,
+        stop.clone(),
+    )));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = api
+                .get_ingestion_job(job.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            if status.state() == v1::IngestionState::TextReady {
+                assert_eq!(status.revision_id, accepted.revision_id);
+                assert_eq!(status.source_id, accepted.source_id);
+                assert_eq!(status.update_sequence, 1);
+                break;
+            }
+            assert!(matches!(
+                status.state(),
+                v1::IngestionState::Accepted | v1::IngestionState::Registered
+            ));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let results = api
+        .search_text(v1::SearchTextRequest {
+            scope: Some(scope),
+            query: "rhodonite".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(results.hits.len(), 1);
+    assert_eq!(results.hits[0].excerpt, TEXT);
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 fn minio_storage() -> Arc<dyn Storage> {
     let storage = S3Storage::new(S3Config {
         bucket: std::env::var("SANCTUM_MINIO_BUCKET").expect("SANCTUM_MINIO_BUCKET"),

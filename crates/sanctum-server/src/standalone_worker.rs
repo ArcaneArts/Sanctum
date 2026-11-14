@@ -8,23 +8,32 @@ const IDLE_INTERVAL: Duration = Duration::from_secs(10);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(crate) async fn run(catalog: HostedCatalog, wake: Arc<Notify>, stop: CancellationToken) {
+    // Dropping the in-flight stage leaves its durable hint and any committed
+    // receipt available for the next worker.
+    tokio::select! {
+        biased;
+        _ = stop.cancelled() => {}
+        _ = run_worker(catalog, wake) => {}
+    }
+}
+
+async fn run_worker(catalog: HostedCatalog, wake: Arc<Notify>) {
     let mut next_maintenance = Instant::now();
     let mut discover_profile = true;
-    while !stop.is_cancelled() {
+    loop {
         if discover_profile {
             match catalog.discover_profile_rebuild().await {
                 Ok(page) => discover_profile = !page.complete,
                 Err(error) => tracing::warn!(%error, "standalone profile discovery will retry"),
             }
         }
-        let worked = scan(&catalog, &stop).await;
-        if !stop.is_cancelled() && Instant::now() >= next_maintenance {
-            maintenance(&catalog, &stop).await;
+        let worked = scan(&catalog).await;
+        if Instant::now() >= next_maintenance {
+            maintenance(&catalog).await;
             next_maintenance = Instant::now() + MAINTENANCE_INTERVAL;
         }
         if !worked {
             tokio::select! {
-                _ = stop.cancelled() => return,
                 _ = wake.notified() => {},
                 _ = tokio::time::sleep(IDLE_INTERVAL) => {},
             }
@@ -32,20 +41,17 @@ pub(crate) async fn run(catalog: HostedCatalog, wake: Arc<Notify>, stop: Cancell
     }
 }
 
-async fn scan(catalog: &HostedCatalog, stop: &CancellationToken) -> bool {
+async fn scan(catalog: &HostedCatalog) -> bool {
     let mut cursors: [Option<String>; DISPATCH_SHARDS as usize] = Default::default();
     let mut finished = [false; DISPATCH_SHARDS as usize];
     let mut worked = false;
-    while finished.contains(&false) && !stop.is_cancelled() {
+    while finished.contains(&false) {
         for ((shard, cursor), done) in (0..DISPATCH_SHARDS).zip(&mut cursors).zip(&mut finished) {
-            if stop.is_cancelled() {
-                return worked;
-            }
             if *done {
                 continue;
             }
             match catalog
-                .work_standalone_shard(shard, cursor.as_deref(), || stop.is_cancelled())
+                .work_standalone_shard(shard, cursor.as_deref(), || false)
                 .await
             {
                 Ok(page) => {
@@ -63,18 +69,14 @@ async fn scan(catalog: &HostedCatalog, stop: &CancellationToken) -> bool {
     worked
 }
 
-async fn maintenance(catalog: &HostedCatalog, stop: &CancellationToken) {
+async fn maintenance(catalog: &HostedCatalog) {
     if let Err(error) = catalog.sweep_hosted_sources().await {
         tracing::warn!(%error, "standalone source sweep will retry");
     }
-    if !stop.is_cancelled()
-        && let Err(error) = catalog.sweep_hosted_snapshots().await
-    {
+    if let Err(error) = catalog.sweep_hosted_snapshots().await {
         tracing::warn!(%error, "standalone snapshot sweep will retry");
     }
-    if !stop.is_cancelled()
-        && let Err(error) = catalog.sweep_abandoned_uploads().await
-    {
+    if let Err(error) = catalog.sweep_abandoned_uploads().await {
         tracing::warn!(%error, "standalone upload sweep will retry");
     }
 }

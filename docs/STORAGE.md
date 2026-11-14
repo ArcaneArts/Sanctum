@@ -222,6 +222,11 @@ for pending work after restart. It shares the server's gRPC/MCP listener
 configuration and needs no worker HTTP listener. Use a dedicated prefix for
 this setup. Cloud Run and Cloud Tasks have their own worker configuration.
 
+On shutdown, the embedded worker stops waiting for in-flight work. A
+fresh worker resumes from the persisted hint and any committed stage
+receipt. If shutdown interrupts a stage holding a writer lease, the
+next attempt can wait for that lease to expire before acquiring it.
+
 The hosted create operation initializes the collection database before
 activating its catalog record. If a request is interrupted between those
 steps, repeat it to activate the existing database. Pass a UUID through
