@@ -135,6 +135,14 @@ pub fn list_limit(limit: u32) -> Result<usize> {
 }
 
 pub async fn usage(store: &dyn Storage, prefix: Option<&Key>) -> Result<UsageMeasurement> {
+    usage_with_progress(store, prefix, |_, _| Ok(())).await
+}
+
+pub async fn usage_with_progress(
+    store: &dyn Storage,
+    prefix: Option<&Key>,
+    mut progress: impl FnMut(u64, u64) -> Result<()>,
+) -> Result<UsageMeasurement> {
     let started_at = SystemTime::now();
     let mut cursor = None;
     let mut bytes = 0u64;
@@ -160,6 +168,7 @@ pub async fn usage(store: &dyn Storage, prefix: Option<&Key>) -> Result<UsageMea
                 "storage list cursor did not advance".into(),
             ));
         }
+        progress(bytes, files)?;
         cursor = page.next_cursor;
     }
 }

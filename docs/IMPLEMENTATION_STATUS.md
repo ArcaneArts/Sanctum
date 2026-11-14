@@ -1460,3 +1460,18 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   estimate in 7.061 s at 29,114,368 bytes peak sampled process RSS.
   The final MCP excerpt matched the source bytes. Provider token limits
   remain model-specific. [Capacity results](CAPACITY.md#estimated-token-budget).
+
+## Storage refresh progress
+
+- `MeasureStorageUsage` streams cumulative scanned counts and a final
+  timestamped measurement for the same scopes as `GetStorageUsage`.
+  The desktop displays progress during a refresh and keeps the last
+  completed total labeled with its measurement time.
+- `pnpm check` and `pnpm desktop:check` passed. Filesystem and object
+  integration tests compared streamed and unary totals. A generated
+  client checked that live MinIO reported progress after its first
+  1,000 objects and finished at 1,137 objects and 35,448 bytes.
+- The sidecar launched by `pnpm devtop` on macOS streamed 46 progress
+  events and a final count of 12,002 files. Chromium exercised the
+  desktop progress, error, and collection-switch states with simulated
+  Tauri IPC. [Storage API](LOCAL_API.md#storage-usage).

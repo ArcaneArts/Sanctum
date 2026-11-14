@@ -1,6 +1,6 @@
 use sanctum_core::{
     Error, ExternalSource, GitProvenance, Result, Scope, UPLOAD_FRAME_BYTES, UrlProvenance,
-    UsageScope,
+    UsageMeasurement, UsageScope,
 };
 use sanctum_proto::v1::{
     self,
@@ -71,6 +71,25 @@ enum Backend {
 }
 
 pub struct Grpc(Backend, CancellationToken, v1::RuntimeInfo);
+
+impl Backend {
+    async fn measure_storage(
+        &self,
+        scope: UsageScope,
+        progress: impl FnMut(u64, u64) -> Result<()> + Send + 'static,
+    ) -> std::result::Result<UsageMeasurement, Status> {
+        match self {
+            Self::Hosted(catalog) => catalog
+                .storage_usage_with_progress(&scope, progress)
+                .await
+                .map_err(status),
+            Self::Local(service) => {
+                let service = service.clone();
+                work(move || service.storage_usage_with_progress(&scope, progress)).await
+            }
+        }
+    }
+}
 
 impl Grpc {
     #[allow(clippy::result_large_err)]
@@ -159,30 +178,53 @@ impl Sanctum for Grpc {
         &self,
         request: Request<v1::StorageUsageRequest>,
     ) -> Reply<v1::StorageUsage> {
-        use v1::storage_usage_request::Scope as WireScope;
         let request = request.into_inner();
-        let scope = match &request.scope {
-            Some(WireScope::Collection(collection)) => {
-                UsageScope::Collection(parse_scope(Some(collection.clone()))?)
-            }
-            Some(WireScope::Tenant(tenant)) => UsageScope::Tenant(tenant.parse().map_err(status)?),
-            Some(WireScope::Cluster(_)) => UsageScope::Cluster,
-            None => return Err(invalid_argument("scope", "storage usage scope is required")),
-        };
-        let measured = if let Backend::Hosted(catalog) = &self.0 {
-            catalog.storage_usage(&scope).await.map_err(status)?
-        } else {
-            let service = self.local()?.clone();
-            work(move || service.storage_usage(&scope)).await?
-        };
-        Ok(Response::new(v1::StorageUsage {
-            scope: Some(request),
-            bytes: measured.bytes,
-            files: measured.files,
-            started_at_unix_ms: unix_ms(measured.started_at).map_err(status)?,
-            finished_at_unix_ms: unix_ms(measured.finished_at).map_err(status)?,
-        }))
+        let scope = usage_scope(&request)?;
+        let measured = self.0.measure_storage(scope, |_, _| Ok(())).await?;
+        wire_usage(request, measured).map(Response::new)
     }
+
+    type MeasureStorageUsageStream =
+        ReceiverStream<std::result::Result<v1::StorageUsageEvent, Status>>;
+
+    async fn measure_storage_usage(
+        &self,
+        request: Request<v1::StorageUsageRequest>,
+    ) -> Reply<Self::MeasureStorageUsageStream> {
+        use v1::storage_usage_event::Event;
+        let request = request.into_inner();
+        let scope = usage_scope(&request)?;
+        let backend = self.0.clone();
+        let shutdown = self.1.clone();
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        tokio::spawn(async move {
+            let progress = sender.clone();
+            let cancel = shutdown.clone();
+            let scan = backend.measure_storage(scope, move |bytes, files| {
+                if cancel.is_cancelled() || progress.is_closed() {
+                    return Err(Error::Busy("storage measurement was canceled".into()));
+                }
+                // Progress is cumulative. Skip intermediate reports while the client is slow.
+                let _ = progress.try_send(Ok(v1::StorageUsageEvent {
+                    event: Some(Event::Progress(v1::StorageUsageProgress { bytes, files })),
+                }));
+                Ok(())
+            });
+            let result = tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = sender.closed() => return,
+                result = scan => result,
+            };
+            let finished = result
+                .and_then(|measured| wire_usage(request, measured))
+                .map(|usage| v1::StorageUsageEvent {
+                    event: Some(Event::Complete(usage)),
+                });
+            let _ = sender.send(finished).await;
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+
     async fn get_metadata(
         &self,
         request: Request<v1::MetadataTarget>,
@@ -1275,6 +1317,33 @@ impl Sanctum for Grpc {
             revision_id: revision.to_string(),
         }))
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn usage_scope(request: &v1::StorageUsageRequest) -> std::result::Result<UsageScope, Status> {
+    use v1::storage_usage_request::Scope as WireScope;
+    match &request.scope {
+        Some(WireScope::Collection(scope)) => {
+            parse_scope(Some(scope.clone())).map(UsageScope::Collection)
+        }
+        Some(WireScope::Tenant(tenant)) => tenant.parse().map(UsageScope::Tenant).map_err(status),
+        Some(WireScope::Cluster(_)) => Ok(UsageScope::Cluster),
+        None => Err(invalid_argument("scope", "storage usage scope is required")),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn wire_usage(
+    request: v1::StorageUsageRequest,
+    measured: UsageMeasurement,
+) -> std::result::Result<v1::StorageUsage, Status> {
+    Ok(v1::StorageUsage {
+        scope: Some(request),
+        bytes: measured.bytes,
+        files: measured.files,
+        started_at_unix_ms: unix_ms(measured.started_at).map_err(status)?,
+        finished_at_unix_ms: unix_ms(measured.finished_at).map_err(status)?,
+    })
 }
 
 fn unix_ms(time: std::time::SystemTime) -> Result<u64> {

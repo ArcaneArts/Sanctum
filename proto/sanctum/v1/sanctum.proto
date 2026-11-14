@@ -41,6 +41,7 @@ service Sanctum {
   rpc WatchChanges(ListChangesRequest) returns (stream ListChangesResponse);
   rpc GetChangeCursor(ChangeCursorRequest) returns (ChangeCursor);
   rpc GetStorageUsage(StorageUsageRequest) returns (StorageUsage);
+  rpc MeasureStorageUsage(StorageUsageRequest) returns (stream StorageUsageEvent);
   rpc OpenDatabaseSession(DatabaseTarget) returns (DatabaseSession);
   rpc QueryDatabase(QueryDatabaseRequest) returns (QueryDatabaseResponse);
   rpc DownloadDatabase(DatabaseSessionRef) returns (stream DatabaseFrame);
@@ -159,6 +160,18 @@ message StorageUsage {
   uint64 files = 3;
   uint64 started_at_unix_ms = 4;
   uint64 finished_at_unix_ms = 5;
+}
+
+message StorageUsageProgress {
+  uint64 bytes = 1;
+  uint64 files = 2;
+}
+
+message StorageUsageEvent {
+  oneof event {
+    StorageUsageProgress progress = 1;
+    StorageUsage complete = 2;
+  }
 }
 
 message MetadataTarget {

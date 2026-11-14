@@ -4318,6 +4318,9 @@ async fn storage_usage_counts_retained_and_staged_files_at_each_scope() {
     let mut running = Running::start_with_workers(&dir, None, false).await;
     let staged = collection.join("staging/working-file");
     std::fs::write(&staged, b"pending bytes").unwrap();
+    for index in 0..300 {
+        std::fs::write(collection.join(format!("staging/fixture-{index}")), b"x").unwrap();
+    }
     std::fs::write(outside.path().join("unmanaged"), vec![0; 64 * 1024]).unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(outside.path(), collection.join("external")).unwrap();
@@ -4352,6 +4355,25 @@ async fn storage_usage_counts_retained_and_staged_files_at_each_scope() {
     assert_eq!(first.scope.as_ref(), Some(&collection_request));
     assert!(first.started_at_unix_ms > 0 && first.finished_at_unix_ms >= first.started_at_unix_ms);
     assert!(canonical.with_file_name("original").is_file());
+    let mut measured = running
+        .client
+        .measure_storage_usage(collection_request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    use v1::storage_usage_event::Event;
+    let Some(Event::Progress(progress)) = measured.message().await.unwrap().unwrap().event else {
+        panic!("large directory walk should yield progress");
+    };
+    assert!(progress.files > 0 && progress.files < first.files);
+    assert!(progress.bytes > 0 && progress.bytes < first.bytes);
+    let Some(Event::Complete(total)) = measured.message().await.unwrap().unwrap().event else {
+        panic!("completed directory walk should yield the measured total");
+    };
+    assert_eq!((total.bytes, total.files), (first.bytes, first.files));
+    assert_eq!(total.scope, first.scope);
+    assert!(total.finished_at_unix_ms >= total.started_at_unix_ms);
+    assert!(measured.message().await.unwrap().is_none());
 
     let tenant_request = v1::StorageUsageRequest {
         scope: Some(UsageScope::Tenant("default".into())),

@@ -201,6 +201,14 @@ impl HostedCatalog {
     }
 
     pub async fn storage_usage(&self, scope: &UsageScope) -> Result<UsageMeasurement> {
+        self.storage_usage_with_progress(scope, |_, _| Ok(())).await
+    }
+
+    pub async fn storage_usage_with_progress(
+        &self,
+        scope: &UsageScope,
+        progress: impl FnMut(u64, u64) -> Result<()>,
+    ) -> Result<UsageMeasurement> {
         let prefix = match scope {
             UsageScope::Cluster => self.prefix.clone(),
             UsageScope::Tenant(tenant) => Some(tenant_prefix(self.prefix.as_ref(), tenant)?),
@@ -209,7 +217,7 @@ impl HostedCatalog {
                 Some(collection_prefix(self.prefix.as_ref(), scope)?)
             }
         };
-        sanctum_storage::usage(self.storage.as_ref(), prefix.as_ref()).await
+        sanctum_storage::usage_with_progress(self.storage.as_ref(), prefix.as_ref(), progress).await
     }
 
     pub(crate) async fn require_collection(&self, scope: &Scope) -> Result<()> {

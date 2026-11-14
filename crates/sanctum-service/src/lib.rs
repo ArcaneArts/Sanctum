@@ -200,10 +200,18 @@ impl Service {
     }
 
     pub fn storage_usage(&self, scope: &UsageScope) -> Result<UsageMeasurement> {
+        self.storage_usage_with_progress(scope, |_, _| Ok(()))
+    }
+
+    pub fn storage_usage_with_progress(
+        &self,
+        scope: &UsageScope,
+        progress: impl FnMut(u64, u64) -> Result<()>,
+    ) -> Result<UsageMeasurement> {
         if let UsageScope::Collection(collection) = scope {
             self.require_collection(collection)?;
         }
-        self.files.usage(scope)
+        self.files.usage_with_progress(scope, progress)
     }
     pub fn metadata(
         &self,

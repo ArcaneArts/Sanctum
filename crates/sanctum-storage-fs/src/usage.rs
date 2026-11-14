@@ -7,6 +7,14 @@ use crate::LocalFiles;
 
 impl LocalFiles {
     pub fn usage(&self, scope: &UsageScope) -> Result<UsageMeasurement> {
+        self.usage_with_progress(scope, |_, _| Ok(()))
+    }
+
+    pub fn usage_with_progress(
+        &self,
+        scope: &UsageScope,
+        mut progress: impl FnMut(u64, u64) -> Result<()>,
+    ) -> Result<UsageMeasurement> {
         let path = match scope {
             UsageScope::Collection(scope) => self.collection_path(scope),
             UsageScope::Tenant(tenant) => self.root.join(tenant.as_str()),
@@ -15,10 +23,15 @@ impl LocalFiles {
         let started_at = SystemTime::now();
         let mut bytes = 0u64;
         let mut files = 0u64;
-        for entry in WalkDir::new(&path)
+        for (index, entry) in WalkDir::new(&path)
             .follow_links(false)
             .follow_root_links(false)
+            .into_iter()
+            .enumerate()
         {
+            if index != 0 && index % 256 == 0 {
+                progress(bytes, files)?;
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) if error.depth() == 0 && missing(&error) => {

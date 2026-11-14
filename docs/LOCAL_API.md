@@ -570,6 +570,13 @@ root. Symbolic links are skipped. Each response includes its scope and
 start and finish timestamps in Unix milliseconds. Concurrent writes may
 change files during a measurement.
 
+`MeasureStorageUsage` streams the same measurement. Each `progress`
+event reports cumulative bytes and files or objects scanned so far.
+Fast scans can return only a `complete` event. The final event carries the
+same scope, totals, and timestamps as `GetStorageUsage`. An error ends the
+stream without a final total. Closing the stream stops enumeration at the
+next local checkpoint or cancels the pending object listing.
+
 ```sh
 cargo run --locked -p sanctum-cli -- usage notes
 cargo run --locked -p sanctum-cli -- --tenant default usage

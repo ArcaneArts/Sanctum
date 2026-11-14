@@ -716,6 +716,33 @@ async fn hosted_catalog_recovers_across_server_restart_and_stays_in_scope() {
     );
     assert_eq!(collection.files, 2);
     assert!(collection.bytes > 0 && collection.bytes < tenant.bytes);
+    for number in 0..1003 {
+        let key = Key::parse(format!("usage-fixture/objects/{number:04}")).unwrap();
+        store
+            .put_control(&key, b"sample".as_slice().into(), Condition::Create)
+            .await
+            .unwrap();
+    }
+    let request = v1::StorageUsageRequest {
+        scope: Some(Scope::Tenant("usage-fixture".into())),
+    };
+    let mut scan = state
+        .client
+        .measure_storage_usage(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    use v1::storage_usage_event::Event;
+    let Some(Event::Progress(progress)) = scan.message().await.unwrap().unwrap().event else {
+        panic!("first object page should yield progress");
+    };
+    assert_eq!((progress.bytes, progress.files), (6000, 1000));
+    let Some(Event::Complete(total)) = scan.message().await.unwrap().unwrap().event else {
+        panic!("last object page should yield the measured total");
+    };
+    assert_eq!((total.bytes, total.files), (6018, 1003));
+    assert_eq!(total.scope, Some(request));
+    assert!(scan.message().await.unwrap().is_none());
     assert_eq!(
         state
             .client
