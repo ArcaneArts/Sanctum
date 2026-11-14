@@ -135,6 +135,89 @@ async fn verify_active_writer(storage: Arc<dyn Storage>, prefix: &str) {
 }
 
 #[tokio::test]
+async fn filesystem_verifies_snapshots_after_a_lost_upload_response() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = sanctum_storage_fs::FileStorage::open(directory.path()).unwrap();
+    verify_snapshot_upload_recovery(Arc::new(storage), "upload-recovery").await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live MinIO bucket and S3 credentials"]
+async fn minio_verifies_snapshots_after_a_lost_upload_response() {
+    let prefix = format!("upload-recovery-{}", Uuid::new_v4());
+    verify_snapshot_upload_recovery(minio_storage(), &prefix).await;
+}
+
+async fn verify_snapshot_upload_recovery(storage: Arc<dyn Storage>, prefix: &str) {
+    let prefix = Key::parse(prefix).unwrap();
+    let unit = Unit::catalog(Some(&prefix), &"default".parse().unwrap()).unwrap();
+    let faults = Arc::new(PublicationStorage::new(storage.clone()));
+    let writer = Publication::new(faults.clone(), Duration::from_secs(15))
+        .unwrap()
+        .with_page_deltas(true);
+    let cold_reader = Publication::new(storage.clone(), Duration::from_secs(15)).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let mut lease = writer.acquire(&unit).await.unwrap();
+
+    let first_id = Uuid::new_v4();
+    *faults.upload_reply.lock().unwrap() = Some(UploadReply::Lost);
+    let (base, receipts) = lease
+        .apply(vec![command(first_id, 7)], |tx, initial| {
+            tx.execute_batch(
+                "CREATE TABLE padding (body BLOB); INSERT INTO padding VALUES (zeroblob(262144));",
+            )
+            .map_err(|error| Error::Internal(Box::new(error)))?;
+            apply_value(tx, initial)
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipts[0].outcome, "7");
+    assert_eq!(faults.snapshot_gets.load(Ordering::Relaxed), 1);
+
+    let next_id = Uuid::new_v4();
+    *faults.upload_reply.lock().unwrap() = Some(UploadReply::Corrupt);
+    assert!(matches!(
+        lease.apply(vec![command(next_id, 3)], apply_value).await,
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
+    ));
+    assert_eq!(cold_reader.generation(&unit).await.unwrap(), Some(base));
+    assert_eq!(cold_reader.receipt(&unit, next_id).await.unwrap(), None);
+
+    *faults.upload_reply.lock().unwrap() = Some(UploadReply::Lost);
+    let (next, receipts) = lease
+        .apply(vec![command(next_id, 3)], apply_value)
+        .await
+        .unwrap();
+    lease.release().await.unwrap();
+    assert_eq!(receipts[0].outcome, "10");
+    let delta = Key::parse(format!(
+        "{prefix}/default/catalog/snapshots/{}/pages.delta",
+        next.id
+    ))
+    .unwrap();
+    assert!(storage.head(&delta).await.is_ok());
+    let reopened = cold_reader
+        .read(&unit, scratch.path())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened.generation, next);
+    assert_eq!(value(reopened.path()), 10);
+    let mut retry = writer.acquire(&unit).await.unwrap();
+    let (replayed, receipts) = retry
+        .apply(vec![command(next_id, 999)], |_, _| {
+            panic!("receipt must prevent reapply")
+        })
+        .await
+        .unwrap();
+    retry.release().await.unwrap();
+    assert_eq!(replayed, next);
+    assert_eq!(receipts[0].outcome, "10");
+
+    delete_prefix(storage.as_ref(), &prefix).await;
+}
+
+#[tokio::test]
 async fn filesystem_snapshot_preparation_observes_cancellation() {
     let directory = tempfile::tempdir().unwrap();
     let storage = sanctum_storage_fs::FileStorage::open(directory.path()).unwrap();
@@ -905,6 +988,11 @@ async fn publication_reuses_immutable_snapshots_for_receipts_and_subsequent_writ
     assert_eq!(gets(), 2);
 }
 
+enum UploadReply {
+    Lost,
+    Corrupt,
+}
+
 struct PublicationStorage {
     inner: Arc<dyn Storage>,
     transfer_delay_ms: std::sync::atomic::AtomicUsize,
@@ -914,6 +1002,7 @@ struct PublicationStorage {
     lose: std::sync::atomic::AtomicBool,
     snapshot_gets: std::sync::atomic::AtomicUsize,
     fail_delta: std::sync::atomic::AtomicBool,
+    upload_reply: Mutex<Option<UploadReply>>,
     fail_only_delta_head: std::sync::atomic::AtomicBool,
     cleanup_delay_ms: AtomicU64,
     list_started: Mutex<Option<oneshot::Sender<()>>>,
@@ -930,6 +1019,7 @@ impl PublicationStorage {
             lose: Default::default(),
             snapshot_gets: Default::default(),
             fail_delta: Default::default(),
+            upload_reply: Default::default(),
             fail_only_delta_head: Default::default(),
             cleanup_delay_ms: Default::default(),
             list_started: Default::default(),
@@ -993,13 +1083,23 @@ impl Storage for PublicationStorage {
         if let Some(hold) = hold {
             hold.await.unwrap();
         }
-        let version = self.inner.put_stream(key, reader, length).await?;
-        if key.as_str().ends_with("/pages.delta")
-            && self
-                .fail_delta
-                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        if key.as_str().ends_with("/pages.delta") && self.fail_delta.swap(false, Ordering::Relaxed)
         {
-            return Err(Error::Busy("delta upload response lost".into()));
+            return Err(Error::Busy("delta upload failed before commit".into()));
+        }
+        let reply = self.upload_reply.lock().unwrap().take();
+        let reader = if matches!(reply, Some(UploadReply::Corrupt)) {
+            let mut bytes = Vec::new();
+            reader.take(length + 1).read_to_end(&mut bytes).await?;
+            assert_eq!(bytes.len() as u64, length);
+            *bytes.last_mut().unwrap() ^= 1;
+            Box::pin(std::io::Cursor::new(bytes))
+        } else {
+            reader
+        };
+        let version = self.inner.put_stream(key, reader, length).await?;
+        if reply.is_some() {
+            return Err(Error::Busy("snapshot upload response lost".into()));
         }
         Ok(version)
     }
