@@ -2278,6 +2278,125 @@ async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf()
 }
 
 #[tokio::test]
+async fn hosted_index_rebuilds_missing_and_damaged_rtf_checkpoints() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let service = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let catalog = service();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let wire = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    catalog.create_collection(&scope, None).await.unwrap();
+    let mut server = start(catalog.clone()).await;
+    let mut pending = Vec::new();
+    for (tag, retain) in [("missing", false), ("damaged", true)] {
+        let rtf = format!(r"{{\rtf1\ansi {tag} caf\'e9}}");
+        let header = v1::UploadTextHeader {
+            scope: Some(wire.clone()),
+            name: format!("{tag}.rtf"),
+            retain_original: retain,
+            ..Default::default()
+        };
+        let accepted = server
+            .client
+            .submit_text(upload_frames(&header, [rtf.as_bytes()]))
+            .await
+            .unwrap()
+            .into_inner();
+        let operation = accepted.operation_id.parse().unwrap();
+        catalog.register_upload(&scope, operation).await.unwrap();
+        catalog.prepare_upload(&scope, operation).await.unwrap();
+        let prefix = Key::parse(format!(
+            "default/collections/notes/sources/{}/{}/objects",
+            accepted.source_id, accepted.revision_id
+        ))
+        .unwrap();
+        let extraction = storage.list(Some(&prefix), None, 10).await.unwrap().objects;
+        assert_eq!(extraction.len(), 1);
+        if retain {
+            let path = directory.path().join(extraction[0].key.as_str());
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[0] = b'X';
+            std::fs::write(path, bytes).unwrap();
+        } else {
+            storage.delete(&extraction[0].key).await.unwrap();
+        }
+        let inputs = Key::parse(format!(
+            "default/collections/notes/operations/{operation}/inputs"
+        ))
+        .unwrap();
+        let input = storage.list(Some(&inputs), None, 10).await.unwrap().objects;
+        assert_eq!(input.len(), 1);
+        let original = directory.path().join(input[0].key.as_str());
+        if retain {
+            let mut wrong = rtf.as_bytes().to_vec();
+            let position = rtf.find(tag).unwrap();
+            wrong[position] = b'X';
+            std::fs::write(&original, wrong).unwrap();
+        }
+        pending.push((tag, retain, accepted, operation, original, rtf));
+    }
+    server.stop().await;
+    drop(catalog);
+
+    let catalog = service();
+    let mut server = start(catalog.clone()).await;
+    for (tag, retain, accepted, operation, original, rtf) in pending {
+        let request = v1::IngestionJobRequest {
+            scope: Some(wire.clone()),
+            operation_id: accepted.operation_id,
+        };
+        if retain {
+            assert!(matches!(catalog.index_upload(&scope, operation).await,
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData));
+            let job = server
+                .client
+                .get_ingestion_job(request.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(job.state(), v1::IngestionState::Registered);
+            assert!(job.text_revision.is_none());
+            std::fs::write(&original, rtf).unwrap();
+        }
+        catalog.index_upload(&scope, operation).await.unwrap();
+        catalog.index_upload(&scope, operation).await.unwrap();
+        let published = server
+            .client
+            .get_ingestion_job(request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(published.state(), v1::IngestionState::TextReady);
+        assert_eq!(published.revision_id, accepted.revision_id);
+        assert_eq!(original.exists(), retain);
+        let result = server
+            .client
+            .search_text(v1::SearchTextRequest {
+                scope: Some(wire.clone()),
+                query: tag.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.hits.len(), 1);
+        let hit = &result.hits[0];
+        assert_eq!(hit.excerpt, format!("{tag} café"));
+        assert_eq!(
+            hit.chunk.as_ref().unwrap().revision_id,
+            published.revision_id
+        );
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_lexical_search_keeps_rank_and_coalesces_touching_excerpts() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));

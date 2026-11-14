@@ -372,9 +372,28 @@ impl HostedCatalog {
         record: &Operation,
         registration: &Registration,
     ) -> Result<(NamedTempFile, Canonical)> {
+        let (file, content) = self.extract_source(scope, prefix, record).await?;
+        let extracted = if is_rtf(&record.upload.name) {
+            Some(
+                self.store_extraction(scope, record, registration, &file, content.bytes)
+                    .await?
+                    .0,
+            )
+        } else {
+            None
+        };
+        Ok((file, Canonical { content, extracted }))
+    }
+
+    async fn extract_source(
+        &self,
+        scope: &Scope,
+        prefix: &Key,
+        record: &Operation,
+    ) -> Result<(NamedTempFile, RevisionContent)> {
         let input = record.input_key(prefix)?;
         let staged = self
-            .download_source(scope, record.operation, &input, record.bytes)
+            .download_source(scope, record.operation, &input, record.bytes, None)
             .await?;
         let is_rtf = is_rtf(&record.upload.name);
         let expected = record.blake3.clone();
@@ -388,18 +407,24 @@ impl HostedCatalog {
             content.chunks,
         )?;
         content.retain_original = record.upload.retain_original;
-        let extracted = if is_rtf {
-            let attempt = Uuid::new_v4();
-            let key = self.extracted_key(scope, record, registration, attempt)?;
-            let reader = tokio::fs::File::from_std(file.reopen()?);
-            self.storage
-                .put_stream(&key, Box::pin(reader), content.bytes)
-                .await?;
-            Some(attempt)
-        } else {
-            None
-        };
-        Ok((file, Canonical { content, extracted }))
+        Ok((file, content))
+    }
+
+    async fn store_extraction(
+        &self,
+        scope: &Scope,
+        record: &Operation,
+        registration: &Registration,
+        file: &NamedTempFile,
+        bytes: u64,
+    ) -> Result<(Uuid, Key)> {
+        let attempt = Uuid::new_v4();
+        let key = self.extracted_key(scope, record, registration, attempt)?;
+        let reader = tokio::fs::File::from_std(file.reopen()?);
+        self.storage
+            .put_stream(&key, Box::pin(reader), bytes)
+            .await?;
+        Ok((attempt, key))
     }
 
     async fn prepare_for_index(
@@ -410,9 +435,25 @@ impl HostedCatalog {
         registration: &Registration,
         preparation: Option<&Preparation>,
     ) -> Result<Prepared> {
-        let (local, content, extracted) = match preparation {
+        let input = record.input_key(prefix)?;
+        let (file, content, text) = match preparation {
             Some(Preparation::Ready(canonical)) => {
-                (None, canonical.content.clone(), canonical.extracted)
+                let (file, text) = if canonical.extracted.is_some() {
+                    self.restore_prepared_rtf(scope, prefix, record, registration, canonical)
+                        .await?
+                } else {
+                    let file = self
+                        .download_source(
+                            scope,
+                            record.operation,
+                            &input,
+                            canonical.content.bytes,
+                            None,
+                        )
+                        .await?;
+                    (file, input.clone())
+                };
+                (file, canonical.content.clone(), text)
             }
             Some(Preparation::Invalid(message)) => return Err(Error::Invalid(message.clone())),
             None => {
@@ -420,22 +461,11 @@ impl HostedCatalog {
                 let (file, canonical) = self
                     .prepare_source(scope, prefix, record, registration)
                     .await?;
-                (Some(file), canonical.content, canonical.extracted)
-            }
-        };
-        let input = record.input_key(prefix)?;
-        let (text, original) = match extracted {
-            Some(attempt) => (
-                self.extracted_key(scope, record, registration, attempt)?,
-                record.upload.retain_original.then(|| input.to_string()),
-            ),
-            None => (input, None),
-        };
-        let file = match local {
-            Some(file) => file,
-            None => {
-                self.download_source(scope, record.operation, &text, content.bytes)
-                    .await?
+                let text = canonical.extracted.map_or_else(
+                    || Ok(input.clone()),
+                    |attempt| self.extracted_key(scope, record, registration, attempt),
+                )?;
+                (file, canonical.content, text)
             }
         };
         Ok(Prepared {
@@ -449,9 +479,60 @@ impl HostedCatalog {
             },
             objects: RevisionObjects {
                 text_key: text.to_string(),
-                original_key: original,
+                original_key: (is_rtf(&record.upload.name) && record.upload.retain_original)
+                    .then(|| input.to_string()),
             },
         })
+    }
+
+    async fn restore_prepared_rtf(
+        &self,
+        scope: &Scope,
+        prefix: &Key,
+        record: &Operation,
+        registration: &Registration,
+        canonical: &Canonical,
+    ) -> Result<(NamedTempFile, Key)> {
+        let (key, _) = self.prepared_rtf_text(scope, record, registration, canonical)?;
+        let expected = &canonical.content;
+        match self
+            .download_source(
+                scope,
+                record.operation,
+                &key,
+                expected.bytes,
+                Some(&expected.hash),
+            )
+            .await
+        {
+            Ok(file) => return Ok((file, key)),
+            Err(Error::NotFound(_)) => {}
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidData => {}
+            Err(error) => return Err(error),
+        }
+
+        let (file, rebuilt) = self.extract_source(scope, prefix, record).await?;
+        if rebuilt.hash != expected.hash
+            || rebuilt.bytes != expected.bytes
+            || rebuilt.chunks != expected.chunks
+            || rebuilt.chunker != expected.chunker
+            || rebuilt.extractor != expected.extractor
+            || rebuilt.encoding != expected.encoding
+        {
+            return Err(invalid_input());
+        }
+        let (_, replacement) = self
+            .store_extraction(scope, record, registration, &file, rebuilt.bytes)
+            .await?;
+        tracing::debug!(
+            event = "hosted_extraction_recovered",
+            tenant = %scope.tenant,
+            collection = %scope.collection,
+            operation = %record.operation,
+            bytes = rebuilt.bytes,
+            "rebuilt a saved RTF extraction from its accepted input"
+        );
+        Ok((file, replacement))
     }
 
     pub(super) fn prepared_rtf_text(
@@ -488,6 +569,7 @@ impl HostedCatalog {
         operation: Uuid,
         key: &Key,
         bytes: u64,
+        digest: Option<&str>,
     ) -> Result<NamedTempFile> {
         let download_started = Instant::now();
         let input = self.storage.get(key).await?;
@@ -496,8 +578,27 @@ impl HostedCatalog {
         }
         let staged = NamedTempFile::new()?;
         let mut output = tokio::fs::File::from_std(staged.reopen()?);
-        let copied =
-            tokio::io::copy(&mut input.reader.take(bytes.saturating_add(1)), &mut output).await?;
+        let mut reader = input.reader.take(bytes.saturating_add(1));
+        let copied = if let Some(digest) = digest {
+            let mut hash = blake3::Hasher::new();
+            let mut buffer = vec![0; 64 * 1024];
+            let mut copied = 0;
+            loop {
+                let read = reader.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                hash.update(&buffer[..read]);
+                output.write_all(&buffer[..read]).await?;
+                copied += read as u64;
+            }
+            if hash.finalize().to_hex().as_str() != digest {
+                return Err(invalid_input());
+            }
+            copied
+        } else {
+            tokio::io::copy(&mut reader, &mut output).await?
+        };
         output.flush().await?;
         drop(output);
         if copied != bytes {
