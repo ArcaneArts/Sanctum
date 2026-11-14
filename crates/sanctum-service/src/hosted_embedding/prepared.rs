@@ -143,13 +143,17 @@ impl HostedCatalog {
             .await
         {
             Ok(_) => Ok(outcomes),
-            Err(Error::Conflict(_)) => self
-                .read_prepared_embeddings(key, provider)
-                .await?
-                .ok_or_else(|| {
-                    Error::Busy("prepared embedding batch changed during publication".into())
-                }),
-            Err(error) => Err(error),
+            // A failed filesystem sync can leave readable, nondurable bytes.
+            Err(error @ (Error::Invalid(_) | Error::Io(_))) => Err(error),
+            Err(error) => match self.read_prepared_embeddings(key, provider).await? {
+                // A competing delivery can win the create with a different
+                // set of inputs. Publish the batch that is actually durable.
+                Some(saved) => Ok(saved),
+                None if matches!(error, Error::Conflict(_)) => Err(Error::Busy(
+                    "prepared embedding batch changed during publication".into(),
+                )),
+                None => Err(error),
+            },
         }
     }
 

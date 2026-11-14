@@ -462,11 +462,14 @@ results and leaves the remaining inputs pending. Upload and profile
 rebuild tasks conditionally create a prepared batch under
 `prepared-embeddings/<batch-id>.json` in the collection's object prefix
 before taking the writer lease. The batch ID stays the same across
-deliveries of the same step and profile. A retry on another instance
-uses the staged results when no committed receipt exists. Two requests
-can still make provider calls before either stages results. A committed
-step's SQLite receipt takes precedence if an envelope write fails.
-The worker removes staged results after publication. The scheduled
+deliveries of the same step and profile. After an ambiguous staging
+response or a create conflict, the worker reads and validates the saved
+batch before attempting publication in the same delivery. If storage
+never saved a batch, the write stays retryable. A retry on another
+instance uses any staged results while there is no committed receipt.
+Two requests can still make provider calls before either stages results.
+A committed step's SQLite receipt takes precedence if an envelope write
+fails. The worker removes staged results after publication. The scheduled
 upload sweep reclaims abandoned batches after 45 days. When workers
 complete the same input concurrently, the first
 committed valid vector is kept for that input and profile. A failure
