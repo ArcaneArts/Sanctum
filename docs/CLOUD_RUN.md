@@ -4,8 +4,11 @@ Sanctum uses one Linux image for two Cloud Run services. The API accepts
 gRPC calls over HTTP/2. The worker accepts private Cloud Tasks and Cloud
 Scheduler HTTP requests. Both use the same GCS bucket and prefix. Cloud Run
 injects PORT and the configured role binds to that port on all interfaces.
-The services handle SIGTERM and recover from the last durable checkpoint
-if shutdown interrupts work. [Cloud Run container contract](https://docs.cloud.google.com/run/docs/container-contract), [HTTP/2 configuration](https://docs.cloud.google.com/run/docs/configuring/http2).
+On SIGTERM the services stop accepting connections and allow up to seven
+seconds for in-flight requests, then up to one second for the Tokio runtime
+to stop. This leaves time within Cloud Run's ten-second termination window.
+Interrupted tasks may lose their HTTP response and resume on redelivery from
+the last durable checkpoint. [Cloud Run container contract](https://docs.cloud.google.com/run/docs/container-contract#shutdown), [HTTP/2 configuration](https://docs.cloud.google.com/run/docs/configuring/http2).
 
 ## Build and prepare Google Cloud resources
 

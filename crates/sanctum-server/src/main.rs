@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use sanctum_config::{Config, EmbeddingConfig};
 use sanctum_service::{
@@ -11,9 +11,22 @@ mod hosted;
 mod hosted_worker;
 mod standalone_worker;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut config = Config::from_env()?;
+fn main() -> anyhow::Result<()> {
+    let config = Config::from_env()?;
+    let cloud_run = config.cloud_run_role.is_some();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(serve(config));
+    if cloud_run {
+        // Dropping a Tokio runtime normally waits for blocking tasks to finish.
+        // The Cloud Run instance has one deadline for both HTTP and runtime shutdown.
+        runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+    result
+}
+
+async fn serve(mut config: Config) -> anyhow::Result<()> {
     let logs = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(

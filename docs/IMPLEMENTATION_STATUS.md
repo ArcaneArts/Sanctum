@@ -638,6 +638,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   and GCS verification are still open.
 - Delivered in [PR #32](https://github.com/ArcaneArts/Sanctum/pull/32).
 
+### Shutdown during an in-flight task
+
+- Cloud Run roles bound listener draining to seven seconds and allow one
+  additional second for runtime shutdown. This includes blocking work that
+  would otherwise keep the runtime alive. [Shutdown behavior](CLOUD_RUN.md).
+- A non-root Linux ARM64 container ran the worker with a real MinIO store
+  and a loopback proxy that stalled the input download during preparation.
+  The container exited 7.08 seconds after SIGTERM and the operation remained
+  registered. A fresh worker completed preparation and indexing, then safely
+  acknowledged a duplicate indexing delivery. gRPC returned the same revision
+  and verified the exact UTF-8 bytes. The idle API and worker exited in
+  0.08 and 0.11 seconds after the gRPC client disconnected.
+  [PR #142](https://github.com/ArcaneArts/Sanctum/pull/142).
+
 ## Hosted snapshot reuse
 
 - Hosted catalog reads and lexical retrieval resolve the current HEAD on
