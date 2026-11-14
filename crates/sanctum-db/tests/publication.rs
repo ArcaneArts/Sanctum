@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -496,6 +496,131 @@ async fn verify_reclamation_lease(storage: Arc<dyn Storage>, prefix: &str) {
     assert_eq!(remaining.objects[0].key, head);
     assert!(other.is_retired(&unit).await.unwrap());
     assert!(other.generation(&unit).await.unwrap().is_none());
+    delete_prefix(storage.as_ref(), &prefix).await;
+}
+
+#[tokio::test]
+async fn filesystem_reclamation_continues_after_a_failed_delete() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = sanctum_storage_fs::FileStorage::open(directory.path()).unwrap();
+    verify_reclamation_after_failed_delete(Arc::new(storage), "cleanup-failure").await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live MinIO bucket and S3 credentials"]
+async fn minio_reclamation_continues_after_a_failed_delete() {
+    let prefix = format!("cleanup-failure-{}", Uuid::new_v4());
+    verify_reclamation_after_failed_delete(minio_storage(), &prefix).await;
+}
+
+async fn verify_reclamation_after_failed_delete(storage: Arc<dyn Storage>, prefix: &str) {
+    let prefix = Key::parse(prefix).unwrap();
+    let unit = Unit::catalog(Some(&prefix), &"default".parse().unwrap()).unwrap();
+    let path = format!("{prefix}/default/catalog");
+    let snapshot = |number, file| {
+        Key::parse(format!(
+            "{path}/snapshots/{}/{file}",
+            Uuid::from_u128(number)
+        ))
+        .unwrap()
+    };
+    let first = snapshot(1, "root.db");
+    let later = snapshot(2, "pages.delta");
+    let first_marker = snapshot(1, "retired.json");
+    let store = Arc::new(PublicationStorage::new(storage.clone()));
+    let publication = Publication::new(store.clone(), Duration::from_secs(15)).unwrap();
+    let mut writer = publication.acquire(&unit).await.unwrap();
+    let (current, _) = writer
+        .apply(vec![command(Uuid::new_v4(), 7)], apply_value)
+        .await
+        .unwrap();
+    writer.release().await.unwrap();
+    for key in [&first, &later] {
+        storage
+            .put_control(
+                key,
+                b"orphan".as_slice().into(),
+                sanctum_storage::Condition::Create,
+            )
+            .await
+            .unwrap();
+    }
+    let grace = Duration::from_secs(300);
+    publication.reclaim(&unit, grace, None).await.unwrap();
+    store.age_retirement_markers.store(true, Ordering::Relaxed);
+    *store.reject_delete.lock().unwrap() = Some(first.clone());
+    let cleanup = publication.reclaim(&unit, grace, None).await;
+    assert!(
+        matches!(storage.head(&later).await, Err(Error::NotFound(_))),
+        "a failed deletion kept a different snapshot on disk"
+    );
+    let cleanup = cleanup.unwrap();
+    assert_eq!((cleanup.deleted, cleanup.failed_deletions), (1, 1));
+    assert!(storage.head(&first).await.is_ok());
+    assert!(storage.head(&first_marker).await.is_ok());
+    let scratch = tempfile::tempdir().unwrap();
+    let reader = publication
+        .read(&unit, scratch.path())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reader.generation, current);
+    assert_eq!(value(reader.path()), 7);
+
+    publication.fence_deletion(&unit).await.unwrap();
+    let head = Key::parse(format!("{path}/HEAD.json")).unwrap();
+    let mut record = storage.get(&head).await.unwrap();
+    let mut bytes = Vec::new();
+    record.reader.read_to_end(&mut bytes).await.unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    manifest["deleted_at_ms"] = serde_json::json!(
+        (SystemTime::now() - grace - Duration::from_secs(1))
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    storage
+        .put_control(
+            &head,
+            serde_json::to_vec(&manifest).unwrap().into(),
+            sanctum_storage::Condition::Match(record.object.version),
+        )
+        .await
+        .unwrap();
+    store.stall_cleanup_delete.store(true, Ordering::Relaxed);
+    let retired = publication
+        .reclaim_retired(&unit, grace, None)
+        .await
+        .unwrap();
+    assert_eq!((retired.deleted, retired.failed_deletions), (2, 1));
+    let unit_prefix = Key::parse(path).unwrap();
+    let remaining = storage.list(Some(&unit_prefix), None, 10).await.unwrap();
+    assert_eq!(
+        remaining
+            .objects
+            .iter()
+            .map(|object| &object.key)
+            .collect::<Vec<_>>(),
+        vec![&head, &first]
+    );
+    assert!(publication.is_retired(&unit).await.unwrap());
+    assert_eq!(value(reader.path()), 7);
+    let mut record = storage.get(&head).await.unwrap();
+    bytes.clear();
+    record.reader.read_to_end(&mut bytes).await.unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(manifest["generation"].is_null());
+
+    let restarted = Publication::new(storage.clone(), Duration::from_secs(15)).unwrap();
+    let retry = restarted.reclaim_retired(&unit, grace, None).await.unwrap();
+    assert_eq!(retry.deleted, 1);
+    let remaining = storage.list(Some(&unit_prefix), None, 10).await.unwrap();
+    assert_eq!(remaining.objects.len(), 1);
+    assert_eq!(remaining.objects[0].key, head);
+    assert!(matches!(
+        restarted.acquire(&unit).await,
+        Err(Error::NotFound(_))
+    ));
     delete_prefix(storage.as_ref(), &prefix).await;
 }
 
@@ -1122,6 +1247,9 @@ struct PublicationStorage {
     upload_reply: Mutex<Option<UploadReply>>,
     cleanup_delay_ms: AtomicU64,
     list_started: Mutex<Option<oneshot::Sender<()>>>,
+    age_retirement_markers: AtomicBool,
+    reject_delete: Mutex<Option<Key>>,
+    stall_cleanup_delete: AtomicBool,
 }
 
 impl PublicationStorage {
@@ -1138,6 +1266,9 @@ impl PublicationStorage {
             upload_reply: Default::default(),
             cleanup_delay_ms: Default::default(),
             list_started: Default::default(),
+            age_retirement_markers: Default::default(),
+            reject_delete: Default::default(),
+            stall_cleanup_delete: Default::default(),
         }
     }
 
@@ -1164,7 +1295,13 @@ impl Storage for PublicationStorage {
         &self,
         key: &sanctum_storage::Key,
     ) -> sanctum_core::Result<sanctum_storage::Object> {
-        self.inner.head(key).await
+        let mut object = self.inner.head(key).await?;
+        if self.age_retirement_markers.load(Ordering::Relaxed)
+            && key.as_str().ends_with("/retired.json")
+        {
+            object.modified_at = UNIX_EPOCH;
+        }
+        Ok(object)
     }
 
     async fn get(
@@ -1307,6 +1444,13 @@ impl Storage for PublicationStorage {
 
     async fn delete(&self, key: &sanctum_storage::Key) -> sanctum_core::Result<()> {
         self.delay_cleanup().await;
+        let rejected = self.reject_delete.lock().unwrap().as_ref() == Some(key);
+        if rejected {
+            if self.stall_cleanup_delete.load(Ordering::Relaxed) {
+                return std::future::pending().await;
+            }
+            return Err(Error::Busy("test rejected one snapshot delete".into()));
+        }
         self.inner.delete(key).await
     }
 }

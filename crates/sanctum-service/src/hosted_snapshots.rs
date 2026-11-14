@@ -31,6 +31,7 @@ struct UnitCursor {
 
 pub struct SnapshotSweep {
     pub deleted: usize,
+    pub failed_deletions: usize,
     pub units: usize,
     pub recovered_creations: usize,
     pub failed: usize,
@@ -106,6 +107,7 @@ impl HostedCatalog {
 
         let mut report = SnapshotSweep {
             deleted: 0,
+            failed_deletions: 0,
             units: 0,
             recovered_creations: 0,
             failed: 0,
@@ -151,6 +153,7 @@ impl HostedCatalog {
                 Ok(page) => {
                     report.units += 1;
                     report.deleted += page.deleted;
+                    report.failed_deletions += page.failed_deletions;
                     if page.next_cursor.is_some() {
                         if page.next_cursor == pending.next {
                             return Err(Error::Internal(
@@ -177,6 +180,7 @@ impl HostedCatalog {
             event = "cleanup_pass",
             kind = "hosted_snapshot",
             deleted_objects = report.deleted,
+            failed_deletions = report.failed_deletions,
             units = report.units,
             recovered_creations = report.recovered_creations,
             failed = report.failed,

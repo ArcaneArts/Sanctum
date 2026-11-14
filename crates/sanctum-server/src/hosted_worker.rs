@@ -336,6 +336,7 @@ async fn sweep_snapshots(State(service): State<HostedCatalog>) -> Response {
     match service.sweep_hosted_snapshots().await {
         Ok(report) => Json(serde_json::json!({
             "deleted": report.deleted,
+            "failed_deletions": report.failed_deletions,
             "units": report.units,
             "recovered_creations": report.recovered_creations,
             "failed": report.failed,

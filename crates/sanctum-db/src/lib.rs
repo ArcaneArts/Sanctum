@@ -26,6 +26,9 @@ const FORMAT: u32 = 1;
 const DELTA_FORMAT: u32 = 2;
 const MAX_BATCH: usize = 64;
 const RECEIPT_RETENTION: Duration = Duration::from_secs(45 * 24 * 3600);
+const CLEANUP_DELETE_TIMEOUT: Duration = Duration::from_secs(2);
+// Leave time for listing and checkpointing within a scheduled sweep item.
+const CLEANUP_PAGE_SIZE: u32 = 64;
 
 #[derive(Clone)]
 pub struct Unit {
@@ -198,6 +201,7 @@ pub struct Receipt {
 
 pub struct CleanupPage {
     pub deleted: usize,
+    pub failed_deletions: usize,
     pub next_cursor: Option<String>,
 }
 
@@ -851,9 +855,10 @@ impl Lease {
         let storage = self.publication.storage.clone();
         let prefix = Key::parse(format!("{}/snapshots", self.unit.prefix))?;
         let page = self
-            .while_renewing(storage.list(Some(&prefix), cursor, 128))
+            .while_renewing(storage.list(Some(&prefix), cursor, CLEANUP_PAGE_SIZE))
             .await?;
         let mut deleted = 0;
+        let mut failed_deletions = 0;
         let prefix = format!("{prefix}/");
         for object in page.objects {
             let Some((generation, file)) = object
@@ -870,8 +875,9 @@ impl Lease {
                 if SystemTime::now()
                     .duration_since(object.modified_at)
                     .is_ok_and(|age| age >= grace)
+                    && !self.delete_cleanup_object(&object.key).await?
                 {
-                    self.while_renewing(storage.delete(&object.key)).await?;
+                    failed_deletions += 1;
                 }
                 continue;
             }
@@ -892,8 +898,10 @@ impl Lease {
             }
             let marker = Key::parse(format!("{prefix}{generation}/retired.json"))?;
             if is_marker {
-                if !self.retired_data_exists(generation).await? {
-                    self.while_renewing(storage.delete(&marker)).await?;
+                if !self.retired_data_exists(generation).await?
+                    && !self.delete_cleanup_object(&marker).await?
+                {
+                    failed_deletions += 1;
                 }
                 continue;
             }
@@ -917,9 +925,13 @@ impl Lease {
                         .duration_since(observation.modified_at)
                         .is_ok_and(|age| age >= grace) =>
                 {
-                    self.while_renewing(storage.delete(&object.key)).await?;
-                    deleted += 1;
-                    self.while_renewing(storage.delete(&marker)).await?;
+                    if self.delete_cleanup_object(&object.key).await? {
+                        deleted += 1;
+                    } else {
+                        failed_deletions += 1;
+                    }
+                    // The marker may cover both a full snapshot and a delta.
+                    // Its own listing entry can remove it when neither remains.
                 }
                 Ok(_) => {}
                 Err(error) => return Err(error),
@@ -927,6 +939,7 @@ impl Lease {
         }
         Ok(CleanupPage {
             deleted,
+            failed_deletions,
             next_cursor: page.next_cursor,
         })
     }
@@ -958,32 +971,62 @@ impl Lease {
         if unix_ms()?.saturating_sub(deleted_at) < grace.as_millis() as u64 {
             return Ok(CleanupPage {
                 deleted: 0,
+                failed_deletions: 0,
                 next_cursor: None,
             });
         }
         let storage = self.publication.storage.clone();
         let prefix = self.unit.prefix.clone();
-        let page = self
-            .while_renewing(storage.list(Some(&prefix), cursor, 128))
-            .await?;
-        let manifest = self.unit.head()?;
-        let mut deleted = 0;
-        for object in page.objects {
-            if object.key == manifest {
-                continue;
-            }
-            self.while_renewing(storage.delete(&object.key)).await?;
-            deleted += 1;
-        }
-        if page.next_cursor.is_none() && self.head.generation.is_some() {
+        if self.head.generation.is_some() {
+            // The tombstone is past reader grace. Drop its obsolete locator
+            // before removing any of its objects, even if cleanup later stalls.
             let mut head = self.head.clone();
             head.generation = None;
             self.write(head).await?;
         }
+        let page = self
+            .while_renewing(storage.list(Some(&prefix), cursor, CLEANUP_PAGE_SIZE))
+            .await?;
+        let manifest = self.unit.head()?;
+        let mut deleted = 0;
+        let mut failed_deletions = 0;
+        for object in page.objects {
+            if object.key == manifest {
+                continue;
+            }
+            if self.delete_cleanup_object(&object.key).await? {
+                deleted += 1;
+            } else {
+                failed_deletions += 1;
+            }
+        }
         Ok(CleanupPage {
             deleted,
+            failed_deletions,
             next_cursor: page.next_cursor,
         })
+    }
+
+    async fn delete_cleanup_object(&mut self, key: &Key) -> Result<bool> {
+        let storage = self.publication.storage.clone();
+        // Keep lease and renewal errors separate from failures of the object
+        // delete itself. The latter can be retried on the next full scan.
+        let deletion = self
+            .while_renewing(async {
+                Ok(tokio::time::timeout(CLEANUP_DELETE_TIMEOUT, storage.delete(key)).await)
+            })
+            .await?;
+        match deletion {
+            Ok(Ok(()) | Err(Error::NotFound(_))) => Ok(true),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, %key, "snapshot cleanup will retry object deletion");
+                Ok(false)
+            }
+            Err(_) => {
+                tracing::warn!(%key, "snapshot cleanup object deletion timed out");
+                Ok(false)
+            }
+        }
     }
 
     fn ensure_live(&mut self) -> Result<()> {

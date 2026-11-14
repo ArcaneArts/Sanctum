@@ -931,7 +931,8 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - A standalone MinIO smoke verified that the scheduled HTTP endpoint
   marks the retired catalog, preserves the current generation and
   reader grace, and continues after restart.
-- Abandoned input and extraction candidates still need a cleanup path.
+- Abandoned inputs and extraction candidates use the separate upload sweep.
+  [Upload reclamation](STORAGE.md#abandoned-upload-candidates).
 - Delivered in [PR #39](https://github.com/ArcaneArts/Sanctum/pull/39).
 
 - The snapshot sweep renews the unit's writer lease during storage I/O.
@@ -940,6 +941,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   cleanup stopped after a renewal response was lost. A later sweep marked the
   orphan, preserved the published generation, and reclaimed the retired unit.
   [PR #143](https://github.com/ArcaneArts/Sanctum/pull/143).
+- Snapshot and retired collection reclamation report failed object
+  deletions and continue through the page. Filesystem and live MinIO
+  tests rejected a snapshot deletion, stalled a retired-unit deletion,
+  and verified retry on a fresh sweep. The current generation and
+  downloaded reader stayed usable. The hosted service regression
+  verifies that a persistent failure on one page leaves later pages
+  reachable and that a fresh scan can reclaim the remaining object.
+  [Scheduled reclamation behavior](STORAGE.md#scheduled-snapshot-reclamation).
 
 ## Hosted MCP ingress
 
