@@ -254,6 +254,14 @@ Merged in [PR #5](https://github.com/ArcaneArts/Sanctum/pull/5).
 - `ImportLocal` and `sanctum-cli import` walk files incrementally, apply include
   and exclude globs, and stream per-file results. Selected UTF-8 files enter
   the existing durable queue.
+- Single-file import uses the selected file's contents, so extensionless
+  or custom-suffix text can enter the durable queue through the desktop's
+  file picker, gRPC, or the CLI. Explicit globs still apply and directory
+  imports still use the default text filename filter. The gRPC regression
+  covers unchanged-input reuse, exact CRLF and Unicode retrieval, and
+  `invalid_source` for malformed UTF-8. A managed server run used a generated
+  Python gRPC client for a custom-suffix file and the CLI for an extensionless
+  file. MCP retrieved the exact text from both. [Local import contract](LOCAL_API.md#local-file-and-directory-imports).
 - A stable import root and relative path identify each source. Content digests
   skip unchanged input and reuse identical pending operations. Edits use the
   same source ID and replacement sequence as uploads.

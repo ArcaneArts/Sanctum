@@ -604,10 +604,13 @@ cargo run --locked -p sanctum-cli -- import notes ./library \
   --include '**/*.md' --exclude drafts
 ```
 
-Include and exclude globs match paths relative to the import root. Without
-include patterns, the importer selects RTF and common UTF-8 text, code, and
-configuration files. Directory traversal skips symbolic links, `.git`,
-`node_modules`, and the managed storage directory.
+Include and exclude globs match paths relative to the import root. For an
+explicit file, they match its basename. An explicitly selected file can have
+any extension or none. The ingestion job validates its contents as UTF-8 text
+or extracts RTF when the filename ends in `.rtf`. Without include patterns,
+directory imports select RTF and common UTF-8 text, code, and configuration
+files. Directory traversal skips symbolic links, `.git`, `node_modules`, and
+the managed storage directory.
 
 A file's import identity combines the canonical import root with its
 relative path. Repeating an import with the same chunk settings reuses a

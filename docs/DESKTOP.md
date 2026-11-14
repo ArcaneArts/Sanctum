@@ -25,9 +25,11 @@ frontend edits. [Tauri development file watching](https://v2.tauri.app/develop/)
    model revision, and dimensions. Use the digest shown by `ollama list` as
    the revision for a local model. Save and restart the server.
 3. In **Activity**, create and select a collection, then import a file or
-   folder. Track accepted jobs and current embedding coverage. Use **Next
-   page** and **Previous page** to browse retained jobs. **First page**
-   returns to the start of the current collection filter. Select
+   folder. **Import file** accepts UTF-8 text with any extension or none.
+   Files ending in `.rtf` use the RTF extractor. **Import folder** scans for
+   common text and RTF filenames. Track accepted jobs and current embedding
+   coverage. Use **Next page** and **Previous page** to browse retained jobs.
+   **First page** returns to the start of the current collection filter. Select
    **Refresh** under Storage to measure the selected collection or the
    entire local store. Larger scans show how many files or objects have
    been counted. The last completed total shows its measurement time.

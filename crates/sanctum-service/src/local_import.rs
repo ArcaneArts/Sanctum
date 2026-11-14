@@ -164,16 +164,16 @@ impl Selection {
     }
 
     pub(crate) fn file_selected(&self, relative: &Path) -> bool {
+        self.matches_filters(relative) && (!self.include.is_empty() || default_text(relative))
+    }
+
+    fn matches_filters(&self, relative: &Path) -> bool {
         !self.exclude.is_match(relative)
             && !relative
                 .ancestors()
                 .skip(1)
                 .any(|path| self.directory_excluded(path))
-            && if self.include.is_empty() {
-                default_text(relative)
-            } else {
-                self.include.is_match(relative)
-            }
+            && (self.include.is_empty() || self.include.is_match(relative))
     }
 }
 
@@ -299,7 +299,15 @@ impl Service {
                 walk.skip_current_dir();
                 continue;
             }
-            if !entry.file_type().is_file() || !select.file_selected(relative) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let selected = if directory {
+                select.file_selected(relative)
+            } else {
+                select.matches_filters(relative)
+            };
+            if !selected {
                 continue;
             }
             let id = match relative_id(relative) {
