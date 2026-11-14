@@ -2282,12 +2282,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   its receipt, and verified that the worker recovered committed text from
   the exact revision. It exercised registration and indexing expiry,
   embedding expiry with future backoff and no provider, missing hint
-  repair, external ID reuse, and replay after compaction.
-- Filesystem and live MinIO worker tests verified that repair enqueues a
-  different task name for an expired upload while leaving the SQLite
-  generation unchanged. A fresh worker accepted duplicate deliveries,
-  recorded the expired outcome, and removed the staged input. The test
-  used a loopback Cloud Tasks fixture.
+  repair after a recent envelope rewrite, external ID reuse, and replay
+  after compaction. Pending expiry uses the acceptance timestamp. Terminal
+  retention still uses the last update of the object returned with the
+  envelope.
+- Filesystem and live MinIO worker tests removed the hint after a recent
+  envelope rewrite. The HTTP upload sweep restored the hint and queued
+  an expiry-specific task without changing the SQLite generation. A
+  fresh worker accepted duplicate deliveries, recorded the expired
+  outcome, and removed the staged input. The test used a loopback Cloud
+  Tasks fixture.
 - A generated Python gRPC client with live MinIO verified the standalone
   restart path. A registered unpublished upload became failed and left
   zero input objects. A committed upload with a stale envelope recovered

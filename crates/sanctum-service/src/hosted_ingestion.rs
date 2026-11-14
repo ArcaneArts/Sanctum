@@ -8,7 +8,7 @@ use sanctum_db::{Command, Unit, collection_prefix, command_receipt};
 use sanctum_db_sqlite::hosted::{
     Registration, RevisionIntent, Target, register_revision, release_canceled_intent,
 };
-use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES, Version};
+use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES, Object, Version};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
@@ -740,7 +740,18 @@ impl HostedCatalog {
         operation: Uuid,
     ) -> Result<Option<(Envelope, Version)>> {
         let key = envelope_key(prefix)?;
-        let download = match self.storage.get(&key).await {
+        Ok(self
+            .read_envelope_object(&key, operation)
+            .await?
+            .map(|(envelope, object)| (envelope, object.version)))
+    }
+
+    async fn read_envelope_object(
+        &self,
+        key: &Key,
+        operation: Uuid,
+    ) -> Result<Option<(Envelope, Object)>> {
+        let download = match self.storage.get(key).await {
             Ok(download) => download,
             Err(Error::NotFound(_)) => return Ok(None),
             Err(error) => return Err(error),
@@ -769,7 +780,7 @@ impl HostedCatalog {
                 "ingestion envelope identity mismatch".into(),
             ));
         }
-        Ok(Some((envelope, download.object.version)))
+        Ok(Some((envelope, download.object)))
     }
 }
 
