@@ -699,6 +699,25 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   snapshot unchanged.
 - Delivered in [PR #30](https://github.com/ArcaneArts/Sanctum/pull/30).
 
+### Superseded uploads with unavailable input
+
+- After a staged-input read fails, preparation and indexing use the
+  existing fenced transaction to resolve the registered revision. A
+  superseded revision records `stale_revision`. Current uploads keep
+  their registration for retry, and a committed indexing or cancellation
+  receipt takes precedence.
+- The hosted gRPC regression removes one superseded RTF input and blocks
+  reads for another. After interrupting the failure checkpoint, a fresh
+  catalog replays the committed receipt without creating a new snapshot.
+  The current replacement remains retryable and publishes exact text
+  after reads recover. [Storage contract](STORAGE.md#hosted-lexical-publication).
+- Against live MinIO, the server's HTTP worker acknowledged missing inputs
+  for superseded jobs during preparation and indexing. The current job
+  returned HTTP 503 in both stages, and duplicate deliveries after restart
+  left the SQLite generation unchanged. Restoring the current input let
+  it publish, and a generated Python gRPC client fetched its exact UTF-8
+  range.
+
 ## Cloud Tasks dispatch and repair
 
 - Hosted upload acceptance records a repair hint before committing the

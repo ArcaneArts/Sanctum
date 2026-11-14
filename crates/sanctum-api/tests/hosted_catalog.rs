@@ -3121,20 +3121,21 @@ async fn hosted_indexing_publishes_searchable_text_and_fences_old_replacements()
         }),
         ..header
     };
-    let old = server
-        .client
-        .submit_text(upload_frames(
-            &replacement,
-            [br"{\rtf1\ansi obsolete}".as_slice()],
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    let old_operation = old.operation_id.parse().unwrap();
-    catalog
-        .register_upload(&scope, old_operation)
-        .await
-        .unwrap();
+    let mut stale_uploads = Vec::new();
+    for _ in 0..2 {
+        let old = server
+            .client
+            .submit_text(upload_frames(
+                &replacement,
+                [br"{\rtf1\ansi obsolete}".as_slice()],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let operation = old.operation_id.parse().unwrap();
+        catalog.register_upload(&scope, operation).await.unwrap();
+        stale_uploads.push(operation);
+    }
     let rtf = br"{\rtf1\ansi replacement caf\'e9\par next}";
     let new = server
         .client
@@ -3147,10 +3148,51 @@ async fn hosted_indexing_publishes_searchable_text_and_fences_old_replacements()
         .register_upload(&scope, new_operation)
         .await
         .unwrap();
-    let stale = catalog.index_upload(&scope, old_operation).await.unwrap();
+    let [missing, unreadable] = stale_uploads.try_into().unwrap();
+    let inputs = Key::parse(format!(
+        "default/collections/notes/operations/{missing}/inputs"
+    ))
+    .unwrap();
+    let staged = storage.list(Some(&inputs), None, 10).await.unwrap().objects;
+    assert_eq!(staged.len(), 1);
+    storage.delete(&staged[0].key).await.unwrap();
+    storage.interrupt.store(1, Ordering::Relaxed);
+    assert!(matches!(
+        catalog.prepare_upload(&scope, missing).await,
+        Err(Error::Busy(message)) if message == "interrupted before envelope write"
+    ));
+    let committed = executor.generation(&unit).await.unwrap();
+    let recovered = HostedCatalog::new(storage.clone(), None, 1024 * 1024).unwrap();
+    let stale = recovered.prepare_upload(&scope, missing).await.unwrap();
+    assert_eq!(executor.generation(&unit).await.unwrap(), committed);
     assert!(
         matches!(stale.state, sanctum_service::HostedJobState::Failed { code, .. } if code == "stale_revision")
     );
+    storage
+        .interrupt
+        .store(REJECT_ORIGINAL_READ, Ordering::Relaxed);
+    let stale = catalog.index_upload(&scope, unreadable).await.unwrap();
+    assert!(
+        matches!(stale.state, sanctum_service::HostedJobState::Failed { code, .. } if code == "stale_revision")
+    );
+    let before_retry = executor.generation(&unit).await.unwrap();
+    for result in [
+        catalog.prepare_upload(&scope, new_operation).await,
+        catalog.index_upload(&scope, new_operation).await,
+    ] {
+        assert!(
+            matches!(result, Err(Error::Busy(message)) if message == "test blocked original input reads")
+        );
+    }
+    assert_eq!(executor.generation(&unit).await.unwrap(), before_retry);
+    for operation in [missing, unreadable] {
+        let replay = recovered.index_upload(&scope, operation).await.unwrap();
+        assert!(
+            matches!(replay.state, sanctum_service::HostedJobState::Failed { code, .. } if code == "stale_revision")
+        );
+    }
+    assert_eq!(executor.generation(&unit).await.unwrap(), before_retry);
+    storage.interrupt.store(0, Ordering::Relaxed);
     catalog.index_upload(&scope, new_operation).await.unwrap();
     let hits = server
         .client

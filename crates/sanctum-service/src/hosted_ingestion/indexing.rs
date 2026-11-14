@@ -11,7 +11,7 @@ use sanctum_db_sqlite::hosted::{
     release_canceled_intent, release_intent,
 };
 use sanctum_extract::{RTF_EXTRACTOR, rtf_to_utf8};
-use sanctum_storage::{Key, Reader};
+use sanctum_storage::{Key, Reader, Version};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -62,6 +62,13 @@ struct Prepared {
     objects: RevisionObjects,
 }
 
+enum IndexInput {
+    Ready(Box<Prepared>),
+    Invalid(String),
+    Unavailable(Error),
+    Expired,
+}
+
 impl HostedCatalog {
     pub async fn prepare_upload(&self, scope: &Scope, operation: Uuid) -> Result<HostedJob> {
         let prefix = self.operation_prefix(scope, operation)?;
@@ -82,7 +89,9 @@ impl HostedCatalog {
         }
         let start = Instant::now();
         if unix_seconds()? >= record.expires_at() {
-            return self.index_upload(scope, operation).await;
+            return self
+                .finish_indexing(scope, &prefix, record, version, None)
+                .await;
         }
         let prepared = match self
             .prepare_source(scope, &prefix, &record, registration)
@@ -90,18 +99,11 @@ impl HostedCatalog {
         {
             Ok((_, canonical)) => Preparation::Ready(Box::new(canonical)),
             Err(Error::Invalid(message)) => Preparation::Invalid(message),
-            Err(Error::NotFound(_)) => {
-                if self
-                    .publication
-                    .stage_receipt(&unit, operation, INDEX_STAGE)
-                    .await?
-                    .is_some()
-                {
-                    return self.index_upload(scope, operation).await;
-                }
-                return Err(Error::Busy("registered input is unavailable".into()));
+            Err(error) => {
+                return self
+                    .finish_indexing(scope, &prefix, record, version, Some(error))
+                    .await;
             }
-            Err(error) => return Err(error),
         };
         let Stage::PendingIndexing { preparation, .. } = &mut record.stage else {
             unreachable!("stage was checked above");
@@ -126,7 +128,7 @@ impl HostedCatalog {
 
     pub async fn index_upload(&self, scope: &Scope, operation: Uuid) -> Result<HostedJob> {
         let prefix = self.operation_prefix(scope, operation)?;
-        let (mut record, version) = self.require_operation(&prefix, operation).await?;
+        let (record, version) = self.require_operation(&prefix, operation).await?;
         match &record.stage {
             Stage::PendingRegistration => {
                 return Err(Error::Busy("upload awaits registration".into()));
@@ -134,7 +136,20 @@ impl HostedCatalog {
             Stage::PendingIndexing { .. } => {}
             _ => return Ok(record.job()),
         }
+        self.finish_indexing(scope, &prefix, record, version, None)
+            .await
+    }
+
+    async fn finish_indexing(
+        &self,
+        scope: &Scope,
+        prefix: &Key,
+        mut record: Operation,
+        version: Version,
+        input_error: Option<Error>,
+    ) -> Result<HostedJob> {
         let start = Instant::now();
+        let operation = record.operation;
         let unit = Unit::collection(self.prefix.as_ref(), scope)?;
         let receipt = self
             .publication
@@ -142,23 +157,14 @@ impl HostedCatalog {
             .await?;
         let outcome = match receipt {
             Some(receipt) => decode(&receipt)?,
-            None => match self.index_registered(scope, &unit, &prefix, &record).await {
-                Ok(outcome) => outcome,
-                Err(Error::NotFound(_)) => {
-                    // A competing index delivery may have committed and removed its RTF input.
-                    let receipt = self
-                        .publication
-                        .stage_receipt(&unit, operation, INDEX_STAGE)
-                        .await?
-                        .ok_or_else(|| Error::Busy("registered input is unavailable".into()))?;
-                    decode(&receipt)?
-                }
-                Err(error) => return Err(error),
-            },
+            None => {
+                self.index_registered(scope, &unit, prefix, &record, input_error)
+                    .await?
+            }
         };
         if let Outcome::Canceled(registration) = outcome {
             let job = self
-                .checkpoint_canceled(scope, &prefix, record, version, registration)
+                .checkpoint_canceled(scope, prefix, record, version, registration)
                 .await?;
             job.log_stage(scope, "index", start);
             return Ok(job);
@@ -191,11 +197,11 @@ impl HostedCatalog {
             },
         };
         let record = self
-            .checkpoint(&prefix, record, version, |current| {
+            .checkpoint(prefix, record, version, |current| {
                 matches!(current.stage, Stage::PendingIndexing { .. })
             })
             .await?;
-        self.try_discard_completed_input(scope, &prefix, &record)
+        self.try_discard_completed_input(scope, prefix, &record)
             .await;
         let job = record.job();
         job.log_stage(scope, "index", start);
@@ -208,6 +214,7 @@ impl HostedCatalog {
         unit: &Unit,
         operation_prefix: &Key,
         record: &Operation,
+        input_error: Option<Error>,
     ) -> Result<Outcome> {
         let Stage::PendingIndexing {
             registration,
@@ -218,11 +225,10 @@ impl HostedCatalog {
         };
         let expires_at = record.expires_at();
         let replacement = record.upload.replacement.is_some();
-        let prepared = if unix_seconds()? >= expires_at {
-            Err(Outcome::Failed {
-                code: "expired".into(),
-                message: "indexing window expired".into(),
-            })
+        let input = if unix_seconds()? >= expires_at {
+            IndexInput::Expired
+        } else if let Some(error) = input_error {
+            IndexInput::Unavailable(error)
         } else {
             match self
                 .prepare_for_index(
@@ -234,12 +240,9 @@ impl HostedCatalog {
                 )
                 .await
             {
-                Ok(prepared) => Ok(prepared),
-                Err(Error::Invalid(message)) => Err(Outcome::Failed {
-                    code: "invalid_source".into(),
-                    message,
-                }),
-                Err(error) => return Err(error),
+                Ok(prepared) => IndexInput::Ready(Box::new(prepared)),
+                Err(Error::Invalid(message)) => IndexInput::Invalid(message),
+                Err(error) => IndexInput::Unavailable(error),
             }
         };
         let profile = self
@@ -264,10 +267,12 @@ impl HostedCatalog {
                 INDEX_STAGE,
                 vec![Command {
                     operation,
-                    payload: prepared,
+                    payload: input,
                 }],
-                move |tx, prepared, checkpoint| {
-                    let outcome = if unix_seconds()? >= expires_at {
+                move |tx, input, checkpoint| {
+                    let outcome = if matches!(input, IndexInput::Expired)
+                        || unix_seconds()? >= expires_at
+                    {
                         // A committed revision can outlive its publication receipt.
                         if let Some(content) =
                             published_revision(tx, registration.source, revision)?
@@ -286,12 +291,25 @@ impl HostedCatalog {
                             message: "a newer operation superseded this revision".into(),
                         }
                     } else {
-                        match prepared {
-                            Err(outcome) => {
+                        match input {
+                            IndexInput::Invalid(message) => {
                                 release_intent(tx, registration.source)?;
-                                outcome
+                                Outcome::Failed {
+                                    code: "invalid_source".into(),
+                                    message,
+                                }
                             }
-                            Ok(prepared) => {
+                            IndexInput::Unavailable(error) => {
+                                // Current uploads keep their intent and can retry the same input.
+                                return Err(match error {
+                                    Error::NotFound(_) => {
+                                        Error::Busy("registered input is unavailable".into())
+                                    }
+                                    error => error,
+                                });
+                            }
+                            IndexInput::Expired => unreachable!("expiry was checked above"),
+                            IndexInput::Ready(prepared) => {
                                 let revision_writer = publish_revision(
                                     tx,
                                     &prepared.revision,
