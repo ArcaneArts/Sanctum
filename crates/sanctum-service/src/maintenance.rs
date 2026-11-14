@@ -172,6 +172,19 @@ impl Service {
         Ok(())
     }
 
+    pub(crate) fn reclaim_staged_inputs(&self) -> Result<()> {
+        let _reader = self
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
+        for pending in self.queue.pending_cleanup()? {
+            if let Err(error) = self.reclaim_staged_input(&pending) {
+                tracing::warn!(%error, operation = %pending.operation, "could not record staged input cleanup");
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn sweep_retired(&self) {
         match self.local_scopes() {
             Ok(scopes) => {

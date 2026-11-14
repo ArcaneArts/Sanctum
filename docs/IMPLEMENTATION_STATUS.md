@@ -104,6 +104,13 @@ Merged in [PR #3](https://github.com/ArcaneArts/Sanctum/pull/3).
   cancellation API at a seeded extraction checkpoint, sent `SIGKILL`, then
   verified the same status over gRPC and MCP after restart.
   [PR #134](https://github.com/ArcaneArts/Sanctum/pull/134).
+- Canceled and permanently failed local jobs keep a cleanup record until
+  their unpublished input is reclaimed. Maintenance retries filesystem
+  failures and retains the job receipt while cleanup is pending. A local
+  gRPC regression exercised both terminal states, receipt retention, and
+  periodic maintenance with real files. A standalone gRPC process check
+  verified startup cleanup and cancellation replay after `SIGKILL`.
+  [PR #140](https://github.com/ArcaneArts/Sanctum/pull/140).
 
 ## Local source lifecycle
 

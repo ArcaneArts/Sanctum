@@ -317,6 +317,9 @@ impl Service {
         if let Err(error) = service.recover_local_collections() {
             tracing::warn!(%error, "could not recover all local collection creations");
         }
+        if let Err(error) = service.reclaim_staged_inputs() {
+            tracing::warn!(%error, "could not reclaim unpublished local inputs");
+        }
         if let Err(error) = service.reclaim_startup_orphans() {
             tracing::warn!(%error, "could not reclaim all unreferenced local uploads");
         }
