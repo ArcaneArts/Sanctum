@@ -1660,6 +1660,12 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - `pnpm check` passed on rerun. Two local polling tests timed out on the
   first run and passed on the rerun. All 11 publication tests passed with
   the live MinIO cases enabled.
+- The lease deadline also bounds acquisition, final HEAD publication,
+  and release writes. Fault tests withheld the storage response after
+  each write committed. Filesystem and MinIO publication tests then
+  recovered the original command receipt and generation without applying
+  the command again. The filesystem test also verified that a new writer
+  could acquire the unit after the timed-out acquisition and release.
 
 ## Profile rebuilds on collection access
 

@@ -50,14 +50,16 @@ snapshot, writer token, lease expiry, epoch, and a unique update ID.
 Writers acquire, renew, publish, and release through conditional writes
 on that same object. While downloading, preparing, or uploading a
 snapshot, the executor renews at half the lease interval. The same task
-serializes renewal and publication. If renewal misses the deadline or
-loses its conditional write, the attempt cannot publish. Once a worker
-stops, another worker can acquire the unit after the last renewal
-expires. Snapshot downloads verify length and BLAKE3. The executor
-applies at most 64 prepared
-commands and their receipts in one SQLite transaction. It uploads a
-consistent SQLite backup under a fresh key before attempting to publish
-it. Replaying a batch of previously applied commands returns the saved
+serializes renewal and publication. Acquisition waits at most one lease
+interval for its conditional write. An active writer stops using its
+lease if a HEAD write loses its condition or exceeds the lease deadline.
+A timed-out write can already have committed on the storage server.
+Reacquire ownership and replay the same operation ID to recover any
+committed receipt. Snapshot downloads verify length and BLAKE3. The
+executor applies at most 64 prepared commands and their receipts in one
+SQLite transaction. It uploads a consistent SQLite backup under a fresh
+key before attempting to publish it. Replaying a batch of previously
+applied commands returns the saved
 outcomes and current generation. Only the successful HEAD write makes a
 new database visible. [SQLite online backup](https://www.sqlite.org/backup.html).
 
