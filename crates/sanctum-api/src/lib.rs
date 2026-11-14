@@ -19,6 +19,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 mod database;
 mod metadata_filter;
+mod metadata_indexes;
 
 pub fn grpc(service: Service, shutdown: CancellationToken) -> SanctumServer<Grpc> {
     let runtime = v1::RuntimeInfo {
@@ -99,6 +100,7 @@ impl Sanctum for Grpc {
             "retrieval",
             "pending_literal_scan",
             "metadata",
+            "metadata_indexes",
             "changes",
             "database_sessions",
             "storage_usage",
@@ -215,6 +217,27 @@ impl Sanctum for Grpc {
                 .map_err(status)?,
         };
         Ok(Response::new(metadata_response(entries)))
+    }
+
+    async fn list_metadata_indexes(
+        &self,
+        request: Request<v1::DatabaseTarget>,
+    ) -> Reply<v1::ListMetadataIndexesResponse> {
+        metadata_indexes::list(&self.0, request.into_inner()).await
+    }
+
+    async fn create_metadata_index(
+        &self,
+        request: Request<v1::CreateMetadataIndexRequest>,
+    ) -> Reply<v1::Empty> {
+        metadata_indexes::create(&self.0, request.into_inner()).await
+    }
+
+    async fn drop_metadata_index(
+        &self,
+        request: Request<v1::DropMetadataIndexRequest>,
+    ) -> Reply<v1::Empty> {
+        metadata_indexes::drop(&self.0, request.into_inner()).await
     }
 
     async fn query_metadata(

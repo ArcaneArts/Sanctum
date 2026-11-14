@@ -3700,6 +3700,110 @@ async fn write_metadata(
 }
 
 #[tokio::test]
+async fn named_metadata_indexes_are_scoped_persisted_and_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    create(&mut running.client, "other").await;
+    let target = v1::DatabaseTarget {
+        tenant: "default".into(),
+        collection: Some("notes".into()),
+    };
+    let index = v1::MetadataIndex {
+        name: "integration-status".into(),
+        level: v1::MetadataLevel::Source.into(),
+        namespace: "integration's".into(),
+        key: "status".into(),
+    };
+    let request = v1::CreateMetadataIndexRequest {
+        target: Some(target.clone()),
+        index: Some(index.clone()),
+    };
+    running
+        .client
+        .create_metadata_index(request.clone())
+        .await
+        .unwrap();
+    running
+        .client
+        .create_metadata_index(request.clone())
+        .await
+        .unwrap();
+    let mut duplicate = request.clone();
+    duplicate.index.as_mut().unwrap().name = "same-field".into();
+    assert_eq!(
+        running
+            .client
+            .create_metadata_index(duplicate)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    let mut wrong_level = request;
+    wrong_level.index.as_mut().unwrap().level = v1::MetadataLevel::Collection.into();
+    assert_eq!(
+        running
+            .client
+            .create_metadata_index(wrong_level)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    running.stop().await;
+
+    let mut running = Running::start(&dir).await;
+    let client = &mut running.client;
+    assert_eq!(
+        client
+            .list_metadata_indexes(target.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .indexes,
+        std::slice::from_ref(&index)
+    );
+    let other = v1::DatabaseTarget {
+        tenant: "other".into(),
+        ..target.clone()
+    };
+    assert!(
+        client
+            .list_metadata_indexes(other.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .indexes
+            .is_empty()
+    );
+    let mut drop = v1::DropMetadataIndexRequest {
+        target: Some(other),
+        name: index.name,
+    };
+    assert_eq!(
+        client
+            .drop_metadata_index(drop.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    drop.target = Some(target.clone());
+    client.drop_metadata_index(drop).await.unwrap();
+    assert!(
+        client
+            .list_metadata_indexes(target)
+            .await
+            .unwrap()
+            .into_inner()
+            .indexes
+            .is_empty()
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn metadata_queries_filter_sort_and_count_without_coercing_json() {
     use v1::{
         MetadataLevel as Level, MetadataOperator as Operator, metadata_filter::Expression,

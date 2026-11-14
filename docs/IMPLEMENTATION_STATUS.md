@@ -1195,3 +1195,17 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - The release ArguAna run completed all 8,674 uploads with 16 workers
   and zero SQLite-busy retries. It reached full Ollama coverage for
   8,695 chunks in 464.96 s. [Method](CAPACITY.md#local-ingestion-with-16-workers).
+
+## Named metadata indexes
+
+- The gRPC API manages optional per-database indexes for top-level
+  existence and equality filters on collection, source, and chunk
+  metadata. Local collection writes share the collection lock, and
+  hosted changes use fenced publication.
+- Bundled SQLite's query plan used the partial index at all three
+  metadata levels. The test checked identical results before creation,
+  after creation, and after removal, including numeric equality.
+- `pnpm check` passed with local and hosted gRPC persistence tests. A
+  generated Python client created catalog and source indexes against
+  live MinIO, queried them after a server restart, and dropped them.
+  [Index API](LOCAL_API.md#named-metadata-indexes).

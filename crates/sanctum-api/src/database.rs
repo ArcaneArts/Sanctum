@@ -242,7 +242,7 @@ fn parse_session(session: Option<v1::DatabaseSessionRef>) -> Result<(DatabaseTar
     Ok((parse_target(target)?, generation))
 }
 
-fn parse_target(target: v1::DatabaseTarget) -> Result<DatabaseTarget> {
+pub(super) fn parse_target(target: v1::DatabaseTarget) -> Result<DatabaseTarget> {
     Ok(DatabaseTarget {
         tenant: target.tenant.parse()?,
         collection: target.collection.map(|value| value.parse()).transpose()?,

@@ -9,7 +9,7 @@ pub use db::metadata::{
     Change, ChunkMetadata, Edit as MetadataEdit, Entry as MetadataEntry,
     Mutation as MetadataMutation, RevisionTarget,
 };
-pub use db::{metadata_filter, metadata_query, snapshot as database_snapshot};
+pub use db::{metadata_filter, metadata_indexes, metadata_query, snapshot as database_snapshot};
 pub use hit_metadata::{HitMetadata, HitMetadataEntry};
 use sanctum_core::{
     ChunkSettings, Error, ExternalSource, Result, Scope, ScopeId, UsageMeasurement, UsageScope,
@@ -40,6 +40,7 @@ mod local_import;
 mod local_jobs;
 mod local_writes;
 mod maintenance;
+mod managed_metadata_indexes;
 mod pending_scan;
 mod source_inspection;
 mod url_import;

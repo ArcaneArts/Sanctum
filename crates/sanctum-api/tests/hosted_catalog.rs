@@ -3332,8 +3332,98 @@ async fn hosted_metadata_is_atomic_and_filters_published_revisions() {
         Code::InvalidArgument
     );
 
+    let catalog_db = v1::DatabaseTarget {
+        tenant: "default".into(),
+        collection: None,
+    };
+    let collection_db = v1::DatabaseTarget {
+        collection: Some("notes".into()),
+        ..catalog_db.clone()
+    };
+    let indexes = [
+        (
+            &catalog_db,
+            v1::MetadataIndex {
+                name: "catalog-status".into(),
+                level: MetadataLevel::Collection.into(),
+                namespace: "integration".into(),
+                key: "status".into(),
+            },
+        ),
+        (
+            &collection_db,
+            v1::MetadataIndex {
+                name: "chunk-status".into(),
+                level: MetadataLevel::Chunk.into(),
+                namespace: "integration".into(),
+                key: "status".into(),
+            },
+        ),
+    ];
+    for (target, index) in &indexes {
+        server
+            .client
+            .create_metadata_index(v1::CreateMetadataIndexRequest {
+                target: Some((*target).clone()),
+                index: Some(index.clone()),
+            })
+            .await
+            .unwrap();
+    }
+
     server.stop().await;
     let mut server = start(HostedCatalog::new(storage, None, 1024).unwrap()).await;
+    for (target, index) in indexes {
+        assert_eq!(
+            server
+                .client
+                .list_metadata_indexes(target.clone())
+                .await
+                .unwrap()
+                .into_inner()
+                .indexes,
+            std::slice::from_ref(&index),
+        );
+        let page = server
+            .client
+            .query_metadata(v1::QueryMetadataRequest {
+                tenant: target.tenant.clone(),
+                collection: target.collection.clone(),
+                level: index.level,
+                filter: Some(v1::MetadataFilter {
+                    expression: Some(Expression::Test(v1::MetadataPredicate {
+                        level: index.level,
+                        namespace: index.namespace.clone(),
+                        key: index.key.clone(),
+                        operator: MetadataOperator::Exists.into(),
+                        ..Default::default()
+                    })),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.matches.len(), 1);
+        server
+            .client
+            .drop_metadata_index(v1::DropMetadataIndexRequest {
+                target: Some(target.clone()),
+                name: index.name,
+            })
+            .await
+            .unwrap();
+        assert!(
+            server
+                .client
+                .list_metadata_indexes(target.clone())
+                .await
+                .unwrap()
+                .into_inner()
+                .indexes
+                .is_empty()
+        );
+    }
     let entries = server
         .client
         .get_metadata(source.clone())
