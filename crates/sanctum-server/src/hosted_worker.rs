@@ -240,6 +240,7 @@ async fn discover_profile(State(service): State<HostedCatalog>) -> Response {
     match service.discover_profile_rebuild().await {
         Ok(page) => Json(serde_json::json!({
             "discovered": page.discovered,
+            "deferred": page.deferred,
             "complete": page.complete,
         }))
         .into_response(),

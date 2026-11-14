@@ -740,6 +740,23 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 
 - Delivered in [PR #37](https://github.com/ArcaneArts/Sanctum/pull/37).
 
+### Profile discovery checkpoint recovery
+
+- Discovery conditionally checkpoints the listing cursor, unvisited manifests,
+  and deferred collections. Each bounded batch continues new discovery alongside
+  retries, so a failing collection cannot strand later pages.
+  [Scheduler behavior](CLOUD_RUN.md#schedule-dispatch-repair).
+- The hosted integration test holds one collection's scheduling write in error
+  and verifies a fresh instance schedules a collection from the next listing
+  page and later dispatches all three rebuilds. A separate regression test
+  resumes a checkpoint from an older worker with the original rebuild ID.
+- With live MinIO and Ollama, a local HTTP proxy injected HTTP 503 for one
+  rebuild record after a profile change. Two other collections rebuilt while
+  the failed collection continued serving lexical results. After a server
+  restart and removal of the injected failure, the failed collection rebuilt
+  and a generated Python gRPC client retrieved exact excerpts through semantic
+  search on all three collections.
+
 ## Hosted source deletion and reclamation
 
 - Hosted deletion uses a fenced SQLite publication with an expected
