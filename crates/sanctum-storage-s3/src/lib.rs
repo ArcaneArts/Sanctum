@@ -3,7 +3,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use futures::{TryStreamExt, stream};
 use object_store::{
-    ClientOptions, ObjectMeta, ObjectStore, PutMode, PutResult, UpdateVersion,
+    ClientOptions, MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutResult, UpdateVersion,
     aws::{AmazonS3, AmazonS3Builder, S3ConditionalPut},
     list::{PaginatedListOptions, PaginatedListStore},
     path::Path,
@@ -13,13 +13,16 @@ use sanctum_storage::{
     Condition, Download, Key, ListPage, MAX_CONTROL_BYTES, Object, Reader, Storage, Version,
     list_limit, range_len,
 };
-use tokio::io::AsyncReadExt;
+use tokio::{io::AsyncReadExt, runtime::Handle, task::JoinHandle, time::timeout};
 use tokio_util::io::StreamReader;
 
 mod download;
 #[cfg(test)]
 mod download_tests;
+#[cfg(test)]
+mod upload_tests;
 
+const MULTIPART_ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 const PART_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct S3Config {
@@ -132,8 +135,16 @@ impl Storage for S3Storage {
                 .map(version)
                 .map_err(storage_error);
         }
-        let mut upload = self.0.put_multipart(&path).await.map_err(storage_error)?;
+        let upload = self.0.put_multipart(&path).await.map_err(storage_error)?;
+        let mut pending = PendingUpload {
+            upload: Some(upload),
+            runtime: Handle::current(),
+        };
         let result = async {
+            let upload = pending
+                .upload
+                .as_mut()
+                .expect("multipart upload is pending");
             let mut remaining = length;
             while remaining > 0 {
                 let bytes = remaining.min(PART_BYTES as u64) as usize;
@@ -149,10 +160,10 @@ impl Storage for S3Storage {
             upload.complete().await.map(version).map_err(storage_error)
         }
         .await;
-        if result.is_err()
-            && let Err(error) = upload.abort().await
-        {
-            tracing::warn!(%error, "could not abort multipart upload");
+        if result.is_ok() {
+            pending.upload = None;
+        } else if let Some(abort) = pending.start_abort() {
+            let _ = abort.await;
         }
         result
     }
@@ -215,6 +226,31 @@ impl Storage for S3Storage {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(error) => Err(storage_error(error)),
         }
+    }
+}
+
+struct PendingUpload {
+    upload: Option<Box<dyn MultipartUpload>>,
+    runtime: Handle,
+}
+
+impl PendingUpload {
+    fn start_abort(&mut self) -> Option<JoinHandle<()>> {
+        let mut upload = self.upload.take()?;
+        Some(self.runtime.spawn(async move {
+            match timeout(MULTIPART_ABORT_TIMEOUT, upload.abort()).await {
+                Ok(Ok(()) | Err(object_store::Error::NotFound { .. })) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "could not abort multipart upload"),
+                Err(_) => tracing::warn!("multipart upload abort timed out"),
+            }
+        }))
+    }
+}
+
+impl Drop for PendingUpload {
+    fn drop(&mut self) {
+        // Dropping the JoinHandle lets the bounded request finish on the runtime.
+        drop(self.start_abort());
     }
 }
 

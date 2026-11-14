@@ -2344,6 +2344,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   and Scheduler delivery remain open.
   [Snapshot maintenance](STORAGE.md#scheduled-snapshot-reclamation).
 
+## S3 multipart upload cancellation
+
+- The S3 adapter gives cleanup five seconds to abort the original multipart
+  upload ID when a transfer fails or its caller drops it. Completed transfers
+  keep their returned object version. If the process exits before cleanup,
+  incomplete parts remain subject to the bucket lifecycle rule.
+- The loopback S3 fixture acknowledged the first part, stalled the second
+  input read, and observed the abort for the original upload ID. Against
+  live MinIO, a separate probe listed the pending upload before cancellation
+  and confirmed that neither the upload ID nor a committed object remained.
+  The shared MinIO storage contract also passed.
+  [S3 storage behavior](STORAGE.md).
+
 ## S3 validation after an interrupted download
 
 - The S3 adapter validates every resumed response against the requested
