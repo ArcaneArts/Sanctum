@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use sanctum_core::{Error, Result, Scope};
 use sanctum_db::Unit;
-use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES, Object};
+use sanctum_storage::{Condition, Download, Key, MAX_CONTROL_BYTES, Object};
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncReadExt, sync::Notify, task::JoinSet, time::timeout};
 use uuid::Uuid;
@@ -20,8 +20,30 @@ const API_DISPATCH_TIMEOUT: Duration = Duration::from_secs(15);
 pub const HOSTED_STAGE_TIMEOUT: Duration = Duration::from_secs(570);
 
 #[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Cursor {
     next: Option<String>,
+}
+
+async fn read_cursor(download: Download, shard: u8) -> Result<(Cursor, Condition)> {
+    let length = download.object.length;
+    if length > MAX_CONTROL_BYTES as u64 {
+        return Err(Error::Internal("dispatch cursor exceeds size limit".into()));
+    }
+    let mut body = Vec::new();
+    download
+        .reader
+        .take(length + 1)
+        .read_to_end(&mut body)
+        .await?;
+    if body.len() as u64 != length {
+        return Err(Error::Busy("dispatch cursor length mismatch".into()));
+    }
+    let cursor = serde_json::from_slice(&body).unwrap_or_else(|error| {
+        tracing::warn!(shard, %error, "restarting dispatch scan after reading an invalid cursor");
+        Cursor::default()
+    });
+    Ok((cursor, Condition::Match(download.object.version)))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,20 +197,7 @@ impl HostedCatalog {
         let partition = self.dispatch_partition(shard)?;
         let key = Key::parse(format!("{partition}/cursor.json"))?;
         let (cursor, condition) = match self.storage.get(&key).await {
-            Ok(download) => {
-                if download.object.length > MAX_CONTROL_BYTES as u64 {
-                    return Err(Error::Internal("dispatch cursor exceeds size limit".into()));
-                }
-                let mut body = Vec::new();
-                download
-                    .reader
-                    .take(MAX_CONTROL_BYTES as u64 + 1)
-                    .read_to_end(&mut body)
-                    .await?;
-                let cursor = serde_json::from_slice(&body)
-                    .map_err(|error| Error::Internal(Box::new(error)))?;
-                (cursor, Condition::Match(download.object.version))
-            }
+            Ok(download) => read_cursor(download, shard).await?,
             Err(Error::NotFound(_)) => (Cursor::default(), Condition::Create),
             Err(error) => return Err(error),
         };
@@ -499,6 +508,33 @@ mod tests {
             }
             self.delivered.lock().unwrap().push(task.operation);
             Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_cursor_requires_a_complete_body_before_using_its_token() {
+        let body = br#"{"next":"opaque token"}"#;
+        let download = |length| Download {
+            object: Object {
+                key: Key::parse("_dispatch/00/cursor.json").unwrap(),
+                length,
+                version: sanctum_storage::Version {
+                    etag: Some("version".into()),
+                    generation: None,
+                },
+                modified_at: std::time::UNIX_EPOCH,
+            },
+            reader: Box::pin(&body[..]),
+        };
+        let length = body.len() as u64;
+        let (cursor, condition) = read_cursor(download(length), 0).await.unwrap();
+        assert_eq!(cursor.next.as_deref(), Some("opaque token"));
+        assert!(
+            matches!(condition, Condition::Match(version) if version.etag.as_deref() == Some("version"))
+        );
+        for incorrect_length in [length - 1, length + 1] {
+            assert!(matches!(read_cursor(download(incorrect_length), 0).await,
+                Err(Error::Busy(message)) if message.contains("length mismatch")));
         }
     }
 
