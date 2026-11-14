@@ -97,12 +97,23 @@ async fn apply(service: HostedCatalog, task: RegisterUpload, stage: TaskStage) -
 
 async fn reconcile(State(service): State<HostedCatalog>, Path(shard): Path<u8>) -> Response {
     match service.reconcile_shard(shard).await {
-        Ok(page) => Json(serde_json::json!({
-            "dispatched": page.dispatched,
-            "failed": page.failed,
-            "more": page.next_cursor.is_some(),
-        }))
-        .into_response(),
+        Ok(page) => {
+            let more = page.next_cursor.is_some();
+            tracing::debug!(
+                event = "dispatch_reconcile",
+                shard,
+                dispatched = page.dispatched,
+                failed = page.failed,
+                more,
+                "completed hosted dispatch scan"
+            );
+            Json(serde_json::json!({
+                "dispatched": page.dispatched,
+                "failed": page.failed,
+                "more": more,
+            }))
+            .into_response()
+        }
         Err(Error::Invalid(_)) => StatusCode::BAD_REQUEST.into_response(),
         Err(error) => {
             tracing::warn!(%error, shard, "could not advance hosted dispatch scan");

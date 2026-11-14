@@ -12,6 +12,10 @@ use tokio::sync::OnceCell;
 const ENDPOINT: &str = "https://cloudtasks.googleapis.com/v2/";
 const SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
+#[cfg(test)]
+#[path = "dispatch_recovery_test.rs"]
+mod dispatch_recovery_test;
+
 pub(crate) struct CloudTasks {
     config: CloudTasksConfig,
     worker: Url,

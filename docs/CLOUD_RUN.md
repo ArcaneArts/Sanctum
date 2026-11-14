@@ -205,9 +205,10 @@ and MinIO configuration. Live Cloud Run, GCS, and IAM verification requires
 an authorized deployment environment.
 
 Cloud Run roles write JSON logs to stderr. Use
-`RUST_LOG=info,sanctum_service=debug,sanctum_db=debug` on the API and
-worker to collect per-operation timings and transfer sizes during a
-measurement window. [Server diagnostics](LOCAL_API.md#server-diagnostics).
+`RUST_LOG=info,sanctum_server=debug,sanctum_service=debug,sanctum_db=debug`
+on the API and worker to collect stage timings, dispatch outcomes, and
+transfer sizes during a measurement window.
+[Server diagnostics](LOCAL_API.md#server-diagnostics).
 
 ### Repeatable ingestion and range check
 
@@ -223,8 +224,8 @@ PYTHONPATH="$generated" python scripts/check-hosted-deployment.py \
 The check uses a new test tenant, streams a deterministic UTF-8 fixture
 through gRPC, waits for lexical publication, and compares the exact bytes
 returned by gRPC and MCP. It checks that both routes reject unauthenticated
-calls and writes a JSON report with the operation ID, byte count, and
-search timings. Use `--mib 200 --wait-seconds 600` to exercise the large
+calls and writes a JSON report with the operation ID, dispatch shard, byte
+count, and search timings. Use `--mib 200 --wait-seconds 600` to exercise the large
 upload. The report's first and repeated search times are client
 measurements. Correlate them with snapshot events and Cloud Run instance
 IDs before interpreting them as cold and warm timings.
@@ -262,10 +263,7 @@ arrives out of order.
    necessary and run the check with the same operation and size using
    `--phase verify --wait-seconds 600`. Record Cloud Tasks and worker
    request logs for registration, preparation, and indexing, then check the operation
-   and source references in the report. Confirm Scheduler separately by
-   using `gcloud scheduler jobs run` on a dispatch job and observing
-   the authenticated repair request and response in the worker logs.
-   [Cloud Scheduler commands](https://docs.cloud.google.com/sdk/gcloud/reference/scheduler/jobs).
+   and source references in the report.
 4. POST the original registration, preparation, and indexing task bodies again using
    the authorized worker identity. Expect HTTP 204 and verify the same
    revision and database generation are returned by another
@@ -273,3 +271,73 @@ arrives out of order.
    from both runs. Cloud Run can choose a different instance for each
    request. The isolated test data stays in its deployment prefix for
    inspection.
+
+### Repair an upload that never reached the queue
+
+Run this exercise on a dedicated deployment with an empty queue and a fresh
+storage prefix. Pause the real test queue and its scheduled dispatch jobs.
+A paused queue still accepts tasks. Use an unused queue name in the test
+API revision to make the task-creation request fail. The worker and Scheduler
+keep the real queue configuration.
+[Cloud Tasks queue behavior](https://docs.cloud.google.com/sdk/gcloud/reference/tasks/queues/pause).
+
+1. Save the exact environment configuration used for the test API revision
+   as `$config_dir/api.json`. If the deployment uses the unmodified
+   example, recreate it with `write_config api` from the deploy section.
+   Keep the diagnostics setting above on the worker. Create a separate
+   file for the temporary API revision:
+
+   ```sh
+   absent_queue="sanctum-absent-$(uuidgen | tr '[:upper:]' '[:lower:]')"
+   jq --arg queue "projects/$PROJECT/locations/$REGION/queues/$absent_queue" '
+     .SANCTUM_CONFIG_JSON |= (fromjson | .cloud_tasks.queue = $queue | tojson)
+   ' "$config_dir/api.json" > "$config_dir/api-repair-test.json"
+   gcloud run services update sanctum-api --project "$PROJECT" --region "$REGION" \
+     --env-vars-file "$config_dir/api-repair-test.json"
+   ```
+
+2. Submit with `--phase submit` and save the JSON report.
+
+   ```sh
+   operation="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+   report="$config_dir/accepted.json"
+   PYTHONPATH="$generated" python scripts/check-hosted-deployment.py \
+     --api-url "$API_URL" --operation "$operation" --phase submit > "$report"
+   gcloud tasks list --queue "$QUEUE" --project "$PROJECT" --location "$REGION"
+   ```
+
+   Confirm `INGESTION_STATE_ACCEPTED`, the API warning
+   `hosted operation remains pending dispatch` for that operation, and an
+   empty real test queue. Restore the API configuration before invoking
+   Scheduler.
+
+   ```sh
+   gcloud run services update sanctum-api --project "$PROJECT" --region "$REGION" \
+     --env-vars-file "$config_dir/api.json"
+   ```
+
+3. Resume only the scheduled dispatch job whose number matches the
+   report's `dispatch_shard`. Keep the real queue paused so the repaired
+   task stays visible. Use its next scheduled invocation or trigger one
+   on demand.
+
+   ```sh
+   shard="$(jq -r '.dispatch_shard' "$report")"
+   gcloud scheduler jobs resume "sanctum-dispatch-$shard" \
+     --project "$PROJECT" --location "$REGION"
+   gcloud scheduler jobs run "sanctum-dispatch-$shard" \
+     --project "$PROJECT" --location "$REGION"
+   ```
+
+   Record the successful Scheduler execution, the worker's
+   `dispatch_reconcile` event with a positive dispatch count, and
+   `upload_task_dispatched` for the operation at stage `Register`.
+   List the queue again after the invocation completes and confirm the
+   registration task appears. During this phase, invoke the repair endpoint only through
+   Scheduler. [Scheduler execution logs](https://docs.cloud.google.com/scheduler/docs/troubleshooting),
+   [Cloud Tasks inspection](https://docs.cloud.google.com/sdk/gcloud/reference/tasks/list).
+
+4. Resume the queue and remaining scheduled jobs. Run `--phase verify`
+   with the original operation and fixture size. Record text readiness,
+   revision, and matching gRPC and MCP bytes. Restore the test deployment's
+   normal queue and scheduler state if any exercise step fails.

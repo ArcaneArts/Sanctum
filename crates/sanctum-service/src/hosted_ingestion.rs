@@ -431,6 +431,16 @@ impl HostedCatalog {
                 not_before,
             })
             .await?;
+        tracing::debug!(
+            event = "upload_task_dispatched",
+            tenant = %scope.tenant,
+            collection = %scope.collection,
+            %operation,
+            ?stage,
+            window,
+            retry = record.dispatch_retry,
+            "handed off hosted upload task"
+        );
         record.dispatched_at = Some(not_before.unwrap_or(now).max(now));
         record.dispatched_embedding_profile = profile.map(str::to_owned);
         record.dispatched_preparation = preparing;
