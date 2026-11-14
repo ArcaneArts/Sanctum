@@ -251,10 +251,14 @@ acceptance. The same verification applies when uploading canonical RTF
 text before a preparation checkpoint. The sibling `operation.json` is
 created conditionally or replaces an abandoned-input fence by version.
 An accepted envelope records the input's length and BLAKE3 digest,
-ingestion options, and pending registration stage. A failed conditional
-write with an uncertain outcome preserves its input for recovery. Concurrent
-requests with the same ID adopt the winning operation and discard their
-losing input when possible.
+ingestion options, and pending registration stage. After an ambiguous
+envelope write, the server reads back the accepted operation and checks
+its upload options, length, and digest against the submitted request. A
+match can return the saved operation and attempt dispatch in the same
+RPC. If there is no accepted envelope, the request stays retryable and
+the staged input remains available to admission-fenced cleanup.
+Concurrent requests with the same ID adopt the winning operation and
+discard their losing input when possible.
 
 The `ACCEPTED` status can be queried after restart through `GetIngestionJob`.
 A replacement targeting an external reference has an empty `source_id` until

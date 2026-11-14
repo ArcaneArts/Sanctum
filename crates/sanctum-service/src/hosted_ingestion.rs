@@ -879,14 +879,20 @@ impl HostedUpload {
             .await?;
         let job = match store.put_control(&key, body.into(), condition).await {
             Ok(_) => Ok(candidate.job()),
-            Err(Error::Conflict(_)) => {
-                let (saved, _) = self
-                    .service
-                    .read_operation(&prefix, self.operation)
-                    .await?
-                    .ok_or_else(|| {
-                        Error::Busy("ingestion envelope changed during acceptance".into())
-                    })?;
+            // A filesystem sync error can leave readable, nondurable bytes.
+            Err(error @ (Error::Invalid(_) | Error::Io(_))) => Err(error),
+            Err(error) => {
+                let Some((saved, _)) = self.service.read_operation(&prefix, self.operation).await?
+                else {
+                    // Without an accepted envelope, the input remains for
+                    // admission-fenced cleanup and the request can be retried.
+                    return Err(match error {
+                        Error::Conflict(_) => {
+                            Error::Busy("ingestion envelope changed during acceptance".into())
+                        }
+                        error => error,
+                    });
+                };
                 if saved.attempt != candidate.attempt {
                     if let Err(error) = store.delete(&input).await {
                         tracing::warn!(%error, operation = %self.operation, "could not delete losing upload attempt");
@@ -901,8 +907,6 @@ impl HostedUpload {
                 }
                 saved.replay(&candidate)
             }
-            // The conditional write may have committed. Preserve its input for replay.
-            Err(error) => Err(error),
         }?;
         self.service.try_dispatch(&self.scope, self.operation).await;
         Ok(job)
