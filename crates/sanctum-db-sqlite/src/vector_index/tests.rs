@@ -32,7 +32,7 @@ fn vector(seed: u64, dimensions: usize) -> Arc<[f32]> {
     values.into()
 }
 
-fn fixture(path: &Path, rows: u32, dimensions: usize) {
+fn fixture(path: &Path, rows: u32, dimensions: usize, analyze: bool) {
     let mut connection = Connection::open(path).unwrap();
     let tx = connection.transaction().unwrap();
     initialize_collection(&tx).unwrap();
@@ -90,7 +90,9 @@ fn fixture(path: &Path, rows: u32, dimensions: usize) {
         }
     }
     tx.commit().unwrap();
-    connection.execute_batch("ANALYZE").unwrap();
+    if analyze {
+        connection.execute_batch("ANALYZE").unwrap();
+    }
 }
 
 struct SqliteVec(Connection);
@@ -197,6 +199,89 @@ fn compare(path: &Path, dimensions: usize, samples: usize) {
 }
 
 #[test]
+#[ignore = "opt-in comparison with a large SQLite fixture"]
+fn compare_vector_scan_order() {
+    let rows: u32 = std::env::var("SANCTUM_VECTOR_BENCH_ROWS")
+        .map_or(Ok(262_144), |value| value.parse())
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    assert!(rows >= 1024);
+    let analyze = std::env::var_os("SANCTUM_VECTOR_BENCH_SKIP_ANALYZE").is_none();
+    let predicate = filter();
+    let mmap = std::env::var("SANCTUM_VECTOR_BENCH_MMAP_BYTES")
+        .map_or(Ok(0i64), |value| value.parse())
+        .unwrap();
+    for dimensions in [DIMENSIONS, 1536] {
+        let path = directory.path().join("vector.db");
+        fixture(&path, rows, dimensions, analyze);
+        let db = CollectionDb::open_read_only(&path).unwrap();
+        db.0.pragma_update(None, "mmap_size", mmap).unwrap();
+        let mapped: i64 =
+            db.0.pragma_query_value(None, "mmap_size", |row| row.get(0))
+                .unwrap();
+        println!(
+            "rows={rows}, dimensions={dimensions}, analyzed={analyze}, mmap={mapped}, db_bytes={}",
+            path.metadata().unwrap().len()
+        );
+        for (label, filter) in [("unfiltered", None), ("filtered", Some(&predicate))] {
+            let mut samples = [Vec::new(), Vec::new()];
+            // CROSS JOIN keeps the embedding table in the outer loop.
+            let plans = [
+                ("automatic", None),
+                ("vector_first", Some(
+                    "embedding_cache e CROSS JOIN chunks c ON c.content_hash = e.input_hash
+                     CROSS JOIN sources s ON s.id = c.source_id AND s.current_revision = c.revision_id",
+                )),
+            ];
+            for sample in 0..=5 {
+                register_dot_product(&db.0, vector(64 * sample as u64, dimensions)).unwrap();
+                let mut results = [Vec::new(), Vec::new()];
+                for order in 0..plans.len() {
+                    let index = (sample + order) % plans.len();
+                    let start = Instant::now();
+                    let arguments = vec![ACTIVE.to_owned().into()];
+                    let ranked = if let Some(tables) = plans[index].1 {
+                        search_with_join_order(
+                            &db.0,
+                            "sanctum_cosine(e.vector)",
+                            tables,
+                            arguments,
+                            TOP_K,
+                            filter,
+                            &[],
+                        )
+                    } else {
+                        search_candidates(
+                            &db.0,
+                            "sanctum_cosine(e.vector)",
+                            arguments,
+                            TOP_K,
+                            filter,
+                            &[],
+                        )
+                    };
+                    results[index] = ranked
+                        .unwrap()
+                        .into_iter()
+                        .map(|hit| (hit.chunk.reference, hit.score))
+                        .collect();
+                    if sample != 0 {
+                        samples[index].push(start.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }
+                assert_eq!(results[0].len(), TOP_K as usize);
+                assert_eq!(results[0], results[1]);
+            }
+            for ((plan, _), times) in plans.iter().zip(samples) {
+                println!("{label} {plan} ms={times:?}");
+            }
+        }
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
 #[ignore = "opt-in vector comparison with a large SQLite fixture"]
 fn compare_sqlite_vec() {
     let rows: u32 = std::env::var("SANCTUM_VECTOR_BENCH_ROWS")
@@ -207,7 +292,7 @@ fn compare_sqlite_vec() {
     for dimensions in [DIMENSIONS, 1536] {
         let path = directory.path().join(format!("vector-{dimensions}.db"));
         let start = Instant::now();
-        fixture(&path, rows, dimensions);
+        fixture(&path, rows, dimensions, true);
         println!(
             "rows={rows}, dimensions={dimensions}, db_bytes={}, setup_seconds={:.3}",
             path.metadata().unwrap().len(),

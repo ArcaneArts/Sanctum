@@ -138,6 +138,58 @@ unfiltered exact scans at this size motivates testing candidate indexes or
 vector layouts against a representative corpus with the same filter and recall
 requirements.
 
+### Query plan and read-only memory mapping
+
+The original sqlite-vec comparison ran `ANALYZE` on its fixtures.
+Sanctum's normal collection writer leaves SQLite planner statistics
+unset. This follow-up uses the same 262,144-vector fixture and compares
+SQLite's chosen join order with a scan starting from the active
+profile's vector rows. Both use the same Rust scoring function, current
+revision checks, and source metadata filter. The test alternates their
+order and verifies the same ordered top ten and scores. [SQLite join order](https://sqlite.org/optoverview.html#manual_control_of_query_plans_using_cross_join).
+
+```sh
+cargo test --release --locked -p sanctum-db-sqlite compare_vector_scan_order \
+  -- --ignored --nocapture
+SANCTUM_VECTOR_BENCH_SKIP_ANALYZE=1 \
+  cargo test --release --locked -p sanctum-db-sqlite compare_vector_scan_order \
+  -- --ignored --nocapture
+SANCTUM_VECTOR_BENCH_SKIP_ANALYZE=1 SANCTUM_VECTOR_BENCH_MMAP_BYTES=2147483648 \
+  cargo test --release --locked -p sanctum-db-sqlite compare_vector_scan_order \
+  -- --ignored --nocapture
+```
+
+Median elapsed time in milliseconds from five measured queries per
+case, after one warm-up, on the same Apple M4 Max:
+
+| Dimensions | Planner statistics | Memory map | Filter | Automatic join | Vectors first |
+| --- | --- | --- | --- | ---: | ---: |
+| 768 | Analyzed | Off | None | 2,462.58 | 521.74 |
+| 768 | Analyzed | Off | Source JSON | 324.57 | 350.34 |
+| 1,536 | Analyzed | Off | None | 4,502.57 | 841.23 |
+| 1,536 | Analyzed | Off | Source JSON | 524.47 | 481.99 |
+| 768 | Unset | Off | None | 498.92 | 494.61 |
+| 768 | Unset | Off | Source JSON | 364.30 | 360.91 |
+| 1,536 | Unset | Off | None | 837.13 | 832.49 |
+| 1,536 | Unset | Off | Source JSON | 496.04 | 491.63 |
+| 768 | Unset | On | None | 273.22 | 270.28 |
+| 768 | Unset | On | Source JSON | 219.09 | 213.56 |
+| 1,536 | Unset | On | None | 456.82 | 447.88 |
+| 1,536 | Unset | On | Source JSON | 273.67 | 272.43 |
+
+SQLite capped the requested mapping at 2,147,418,112 bytes. It covered
+the 1.19 GiB fixture and part of the 2.19 GiB fixture. Both join orders
+returned the same ordered hits and scores in all 72 comparisons.
+Forcing vector order recovered most of the unfiltered slowdown from
+`ANALYZE`. Without planner statistics, the two orders performed
+similarly. The default query keeps SQLite's automatic planning.
+
+Memory mapping lowered warm scoring latency on these closed read-only
+files. The server continues to use ordinary SQLite reads. A hosted
+rollout needs measurements of instance memory and concurrent snapshot
+access, and the filesystem server also opens mutable databases.
+[SQLite memory-mapped I/O](https://sqlite.org/mmap.html).
+
 ## Concurrent collections among 1,000 tenants
 
 The release benchmark creates one collection each for 1,000 tenant IDs in
