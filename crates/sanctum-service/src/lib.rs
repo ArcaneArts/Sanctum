@@ -232,7 +232,10 @@ impl Service {
         progress: impl FnMut(u64, u64) -> Result<()>,
     ) -> Result<UsageMeasurement> {
         if let UsageScope::Collection(collection) = scope {
-            self.require_collection(collection)?;
+            db::require_collection_for_usage(
+                &self.files.catalog_path(&collection.tenant),
+                collection.collection.as_str(),
+            )?;
         }
         self.files.usage_with_progress(scope, progress)
     }

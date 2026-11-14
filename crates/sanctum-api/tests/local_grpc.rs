@@ -1051,13 +1051,34 @@ async fn local_collection_deletion_purges_jobs_and_recovers_from_a_tombstone() {
         page.rows[0].values[0].value,
         Some(v1::sql_value::Value::Text(uploaded.revision_id))
     );
-    api.stop().await;
-
     // Simulate a stop after catalog publication and before removal of the files.
     sanctum_db_sqlite::retire_local_collection(&dir.path().join("other/root.db"), "notes").unwrap();
-    assert!(dir.path().join("other/notes/meta.db").exists());
+    let retained_path = dir.path().join("other/notes");
+    let database_bytes = retained_path.join("meta.db").metadata().unwrap().len();
+    let usage = v1::StorageUsageRequest {
+        scope: Some(v1::storage_usage_request::Scope::Collection(
+            scope("other").unwrap(),
+        )),
+    };
+    let measured = api
+        .client
+        .get_storage_usage(usage.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((measured.bytes, measured.files), (database_bytes, 1));
+    assert_eq!(measured.scope, Some(usage.clone()));
+    api.stop().await;
     let mut api = Running::start(&dir).await;
     assert!(!dir.path().join("other/notes").exists());
+    assert_eq!(
+        api.client
+            .get_storage_usage(usage)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
     assert!(
         sanctum_db_sqlite::deleted_catalog_collections(&dir.path().join("other/root.db"))
             .unwrap()
