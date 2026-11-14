@@ -657,7 +657,7 @@ message TextRevision {
   string chunker = 15;
 }
 
-// Bounded, case-sensitive scan of the staged UTF-8 input for one pending job.
+// Bounded, case-sensitive scan of UTF-8 text for one pending job.
 message ScanPendingTextRequest {
   IngestionJobRequest job = 1;
   string literal = 2;
@@ -675,6 +675,7 @@ message PendingTextScanSource {
   string revision_id = 4;
   string name = 5;
   ExternalSource external = 6;
+  // UTF-8 text length, or original upload length when extraction is pending.
   uint64 total_bytes = 7;
 }
 

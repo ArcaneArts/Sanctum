@@ -364,7 +364,31 @@ def check_hosted(bin_dir):
         )
         h2_result = json.loads(response.stdout)
         assert h2_result["id"] == 8 and "tools" in h2_result["result"], h2_result
-    print("Hosted MCP used HTTP/1.1 and h2c on the gRPC port and continued across API processes.")
+
+        rtf = r"{\rtf1\ansi Prepared caf\'e9}"
+        canonical = "Prepared café".encode()
+        rtf_job = rpc.tool("ingest_text", **scope, name="prepared.rtf", text=rtf)
+        rtf_operation = scope | {"operation_id": rtf_job["operation_id"]}
+        pending = rpc.tool("scan_pending_text", **rtf_operation, literal="café")
+        assert pending["stop"] == "extraction_pending" and pending["read_bytes"] == 0, pending
+        assert pending["source"]["total_bytes"] == len(rtf.encode()), pending
+        for stage in ("register", "prepare"):
+            delivery = urllib.request.Request(f"http://{worker['worker']}/internal/tasks/{stage}-upload",
+                                              json.dumps(rtf_operation).encode(),
+                                              {"Content-Type": "application/json"})
+            with urllib.request.urlopen(delivery, timeout=30) as response:
+                assert response.status == 204
+        pending = rpc.tool("scan_pending_text", **rtf_operation, literal="café")
+        assert pending["stop"] == "complete" and pending["read_bytes"] == len(canonical), pending
+        assert pending["source"]["total_bytes"] == len(canonical), pending
+        assert pending["matches"] == [{"start_byte": canonical.index(b"caf"), "end_byte": len(canonical)}]
+        limited = rpc.tool("scan_pending_text", **rtf_operation, literal="café",
+                           byte_limit=len(canonical) - 1)
+        assert limited["stop"] == "byte_limit" and not limited["matches"], limited
+        assert limited["read_bytes"] == len(canonical) - 1, limited
+        assert limited["scanned_bytes"] == len(canonical) - len("é".encode()), limited
+        assert not rpc.tool("search", **scope, query="prepared")["hits"]
+    print("Hosted MCP verified HTTP/1.1, h2c, cross-process requests, and pending RTF byte ranges.")
 
 
 if __name__ == "__main__":

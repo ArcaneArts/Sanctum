@@ -454,6 +454,20 @@ impl HostedCatalog {
         })
     }
 
+    pub(super) fn prepared_rtf_text(
+        &self,
+        scope: &Scope,
+        record: &Operation,
+        registration: &Registration,
+        canonical: &Canonical,
+    ) -> Result<(Key, u64)> {
+        let attempt = canonical.extracted.ok_or_else(|| {
+            Error::Internal("prepared RTF is missing its canonical object".into())
+        })?;
+        let key = self.extracted_key(scope, record, registration, attempt)?;
+        Ok((key, canonical.content.bytes))
+    }
+
     fn extracted_key(
         &self,
         scope: &Scope,

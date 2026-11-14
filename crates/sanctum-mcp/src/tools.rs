@@ -425,7 +425,7 @@ impl Tools {
     }
 
     #[tool(
-        description = "Find a case-sensitive literal in one pending UTF-8 upload. Reports actual scan coverage and exact match ranges.",
+        description = "Find a case-sensitive literal in the UTF-8 text of one pending upload. Reports actual scan coverage and exact match ranges.",
         annotations(read_only_hint = true)
     )]
     async fn scan_pending_text(

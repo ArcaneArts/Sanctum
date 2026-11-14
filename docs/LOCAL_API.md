@@ -212,8 +212,12 @@ boundary or when the hit limit stops the search inside the current buffer.
 The default byte budget is 1 MiB and the maximum is 32 MiB. The literal can
 be 1 to 1024 UTF-8 bytes. The default hit limit is 10 and the maximum is 100.
 The final event reports `COMPLETE`, `BYTE_LIMIT`, `HIT_LIMIT`,
-`INVALID_TEXT`, or `EXTRACTION_PENDING` for an RTF upload awaiting canonical
-text. A match is provisional until its source is published. Closing the
+`INVALID_TEXT`, or `EXTRACTION_PENDING` with zero bytes read when a pending
+RTF upload has no scan-ready text. The first event reports the original
+upload length in that case. Hosted RTF becomes scan-ready as soon as
+preparation saves the canonical UTF-8 object, even while lexical indexing
+is pending. The reported length and ranges then refer to those UTF-8
+bytes. A match is provisional until its source is published. Closing the
 gRPC stream stops the scan. Published text uses the ordinary search path.
 
 ```sh
