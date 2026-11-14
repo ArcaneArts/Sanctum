@@ -4270,6 +4270,131 @@ async fn deletion_blocks_queued_replacement_and_reclaims_all_revisions() {
 }
 
 #[tokio::test]
+async fn local_source_deletion_request_replays_after_restart_and_reclamation() {
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    create(&mut running.client, "other").await;
+    let original = upload(&mut running.client, header("default"), b"original opal").await;
+    let other = upload(&mut running.client, header("other"), b"other opal").await;
+    let mut delete = v1::DeleteSourceRequest {
+        scope: scope("default"),
+        source_id: original.source_id.clone(),
+        expected_revision_id: Some(uuid::Uuid::new_v4().to_string()),
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+    };
+    assert_eq!(
+        running
+            .client
+            .delete_source(delete.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    delete.expected_revision_id = Some(original.revision_id.clone());
+    let mut retry = running.client.clone();
+    let (first, second) = tokio::join!(
+        running.client.delete_source(delete.clone()),
+        retry.delete_source(delete.clone())
+    );
+    let receipt = first.unwrap().into_inner();
+    assert_eq!(receipt, second.unwrap().into_inner());
+    assert_eq!(receipt.source_id, original.source_id);
+    assert_eq!(receipt.revision_id, original.revision_id);
+    drop(retry);
+    running.stop().await;
+
+    let mut running = Running::start(&dir).await;
+    expire_and_reclaim(&dir, &running.service);
+    assert!(!text_path(&dir, &original.source_id, &original.revision_id).exists());
+    let fresh = upload(&mut running.client, header("default"), b"fresh opal").await;
+    assert_ne!(fresh.source_id, original.source_id);
+    assert_eq!(
+        running
+            .client
+            .delete_source(delete.clone())
+            .await
+            .unwrap()
+            .into_inner(),
+        receipt
+    );
+    for conflict in [
+        v1::DeleteSourceRequest {
+            source_id: fresh.source_id.clone(),
+            expected_revision_id: Some(fresh.revision_id.clone()),
+            ..delete.clone()
+        },
+        v1::DeleteSourceRequest {
+            expected_revision_id: None,
+            ..delete.clone()
+        },
+    ] {
+        assert_eq!(
+            running
+                .client
+                .delete_source(conflict)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::AlreadyExists
+        );
+    }
+    let hits = search(&mut running.client, "default", "opal").await;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].excerpt, "fresh opal");
+    let changes = running
+        .client
+        .list_changes(v1::ListChangesRequest {
+            scope: scope("default"),
+            after_cursor: 0,
+            limit: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        changes
+            .changes
+            .iter()
+            .filter(|change| change.kind == "source_deleted")
+            .count(),
+        1
+    );
+    let other_receipt = running
+        .client
+        .delete_source(v1::DeleteSourceRequest {
+            scope: scope("other"),
+            source_id: other.source_id.clone(),
+            expected_revision_id: Some(other.revision_id.clone()),
+            ..delete.clone()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(other_receipt.source_id, other.source_id);
+
+    rusqlite::Connection::open(dir.path().join("default/notes/meta.db"))
+        .unwrap()
+        .execute(
+            "UPDATE local_source_deletion_receipts SET expires_at = 0",
+            [],
+        )
+        .unwrap();
+    expire_and_reclaim(&dir, &running.service);
+    assert_eq!(
+        running
+            .client
+            .delete_source(delete)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn deleting_a_local_source_reclaims_its_failed_replacement_while_queue_is_paused() {
     let dir = TempDir::new().unwrap();
     let mut running = Running::start(&dir).await;

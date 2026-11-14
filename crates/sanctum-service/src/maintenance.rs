@@ -105,6 +105,19 @@ impl Service {
         source: Uuid,
         expected: Option<Uuid>,
     ) -> Result<Uuid> {
+        self.delete_source_with_request(scope, source, expected, None)
+    }
+
+    pub fn delete_source_with_request(
+        &self,
+        scope: &Scope,
+        source: Uuid,
+        expected: Option<Uuid>,
+        request: Option<Uuid>,
+    ) -> Result<Uuid> {
+        if request.is_some_and(|id| id.is_nil()) {
+            return Err(Error::Invalid("request ID must be a nonzero UUID".into()));
+        }
         let _reader = self
             .retrieval
             .read()
@@ -112,9 +125,9 @@ impl Service {
         self.local_writes.run(scope, || {
             let mut database = self.database(scope)?;
             let writer = database.write()?;
-            let deleted = writer.delete_source(source, expected)?;
+            let revision = writer.delete_source_with_request(source, expected, request)?;
             writer.commit()?;
-            Ok(deleted.revision)
+            Ok(revision)
         })
     }
 
@@ -134,6 +147,7 @@ impl Service {
                 }
             }
             writer.expire_deletion_receipts()?;
+            writer.expire_local_deletion_requests()?;
             writer.prune_unreferenced_embeddings()?;
             writer.commit()?;
         }

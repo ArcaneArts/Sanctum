@@ -147,6 +147,7 @@ enum Command {
         source_id: String,
         #[arg(long)]
         expected_revision: Option<String>,
+        /// Replay this deletion with the same UUID, source, and expected revision.
         #[arg(long)]
         request_id: Option<String>,
     },

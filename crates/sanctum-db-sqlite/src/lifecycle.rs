@@ -2,10 +2,14 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sanctum_core::{Error, ExternalSource, GitProvenance, Result};
 use uuid::Uuid;
 
-use super::{CollectionDb, Revision, RevisionWrite, database_error, query_all, read_json};
+use super::{
+    CollectionDb, Revision, RevisionWrite, RevisionWriter, database_error, query_all, read_json,
+    row_uuid,
+};
 
 pub const RETIRE_GRACE_SECONDS: i64 = 300;
 const DELETION_RECEIPT_SECONDS: i64 = 24 * 60 * 60;
+const LOCAL_DELETION_REQUEST_SECONDS: i64 = 45 * 24 * 60 * 60;
 const CLEANUP_RETRY_SECONDS: i64 = 60;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,7 +109,8 @@ impl CollectionDb {
                       ))
                  )
                  OR EXISTS(SELECT 1 FROM deleted_sources d WHERE d.expires_at <= unixepoch()
-                     AND NOT EXISTS(SELECT 1 FROM sources WHERE id = d.id))",
+                     AND NOT EXISTS(SELECT 1 FROM sources WHERE id = d.id))
+                 OR EXISTS(SELECT 1 FROM local_source_deletion_receipts WHERE expires_at <= unixepoch())",
                 [profile],
                 |row| row.get(0),
             )
@@ -150,6 +155,75 @@ pub(super) fn find_source(
         .map_err(database_error)?
         .ok_or_else(|| Error::NotFound("source was not found".into()))?;
     Ok(source)
+}
+
+impl RevisionWriter<'_> {
+    pub fn delete_source_with_request(
+        &self,
+        source: Uuid,
+        expected: Option<Uuid>,
+        request: Option<Uuid>,
+    ) -> Result<Uuid> {
+        let Some(request) = request else {
+            return Ok(self.delete_source(source, expected)?.revision);
+        };
+        let request = request.to_string();
+        let source_id = source.to_string();
+        let expected_id = expected.map(|id| id.to_string());
+        let receipt = self
+            .0
+            .query_row(
+                "SELECT source_id, expected_revision_id, revision_id
+                 FROM local_source_deletion_receipts WHERE request_id = ?1",
+                [&request],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row_uuid(row, 2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error)?;
+        if let Some((saved_source, saved_expected, revision)) = receipt {
+            if saved_source != source_id || saved_expected != expected_id {
+                return Err(Error::Conflict(
+                    "request ID already applies to a different source deletion".into(),
+                ));
+            }
+            return Ok(revision);
+        }
+        let deleted = self.delete_source(source, expected)?;
+        self.0
+            .execute(
+                "INSERT INTO local_source_deletion_receipts
+                 (request_id, source_id, expected_revision_id, revision_id, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, unixepoch() + ?5)",
+                params![
+                    request,
+                    source_id,
+                    expected_id,
+                    deleted.revision.to_string(),
+                    LOCAL_DELETION_REQUEST_SECONDS,
+                ],
+            )
+            .map_err(database_error)?;
+        Ok(deleted.revision)
+    }
+
+    pub fn expire_local_deletion_requests(&self) -> Result<()> {
+        self.0
+            .execute(
+                "DELETE FROM local_source_deletion_receipts WHERE request_id IN (
+                     SELECT request_id FROM local_source_deletion_receipts
+                     WHERE expires_at <= unixepoch() ORDER BY expires_at, request_id LIMIT 256
+                 )",
+                [],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
 }
 
 impl<T: std::ops::Deref<Target = rusqlite::Connection>> RevisionWrite<T> {
