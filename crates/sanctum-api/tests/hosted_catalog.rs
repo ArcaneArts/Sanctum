@@ -4505,9 +4505,10 @@ async fn hosted_upload_and_retry_return_saved_receipts_when_dispatch_checkpoint_
         assert!(!response.is_finished());
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(15)).await;
-        let response = tokio::time::timeout(Duration::from_secs(1), response).await;
         tokio::time::resume();
-        let receipt = response
+        // Let the gRPC response cross the socket before measuring its delivery.
+        let receipt = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
             .expect("dispatch stalled beyond the receipt deadline")
             .unwrap()
             .unwrap()
