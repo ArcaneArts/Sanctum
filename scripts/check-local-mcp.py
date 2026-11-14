@@ -298,7 +298,7 @@ def check_hosted(bin_dir):
         start = text.encode().index("café".encode())
         assert pending["matches"] == [{"start_byte": start, "end_byte": start + len("café".encode())}]
         assert pending["stop"] == "complete" and pending["scanned_bytes"] == len(text.encode())
-        for stage, state in [("register", "registered"), ("index", "text_ready")]:
+        for stage, state in [("register", "registered"), ("prepare", "registered"), ("index", "text_ready")]:
             delivery = urllib.request.Request(f"http://{worker['worker']}/internal/tasks/{stage}-upload",
                                               json.dumps(job).encode(),
                                               {"Content-Type": "application/json"})
@@ -306,6 +306,20 @@ def check_hosted(bin_dir):
                 assert response.status == 204
             status = rpc.tool("ingestion_status", **job)
             assert status["state"] == state, status
+            if stage == "prepare":
+                assert status["preparation"] == {
+                    "ready": {"canonical_bytes": len(text.encode()), "chunks": 1}
+                }, status
+                assert status["processed_bytes"] == len(text.encode()), status
+                result = rpc.tool("search", **scope, query="quartz")
+                assert not result["hits"], result
+                grpc_job = subprocess.run(
+                    [cli, "--endpoint", api, "--tenant", scope["tenant"], "job", "notes", request],
+                    check=True, capture_output=True, text=True, timeout=10,
+                )
+                assert "Awaiting indexing" in grpc_job.stdout, grpc_job.stdout
+            else:
+                assert status["preparation"] is None, status
 
         edit = {"namespace": "field", "key": "classification", "operation": "set",
                 "value": {"tags": ["sample", None]}}

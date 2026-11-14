@@ -362,6 +362,20 @@ message IngestionJob {
   GitProvenance git = 17;
   // Durable worker checkpoint after hosted lexical publication, when present.
   HostedEmbeddingWork embedding_work = 18;
+  // Durable hosted preparation result while lexical publication is pending.
+  HostedPreparation preparation = 19;
+}
+
+message HostedPreparation {
+  oneof outcome {
+    PreparedText ready = 1;
+    string invalid_source = 2;
+  }
+}
+
+message PreparedText {
+  uint64 canonical_bytes = 1;
+  uint64 chunks = 2;
 }
 
 message HostedEmbeddingWork {

@@ -91,6 +91,13 @@ Poll `GetIngestionJob` in the same tenant and collection to see processed
 bytes, attempts, failure details, or the committed lexical revision. The
 local queue persists through process restarts.
 
+Hosted jobs expose the durable preparation result in the optional
+`preparation` field while lexical indexing is pending. A successful
+preparation reports canonical bytes and chunks. `processed_bytes` then
+equals the original input size. An invalid source reports its preparation
+error and remains `REGISTERED` until the worker commits the terminal
+result. `text_revision` becomes available with `TEXT_READY`.
+
 New uploads can enter the durable queue while the collection database is
 indexing another source. The local server serializes collection mutations
 and replacement registration for each collection. Uploading bytes and

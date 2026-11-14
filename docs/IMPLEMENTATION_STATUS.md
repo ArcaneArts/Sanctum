@@ -1790,3 +1790,22 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   through a proxy that closed a 17 MiB multipart object's download after
   1,048,576 bytes. The next request started at that offset and the contract
   verified all 17,825,799 bytes. [S3 storage behavior](STORAGE.md#storage-backends).
+
+## Hosted preparation progress
+
+- gRPC job status and activity, MCP ingestion status, and the CLI expose
+  the durable preparation outcome while lexical publication is pending.
+  Successful preparation reports canonical bytes and chunk count.
+  Invalid input exposes the saved error before the worker commits the
+  terminal result. Desktop activity shows the same preparation state.
+- The filesystem-backed gRPC test recovered the preparation checkpoint
+  after a lost write response. Status and activity returned matching RTF
+  counts before any lexical hit was visible. After index publication,
+  the exact UTF-8 text became searchable. The invalid-input case verified
+  that its preparation error flowed into the terminal job failure.
+  [Hosted lexical publication](STORAGE.md#hosted-lexical-publication).
+- With live MinIO, the hosted MCP smoke test verified the counts before
+  publication and the gRPC CLI displayed `Awaiting indexing`. A generated
+  Python client saw the persisted 32 input bytes, 17 canonical bytes, and
+  one chunk after restarting the API. After indexing, the job exposed
+  the published text revision and cleared the preparation field.

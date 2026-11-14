@@ -276,7 +276,12 @@ The snapshot commits text-object locators, the lexical index, and the
 indexing receipt together. Replaying a published receipt avoids rebuilding
 its index.
 
-`GetIngestionJob` reports `TEXT_READY` with the committed revision. While
+`GetIngestionJob` keeps the job `REGISTERED` while indexing is pending.
+After successful preparation, `preparation.ready` reports the canonical byte
+and chunk counts, and `processed_bytes` reports the original bytes processed.
+If preparation found unusable input, `preparation.invalid_source` carries the
+saved error until the index stage commits the failure. The job reports
+`TEXT_READY` with the committed revision after lexical publication. While
 embedding work remains queued, `embedding_work` reports the next durable
 batch number and its earliest eligible dispatch time, when scheduled.
 `ListIngestionJobs` and MCP `ingestion_status` report the same checkpoint.
