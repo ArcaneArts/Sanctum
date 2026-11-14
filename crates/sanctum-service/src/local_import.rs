@@ -84,6 +84,24 @@ pub(crate) enum LocalScan {
     AlreadyRunning,
 }
 
+pub(crate) enum ImportPath<'a> {
+    Explicit(&'a Path),
+    Watched(&'a Path),
+}
+
+pub(crate) fn canonical_watch_root(path: &Path) -> std::io::Result<PathBuf> {
+    let root = fs::canonicalize(path)?;
+    if root != path {
+        return Err(std::io::Error::other(
+            "saved watch path now resolves to a different directory",
+        ));
+    }
+    if !root.symlink_metadata()?.is_dir() {
+        return Err(std::io::Error::other("watch root is no longer a directory"));
+    }
+    Ok(root)
+}
+
 #[derive(Clone, Copy)]
 pub enum ImportState {
     Queued,
@@ -201,7 +219,7 @@ impl Service {
         stopped: impl Fn() -> bool,
         emit: impl FnMut(ImportEvent) -> bool,
     ) -> Result<()> {
-        match self.scan_local_until(scope, path, options, stopped, emit)? {
+        match self.scan_local_until(scope, ImportPath::Explicit(path), options, stopped, emit)? {
             LocalScan::Finished => Ok(()),
             LocalScan::AlreadyRunning => Err(Error::Busy(LOCAL_IMPORT_BUSY.into())),
         }
@@ -210,20 +228,25 @@ impl Service {
     pub(crate) fn scan_local_until(
         &self,
         scope: &Scope,
-        path: &Path,
+        input: ImportPath<'_>,
         options: &ImportOptions,
         stopped: impl Fn() -> bool,
         mut emit: impl FnMut(ImportEvent) -> bool,
     ) -> Result<LocalScan> {
         self.require_collection(scope)?;
-        let file_type = fs::symlink_metadata(path)?.file_type();
-        if !(file_type.is_dir() || file_type.is_file()) {
-            return Err(Error::Invalid("select a regular file or directory".into()));
-        }
-        if options.prune_missing && !file_type.is_dir() {
+        let (root, directory) = match input {
+            ImportPath::Explicit(path) => {
+                let kind = fs::symlink_metadata(path)?.file_type();
+                if !(kind.is_dir() || kind.is_file()) {
+                    return Err(Error::Invalid("select a regular file or directory".into()));
+                }
+                (fs::canonicalize(path)?, kind.is_dir())
+            }
+            ImportPath::Watched(path) => (canonical_watch_root(path)?, true),
+        };
+        if options.prune_missing && !directory {
             return Err(Error::Invalid("prune_missing requires a directory".into()));
         }
-        let root = fs::canonicalize(path)?;
         if root.starts_with(self.files.root()) {
             return Err(Error::Invalid(
                 "cannot import from Sanctum's managed storage".into(),
@@ -240,7 +263,7 @@ impl Service {
         else {
             return Ok(LocalScan::AlreadyRunning);
         };
-        let base = if file_type.is_dir() {
+        let base = if directory {
             root.as_path()
         } else {
             root.parent()
@@ -307,7 +330,7 @@ impl Service {
                 return Ok(LocalScan::Finished);
             }
         }
-        if file_type.is_dir() && !had_errors && !stopped() {
+        if directory && !had_errors && !stopped() {
             self.reconcile_import(scope, &root, &namespace, &select, &stopped, emit)?;
         }
         Ok(LocalScan::Finished)

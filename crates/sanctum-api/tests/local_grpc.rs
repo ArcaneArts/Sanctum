@@ -5102,6 +5102,105 @@ async fn folder_watch_reconciles_offline_edits_and_prunes_explicitly() {
     running.stop().await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn folder_watch_preserves_sources_when_an_ancestor_becomes_a_symlink() {
+    use std::{fs, os::unix::fs::symlink};
+
+    let data = TempDir::new().unwrap();
+    let tree = TempDir::new().unwrap();
+    let parent = tree.path().join("workspace");
+    let folder = parent.join("notes");
+    let moved = tree.path().join("offline");
+    let redirect = tree.path().join("redirect");
+    fs::create_dir_all(&folder).unwrap();
+    fs::create_dir_all(redirect.join("notes")).unwrap();
+    fs::write(folder.join("sample.md"), "original zircon").unwrap();
+    fs::write(redirect.join("notes/sample.md"), "unrelated pyrite").unwrap();
+
+    let mut running = Running::start(&data).await;
+    create(&mut running.client, "default").await;
+    let watch = running
+        .client
+        .watch_folder(v1::WatchFolderRequest {
+            scope: scope("default"),
+            path: folder.to_str().unwrap().into(),
+            prune_missing: true,
+            interval_seconds: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let original = await_watch_hit(&mut running.client, "zircon").await;
+    running.stop().await;
+
+    fs::rename(&parent, &moved).unwrap();
+    symlink(&redirect, &parent).unwrap();
+    let mut running = Running::start(&data).await;
+    let list = v1::ListWatchedFoldersRequest {
+        scope: scope("default"),
+        ..Default::default()
+    };
+    let failed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let folders = running
+                .client
+                .list_watched_folders(list.clone())
+                .await
+                .unwrap()
+                .into_inner()
+                .folders;
+            let current = folders.into_iter().next().unwrap();
+            if current.last_failed > 0
+                || !search(&mut running.client, "default", "pyrite")
+                    .await
+                    .is_empty()
+            {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(failed.id, watch.id);
+    assert_eq!(
+        (failed.last_failed, failed.last_deleted, failed.last_queued),
+        (1, 0, 0)
+    );
+    assert!(
+        failed
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("different directory"))
+    );
+    assert_eq!(
+        await_watch_hit(&mut running.client, "zircon")
+            .await
+            .revision_id,
+        original.revision_id
+    );
+    assert!(
+        search(&mut running.client, "default", "pyrite")
+            .await
+            .is_empty()
+    );
+
+    fs::remove_file(&parent).unwrap();
+    fs::rename(moved, &parent).unwrap();
+    fs::write(folder.join("sample.md"), "restored spinel").unwrap();
+    let restored = await_watch_hit(&mut running.client, "spinel").await;
+    assert_eq!(restored.source_id, original.source_id);
+    assert_ne!(restored.revision_id, original.revision_id);
+    assert!(
+        search(&mut running.client, "default", "pyrite")
+            .await
+            .is_empty()
+    );
+    running.stop().await;
+}
+
 async fn await_watch_hit(client: &mut SanctumClient<Channel>, query: &str) -> v1::ChunkRef {
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
