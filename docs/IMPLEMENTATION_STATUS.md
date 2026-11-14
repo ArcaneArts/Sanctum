@@ -1679,3 +1679,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   Semantic search and gRPC fetch returned the exact UTF-8 excerpt.
   Live Vertex verification remains open.
   [Embedding batches](STORAGE.md#hosted-embedding-batches).
+
+## Concurrent embedding outcomes
+
+- A worker records a failure only when the input's cache entry still
+  matches the retry state it read before making the provider call.
+  Successful predictions keep the first committed vector for each
+  current input and profile.
+- A filesystem-backed gRPC regression ordered competing workers'
+  responses for the initial attempt and a scheduled retry. The late
+  failure left the original error, retry time, and attempt count intact.
+  The late success left semantic retrieval using the first vector.
+- Two standalone workers on live MinIO reproduced the ordering over
+  HTTP with a controlled OpenAI-compatible endpoint. A generated Python
+  client verified unchanged retry status, a cosine score of 1.0 from the
+  first vector, and exact UTF-8 text from the cited chunk.
+  [Embedding batches](STORAGE.md#hosted-embedding-batches).

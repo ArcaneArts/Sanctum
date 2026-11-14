@@ -30,6 +30,17 @@ pub enum ChunkEmbeddingState {
     Failed,
 }
 
+pub struct PendingEmbedding {
+    pub chunk: Chunk,
+    pub retry: Option<EmbeddingRetry>,
+}
+
+#[derive(Clone, Copy)]
+pub struct EmbeddingRetry {
+    attempts: i64,
+    at: i64,
+}
+
 pub use crate::vector_index::ScoredChunk;
 
 impl CollectionDb {
@@ -181,16 +192,22 @@ impl CollectionDb {
         ).map_err(database_error)
     }
 
-    pub fn pending_embeddings(&self, profile: &str, limit: u32) -> Result<Vec<Chunk>> {
+    pub fn pending_embeddings(&self, profile: &str, limit: u32) -> Result<Vec<PendingEmbedding>> {
         query_all(
             &self.0,
             "SELECT c.source_id, c.revision_id, c.ordinal, s.name, s.external_namespace,
-                    s.external_id, c.start_byte, c.end_byte, c.content_hash
+                    s.external_id, c.start_byte, c.end_byte, c.content_hash, e.attempts, e.retry_at
              FROM chunks c JOIN sources s ON s.id = c.source_id AND s.current_revision = c.revision_id
              LEFT JOIN embedding_cache e ON e.profile = ?1 AND e.input_hash = c.content_hash
-             WHERE s.deleted = 0 AND (e.input_hash IS NULL OR e.retry_at <= unixepoch())
+             WHERE s.deleted = 0 AND
+                 (e.input_hash IS NULL OR (e.vector IS NULL AND e.retry_at <= unixepoch()))
              GROUP BY c.content_hash ORDER BY min(c.id) LIMIT ?2",
-            params![profile, limit], row_chunk,
+            params![profile, limit], |row| {
+                let retry = row.get::<_, Option<i64>>(9)?.map(|attempts| {
+                    Ok::<_, rusqlite::Error>(EmbeddingRetry { attempts, at: row.get(10)? })
+                }).transpose()?;
+                Ok(PendingEmbedding { chunk: row_chunk(row)?, retry })
+            },
         )
     }
 }
@@ -227,7 +244,8 @@ impl<T: std::ops::Deref<Target = rusqlite::Connection>> RevisionWrite<T> {
                WHERE s.deleted = 0 AND c.content_hash = ?2
              )
              ON CONFLICT (profile, input_hash) DO UPDATE SET
-               vector = excluded.vector, error = NULL, attempts = 0, retry_at = NULL",
+               vector = excluded.vector, error = NULL, attempts = 0, retry_at = NULL
+             WHERE embedding_cache.vector IS NULL",
                 params![profile, hash, bytes],
             )
             .map_err(database_error)?;
@@ -238,9 +256,12 @@ impl<T: std::ops::Deref<Target = rusqlite::Connection>> RevisionWrite<T> {
         &self,
         profile: &str,
         hash: &str,
+        selected: Option<EmbeddingRetry>,
         message: &str,
         transient: bool,
     ) -> Result<()> {
+        // Several workers can prepare the same input outside the writer lease.
+        // Count a failure only if its observed retry state is still current.
         self.0
             .execute(
                 "INSERT INTO embedding_cache (profile, input_hash, error, attempts, retry_at)
@@ -250,13 +271,25 @@ impl<T: std::ops::Deref<Target = rusqlite::Connection>> RevisionWrite<T> {
                  AND s.current_revision = c.revision_id
                WHERE s.deleted = 0 AND c.content_hash = ?2
              )
+             AND (?5 IS NULL OR EXISTS (
+               SELECT 1 FROM embedding_cache
+               WHERE profile = ?1 AND input_hash = ?2
+             ))
              ON CONFLICT (profile, input_hash) DO UPDATE SET
                error = excluded.error, attempts = min(embedding_cache.attempts + 1, 10),
                retry_at = CASE WHEN ?4 THEN
                  unixepoch() + min(300, 5 * (1 << embedding_cache.attempts))
                END
-             WHERE embedding_cache.vector IS NULL",
-                params![profile, hash, message, transient],
+             WHERE embedding_cache.vector IS NULL
+               AND embedding_cache.attempts = ?5 AND embedding_cache.retry_at = ?6",
+                params![
+                    profile,
+                    hash,
+                    message,
+                    transient,
+                    selected.map(|retry| retry.attempts),
+                    selected.map(|retry| retry.at),
+                ],
             )
             .map_err(database_error)?;
         Ok(())

@@ -2803,6 +2803,180 @@ struct HostedEmbeddingFixture {
     queries: AtomicUsize,
 }
 
+#[tokio::test]
+async fn competing_embedding_workers_preserve_the_committed_vector_and_retry_state() {
+    use sanctum_embedding::{EmbedError, Provider, Purpose};
+    use tokio::sync::{mpsc, oneshot};
+
+    type Prediction = Result<Vec<Vec<f32>>, EmbedError>;
+    struct ControlledProvider(mpsc::UnboundedSender<oneshot::Sender<Prediction>>);
+
+    #[async_trait::async_trait]
+    impl Provider for ControlledProvider {
+        fn profile_id(&self) -> &str {
+            "controlled"
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+
+        async fn embed(&self, purpose: Purpose, texts: &[String]) -> Prediction {
+            assert_eq!(texts.len(), 1);
+            if matches!(purpose, Purpose::Query) {
+                return Ok(vec![vec![1.0, 0.0]]);
+            }
+            let (reply, result) = oneshot::channel();
+            self.0.send(reply).unwrap();
+            result.await.unwrap()
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let (requests, mut predictions) = mpsc::unbounded_channel();
+    let provider = Arc::new(ControlledProvider(requests));
+    let catalog = || {
+        HostedCatalog::new(storage.clone(), None, 1024)
+            .unwrap()
+            .with_embedding(Some(provider.clone()))
+    };
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let service = catalog();
+    service.create_collection(&scope, None).await.unwrap();
+    let mut server = start(service.clone()).await;
+    let wire_scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    let header = v1::UploadTextHeader {
+        scope: Some(wire_scope.clone()),
+        name: "sample.txt".into(),
+        ..Default::default()
+    };
+    let accepted = server
+        .client
+        .submit_text(upload_frames(&header, [b"cobalt seam".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let operation = accepted.operation_id.parse().unwrap();
+    service.register_upload(&scope, operation).await.unwrap();
+    service.index_upload(&scope, operation).await.unwrap();
+
+    let compute = || {
+        let worker = catalog();
+        let scope = scope.clone();
+        tokio::spawn(async move { worker.embed_collection(&scope).await })
+    };
+    let executor =
+        sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(15)).unwrap();
+    let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
+    let age_retry = || async {
+        let mut writer = executor.acquire(&unit).await.unwrap();
+        writer
+            .apply(
+                vec![sanctum_db::Command {
+                    operation: uuid::Uuid::new_v4(),
+                    payload: (),
+                }],
+                |tx, ()| {
+                    tx.execute("UPDATE embedding_cache SET retry_at = unixepoch() - 1", [])
+                        .map_err(|error| Error::Internal(Box::new(error)))?;
+                    Ok("aged".into())
+                },
+            )
+            .await
+            .unwrap();
+        writer.release().await.unwrap();
+    };
+    let status = v1::EmbeddingStatusRequest {
+        scope: Some(wire_scope.clone()),
+        ..Default::default()
+    };
+    for retry in [false, true] {
+        if retry {
+            age_retry().await;
+        }
+        let (late, late_reply) = start_prediction(compute(), &mut predictions).await;
+        let (first, first_reply) = start_prediction(compute(), &mut predictions).await;
+        first_reply
+            .send(Err(EmbedError::Transient("first failure".into())))
+            .unwrap();
+        first.await.unwrap().unwrap();
+        let before = server
+            .client
+            .get_embedding_status(status.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(before.retrying_chunks, 1);
+        assert!(before.next_retry_at_unix_seconds.is_some());
+        assert_eq!(before.sample_error.as_deref(), Some("first failure"));
+        late_reply
+            .send(Err(EmbedError::Permanent("late failure".into())))
+            .unwrap();
+        late.await.unwrap().unwrap();
+        let after = server
+            .client
+            .get_embedding_status(status.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(after, before);
+        let snapshot = executor
+            .read(&unit, directory.path())
+            .await
+            .unwrap()
+            .unwrap();
+        let attempts: i64 = rusqlite::Connection::open(snapshot.path())
+            .unwrap()
+            .query_row("SELECT attempts FROM embedding_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(attempts, if retry { 2 } else { 1 });
+    }
+    age_retry().await;
+
+    let (late, late_reply) = start_prediction(compute(), &mut predictions).await;
+    let (first, first_reply) = start_prediction(compute(), &mut predictions).await;
+    first_reply.send(Ok(vec![vec![1.0, 0.0]])).unwrap();
+    first.await.unwrap().unwrap();
+    late_reply.send(Ok(vec![vec![0.0, 1.0]])).unwrap();
+    late.await.unwrap().unwrap();
+    let result = server
+        .client
+        .search_text(v1::SearchTextRequest {
+            scope: Some(wire_scope),
+            query: "cobalt".into(),
+            mode: v1::SearchMode::Semantic.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(result.embedding_coverage.unwrap().embedded_chunks, 1);
+    assert_eq!(result.hits[0].score, Some(1.0));
+    assert_eq!(result.hits[0].excerpt, "cobalt seam");
+    server.stop().await;
+
+    async fn start_prediction(
+        task: tokio::task::JoinHandle<StorageResult<usize>>,
+        requests: &mut mpsc::UnboundedReceiver<oneshot::Sender<Prediction>>,
+    ) -> (
+        tokio::task::JoinHandle<StorageResult<usize>>,
+        oneshot::Sender<Prediction>,
+    ) {
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        (task, reply)
+    }
+}
+
 #[async_trait::async_trait]
 impl sanctum_embedding::Provider for HostedEmbeddingFixture {
     fn profile_id(&self) -> &str {
