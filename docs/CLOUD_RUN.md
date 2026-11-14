@@ -175,17 +175,18 @@ gcloud scheduler jobs create http sanctum-upload-sweep \
 
 The upload sweep reclaims losing input attempts and old unpublished
 extractions, settles stale uploads after their processing window, and
-compacts terminal records. It saves a scan cursor so subsequent calls
-continue the same pass. The snapshot sweep advances stored cursors for catalog and collection
-snapshots, resumes pending collection creations, and deletes noncurrent
-generations after reader grace.
-The source sweep saves both its listing cursor and the unprocessed
-collections from the current page. An invocation attempts up to eight
-collections, budgets 180 seconds for each, and stops starting work
-at its 210-second work deadline. It has up to 240 seconds total to return
-with the checkpoint saved. A collection interrupted by the work deadline
-remains first in the saved page. Individual failures are counted and
-revisited on the next full scan. The response and cleanup log report
+compacts terminal records. The snapshot sweep advances stored cursors for
+catalog and collection snapshots, resumes pending collection creations,
+and deletes noncurrent generations after reader grace. The source sweep
+reclaims retired revisions and their objects.
+
+Each sweep attempts up to eight items per invocation and budgets up to
+180 seconds per item. At its 210-second work deadline, the sweep keeps any
+interrupted item in its saved page. It has up to 240 seconds total to save
+the checkpoint and return. A failed or timed-out item whose attempt had the
+full budget is counted as a failure and rediscovered on a future full scan.
+The next invocation drains the saved page before listing again. The
+source sweep response and cleanup log report
 `deferred_objects` when a failed delete has been rescheduled. The worker
 continues with other due objects in that collection. The embedding profile
 job checks the worker's configured profile and

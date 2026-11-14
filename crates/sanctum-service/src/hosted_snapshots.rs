@@ -4,11 +4,13 @@ use sanctum_core::{Error, Result};
 use sanctum_db::Unit;
 use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
+use tokio::{io::AsyncReadExt, time::timeout};
 
 use crate::{
-    HostedCatalog, hosted_collection_creation::creation_key_scope,
+    HostedCatalog,
+    hosted_collection_creation::creation_key_scope,
     hosted_rebuild::collection_manifest,
+    maintenance_budget::{REQUEST_TIMEOUT, SweepBudget},
 };
 
 const GRACE: Duration = Duration::from_secs(900);
@@ -38,6 +40,15 @@ pub struct SnapshotSweep {
 impl HostedCatalog {
     /// Scans a bounded page of manifests and pending creations.
     pub async fn sweep_hosted_snapshots(&self) -> Result<SnapshotSweep> {
+        timeout(
+            REQUEST_TIMEOUT,
+            self.sweep_snapshot_page(SweepBudget::start()),
+        )
+        .await
+        .map_err(|_| Error::Busy("hosted snapshot sweep checkpoint timed out".into()))?
+    }
+
+    async fn sweep_snapshot_page(&self, budget: SweepBudget) -> Result<SnapshotSweep> {
         let path = "_maintenance/snapshot-sweep.json";
         let key = Key::parse(
             self.prefix
@@ -101,31 +112,42 @@ impl HostedCatalog {
             more: false,
         };
         for _ in 0..UNIT_BUDGET.min(cursor.pending.len()) {
-            let mut pending = cursor
+            let pending = cursor
                 .pending
-                .pop_front()
+                .front()
                 .expect("budget is bounded by the queue");
             let manifest = Key::parse(&pending.key)?;
             if let Some((tenant, operation)) = creation_key_scope(self.prefix.as_ref(), &manifest) {
-                match self
-                    .recover_collection_creation(tenant, operation, &manifest)
-                    .await
-                {
-                    Ok(recovered) => report.recovered_creations += usize::from(recovered),
+                let result = budget
+                    .attempt(self.recover_collection_creation(tenant, operation, &manifest))
+                    .await;
+                match result {
+                    Ok(None) => break,
+                    Ok(Some(recovered)) => report.recovered_creations += usize::from(recovered),
                     Err(error) => {
                         report.failed += 1;
                         tracing::warn!(%error, key = %manifest, "collection creation remains pending");
                     }
                 }
+                cursor.pending.pop_front();
                 continue;
             }
             let Some(unit) = unit_from_manifest(self.prefix.as_ref(), &manifest)? else {
+                cursor.pending.pop_front();
                 continue;
             };
-            match self
-                .sweep_snapshot_unit(&manifest, &unit, pending.next.as_deref())
+            let Some(result) = budget
+                .attempt(self.sweep_snapshot_unit(&manifest, &unit, pending.next.as_deref()))
                 .await
-            {
+                .transpose()
+            else {
+                break;
+            };
+            let mut pending = cursor
+                .pending
+                .pop_front()
+                .expect("attempt used the front of the queue");
+            match result {
                 Ok(page) => {
                     report.units += 1;
                     report.deleted += page.deleted;
@@ -198,4 +220,41 @@ fn unit_from_manifest(prefix: Option<&Key>, key: &Key) -> Result<Option<Unit>> {
         return Ok(None);
     };
     Unit::catalog(prefix, &tenant).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use sanctum_core::Scope;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn snapshot_sweep_resumes_discovered_units_after_the_work_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+        let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+        let first = catalog();
+        first
+            .create_collection(
+                &Scope {
+                    tenant: "default".parse().unwrap(),
+                    collection: "notes".parse().unwrap(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let paused = first
+            .sweep_snapshot_page(SweepBudget::exhausted())
+            .await
+            .unwrap();
+        assert_eq!((paused.units, paused.failed), (0, 0));
+        assert!(paused.more);
+        drop(first);
+        let resumed = catalog().sweep_hosted_snapshots().await.unwrap();
+        assert_eq!((resumed.units, resumed.failed), (2, 0));
+        assert!(!resumed.more);
+    }
 }

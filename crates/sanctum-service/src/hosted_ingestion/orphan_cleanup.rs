@@ -3,13 +3,14 @@ use std::time::{Duration, SystemTime};
 use sanctum_core::{Error, Result, Scope, is_rtf};
 use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES, Object, Version};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
+use tokio::{io::AsyncReadExt, time::timeout};
 use uuid::Uuid;
 
 use super::{
     AcceptanceFence, Envelope, ExpiredOperation, HostedCatalog, HostedJobState, Operation,
     REGISTRATION_WINDOW, Stage, envelope_key, unix_seconds,
 };
+use crate::maintenance_budget::{REQUEST_TIMEOUT, SweepBudget};
 
 const READER_GRACE: Duration = Duration::from_secs(900);
 const OPERATION_RETENTION: Duration = Duration::from_secs(45 * 24 * 3600);
@@ -38,6 +39,15 @@ enum Candidate {
 
 impl HostedCatalog {
     pub async fn sweep_abandoned_uploads(&self) -> Result<UploadSweep> {
+        timeout(
+            REQUEST_TIMEOUT,
+            self.sweep_upload_page(SweepBudget::start()),
+        )
+        .await
+        .map_err(|_| Error::Busy("hosted upload sweep checkpoint timed out".into()))?
+    }
+
+    async fn sweep_upload_page(&self, budget: SweepBudget) -> Result<UploadSweep> {
         let path = "_maintenance/upload-sweep.json";
         let key = Key::parse(
             self.prefix
@@ -98,31 +108,37 @@ impl HostedCatalog {
             more: false,
         };
         for _ in 0..CANDIDATE_LIMIT.min(cursor.pending.len()) {
-            let object = Key::parse(cursor.pending.pop().expect("work is bounded by the queue"))?;
+            let object = Key::parse(cursor.pending.last().expect("work is bounded by the queue"))?;
             let Some((scope, candidate)) = candidate(self.prefix.as_ref(), &object) else {
+                cursor.pending.pop();
                 continue;
             };
-            let result = match candidate {
-                Candidate::Operation { operation } => self
-                    .expire_operation(&scope, &object, operation)
-                    .await
-                    .map(|expired| {
-                        report.expired += usize::from(expired);
-                    }),
-                candidate => self
-                    .reclaim_candidate(&scope, &object, candidate)
-                    .await
-                    .map(|deleted| {
-                        report.deleted += usize::from(deleted);
-                    }),
+            let work = async {
+                match candidate {
+                    Candidate::Operation { operation } => self
+                        .expire_operation(&scope, &object, operation)
+                        .await
+                        .map(|expired| (false, expired)),
+                    candidate => self
+                        .reclaim_candidate(&scope, &object, candidate)
+                        .await
+                        .map(|deleted| (deleted, false)),
+                }
             };
+            let result = budget.attempt(work).await;
             match result {
-                Ok(()) | Err(Error::NotFound(_)) => {}
+                Ok(None) => break,
+                Ok(Some((deleted, expired))) => {
+                    report.deleted += usize::from(deleted);
+                    report.expired += usize::from(expired);
+                }
+                Err(Error::NotFound(_)) => {}
                 Err(error) => {
                     report.failed += 1;
                     tracing::warn!(%error, key = %object, "abandoned upload sweep will retry on the next pass");
                 }
             }
+            cursor.pending.pop();
         }
         report.more = cursor.next.is_some() || !cursor.pending.is_empty();
         self.storage
@@ -382,4 +398,52 @@ fn candidate(prefix: Option<&Key>, key: &Key) -> Option<(Scope, Candidate)> {
         return None;
     }
     Some((Scope { tenant, collection }, candidate))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use sanctum_storage::Storage;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn upload_sweep_resumes_an_abandoned_input_after_the_work_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+        let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+        let first = catalog();
+        let operation = Uuid::new_v4();
+        let attempt = Uuid::new_v4();
+        let input = Key::parse(format!(
+            "default/collections/notes/operations/{operation}/inputs/{attempt}"
+        ))
+        .unwrap();
+        storage
+            .put_stream(&input, Box::pin(&b"input"[..]), 5)
+            .await
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.path().join(input.as_str()))
+            .unwrap()
+            .set_modified(SystemTime::now() - READER_GRACE - Duration::from_secs(60))
+            .unwrap();
+        let paused = first
+            .sweep_upload_page(SweepBudget::exhausted())
+            .await
+            .unwrap();
+        assert_eq!((paused.deleted, paused.failed), (0, 0));
+        assert!(paused.more);
+        assert!(storage.head(&input).await.is_ok());
+        drop(first);
+        let resumed = catalog().sweep_abandoned_uploads().await.unwrap();
+        assert_eq!((resumed.deleted, resumed.failed), (1, 0));
+        assert!(!resumed.more);
+        assert!(matches!(
+            storage.head(&input).await,
+            Err(Error::NotFound(_))
+        ));
+    }
 }
