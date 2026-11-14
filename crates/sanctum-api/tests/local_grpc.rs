@@ -4888,6 +4888,80 @@ async fn rtf_upload_indexes_canonical_bytes_and_honors_original_retention() {
 }
 
 #[tokio::test]
+async fn local_rtf_original_cleanup_failure_keeps_published_text_ready() {
+    let dir = TempDir::new().unwrap();
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    create(&mut api.client, "default").await;
+    let job = api
+        .client
+        .submit_text(tokio_stream::iter([
+            rtf_header(false, "cleanup"),
+            data(br"{\rtf1 Caf\'e9 jasper}"),
+            end(),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(api.service.process_next().unwrap());
+    let request = job_request(job.operation_id);
+    let published = await_ready(&mut api.client, request.clone()).await;
+    let text = text_path(&dir, &published.source_id, &published.revision_id);
+    let original = text.with_file_name("original");
+    assert!(!original.exists());
+    api.stop().await;
+
+    // Restore the crash window between publication and original cleanup.
+    // A directory at the original's path makes unlink fail on every platform.
+    std::fs::create_dir(&original).unwrap();
+    let runtime = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
+    runtime.execute_batch("PRAGMA user_version = 18").unwrap();
+    runtime.execute(
+        "UPDATE ingestion_jobs SET status = 'failed', error_code = 'retryable',
+             error_message = 'could not remove the staged original', chunks = NULL, content_hash = NULL
+         WHERE operation_id = ?1",
+        [&request.operation_id],
+    ).unwrap();
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    assert!(api.service.process_next().unwrap());
+    let ready = await_ready(&mut api.client, request.clone()).await;
+    assert_eq!(ready.text_revision, published.text_revision);
+    assert_eq!(ready.attempts, published.attempts + 1);
+    assert!(original.is_dir());
+    let due = || {
+        runtime
+            .query_row(
+                "SELECT cleanup_after FROM ingestion_jobs WHERE operation_id = ?1",
+                [&request.operation_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap()
+    };
+    assert!(due().is_some());
+    api.service.pause_queue(true).unwrap();
+    api.stop().await;
+
+    std::fs::remove_dir(&original).unwrap();
+    std::fs::write(&original, br"{\rtf1 Caf\'e9 jasper}").unwrap();
+    runtime
+        .execute(
+            "UPDATE ingestion_jobs SET cleanup_after = 0 WHERE operation_id = ?1",
+            [&request.operation_id],
+        )
+        .unwrap();
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    assert!(api.service.queue_paused().unwrap());
+    assert!(!original.exists());
+    assert!(due().is_none());
+    assert_eq!(std::fs::read_to_string(&text).unwrap(), "Café jasper");
+    assert_eq!(
+        search(&mut api.client, "default", "jasper").await[0].excerpt,
+        "Café jasper"
+    );
+    assert_eq!(await_ready(&mut api.client, request.clone()).await, ready);
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn rtf_directory_import_compares_original_digest_and_retention_policy() {
     let dir = TempDir::new().unwrap();
     let input = TempDir::new().unwrap();

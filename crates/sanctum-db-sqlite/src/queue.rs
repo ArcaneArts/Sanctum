@@ -95,6 +95,7 @@ pub struct StagedCleanup {
     pub scope: Scope,
     pub source: Uuid,
     pub revision: Uuid,
+    pub original_only: bool,
 }
 
 const COLUMNS: &str = "operation_id, tenant, collection, source_id, revision_id,
@@ -128,6 +129,7 @@ impl LocalQueue {
                 include_str!("runtime_v16.sql"),
                 include_str!("runtime_v17.sql"),
                 include_str!("runtime_v18.sql"),
+                include_str!("runtime_v19.sql"),
             ],
         )?;
         // The previous worker may have stopped after recording a cancellation.
@@ -224,7 +226,7 @@ impl LocalQueue {
     pub fn pending_cleanup(&self) -> Result<Vec<StagedCleanup>> {
         super::query_all(
             &self.connect()?,
-            "SELECT operation_id, tenant, collection, source_id, revision_id
+            "SELECT operation_id, tenant, collection, source_id, revision_id, status = 'text_ready'
              FROM ingestion_jobs WHERE cleanup_after <= unixepoch()
              ORDER BY cleanup_after, operation_id LIMIT 128",
             [],
@@ -237,6 +239,7 @@ impl LocalQueue {
                     },
                     source: uuid(row, 3)?,
                     revision: uuid(row, 4)?,
+                    original_only: row.get(5)?,
                 })
             },
         )
@@ -629,7 +632,12 @@ impl LocalQueue {
         Ok(changed == 1)
     }
 
-    pub fn ready(&self, id: Uuid, revision: &Revision) -> Result<()> {
+    pub fn ready(
+        &self,
+        id: Uuid,
+        revision: &Revision,
+        original_cleanup_pending: bool,
+    ) -> Result<()> {
         self.connect()?
             .execute(
                 "UPDATE ingestion_jobs
@@ -637,7 +645,7 @@ impl LocalQueue {
                  canonical_bytes = ?4, original_hash = ?5, source_encoding = ?6, extractor = ?7,
                  processed_bytes = total_bytes, error_code = NULL, error_message = NULL,
                  finished_at = unixepoch(), initial_metadata = NULL, initial_chunk_metadata = NULL,
-                 rtf_preparation = NULL
+                 rtf_preparation = NULL, cleanup_after = CASE WHEN ?8 THEN unixepoch() + 60 END
              WHERE operation_id = ?1 AND status IN ('indexing', 'publishing')",
                 params![
                     id.to_string(),
@@ -646,7 +654,8 @@ impl LocalQueue {
                     sql_integer(revision.content.bytes)?,
                     revision.content.original_hash,
                     revision.content.encoding,
-                    revision.content.extractor
+                    revision.content.extractor,
+                    original_cleanup_pending,
                 ],
             )
             .map_err(database_error)?;
