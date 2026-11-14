@@ -2344,6 +2344,18 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   and Scheduler delivery remain open.
   [Snapshot maintenance](STORAGE.md#scheduled-snapshot-reclamation).
 
+## SQLite snapshot uploads with lost responses
+
+- A writer can publish a snapshot or page delta whose upload reply was
+  lost after storage committed the bytes. It streams the candidate through
+  the existing length and BLAKE3 verification while renewing the lease.
+  The manifest still changes only through conditional publication.
+- Filesystem and live MinIO tests lost the reply after a full snapshot and
+  a page delta upload. They verified correct cold reconstruction and
+  idempotent command replay. A same-length corrupted candidate left the
+  committed generation and receipts untouched.
+  [Database publication](STORAGE.md#object-backed-database-publication).
+
 ## S3 multipart upload cancellation
 
 - The S3 adapter gives cleanup five seconds to abort the original multipart

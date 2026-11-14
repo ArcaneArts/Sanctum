@@ -537,14 +537,26 @@ impl Publication {
         digest: &str,
         directory: &Path,
     ) -> Result<NamedTempFile> {
+        let file = NamedTempFile::new_in(directory)?;
+        let mut output = tokio::fs::File::from_std(file.reopen()?);
+        self.verify_object(key, length, digest, &mut output).await?;
+        output.flush().await?;
+        Ok(file)
+    }
+
+    async fn verify_object(
+        &self,
+        key: &Key,
+        length: u64,
+        digest: &str,
+        mut output: impl tokio::io::AsyncWrite + Unpin,
+    ) -> Result<()> {
         let response = self.storage.get(key).await?;
         if response.object.length != length {
             return Err(corrupt(
                 "database snapshot length differs from its manifest",
             ));
         }
-        let file = NamedTempFile::new_in(directory)?;
-        let mut output = tokio::fs::File::from_std(file.reopen()?);
         let mut input = response.reader;
         let mut hasher = blake3::Hasher::new();
         let mut buffer = vec![0; 256 * 1024];
@@ -566,8 +578,7 @@ impl Publication {
         if read != length || hasher.finalize().to_hex().as_str() != digest {
             return Err(corrupt("database snapshot does not match its manifest"));
         }
-        output.flush().await?;
-        Ok(file)
+        Ok(())
     }
 }
 
@@ -718,20 +729,59 @@ impl Lease {
             } => return Ok((generation, receipts)),
         };
         self.renew().await?;
-        let (key, file) = match &delta {
-            Some(delta) => (self.unit.delta(generation.id)?, delta.reopen()?),
-            None => (self.unit.snapshot(generation.id)?, staged.reopen()?),
+        let (key, file, uploaded_bytes, digest) = match &delta {
+            Some(delta) => {
+                let entry = generation
+                    .chain
+                    .as_ref()
+                    .and_then(|chain| chain.deltas.last())
+                    .expect("prepared delta has a manifest entry");
+                (
+                    self.unit.delta(generation.id)?,
+                    delta.reopen()?,
+                    entry.bytes,
+                    entry.blake3.as_str(),
+                )
+            }
+            None => (
+                self.unit.snapshot(generation.id)?,
+                staged.reopen()?,
+                generation.bytes,
+                generation.blake3.as_str(),
+            ),
         };
-        let uploaded_bytes = file.metadata()?.len();
-        let storage = self.publication.storage.clone();
-        self.while_renewing(async move {
-            storage
+        let publication = self.publication.clone();
+        self.while_renewing(async {
+            match publication
+                .storage
                 .put_stream(
                     &key,
                     Box::pin(tokio::fs::File::from_std(file)),
                     uploaded_bytes,
                 )
                 .await
+            {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    // The upload can commit before its reply reaches the writer.
+                    // This is a fresh object key. Verify the candidate by digest
+                    // before making it visible through the manifest.
+                    match publication
+                        .verify_object(&key, uploaded_bytes, digest, tokio::io::sink())
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::debug!(%key, %error, "recovered a committed SQLite upload");
+                            Ok(())
+                        }
+                        Err(Error::NotFound(_)) => Err(error),
+                        Err(verification) => {
+                            tracing::warn!(%key, %error, "could not verify the SQLite upload");
+                            Err(verification)
+                        }
+                    }
+                }
+            }
         })
         .await?;
         let mut head = self.head.clone();

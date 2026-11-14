@@ -59,10 +59,12 @@ Reacquire ownership and replay the same operation ID to recover any
 committed receipt. Snapshot downloads verify length and BLAKE3. The
 executor applies at most 64 prepared commands and their receipts in one
 SQLite transaction. It uploads a consistent SQLite backup under a fresh
-key before attempting to publish it. Replaying a batch of previously
-applied commands returns the saved
-outcomes and current generation. Only the successful HEAD write makes a
-new database visible. [SQLite online backup](https://www.sqlite.org/backup.html).
+key before attempting to publish it. If that upload returns an error,
+the writer can recover by streaming the candidate back and verifying its
+exact byte length and BLAKE3 digest under the same lease. This also applies
+to page deltas. Replaying a batch of previously applied commands returns
+the saved outcomes and current generation. Only the successful HEAD write
+makes a new database visible. [SQLite online backup](https://www.sqlite.org/backup.html).
 
 Cleanup marks a noncurrent snapshot when it first observes it, then
 waits at least five minutes before removing it. The grace period starts
