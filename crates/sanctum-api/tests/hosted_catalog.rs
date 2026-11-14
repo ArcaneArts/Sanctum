@@ -1792,11 +1792,22 @@ async fn hosted_job_outcomes_survive_staged_input_cleanup_failure() {
     drop(catalog);
 
     let catalog = service();
-    let sweep = catalog.sweep_abandoned_uploads().await.unwrap();
-    assert_eq!((sweep.deleted, sweep.failed), (0, 3));
+    let run_sweep = || async {
+        let mut deleted = 0;
+        let mut failed = 0;
+        for _ in 0..8 {
+            let page = catalog.sweep_abandoned_uploads().await.unwrap();
+            deleted += page.deleted;
+            failed += page.failed;
+            if !page.more {
+                return (deleted, failed);
+            }
+        }
+        panic!("upload sweep did not finish scanning the test store");
+    };
+    assert_eq!(run_sweep().await, (0, 3));
     storage.interrupt.store(0, Ordering::Relaxed);
-    let recovered = catalog.sweep_abandoned_uploads().await.unwrap();
-    assert_eq!((recovered.deleted, recovered.failed), (3, 0));
+    assert_eq!(run_sweep().await, (3, 0));
     let mut server = start(catalog).await;
     for (name, request, state, input) in cases {
         let recovered = server
@@ -7022,7 +7033,7 @@ async fn hosted_expiration_settles_pending_stages_and_preserves_committed_text()
             )
             .await
             .unwrap();
-        if id != redispatch.operation {
+        if id != redispatch.operation && id != abandoned.operation {
             age(&key, 31_u64);
         }
     }
@@ -7042,7 +7053,8 @@ async fn hosted_expiration_settles_pending_stages_and_preserves_committed_text()
         sanctum_service::HostedJobState::Accepted
     ));
 
-    // The aged envelopes are still recoverable if an old worker lost a hint.
+    // The abandoned envelope was rewritten recently, after the upload expired.
+    // Its last update must not delay recovery of a missing hint.
     let download = storage.get(&envelope(abandoned.operation)).await.unwrap();
     let mut bytes = Vec::new();
     download

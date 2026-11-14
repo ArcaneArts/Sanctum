@@ -163,22 +163,11 @@ impl HostedCatalog {
     }
 
     async fn expire_operation(&self, scope: &Scope, object: &Key, operation: Uuid) -> Result<bool> {
-        let head = self.storage.head(object).await?;
-        let age = SystemTime::now()
-            .duration_since(head.modified_at)
-            .unwrap_or_default();
-        if age < REGISTRATION_WINDOW {
-            return Ok(false);
-        }
-        let prefix = self.operation_prefix(scope, operation)?;
-        let Some((Envelope::Accepted(record), version)) =
-            self.read_envelope(&prefix, operation).await?
+        let Some((Envelope::Accepted(record), metadata)) =
+            self.read_envelope_object(object, operation).await?
         else {
             return Ok(false);
         };
-        if version != head.version {
-            return Ok(false);
-        }
         if record.is_pending() {
             if unix_seconds()? >= record.expires_at() {
                 if self.dispatcher.is_some() {
@@ -191,9 +180,13 @@ impl HostedCatalog {
             }
             return Ok(false);
         }
-        if age < OPERATION_RETENTION {
+        if !SystemTime::now()
+            .duration_since(metadata.modified_at)
+            .is_ok_and(|age| age >= OPERATION_RETENTION)
+        {
             return Ok(false);
         }
+        let prefix = self.operation_prefix(scope, operation)?;
         let retained_attempt = match record.stage {
             Stage::TextReady {
                 embedding: None, ..
@@ -221,7 +214,7 @@ impl HostedCatalog {
             serde_json::to_vec(&compact).map_err(|error| Error::Internal(Box::new(error)))?;
         match self
             .storage
-            .put_control(object, body.into(), Condition::Match(version))
+            .put_control(object, body.into(), Condition::Match(metadata.version))
             .await
         {
             Ok(_) => Ok(true),
@@ -349,7 +342,8 @@ pub(super) fn admission_grace_elapsed(object: &Object) -> bool {
 fn old_enough(object: &Object, candidate: &Candidate, now: SystemTime) -> bool {
     let minimum = match candidate {
         Candidate::Input { .. } => READER_GRACE,
-        Candidate::Operation { .. } => REGISTRATION_WINDOW,
+        // Dispatch checkpoints can rewrite an envelope after its upload expired.
+        Candidate::Operation { .. } => return true,
         Candidate::PreparedEmbedding => OPERATION_RETENTION,
         // Registration starts before extraction. Even a delayed index writer has
         // expired by now and cannot introduce this locator into a new snapshot.

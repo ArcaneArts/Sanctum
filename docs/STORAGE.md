@@ -684,9 +684,11 @@ only an admission fence still returns HTTP 404.
 
 Once a pending upload reaches its 30-day processing limit, dispatch repair
 queues its current settlement stage with an expiry-specific task name. The
-upload sweep can restore a missing hint before dispatching aged pending
-envelopes. With Cloud Tasks configured, the task worker settles the upload
-under the regular task deadline. The standalone worker settles it directly.
+upload sweep checks pending envelopes against their recorded creation time
+and restores missing hints even after a recent checkpoint. It reads envelopes
+within the same per-invocation candidate budget. With Cloud Tasks configured,
+the task worker settles the upload under the regular task deadline. The
+standalone worker settles it directly.
 Both reuse registration and indexing receipts or check the exact revision
 in the fenced collection database if the indexing receipt has aged out.
 Unpublished work becomes `FAILED` with

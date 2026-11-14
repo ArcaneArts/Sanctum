@@ -1061,6 +1061,11 @@ async fn verify_expired_dispatch(
         &format!("default/collections/repair/operations/{id}/operation.json"),
     );
     let (mut record, version) = read_control(storage, &key).await;
+    let attempt = record["attempt"].as_str().unwrap();
+    let hint = scoped_key(
+        prefix,
+        &format!("_dispatch/0f/pending/default/repair/{id}.{attempt}"),
+    );
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
@@ -1077,10 +1082,33 @@ async fn verify_expired_dispatch(
 
     let generation = collection_generation(storage, prefix).await;
     let (worker, worker_server) = serve_http(crate::hosted_worker::router(make_catalog())).await;
+    storage.delete(&hint).await.unwrap();
     assert_eq!(
         reconcile(http, &worker, 15).await,
-        json!({"dispatched": 1, "failed": 0, "more": false}),
+        json!({"dispatched": 0, "failed": 0, "more": false}),
     );
+    // Sweep the recently rewritten envelope with the hint missing. This
+    // exercises the same path with ordinary modification times on MinIO.
+    let mut more = true;
+    for _ in 0..64 {
+        let report: Value = http
+            .post(format!("{worker}/internal/maintenance/upload-sweep"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(report["failed"], 0);
+        more = report["more"].as_bool().unwrap();
+        if !more {
+            break;
+        }
+    }
+    assert!(!more, "upload sweep did not finish scanning the test store");
+    storage.head(&hint).await.unwrap();
     let recovery = queue.accepted.lock().unwrap().last().unwrap().clone();
     assert_ne!(recovery["task"]["name"], original["task"]["name"]);
     assert_eq!(
