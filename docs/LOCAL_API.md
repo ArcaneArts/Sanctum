@@ -625,9 +625,12 @@ of those updates. A cursor ahead of the log returns `INVALID_ARGUMENT`.
 
 Hosted deployments expose the same change methods. Registration by
 itself emits no source change. Events become visible when the worker
-publishes a searchable revision. The hosted stream checks for a newer
-snapshot about every two seconds when caught up. If the published generation
-is unchanged, it skips downloading and querying the collection database.
+publishes a searchable revision. The hosted stream checks the tenant catalog
+and collection manifests about every two seconds when caught up. It reuses
+confirmed membership while the catalog generation stays current, and resumes
+reading the change log when the collection generation changes. Collection
+deletion ends the stream with `NOT_FOUND` as soon as it sees the catalog
+tombstone.
 Reconnect with the saved cursor when the API connection or its deployment
 deadline ends.
 

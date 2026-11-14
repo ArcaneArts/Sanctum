@@ -4,11 +4,19 @@ use uuid::Uuid;
 
 use crate::{
     Change, HostedCatalog, MetadataEntry, MetadataMutation, RevisionTarget,
-    db::{CollectionDb, metadata},
+    db::{self, CollectionDb, metadata},
     hosted_retrieval::query_snapshot,
     metadata_filter::Level,
     metadata_query,
 };
+
+/// Progress from one hosted change poll. The catalog observation is only
+/// reusable for the same collection, even within one tenant.
+pub struct HostedChangePosition {
+    scope: Scope,
+    catalog_generation: Uuid,
+    caught_up: Option<(Uuid, u64)>,
+}
 
 impl HostedCatalog {
     pub async fn metadata(
@@ -122,29 +130,71 @@ impl HostedCatalog {
             .map(|(changes, _)| changes)
     }
 
-    /// A stream caught up to a generation can skip querying it again.
+    /// Checks both published manifests. An unchanged generation can reuse
+    /// confirmed membership or a caught-up cursor from the previous poll.
     pub async fn poll_changes(
         &self,
         scope: &Scope,
         after: u64,
         limit: u32,
-        caught_up_to: Option<Uuid>,
-    ) -> Result<(Vec<Change>, Uuid)> {
+        previous: Option<&HostedChangePosition>,
+    ) -> Result<(Vec<Change>, HostedChangePosition)> {
         super::validate_change_limit(limit)?;
-        self.require_collection(scope).await?;
+        let previous = previous.filter(|position| {
+            position.scope.tenant == scope.tenant && position.scope.collection == scope.collection
+        });
+        let catalog = Unit::catalog(self.prefix.as_ref(), &scope.tenant)?;
+        let catalog_generation = self
+            .publication
+            .generation(&catalog)
+            .await?
+            .ok_or_else(|| Error::NotFound("tenant catalog was not found".into()))?;
+        let catalog_id = catalog_generation.id;
+        if previous.is_none_or(|position| position.catalog_generation != catalog_id) {
+            let snapshot = self
+                .snapshots
+                .read_generation(&self.publication, &catalog, catalog_generation)
+                .await?;
+            let collection = scope.collection.to_string();
+            tokio::task::spawn_blocking(move || {
+                db::require_collection(snapshot.path(), &collection)
+            })
+            .await
+            .map_err(|error| Error::Internal(Box::new(error)))??;
+        }
         let unit = Unit::collection(self.prefix.as_ref(), scope)?;
         let generation = self
             .publication
             .generation(&unit)
             .await?
             .ok_or_else(|| Error::NotFound("collection database was not found".into()))?;
-        if caught_up_to == Some(generation.id) {
-            return Ok((Vec::new(), generation.id));
-        }
-        let snapshot = self
-            .snapshots
-            .read_generation(&self.publication, &unit, generation)
-            .await?;
-        query_snapshot(snapshot, move |database| database.changes(after, limit)).await
+        let generation_id = generation.id;
+        let changes = if previous
+            .is_some_and(|position| position.caught_up == Some((generation_id, after)))
+        {
+            Vec::new()
+        } else {
+            let snapshot = self
+                .snapshots
+                .read_generation(&self.publication, &unit, generation)
+                .await?;
+            query_snapshot(snapshot, move |database| database.changes(after, limit))
+                .await?
+                .0
+        };
+        let caught_up = (changes.len() < limit as usize).then(|| {
+            (
+                generation_id,
+                changes.last().map_or(after, |change| change.cursor),
+            )
+        });
+        Ok((
+            changes,
+            HostedChangePosition {
+                scope: scope.clone(),
+                catalog_generation: catalog_id,
+                caught_up,
+            },
+        ))
     }
 }

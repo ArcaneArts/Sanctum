@@ -60,6 +60,7 @@ pub use hosted_ingestion::{
     HostedActivityPage, HostedEmbeddingWork, HostedJob, HostedJobState, HostedPreparation,
     HostedUpload, UploadSweep,
 };
+pub use hosted_metadata::HostedChangePosition;
 pub use hosted_rebuild::RebuildPage;
 pub use local_import::{ImportEvent, ImportOptions, ImportState};
 pub use pending_scan::{PendingText, ScanOptions, ScanPage, ScanStop};

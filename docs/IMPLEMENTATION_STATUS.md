@@ -925,6 +925,18 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   It observed source publication, replayed replacement and `metadata_reset`
   with one event per page after reconnecting, and observed `NOT_FOUND` after
   a second process deleted the collection.
+- The watch now also reuses confirmed membership while the tenant catalog
+  generation stays current. With retention disabled, the gRPC test verifies
+  that idle polls check both manifests without downloading either database.
+  It publishes a sibling collection to trigger a fresh catalog check, then
+  holds the collection writer lease during deletion to verify the catalog
+  tombstone alone ends the watch.
+- A generated Python gRPC client against live MinIO with retention disabled
+  observed three reads of each manifest and one download of each database
+  across the initial page and two idle polls. Creating a sibling caused one
+  additional catalog download. The watch then delivered `source_created`
+  and returned `NOT_FOUND` after catalog deletion while the previous
+  collection generation was still published.
 
 ## Hosted database inspection
 
@@ -1293,6 +1305,7 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   pages with catalog retention disabled. It observed one catalog manifest read
   and one download, returned the accepted and canceled jobs from two active
   collections, and skipped the retired collection's job envelope.
+- Delivered in [PR #154](https://github.com/ArcaneArts/Sanctum/pull/154).
 
 ## Local upload request replay
 
