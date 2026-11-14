@@ -15,6 +15,7 @@ const HINT_PAGE_SIZE: u32 = 16;
 const REPAIR_CONCURRENCY: usize = 4;
 const REPAIR_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 const REPAIR_PAGE_TIMEOUT: Duration = Duration::from_secs(240);
+const STANDALONE_LIST_TIMEOUT: Duration = Duration::from_secs(45);
 pub const HOSTED_STAGE_TIMEOUT: Duration = Duration::from_secs(570);
 
 #[derive(Default, Serialize, Deserialize)]
@@ -246,7 +247,12 @@ impl HostedCatalog {
         stage_timeout: Duration,
         stopping: impl Fn() -> bool,
     ) -> Result<ReconcilePage> {
-        let HintPage { hints, next_cursor } = self.hint_page(shard, cursor).await?;
+        let HintPage { hints, next_cursor } = timeout(
+            STANDALONE_LIST_TIMEOUT.min(stage_timeout),
+            self.hint_page(shard, cursor),
+        )
+        .await
+        .map_err(|_| Error::Busy("standalone dispatch listing timed out".into()))??;
         let mut report = ReconcilePage {
             dispatched: 0,
             failed: 0,

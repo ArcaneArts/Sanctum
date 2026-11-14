@@ -81,6 +81,113 @@ async fn minio_standalone_worker_continues_after_a_stage_deadline() {
     clear_prefix(storage.as_ref(), &prefix).await;
 }
 
+#[tokio::test]
+async fn filesystem_standalone_worker_continues_after_a_listing_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    verify_standalone_listing_deadline(storage, None).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live MinIO bucket and S3 credentials"]
+async fn minio_standalone_worker_continues_after_a_listing_deadline() {
+    let storage = minio_storage();
+    let prefix = Key::parse(format!("standalone-listing-{}", Uuid::new_v4())).unwrap();
+    eprintln!("MinIO test prefix {prefix}");
+    verify_standalone_listing_deadline(storage.clone(), Some(prefix.clone())).await;
+    clear_prefix(storage.as_ref(), &prefix).await;
+}
+
+async fn verify_standalone_listing_deadline(storage: Arc<dyn Storage>, prefix: Option<Key>) {
+    let (entered, reached) = oneshot::channel();
+    let released = Arc::new(AtomicBool::new(false));
+    let fault = Arc::new(StalledCheckpoint {
+        storage,
+        checkpoint: Mutex::new(None),
+        after_dispatch: false,
+        lose_source_reply: None,
+        lose_control_reply: Mutex::new(None),
+        stall_listing: Some(StalledListing {
+            key_suffix: "_dispatch/00/pending",
+            released: released.clone(),
+            entered: Mutex::new(Some(entered)),
+        }),
+    });
+    let scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "repair".into(),
+    };
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let catalog = HostedCatalog::new(fault, prefix, 1024)
+        .unwrap()
+        .with_standalone_worker(wake.clone());
+    let (mut api, _api_server) = serve_api(catalog.clone()).await;
+    api.create_collection(v1::CreateCollectionRequest {
+        scope: Some(scope.clone()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    // The first UUID byte selects the shard.
+    let first = submit_source(&mut api, &scope, Uuid::from_u128(1), "stalled.rtf", RTF).await;
+    let next = submit_source(
+        &mut api,
+        &scope,
+        Uuid::from_u128((1 << 120) | 2),
+        "next.txt",
+        "Café quartz from a later shard.".as_bytes(),
+    )
+    .await;
+
+    let stop = CancellationToken::new();
+    let attempt_timeout = Duration::from_secs(2);
+    let worker = AbortOnDropHandle::new(tokio::spawn(
+        crate::standalone_worker::run_with_stage_timeout(
+            catalog,
+            wake.clone(),
+            stop.clone(),
+            attempt_timeout,
+        ),
+    ));
+    let dropped = tokio::time::timeout(Duration::from_secs(5), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(attempt_timeout + Duration::from_secs(1), dropped)
+            .await
+            .expect("the stalled listing must be dropped at its deadline")
+            .is_err()
+    );
+
+    assert_upload_published(
+        &mut api,
+        &scope,
+        &next,
+        "quartz",
+        "Café quartz from a later shard.",
+    )
+    .await;
+    let first_job = v1::IngestionJobRequest {
+        scope: Some(scope.clone()),
+        operation_id: first.operation_id.clone(),
+    };
+    assert_eq!(
+        api.get_ingestion_job(first_job).await.unwrap().into_inner(),
+        first
+    );
+
+    released.store(true, Ordering::Release);
+    wake.notify_one();
+    assert_upload_published(&mut api, &scope, &first, "rhodonite", TEXT).await;
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 async fn verify_standalone_deadline(storage: Arc<dyn Storage>, prefix: Option<Key>) {
     let (checkpoint, reached) = oneshot::channel();
     let fault = Arc::new(StalledCheckpoint {
@@ -89,6 +196,7 @@ async fn verify_standalone_deadline(storage: Arc<dyn Storage>, prefix: Option<Ke
         after_dispatch: false,
         lose_source_reply: None,
         lose_control_reply: Mutex::new(None),
+        stall_listing: None,
     });
     let scope = v1::Scope {
         tenant: "default".into(),
@@ -146,46 +254,70 @@ async fn verify_standalone_deadline(storage: Arc<dyn Storage>, prefix: Option<Ke
             .is_err()
     );
 
-    for (accepted, word, text) in [
-        (first, "rhodonite", TEXT),
-        (next, "quartz", "Café quartz after the stalled stage."),
-    ] {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let status = api
-                    .get_ingestion_job(job(&accepted.operation_id))
-                    .await
-                    .unwrap()
-                    .into_inner();
-                if status.state() == v1::IngestionState::TextReady {
-                    assert_eq!(status.revision_id, accepted.revision_id);
-                    assert_eq!(status.source_id, accepted.source_id);
-                    assert_eq!(status.update_sequence, 1);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let hits = api
-            .search_text(v1::SearchTextRequest {
-                scope: Some(scope.clone()),
-                query: word.into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .into_inner()
-            .hits;
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].excerpt, text);
-    }
+    assert_upload_published(&mut api, &scope, &first, "rhodonite", TEXT).await;
+    assert_upload_published(
+        &mut api,
+        &scope,
+        &next,
+        "quartz",
+        "Café quartz after the stalled stage.",
+    )
+    .await;
     stop.cancel();
     tokio::time::timeout(Duration::from_secs(2), worker)
         .await
         .unwrap()
         .unwrap();
+}
+
+async fn assert_upload_published(
+    api: &mut SanctumClient<Channel>,
+    scope: &v1::Scope,
+    accepted: &v1::IngestionJob,
+    word: &str,
+    text: &str,
+) {
+    let request = v1::IngestionJobRequest {
+        scope: Some(scope.clone()),
+        operation_id: accepted.operation_id.clone(),
+    };
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let status = api
+                .get_ingestion_job(request.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            if status.state() == v1::IngestionState::TextReady {
+                assert_eq!(status.revision_id, accepted.revision_id);
+                assert_eq!(status.source_id, accepted.source_id);
+                assert_eq!(status.update_sequence, 1);
+                break;
+            }
+            assert!(
+                matches!(
+                    status.state(),
+                    v1::IngestionState::Accepted | v1::IngestionState::Registered
+                ),
+                "{status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let hits = api
+        .search_text(v1::SearchTextRequest {
+            scope: Some(scope.clone()),
+            query: word.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .hits;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].excerpt, text);
 }
 
 async fn verify_standalone_shutdown(storage: Arc<dyn Storage>, prefix: Option<Key>) {
@@ -196,6 +328,7 @@ async fn verify_standalone_shutdown(storage: Arc<dyn Storage>, prefix: Option<Ke
         after_dispatch: false,
         lose_source_reply: None,
         lose_control_reply: Mutex::new(None),
+        stall_listing: None,
     });
     let scope = v1::Scope {
         tenant: "default".into(),
@@ -391,6 +524,7 @@ async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
         after_dispatch: false,
         lose_source_reply: None,
         lose_control_reply: Mutex::new(Some("/prepared-embeddings/")),
+        stall_listing: None,
     });
     let (worker, worker_server) =
         serve_http(crate::hosted_worker::router(make_catalog(fault.clone()))).await;
@@ -528,6 +662,7 @@ async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
         after_dispatch: false,
         lose_source_reply: None,
         lose_control_reply: Mutex::new(None),
+        stall_listing: None,
     });
     let rebuild = rebuild_catalog(faults.clone());
     let (record, _) = read_control(storage.as_ref(), &rebuild_key).await;
@@ -728,6 +863,13 @@ struct StalledCheckpoint {
     after_dispatch: bool,
     lose_source_reply: Option<&'static str>,
     lose_control_reply: Mutex<Option<&'static str>>,
+    stall_listing: Option<StalledListing>,
+}
+
+struct StalledListing {
+    key_suffix: &'static str,
+    released: Arc<AtomicBool>,
+    entered: Mutex<Option<oneshot::Sender<oneshot::Receiver<()>>>>,
 }
 
 #[async_trait::async_trait]
@@ -785,6 +927,18 @@ impl Storage for StalledCheckpoint {
         cursor: Option<&str>,
         limit: u32,
     ) -> Result<ListPage> {
+        if let Some(stalled) = &self.stall_listing
+            && prefix.is_some_and(|key| key.as_str().ends_with(stalled.key_suffix))
+            && !stalled.released.load(Ordering::Acquire)
+        {
+            let entered = stalled.entered.lock().unwrap().take();
+            let (in_flight, canceled) = oneshot::channel();
+            if let Some(entered) = entered {
+                entered.send(canceled).unwrap();
+            }
+            std::future::pending::<()>().await;
+            drop(in_flight);
+        }
         self.storage.list(prefix, cursor, limit).await
     }
 
@@ -889,6 +1043,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         after_dispatch: false,
         lose_source_reply: Some("/inputs/"),
         lose_control_reply: Mutex::new(Some("/catalog/creations/")),
+        stall_listing: None,
     });
     let (mut api, api_server) = serve_api(catalog_with_storage(api_storage.clone())).await;
     let creation = v1::CreateCollectionRequest {
@@ -1023,6 +1178,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         after_dispatch: false,
         lose_source_reply: None,
         lose_control_reply: Mutex::new(None),
+        stall_listing: None,
     }));
     let (deadline_worker, deadline_server) =
         serve_http(crate::hosted_worker::router_with_task_budgets(
@@ -1068,6 +1224,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         after_dispatch: true,
         lose_source_reply: None,
         lose_control_reply: Mutex::new(Some("/operation.json")),
+        stall_listing: None,
     });
     let stalled = catalog_with_storage(checkpoint_fault.clone());
     let (handoff_worker, handoff_server) =
@@ -1147,6 +1304,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
                 after_dispatch: false,
                 lose_source_reply: None,
                 lose_control_reply: Mutex::new(None),
+                stall_listing: None,
             }));
             let (slow_worker, _slow_server) =
                 serve_http(crate::hosted_worker::router_with_task_budgets(
@@ -1189,6 +1347,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
                 after_dispatch: false,
                 lose_source_reply: (index == 1).then_some("/objects/"),
                 lose_control_reply: Mutex::new(Some("/operation.json")),
+                stall_listing: None,
             });
             let (worker, server) = serve_http(crate::hosted_worker::router(catalog_with_storage(
                 fault.clone(),

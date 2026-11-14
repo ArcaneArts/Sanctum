@@ -1594,6 +1594,13 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   The regression passed against filesystem storage and live MinIO using
   a shortened stage deadline. The MinIO test removed its isolated prefix.
   [Standalone worker behavior](STORAGE.md#hosted-server-configuration).
+- The standalone dispatch scan now bounds each listing request. The
+  regression stalls all listings for the first shard and verifies that a
+  later shard's upload becomes searchable while the first stays accepted.
+  After the listing recovers, the same worker publishes the first upload
+  under its original revision ID. Both published excerpts match the source.
+  The regression runs against filesystem storage and live MinIO with a
+  shortened deadline and isolated storage.
 
 - Set `standalone_object_worker` to process durable object-backed uploads in
   the same server as gRPC and MCP. The worker uses the existing publication
