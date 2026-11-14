@@ -41,6 +41,8 @@ Startup resumes pending intents, and the collection becomes visible only after
 initialization commits. Local success receipts become eligible for cleanup
 after 45 days. Generate a fresh ID for each new operation.
 
+## Text uploads
+
 Each `UploadText` stream starts with one header containing the tenant,
 collection, and source name. It follows with data frames of up to 256 KiB and
 an explicit end frame. Close the sending side of the stream after the end
@@ -49,6 +51,14 @@ new source with an existing external namespace and ID returns `ALREADY_EXISTS`.
 `UploadText` waits up to 30 seconds for lexical publication.
 If its wait expires, the response includes the operation ID. The
 accepted work can continue after the client disconnects.
+
+During server shutdown, `SubmitText` and `UploadText` can return retryable
+`UNAVAILABLE` while receiving frames or waiting on hosted storage. An
+incomplete stream never enters the durable queue. An upload may already
+be accepted if the server stops while sending its receipt. A shutdown
+during the `UploadText` publication wait includes the accepted operation ID.
+Use `GetIngestionJob` after restart to check any returned ID. If you resend
+the original upload, reuse the request ID and input.
 
 Local upload acceptance records a BLAKE3 digest of the staged input.
 The worker checks it before publishing UTF-8 or RTF. A storage digest

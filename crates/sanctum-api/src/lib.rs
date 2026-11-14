@@ -712,64 +712,21 @@ impl Sanctum for Grpc {
         let service = match &self.0 {
             Backend::Local(service) => service,
             Backend::Hosted(catalog) => {
-                let (scope, job) = submit_hosted(catalog, stream).await?;
-                return wait_hosted_upload(catalog, &scope, job)
-                    .await
-                    .map(Response::new);
+                let (scope, job) = submit_hosted(catalog, &self.1, stream).await?;
+                let operation = job.operation;
+                return until_upload_shutdown(
+                    &self.1,
+                    Some(operation),
+                    wait_hosted_upload(catalog, &scope, job),
+                )
+                .await
+                .map(Response::new);
             }
         };
-        let mut job = submit_local(service, stream).await?;
-        let operation = job.id;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            match job.state {
-                JobState::TextReady => {
-                    return text_revision(&job)
-                        .map(Response::new)
-                        .ok_or_else(|| missing_upload_receipt(operation));
-                }
-                JobState::Failed => {
-                    let failure = job.failure.ok_or_else(|| {
-                        operation_status(
-                            Code::Internal,
-                            "ingestion failed",
-                            "internal",
-                            false,
-                            operation,
-                        )
-                    })?;
-                    let code = match failure.code.as_str() {
-                        "invalid_source" => Code::InvalidArgument,
-                        "conflict" => Code::AlreadyExists,
-                        _ => Code::Unavailable,
-                    };
-                    return Err(operation_status(
-                        code,
-                        failure.message,
-                        &failure.code,
-                        failure.code == "retryable",
-                        operation,
-                    ));
-                }
-                JobState::Canceled => {
-                    return Err(operation_status(
-                        Code::Cancelled,
-                        "ingestion canceled",
-                        "canceled",
-                        false,
-                        operation,
-                    ));
-                }
-                _ => {}
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(upload_wait_expired(operation));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            let service = service.clone();
-            job = work_for_operation(Some(operation), move || service.job(&job.scope, operation))
-                .await?;
-        }
+        let job = submit_local(service, &self.1, stream).await?;
+        until_upload_shutdown(&self.1, Some(job.id), wait_local_upload(service, job))
+            .await
+            .map(Response::new)
     }
 
     async fn submit_text(
@@ -778,9 +735,9 @@ impl Sanctum for Grpc {
     ) -> Reply<v1::IngestionJob> {
         let stream = request.into_inner();
         let job = match &self.0 {
-            Backend::Local(service) => wire_job(submit_local(service, stream).await?),
+            Backend::Local(service) => wire_job(submit_local(service, &self.1, stream).await?),
             Backend::Hosted(catalog) => {
-                let (scope, accepted) = submit_hosted(catalog, stream).await?;
+                let (scope, accepted) = submit_hosted(catalog, &self.1, stream).await?;
                 wire_hosted_job(&scope, accepted)
             }
         };
@@ -1399,9 +1356,11 @@ fn unix_ms(time: std::time::SystemTime) -> Result<u64> {
 
 async fn submit_local(
     service: &Service,
+    shutdown: &CancellationToken,
     mut stream: Streaming<v1::UploadTextFrame>,
 ) -> std::result::Result<Job, Status> {
-    let (scope, upload, request_id) = read_upload_header(&mut stream).await?;
+    let (scope, upload, request_id) =
+        until_upload_shutdown(shutdown, None, read_upload_header(&mut stream)).await?;
     let service = service.clone();
     let max_bytes = service.max_source_bytes();
     let (staged, file) = work_for_operation(request_id, move || {
@@ -1410,28 +1369,107 @@ async fn submit_local(
         Ok((staged, file))
     })
     .await?;
-    receive_upload(&mut stream, file, max_bytes).await?;
+    until_upload_shutdown(shutdown, None, receive_upload(&mut stream, file, max_bytes)).await?;
+    // Once all frames are received, let local acceptance finish as one
+    // blocking operation. The job can then be recovered by its receipt.
     work_for_operation(request_id, move || staged.enqueue_with_request(request_id)).await
 }
 
 async fn submit_hosted(
     catalog: &HostedCatalog,
+    shutdown: &CancellationToken,
     mut stream: Streaming<v1::UploadTextFrame>,
 ) -> std::result::Result<(Scope, HostedJob), Status> {
-    let (scope, upload, operation) = read_upload_header(&mut stream).await?;
-    let staged = catalog
-        .stage_upload(scope.clone(), upload, operation)
-        .await
-        .map_err(|error| from_error(error, operation))?;
-    let file = staged
-        .reopen()
-        .map_err(|error| from_error(error, operation))?;
-    receive_upload(&mut stream, file, catalog.max_source_bytes()).await?;
-    let accepted = staged
-        .enqueue()
-        .await
-        .map_err(|error| from_error(error, operation))?;
+    let (scope, upload, request_id) =
+        until_upload_shutdown(shutdown, None, read_upload_header(&mut stream)).await?;
+    let operation = Some(request_id.unwrap_or_else(uuid::Uuid::new_v4));
+    let accepted = until_upload_shutdown(shutdown, operation, async {
+        let staged = catalog
+            .stage_upload(scope.clone(), upload, operation)
+            .await
+            .map_err(|error| from_error(error, operation))?;
+        let file = staged
+            .reopen()
+            .map_err(|error| from_error(error, operation))?;
+        receive_upload(&mut stream, file, catalog.max_source_bytes()).await?;
+        staged
+            .enqueue()
+            .await
+            .map_err(|error| from_error(error, operation))
+    })
+    .await?;
     Ok((scope, accepted))
+}
+
+async fn until_upload_shutdown<T>(
+    shutdown: &CancellationToken,
+    operation: Option<uuid::Uuid>,
+    upload: impl Future<Output = std::result::Result<T, Status>>,
+) -> std::result::Result<T, Status> {
+    tokio::select! {
+        biased;
+        result = upload => result,
+        _ = shutdown.cancelled() => Err(from_error(
+            Error::Busy("upload interrupted by server shutdown".into()),
+            operation,
+        )),
+    }
+}
+
+async fn wait_local_upload(
+    service: &Service,
+    mut job: Job,
+) -> std::result::Result<v1::TextRevision, Status> {
+    use std::time::Duration;
+    let operation = job.id;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match job.state {
+            JobState::TextReady => {
+                return text_revision(&job).ok_or_else(|| missing_upload_receipt(operation));
+            }
+            JobState::Failed => {
+                let failure = job.failure.ok_or_else(|| {
+                    operation_status(
+                        Code::Internal,
+                        "ingestion failed",
+                        "internal",
+                        false,
+                        operation,
+                    )
+                })?;
+                let code = match failure.code.as_str() {
+                    "invalid_source" => Code::InvalidArgument,
+                    "conflict" => Code::AlreadyExists,
+                    _ => Code::Unavailable,
+                };
+                return Err(operation_status(
+                    code,
+                    failure.message,
+                    &failure.code,
+                    failure.code == "retryable",
+                    operation,
+                ));
+            }
+            JobState::Canceled => {
+                return Err(operation_status(
+                    Code::Cancelled,
+                    "ingestion canceled",
+                    "canceled",
+                    false,
+                    operation,
+                ));
+            }
+            _ => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(upload_wait_expired(operation));
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let service = service.clone();
+        job =
+            work_for_operation(Some(operation), move || service.job(&job.scope, operation)).await?;
+    }
 }
 
 async fn wait_hosted_upload(
