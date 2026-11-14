@@ -276,6 +276,9 @@ to the accepted input object.
 The next task delivers the same operation reference to
 `/internal/tasks/index-upload`. It indexes overlapping chunks from the
 canonical object and verifies its digest, length, and chunk count as it reads.
+If a saved RTF extraction is missing or fails verification, the worker rebuilds
+it from the accepted RTF. It publishes a fresh object only if the reconstructed
+text and processing metadata match the recorded extraction.
 The worker checks the registered sequence inside the publishing transaction.
 An older replacement cannot displace a newer registered revision.
 The snapshot commits text-object locators, the lexical index, and the

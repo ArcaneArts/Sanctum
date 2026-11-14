@@ -1606,6 +1606,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   timing remains open.
   [Storage contract](STORAGE.md#hosted-lexical-publication).
 
+- Hosted indexing rebuilds a missing or damaged RTF extraction from the
+  accepted original. It verifies the reconstructed bytes and extraction
+  details against the saved checkpoint before publishing a fresh locator.
+  The gRPC regression and standalone worker tests on live MinIO recovered
+  both cases after restart. A same-size change to the original blocked
+  publication until the accepted bytes were restored. Duplicate indexing
+  reused the existing revision. Range fetch returned exact UTF-8 and the
+  original retention choice was honored.
+  [PR #145](https://github.com/ArcaneArts/Sanctum/pull/145).
+
 ## Two simultaneous GiB-scale snapshot reads
 
 - The release snapshot benchmark ran against live MinIO with two 1 GiB
