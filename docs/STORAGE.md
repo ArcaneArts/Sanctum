@@ -696,6 +696,10 @@ The worker saves the job outcome before deleting unused staged input.
 Cancellation, permanent failure, and publication of text-only RTF can
 report their committed status even if deletion fails. The upload sweep
 retries cleanup from the saved outcome.
+Cancellation also returns its saved status when deleting its dispatch
+hint fails or times out. Input and hint cleanup run concurrently with
+separate ten-second deadlines. Dispatch repair removes remaining hints
+for canceled jobs without delivering new work.
 
 ### Hosted upload retry
 

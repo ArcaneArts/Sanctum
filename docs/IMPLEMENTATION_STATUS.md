@@ -1434,6 +1434,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - Live MinIO verified cancellation before and after registration, duplicate
   delivery across restart, input reclamation, and refusal after commit.
 - Delivered in [PR #59](https://github.com/ArcaneArts/Sanctum/pull/59).
+- A filesystem gRPC regression denied dispatch hint deletion after
+  cancellation. The initial request and its replay returned the same
+  canceled receipt. Repair reported the failed cleanup, then removed
+  the hint without dispatching after deletes recovered. A generated
+  Python client repeated the cancellation and restart against live
+  MinIO with a proxy denying hint deletes. A fresh standalone worker
+  removed the surviving hint, and the canceled source stayed unpublished.
+  [Cancellation recovery](STORAGE.md#hosted-upload-cancellation).
 
 ### Hosted staged input cleanup after publication
 
