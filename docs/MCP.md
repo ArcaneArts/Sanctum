@@ -77,6 +77,7 @@ bridge.
 | `scan_pending_text` | Supply `collection`, `operation_id`, and a case-sensitive `literal` (1 to 1024 UTF-8 bytes). Returns exact UTF-8 ranges, scanned and read byte counts, and why the scan stopped. RTF can be scanned after extraction, while indexing is pending. Optional `byte_limit` defaults to 1 MiB and caps at 4 MiB. Optional `hit_limit` defaults to 10 and caps at 100. |
 | `fetch_chunk` | Supply `collection`, `source_id`, `revision_id`, and `ordinal` from a hit. Returns the exact UTF-8 excerpt and its half-open byte range. |
 | `fetch_context` | Supply the same reference as `fetch_chunk` and optional `before_bytes` and `after_bytes` (each defaults to 1024, maximum 16384). Returns canonical UTF-8 context, its half-open byte range, and the original hit. |
+| `fetch_source_range` | Supply `collection`, `source_id`, `revision_id`, `start_byte`, and `end_byte`. Returns exact canonical UTF-8 text for a published revision. The half-open range must contain 1 to 65536 bytes and align to UTF-8 character boundaries. |
 | `get_metadata` | Supply `collection` for collection metadata, both `source_id` and `revision_id` for the current source, or those IDs and `ordinal` for a chunk. Returns up to 64 namespaced entries, subject to the shared 512 KiB value limit. |
 | `mutate_metadata` | Supply the same target as `get_metadata` plus up to 32 `edits`. Each edit uses `namespace`, `key`, and `operation` (`set`, `patch`, or `remove`). Set and patch also take `value`. |
 

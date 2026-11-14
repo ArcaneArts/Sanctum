@@ -294,9 +294,12 @@ one range request of up to 64 KiB. Each search reads up to four
 independent ranges concurrently, verifies each fingerprint separately,
 and returns excerpts in ranked order. Hosted
 `SearchCollections` accepts one to eight collections in a tenant and
-returns the aggregate coverage and scoped references. The pending literal
-scan uses bounded range reads on the staged input object and reports the
-exact scan coverage. See [the scan API](LOCAL_API.md#literal-scan-of-pending-text).
+returns the aggregate coverage and scoped references. `FetchSourceRange`
+resolves a published revision's object in the collection snapshot and
+reads the requested range, up to 64 KiB. A pending literal scan reads the
+accepted UTF-8 input or saved RTF extraction in bounded ranges and reports
+the exact scan coverage. [Range API](LOCAL_API.md#fetch-text-by-source-range),
+[pending scan API](LOCAL_API.md#literal-scan-of-pending-text).
 
 ### Cloud Tasks dispatch
 

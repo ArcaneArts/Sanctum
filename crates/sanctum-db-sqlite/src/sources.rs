@@ -30,6 +30,24 @@ const CURRENT: &str =
     WHERE s.deleted = 0";
 
 impl CollectionDb {
+    pub fn readable_revision_bytes(&self, source: Uuid, revision: Uuid) -> Result<u64> {
+        let bytes = self
+            .0
+            .query_row(
+                "SELECT r.bytes FROM sources s JOIN revisions r ON r.source_id = s.id
+                 WHERE s.id = ?1 AND r.id = ?2 AND s.deleted = 0",
+                params![source.to_string(), revision.to_string()],
+                |row| unsigned_column(row, 0),
+            )
+            .optional()
+            .map_err(database_error)?;
+        if let Some(bytes) = bytes {
+            return Ok(bytes);
+        }
+        self.check_revision_staleness(source, revision)?;
+        Err(Error::NotFound("source revision was not found".into()))
+    }
+
     pub fn source_status(
         &self,
         id: Uuid,

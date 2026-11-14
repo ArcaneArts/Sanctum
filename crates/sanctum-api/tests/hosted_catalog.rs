@@ -988,9 +988,9 @@ async fn hosted_context_trims_utf8_boundaries_and_bounds_the_response() {
     catalog.index_upload(&scope, operation).await.unwrap();
     let request = v1::FetchContextRequest {
         chunk: Some(v1::ChunkRef {
-            scope: Some(wire_scope),
-            source_id: job.source_id,
-            revision_id: job.revision_id,
+            scope: Some(wire_scope.clone()),
+            source_id: job.source_id.clone(),
+            revision_id: job.revision_id.clone(),
             ordinal: 1,
         }),
         before_bytes: 5,
@@ -1035,6 +1035,74 @@ async fn hosted_context_trims_utf8_boundaries_and_bounds_the_response() {
             .unwrap_err()
             .code(),
         Code::InvalidArgument
+    );
+    let fetch = v1::FetchSourceRangeRequest {
+        scope: Some(wire_scope.clone()),
+        source_id: job.source_id,
+        revision_id: job.revision_id,
+        start_byte: 4,
+        end_byte: 12,
+    };
+    let fetched = api
+        .client
+        .fetch_source_range(fetch.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fetched.text, "🦀🦀");
+    assert_eq!((fetched.start_byte, fetched.end_byte), (4, 12));
+    assert_eq!(fetched.representation, "canonical_utf8");
+    assert_eq!(fetched.database_generation, hit.database_generation);
+    for (start_byte, end_byte) in [(1, 12), (4, 13), (4, 4), (12, 4), (0, 65_537), (4, 12_004)] {
+        assert_eq!(
+            api.client
+                .fetch_source_range(v1::FetchSourceRangeRequest {
+                    start_byte,
+                    end_byte,
+                    ..fetch.clone()
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+    }
+    let other = sanctum_core::Scope {
+        tenant: "other".parse().unwrap(),
+        ..scope.clone()
+    };
+    catalog.create_collection(&other, None).await.unwrap();
+    let foreign = v1::FetchSourceRangeRequest {
+        scope: Some(v1::Scope {
+            tenant: "other".into(),
+            ..wire_scope
+        }),
+        ..fetch.clone()
+    };
+    assert_eq!(
+        api.client
+            .fetch_source_range(foreign)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    api.client
+        .delete_source(v1::DeleteSourceRequest {
+            scope: fetch.scope.clone(),
+            source_id: fetch.source_id.clone(),
+            expected_revision_id: Some(fetch.revision_id.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        api.client
+            .fetch_source_range(fetch)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
     );
     api.stop().await;
 }
@@ -2738,6 +2806,13 @@ async fn hosted_embeddings_reuse_current_inputs_and_isolate_profiles() {
         v1::ChunkEmbeddingState::Ready
     );
 
+    let previous_range = v1::FetchSourceRangeRequest {
+        scope: Some(wire_scope.clone()),
+        source_id: first.source_id.clone(),
+        revision_id: first.revision_id.clone(),
+        end_byte: 7,
+        ..Default::default()
+    };
     let replacement = v1::UploadTextHeader {
         replacement: Some(v1::Replacement {
             source_id: Some(first.source_id),
@@ -2817,6 +2892,13 @@ async fn hosted_embeddings_reuse_current_inputs_and_isolate_profiles() {
         .unwrap();
     assert!(ready.ready);
     assert_eq!(ready.retained_revisions, 1);
+    let range = server
+        .client
+        .fetch_source_range(previous_range.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(range.text, "unicorn");
     let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
     let executor =
         sanctum_db::Publication::new(storage, std::time::Duration::from_secs(15)).unwrap();
@@ -2841,6 +2923,15 @@ async fn hosted_embeddings_reuse_current_inputs_and_isolate_profiles() {
     };
     age("UPDATE revisions SET retire_at = 0 WHERE retire_at IS NOT NULL").await;
     catalog.reclaim_hosted_sources(&scope).await.unwrap();
+    assert_eq!(
+        server
+            .client
+            .fetch_source_range(previous_range)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
     let cleanup = server
         .client
         .get_source(current_source.clone())

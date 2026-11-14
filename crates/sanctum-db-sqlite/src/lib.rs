@@ -450,12 +450,17 @@ impl CollectionDb {
         if let Some(chunk) = chunk {
             return Ok(chunk);
         }
+        self.check_revision_staleness(reference.source, reference.revision)?;
+        Err(Error::NotFound("chunk was not found".into()))
+    }
+
+    fn check_revision_staleness(&self, source: Uuid, revision: Uuid) -> Result<()> {
         let stale = self
             .0
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM deleted_sources WHERE id = ?1)
                  OR EXISTS(SELECT 1 FROM sources WHERE id = ?1 AND current_revision <> ?2)",
-                params![reference.source.to_string(), reference.revision.to_string()],
+                params![source.to_string(), revision.to_string()],
                 |row| row.get::<_, bool>(0),
             )
             .map_err(database_error)?;
@@ -464,7 +469,7 @@ impl CollectionDb {
                 "source revision is no longer available".into(),
             ));
         }
-        Err(Error::NotFound("chunk was not found".into()))
+        Ok(())
     }
 }
 

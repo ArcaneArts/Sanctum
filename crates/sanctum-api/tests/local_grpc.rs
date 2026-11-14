@@ -361,6 +361,20 @@ async fn local_pending_rtf_scan_uses_saved_utf8_while_the_index_writer_waits() {
     assert!(worker.await.unwrap().unwrap());
     let hits = search(&mut api.client, "default", "café").await;
     assert_eq!(hits[0].excerpt, canonical);
+    let fetched = api
+        .client
+        .fetch_source_range(v1::FetchSourceRangeRequest {
+            scope: scope("default"),
+            source_id: queued.source_id,
+            revision_id: queued.revision_id,
+            start_byte: hit.start_byte,
+            end_byte: hit.end_byte,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fetched.text, "café");
+    assert_eq!(fetched.database_generation, None);
     assert_eq!(
         api.client.scan_pending_text(scan).await.unwrap_err().code(),
         Code::AlreadyExists

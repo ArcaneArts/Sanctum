@@ -63,7 +63,12 @@ def main():
         if args.query:
             response = client.SearchText(pb.SearchTextRequest(scope=scope, query=args.query), timeout=10)
             for hit in response.hits:
-                print(f"{hit.chunk.source_id}: {hit.excerpt}")
+                source_range = client.FetchSourceRange(pb.FetchSourceRangeRequest(
+                    scope=hit.chunk.scope, source_id=hit.chunk.source_id,
+                    revision_id=hit.chunk.revision_id, start_byte=hit.start_byte,
+                    end_byte=hit.end_byte,
+                ), timeout=10)
+                print(f"{source_range.source_id}: {source_range.text}")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 use sanctum_core::{
-    Error, ExternalSource, GitProvenance, Result, Scope, UPLOAD_FRAME_BYTES, UrlProvenance,
-    UsageMeasurement, UsageScope,
+    ByteRange, Error, ExternalSource, GitProvenance, Result, Scope, UPLOAD_FRAME_BYTES,
+    UrlProvenance, UsageMeasurement, UsageScope,
 };
 use sanctum_proto::v1::{
     self,
@@ -1178,6 +1178,47 @@ impl Sanctum for Grpc {
             start_byte: context.start_byte,
             end_byte: context.end_byte,
             text: context.text,
+        }))
+    }
+
+    async fn fetch_source_range(
+        &self,
+        request: Request<v1::FetchSourceRangeRequest>,
+    ) -> Reply<v1::SourceTextRange> {
+        let request = request.into_inner();
+        let scope = parse_scope(request.scope)?;
+        let source = request
+            .source_id
+            .parse::<uuid::Uuid>()
+            .map_err(|_| invalid_argument("source_id", "invalid source ID"))?;
+        let revision = request
+            .revision_id
+            .parse::<uuid::Uuid>()
+            .map_err(|_| invalid_argument("revision_id", "invalid revision ID"))?;
+        let range = ByteRange {
+            start: request.start_byte,
+            end: request.end_byte,
+        };
+        let result = match &self.0 {
+            Backend::Local(service) => {
+                let service = service.clone();
+                let scope = scope.clone();
+                work(move || service.fetch_source_range(&scope, source, revision, range)).await?
+            }
+            Backend::Hosted(catalog) => catalog
+                .fetch_source_range(&scope, source, revision, range)
+                .await
+                .map_err(status)?,
+        };
+        Ok(Response::new(v1::SourceTextRange {
+            scope: Some(wire_scope(&scope)),
+            source_id: source.to_string(),
+            revision_id: revision.to_string(),
+            start_byte: range.start,
+            end_byte: range.end,
+            text: result.text,
+            representation: "canonical_utf8".into(),
+            database_generation: result.database_generation.map(|id| id.to_string()),
         }))
     }
 

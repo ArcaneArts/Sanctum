@@ -142,6 +142,22 @@ points at either outer boundary. The returned half-open range identifies
 the context. The nested hit still describes the exact cited chunk and
 its verified content hash.
 
+## Fetch text by source range
+
+Use `FetchSourceRange` with the tenant and collection scope, source and
+revision IDs, and half-open byte offsets for direct access to a slice
+of the source. The response includes the exact canonical
+UTF-8 text, the range, and the database generation in hosted mode. The
+range must span 1 to 65,536 bytes within the revision and start and end
+on UTF-8 character boundaries. This lets a client fetch offsets reported
+by `ScanPendingText` once the revision is published. Retained revisions
+can be read until reclaimed. A reclaimed or deleted source revision
+returns `stale_revision`.
+
+```sh
+cargo run --locked -p sanctum-cli -- fetch-range notes SOURCE_ID REVISION_ID 12 17
+```
+
 ## gRPC error details
 
 Application errors can include a `sanctum.v1.RpcError` message in

@@ -8,7 +8,7 @@ use rmcp::{
     model::{CallToolResult, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
 };
-use sanctum_core::{Error, ExternalSource, Result as SanctumResult, Scope, ScopeId};
+use sanctum_core::{ByteRange, Error, ExternalSource, Result as SanctumResult, Scope, ScopeId};
 use sanctum_service::{
     ChunkRef, Hit, HostedCatalog, HostedJob, HostedJobState, HostedPreparation, Job, JobState,
     MetadataEdit, MetadataEntry, MetadataMutation, Replacement, RevisionTarget, ScanOptions,
@@ -206,6 +206,18 @@ struct FetchContext {
     before_bytes: Option<u32>,
     /// Maximum UTF-8 bytes after the chunk, default 1024 and maximum 16384.
     after_bytes: Option<u32>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct FetchSourceRange {
+    #[serde(flatten)]
+    scope: Collection,
+    source_id: String,
+    revision_id: String,
+    /// Inclusive canonical UTF-8 byte offset on a character boundary.
+    start_byte: u64,
+    /// Exclusive UTF-8 byte offset on a character boundary, up to 65536 bytes after start_byte.
+    end_byte: u64,
 }
 
 impl Fetch {
@@ -562,6 +574,51 @@ impl Tools {
                 "start_byte": context.start_byte,
                 "end_byte": context.end_byte,
                 "text": context.text,
+            }))
+        }
+        .await;
+        response(result)
+    }
+
+    #[tool(
+        description = "Read an exact canonical UTF-8 byte range from a source revision, up to 65536 bytes.",
+        annotations(read_only_hint = true)
+    )]
+    async fn fetch_source_range(
+        &self,
+        Parameters(args): Parameters<FetchSourceRange>,
+    ) -> CallToolResult {
+        let result = async {
+            let scope = args.scope.scope()?;
+            let source = id(&args.source_id)?;
+            let revision = id(&args.revision_id)?;
+            let range = ByteRange {
+                start: args.start_byte,
+                end: args.end_byte,
+            };
+            let text = match &self.backend {
+                Backend::Local(service) => {
+                    local(service, {
+                        let scope = scope.clone();
+                        move |service| service.fetch_source_range(&scope, source, revision, range)
+                    })
+                    .await?
+                }
+                Backend::Hosted(catalog) => {
+                    catalog
+                        .fetch_source_range(&scope, source, revision, range)
+                        .await?
+                }
+            };
+            Ok(json!({
+                "scope": scope_value(&scope),
+                "source_id": source,
+                "revision_id": revision,
+                "start_byte": range.start,
+                "end_byte": range.end,
+                "text": text.text,
+                "representation": "canonical_utf8",
+                "database_generation": text.database_generation,
             }))
         }
         .await;
