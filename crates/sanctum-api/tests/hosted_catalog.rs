@@ -935,6 +935,29 @@ async fn hosted_collection_reclamation_keeps_open_snapshots_and_resumes() {
 
     let prefix = Key::parse("default/collections/notes").unwrap();
     let head = Key::parse(format!("{prefix}/HEAD.json")).unwrap();
+    let usage = v1::StorageUsageRequest {
+        scope: Some(v1::storage_usage_request::Scope::Collection(v1::Scope {
+            tenant: "default".into(),
+            collection: "notes".into(),
+        })),
+    };
+    let mut api = start(catalog()).await;
+    let retained = store.list(Some(&prefix), None, 16).await.unwrap().objects;
+    assert!(retained.len() > 1);
+    let measured = api
+        .client
+        .get_storage_usage(usage.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (measured.bytes, measured.files),
+        (
+            retained.iter().map(|object| object.length).sum(),
+            retained.len() as u64
+        )
+    );
+    assert_eq!(measured.scope, Some(usage.clone()));
     for index in 0..130 {
         let key = Key::parse(format!("{prefix}/sources/late-{index:03}")).unwrap();
         store
@@ -988,6 +1011,21 @@ async fn hosted_collection_reclamation_keeps_open_snapshots_and_resumes() {
     let remaining = store.list(Some(&prefix), None, 8).await.unwrap().objects;
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].key, head);
+    let mut scan = api
+        .client
+        .measure_storage_usage(usage.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let Some(v1::storage_usage_event::Event::Complete(measured)) =
+        scan.message().await.unwrap().unwrap().event
+    else {
+        panic!("expected the final tombstone measurement");
+    };
+    assert_eq!(measured.scope, Some(usage));
+    assert_eq!((measured.bytes, measured.files), (remaining[0].length, 1));
+    assert!(scan.message().await.unwrap().is_none());
+    api.stop().await;
     let result = sanctum_service::database_snapshot::query(
         downloaded.path(),
         "SELECT count(*) FROM chunks",

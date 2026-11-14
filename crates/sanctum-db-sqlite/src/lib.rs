@@ -287,6 +287,19 @@ pub fn require_collection(path: &Path, collection: &str) -> Result<()> {
         .ok_or_else(|| missing_collection(collection))
 }
 
+pub fn require_collection_for_usage(path: &Path, collection: &str) -> Result<()> {
+    read_initialized_catalog(path, |catalog, version| {
+        if contains_collection(catalog, collection)?
+            || (version >= 3 && collection_deleted(catalog, collection)?)
+        {
+            Ok(())
+        } else {
+            Err(missing_collection(collection))
+        }
+    })?
+    .ok_or_else(|| missing_collection(collection))
+}
+
 /// Returns one membership flag per requested collection.
 pub fn catalog_membership<'a>(
     path: &Path,

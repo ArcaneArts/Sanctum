@@ -171,7 +171,10 @@ impl HostedCatalog {
             UsageScope::Cluster => self.prefix.clone(),
             UsageScope::Tenant(tenant) => Some(tenant_prefix(self.prefix.as_ref(), tenant)?),
             UsageScope::Collection(scope) => {
-                self.require_collection(scope).await?;
+                self.with_catalog(scope, |path, collection| {
+                    db::require_collection_for_usage(path, &collection)
+                })
+                .await?;
                 Some(collection_prefix(self.prefix.as_ref(), scope)?)
             }
         };

@@ -756,13 +756,15 @@ eight expression levels, and 16 segments per path.
 
 ## Storage usage
 
-`GetStorageUsage` walks the local storage directory for the selected
-collection, tenant, or cluster. It returns regular-file counts and byte
-lengths, including databases, staging files, and retained revisions still
-on disk. The cluster total also includes shared files inside the storage
-root. Symbolic links are skipped. Each response includes its scope and
-start and finish timestamps in Unix milliseconds. Concurrent writes may
-change files during a measurement.
+`GetStorageUsage` measures stored file or object lengths for the selected
+collection, tenant, or cluster. This includes databases, staging data,
+and retained revisions. A retired collection can still be measured by ID
+while its directory or hosted tombstone remains in managed storage. After
+local cleanup removes the directory, collection usage returns `NOT_FOUND`.
+Hosted usage includes the retained tombstone. The cluster total includes
+shared data inside the managed storage root. Local scans skip symbolic
+links. Responses include scope and start and finish timestamps in Unix
+milliseconds. Concurrent writes may change the total during a measurement.
 
 `MeasureStorageUsage` streams the same measurement. Each `progress`
 event reports cumulative bytes and files or objects scanned so far.

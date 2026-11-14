@@ -1298,6 +1298,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   checked that the other tenant's database was preserved.
 - Delivered in [PR #49](https://github.com/ArcaneArts/Sanctum/pull/49).
 
+## Storage usage during collection retirement
+
+- Collection usage can measure files and objects after the catalog records
+  retirement. Filesystem gRPC coverage matches the retained SQLite file
+  length and returns `NOT_FOUND` after restart removes the directory.
+- Hosted gRPC coverage matches the objects retained for reader grace and
+  reports just the permanent tombstone's length after reclamation. The
+  catalog still excludes these collections from normal operations.
+- On live MinIO, a generated Python client measured 172,332 bytes across
+  three objects after retirement. After a worker restart and reclamation,
+  a streamed scan measured the remaining 146-byte tombstone. Both totals
+  matched independent object listings, and the other tenant remained intact.
+  [Storage usage](LOCAL_API.md#storage-usage).
+
 ## Source listing and inspection
 
 - Both gRPC backends list current published sources with UUID
