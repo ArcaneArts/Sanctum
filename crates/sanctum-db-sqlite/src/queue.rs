@@ -108,6 +108,10 @@ const SETTLE_FAILED_INPUT: &str = "extracting = 0, rtf_preparation = NULL,
     initial_metadata = NULL, initial_chunk_metadata = NULL,
     cleanup_after = unixepoch(), finished_at = unixepoch()";
 
+const RECONCILABLE_JOB: &str = "((publication_started = 1 AND status IN ('accepted', 'publishing'))
+    OR ((replacement = 1 OR publication_started = 1)
+        AND status = 'failed' AND error_code = 'retryable'))";
+
 impl LocalQueue {
     /// The caller holds the storage owner's exclusive lock for this queue.
     pub fn open(path: PathBuf) -> Result<Self> {
@@ -136,6 +140,7 @@ impl LocalQueue {
                 include_str!("runtime_v19.sql"),
                 include_str!("runtime_v20.sql"),
                 include_str!("runtime_v21.sql"),
+                include_str!("runtime_v22.sql"),
             ],
         )?;
         // The previous worker may have stopped after recording a cancellation.
@@ -152,7 +157,7 @@ impl LocalQueue {
             .map_err(database_error)?;
         connection
             .execute(
-                "UPDATE ingestion_jobs SET status = 'accepted',
+                "UPDATE ingestion_jobs SET status = 'accepted', reconcile_after = 0,
                  processed_bytes = CASE WHEN rtf_preparation IS NULL OR extracting = 1
                                         THEN 0 ELSE total_bytes END
              WHERE status IN ('indexing', 'publishing')",
@@ -229,14 +234,12 @@ impl LocalQueue {
             .map_err(database_error)
     }
 
-    pub fn failed_reconciliation_candidates(&self) -> Result<Vec<Job>> {
+    pub fn reconciliation_candidates(&self) -> Result<Vec<Job>> {
         super::query_all(
             &self.connect()?,
             &format!(
                 "SELECT {COLUMNS} FROM ingestion_jobs
-                 WHERE (replacement = 1 OR publication_started = 1)
-                   AND status = 'failed' AND error_code = 'retryable'
-                   AND reconcile_after <= unixepoch()
+                 WHERE {RECONCILABLE_JOB} AND reconcile_after <= unixepoch()
                  ORDER BY reconcile_after, operation_id LIMIT 128"
             ),
             [],
@@ -244,9 +247,9 @@ impl LocalQueue {
         )
     }
 
-    /// A committed revision wins. Settle an uncommitted failure when a newer
-    /// intent or source deletion prevents publication. Leave retried jobs to the worker.
-    pub fn reconcile_failed_input(
+    /// Recover a committed revision. Settle an uncommitted failure only when
+    /// a newer intent or source deletion prevents publication.
+    pub fn reconcile_input(
         &self,
         job: &Job,
         committed: Option<&Revision>,
@@ -259,6 +262,9 @@ impl LocalQueue {
                 (job.extract_rtf && !job.retain_original).then_some(0),
                 Some(job.attempts),
             );
+        }
+        if job.state != JobState::Failed {
+            return self.defer_reconciliation(job);
         }
         let settled = self
             .connect()?
@@ -281,17 +287,18 @@ impl LocalQueue {
             )
             .map_err(database_error)?;
         if settled == 0 {
-            self.defer_failed_reconciliation(job)?;
+            self.defer_reconciliation(job)?;
         }
         Ok(())
     }
 
-    pub fn defer_failed_reconciliation(&self, job: &Job) -> Result<()> {
+    pub fn defer_reconciliation(&self, job: &Job) -> Result<()> {
         self.connect()?
             .execute(
-                "UPDATE ingestion_jobs SET reconcile_after = unixepoch() + 60
-                 WHERE operation_id = ?1 AND attempts = ?2
-                   AND status = 'failed' AND error_code = 'retryable'",
+                &format!(
+                    "UPDATE ingestion_jobs SET reconcile_after = unixepoch() + 60
+                     WHERE operation_id = ?1 AND attempts = ?2 AND {RECONCILABLE_JOB}"
+                ),
                 params![job.id.to_string(), job.attempts],
             )
             .map_err(database_error)?;
@@ -699,7 +706,7 @@ impl LocalQueue {
             .connect()?
             .execute(
                 "UPDATE ingestion_jobs SET status = 'publishing', publication_started = 1,
-                 processed_bytes = total_bytes
+                 processed_bytes = total_bytes, reconcile_after = 0
              WHERE operation_id = ?1 AND status = 'indexing' AND cancel_requested = 0",
                 [id.to_string()],
             )
@@ -721,7 +728,7 @@ impl LocalQueue {
         id: Uuid,
         revision: &Revision,
         original_cleanup_delay: Option<u32>,
-        failed_attempt: Option<u32>,
+        recovery_attempt: Option<u32>,
     ) -> Result<()> {
         self.connect()?
             .execute(
@@ -734,8 +741,10 @@ impl LocalQueue {
                  cleanup_after = unixepoch() + ?8
              WHERE operation_id = ?1 AND (
                  (?9 IS NULL AND status IN ('indexing', 'publishing'))
-                 OR (attempts = ?9 AND publication_started = 1
-                     AND status = 'failed' AND error_code = 'retryable')
+                 OR (attempts = ?9 AND publication_started = 1 AND (
+                     status IN ('accepted', 'publishing')
+                     OR (status = 'failed' AND error_code = 'retryable')
+                 ))
              )",
                 params![
                     id.to_string(),
@@ -746,7 +755,7 @@ impl LocalQueue {
                     revision.content.encoding,
                     revision.content.extractor,
                     original_cleanup_delay,
-                    failed_attempt,
+                    recovery_attempt,
                 ],
             )
             .map_err(database_error)?;

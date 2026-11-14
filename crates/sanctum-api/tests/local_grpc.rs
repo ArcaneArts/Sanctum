@@ -3664,6 +3664,7 @@ async fn recovery_reuses_a_collection_commit_with_a_missing_queue_receipt() {
         operation_id: job.operation_id,
     };
     let complete = await_ready(&mut first.client, id.clone()).await;
+    first.service.pause_queue(true).unwrap();
     first.stop().await;
 
     let connection = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
@@ -3678,13 +3679,70 @@ async fn recovery_reuses_a_collection_commit_with_a_missing_queue_receipt() {
 
     let mut second = Running::start(&dir).await;
     let recovered = await_ready(&mut second.client, id).await;
-    assert_eq!(recovered.attempts, 2);
+    assert_eq!(recovered.attempts, complete.attempts);
     assert_eq!(recovered.text_revision, complete.text_revision);
     assert_eq!(
         search(&mut second.client, "default", "zircon").await.len(),
         1
     );
     second.stop().await;
+}
+
+#[tokio::test]
+async fn maintenance_recovers_a_committed_revision_after_queue_receipt_failure() {
+    let dir = TempDir::new().unwrap();
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    create(&mut api.client, "default").await;
+    let mut frame = rtf_header(false, "receipt-failure");
+    if let Some(Frame::Header(header)) = &mut frame.frame {
+        header.request_id = Some(uuid::Uuid::new_v4().to_string());
+    }
+    let upload =
+        || tokio_stream::iter([frame.clone(), data(br"{\rtf1\ansi Caf\'e9 azurite}"), end()]);
+    let accepted = api.client.submit_text(upload()).await.unwrap().into_inner();
+    let request = job_request(accepted.operation_id);
+    let runtime = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
+    runtime
+        .execute_batch(
+            "CREATE TRIGGER block_ready_receipt BEFORE UPDATE OF status ON ingestion_jobs
+             WHEN NEW.status = 'text_ready'
+             BEGIN SELECT RAISE(ABORT, 'queue receipt write failed'); END;",
+        )
+        .unwrap();
+    assert!(api.service.process_next().is_err());
+    let publishing = api
+        .client
+        .get_ingestion_job(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(publishing.state(), v1::IngestionState::Publishing);
+    assert_eq!(
+        search(&mut api.client, "default", "azurite").await[0].excerpt,
+        "Café azurite"
+    );
+    api.service.pause_queue(true).unwrap();
+    runtime
+        .execute("DROP TRIGGER block_ready_receipt", [])
+        .unwrap();
+    drop(runtime);
+
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let maintenance = tokio::spawn(run_local_maintenance(api.service.clone(), shutdown));
+    let recovered = await_ready(&mut api.client, request).await;
+    stop.send(true).unwrap();
+    maintenance.await.unwrap();
+    assert_eq!(recovered.attempts, publishing.attempts);
+    assert_eq!(
+        recovered.text_revision.as_ref().unwrap().revision_id,
+        accepted.revision_id
+    );
+    assert_eq!(
+        api.client.submit_text(upload()).await.unwrap().into_inner(),
+        recovered
+    );
+    assert!(api.service.queue_paused().unwrap());
+    api.stop().await;
 }
 
 async fn await_ready(
@@ -5443,10 +5501,10 @@ async fn local_rtf_original_cleanup_failure_keeps_published_text_ready() {
         [&request.operation_id],
     ).unwrap();
     let mut api = Running::start_with_workers(&dir, None, false).await;
-    assert!(api.service.process_next().unwrap());
+    assert!(!api.service.process_next().unwrap());
     let ready = await_ready(&mut api.client, request.clone()).await;
     assert_eq!(ready.text_revision, published.text_revision);
-    assert_eq!(ready.attempts, published.attempts + 1);
+    assert_eq!(ready.attempts, published.attempts);
     assert!(original.is_dir());
     let due = || {
         runtime

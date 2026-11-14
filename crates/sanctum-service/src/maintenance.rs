@@ -236,7 +236,7 @@ impl Service {
                 "scheduled cleanup for superseded ingestion inputs"
             );
         }
-        for job in self.queue.failed_reconciliation_candidates()? {
+        for job in self.queue.reconciliation_candidates()? {
             let reconcile = || {
                 self.require_collection(&job.scope)?;
                 // The retrieval guard prevents retirement. If a manual retry
@@ -254,14 +254,14 @@ impl Service {
                     ))
                 })?;
                 self.queue
-                    .reconcile_failed_input(&job, committed.as_ref(), deleted_source)
+                    .reconcile_input(&job, committed.as_ref(), deleted_source)
             };
             let settled = reconcile();
             if let Err(error) = settled {
-                self.queue.defer_failed_reconciliation(&job)?;
+                self.queue.defer_reconciliation(&job)?;
                 tracing::warn!(
                     %error, tenant = %job.scope.tenant, collection = %job.scope.collection,
-                    operation = %job.id, "could not reconcile a failed local upload"
+                    operation = %job.id, "could not reconcile local upload publication"
                 );
             }
         }
