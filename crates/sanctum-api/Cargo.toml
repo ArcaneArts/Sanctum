@@ -22,6 +22,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 axum.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 async-trait.workspace = true
 rusqlite.workspace = true
 sanctum-embedding = { path = "../sanctum-embedding" }

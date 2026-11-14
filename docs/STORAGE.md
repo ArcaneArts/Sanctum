@@ -577,10 +577,13 @@ to the collection.
 ### Hosted database inspection
 
 `OpenDatabaseSession` pins the current catalog or collection generation for
-five minutes. An object-backed handle can be used by any API instance with
-access to the same deployment prefix. It refers to the existing published
-SQLite generation. API processes verify the complete file against its recorded size and
-BLAKE3 digest and reuse it within the configured snapshot cache budget.
+five minutes from the start of the open request. If storage loses the
+handle write reply, the API verifies the saved generation and expiration
+before returning the handle. Opening and verification must finish within
+the same five-minute lifetime. Any API instance with access to the same
+deployment prefix can use the handle. API processes verify the published
+SQLite file against its recorded size and BLAKE3 digest and reuse it
+within the configured snapshot cache budget.
 The regular snapshot sweep removes expired session records after the
 reader grace period. Close a session early to release its handle.
 [Operator SQL and export](LOCAL_API.md#read-only-sql-sessions-and-snapshots).

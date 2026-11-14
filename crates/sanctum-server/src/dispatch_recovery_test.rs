@@ -540,6 +540,35 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         collection_generation(storage.as_ref(), prefix.as_ref()).await,
         created_generation
     );
+    *api_storage.lose_control_reply.lock().unwrap() = Some("/snapshots/sessions/");
+    let session = api
+        .open_database_session(v1::DatabaseTarget {
+            tenant: scope.tenant.clone(),
+            collection: Some(scope.collection.clone()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(api_storage.lose_control_reply.lock().unwrap().is_none());
+    assert_eq!(
+        session.snapshot_generation,
+        Some(created_generation.to_string())
+    );
+    let session_ref = session.session.unwrap();
+    let row = api
+        .query_database(v1::QueryDatabaseRequest {
+            session: Some(session_ref.clone()),
+            sql: "SELECT count(*) FROM sources".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        row.rows[0].values[0].value,
+        Some(v1::sql_value::Value::Integer(0))
+    );
+    api.close_database_session(session_ref).await.unwrap();
     *api_storage.lose_control_reply.lock().unwrap() = Some("/operation.json");
     let accepted = submit_source(&mut api, &scope, operation, "repair.rtf", RTF).await;
     assert!(api_storage.lose_control_reply.lock().unwrap().is_none());
