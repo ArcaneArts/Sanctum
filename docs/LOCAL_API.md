@@ -60,6 +60,12 @@ during the `UploadText` publication wait includes the accepted operation ID.
 Use `GetIngestionJob` after restart to check any returned ID. If you resend
 the original upload, reuse the request ID and input.
 
+If the local queue reports a write failure during acceptance, the server
+checks for the operation in a fresh read. A committed job keeps its input
+and can return its receipt. If the read confirms the operation is absent,
+the server attempts to reclaim the input immediately. Startup rechecks
+input left behind after interruption, an inconclusive read, or failed cleanup.
+
 If a local upload fails after entering publication, maintenance checks
 the collection database before settling its queue record. An already
 committed revision recovers its `TEXT_READY` receipt. If the revision

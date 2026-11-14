@@ -614,8 +614,35 @@ impl StagedUpload {
                 .files
                 .publish(&job.scope, job.source, job.revision, self.file)?;
         }
-        self.service.queue.insert(&mut job, request)?;
-        Ok(job)
+        let error = match self.service.queue.insert(&mut job, request) {
+            Ok(()) => return Ok(job),
+            Err(error) => error,
+        };
+        // Check the durable queue after the failed transaction has closed.
+        // A committed job can already be running, so only remove input
+        // when a separate read confirms the operation is absent.
+        match self.service.queue.get(&job.scope, job.id) {
+            Ok(accepted) => return Ok(accepted),
+            Err(Error::NotFound(_)) => {
+                if let Err(cleanup) =
+                    self.service
+                        .files
+                        .discard_text(&job.scope, job.source, job.revision)
+                {
+                    tracing::warn!(
+                        %cleanup, tenant = %job.scope.tenant, collection = %job.scope.collection,
+                        operation = %job.id, "could not reclaim unaccepted local input"
+                    );
+                }
+            }
+            Err(probe) => {
+                tracing::warn!(
+                    %probe, tenant = %job.scope.tenant, collection = %job.scope.collection,
+                    operation = %job.id, "could not confirm local queue acceptance"
+                );
+            }
+        }
+        Err(error)
     }
 }
 
