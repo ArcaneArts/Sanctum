@@ -3367,7 +3367,7 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
             assert_eq!(
                 self.fail.load(Ordering::Relaxed),
                 0,
-                "receipt must prevent another request"
+                "a staged batch or receipt must prevent another request"
             );
             Ok(vec![vec![1.0, 0.0]])
         }
@@ -3465,13 +3465,45 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
             .len()
     };
     let before = count_snapshots().await;
-    storage.interrupt.store(1, Ordering::Relaxed);
+    let executor =
+        sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(30)).unwrap();
+    let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
+    let competing_writer = executor.acquire(&unit).await.unwrap();
+    storage
+        .interrupt
+        .store(LOSE_PREPARED_EMBEDDING_RESPONSE, Ordering::Relaxed);
     assert!(matches!(
         service.embed_upload(&scope, operation, 0).await,
+        Err(Error::Busy(message)) if message == "prepared embedding write response lost"
+    ));
+    assert!(matches!(
+        service.embed_upload(&scope, operation, 0).await,
+        Err(Error::Busy(message)) if message.contains("owned by another writer")
+    ));
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
+    assert_eq!(count_snapshots().await, before);
+    let prepared = Key::parse("default/collections/notes/prepared-embeddings").unwrap();
+    let pending = storage.list(Some(&prepared), None, 10).await.unwrap();
+    assert_eq!(pending.objects.len(), 1);
+    competing_writer.release().await.unwrap();
+    server.stop().await;
+    drop(service);
+
+    provider.fail.store(1, Ordering::Relaxed);
+    let restart = || {
+        HostedCatalog::new(storage.clone(), None, 1024)
+            .unwrap()
+            .with_dispatch(dispatch.clone())
+            .with_embedding(Some(provider.clone()))
+    };
+    let publishing_worker = restart();
+    storage.interrupt.store(1, Ordering::Relaxed);
+    assert!(matches!(
+        publishing_worker.embed_upload(&scope, operation, 0).await,
         Err(Error::Busy(_))
     ));
     assert_eq!(
-        service
+        publishing_worker
             .embedding_status(&scope, None)
             .await
             .unwrap()
@@ -3481,17 +3513,13 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
     );
     assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
     assert_eq!(count_snapshots().await, before + 1);
-    let executor =
-        sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(15)).unwrap();
-    let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
+    assert!(matches!(
+        storage.head(&pending.objects[0].key).await,
+        Err(Error::NotFound(_))
+    ));
     let snapshot = executor.generation(&unit).await.unwrap();
-    server.stop().await;
-
-    provider.fail.store(1, Ordering::Relaxed);
-    let restarted = HostedCatalog::new(storage.clone(), None, 1024)
-        .unwrap()
-        .with_dispatch(dispatch.clone())
-        .with_embedding(Some(provider.clone()));
+    drop(publishing_worker);
+    let restarted = restart();
     restarted.embed_upload(&scope, operation, 0).await.unwrap();
     let mut server = start(restarted.clone()).await;
     let resumed = server
@@ -4838,12 +4866,12 @@ async fn upload_sweep_reclaims_only_unreferenced_candidates_and_resumes() {
         .objects
         .remove(0)
         .key;
-    let age = |key: &Key| {
+    let age = |key: &Key, days: u64| {
         std::fs::OpenOptions::new()
             .write(true)
             .open(dir.path().join(key.as_str()))
             .unwrap()
-            .set_modified(SystemTime::now() - Duration::from_secs(31 * 86_400))
+            .set_modified(SystemTime::now() - Duration::from_secs(days * 86_400))
             .unwrap();
     };
     let make = |key: Key, old: bool| {
@@ -4854,13 +4882,13 @@ async fn upload_sweep_reclaims_only_unreferenced_candidates_and_resumes() {
                 .await
                 .unwrap();
             if old {
-                age(&key);
+                age(&key, 31);
             }
             key
         }
     };
-    age(&winner);
-    age(&canonical);
+    age(&winner, 31);
+    age(&canonical, 31);
     let young = make(
         Key::parse(format!("{inputs}/{}", uuid::Uuid::new_v4())).unwrap(),
         false,
@@ -4881,6 +4909,19 @@ async fn upload_sweep_reclaims_only_unreferenced_candidates_and_resumes() {
         true,
     )
     .await;
+    let make_prepared = || {
+        make(
+            Key::parse(format!(
+                "{base}/prepared-embeddings/{}.json",
+                uuid::Uuid::new_v4()
+            ))
+            .unwrap(),
+            true,
+        )
+    };
+    let pending_batch = make_prepared().await;
+    let abandoned_batch = make_prepared().await;
+    age(&abandoned_batch, 46);
     let mut losers = Vec::new();
     for _ in 0..10 {
         losers.push(
@@ -4905,11 +4946,14 @@ async fn upload_sweep_reclaims_only_unreferenced_candidates_and_resumes() {
             break;
         }
     }
-    assert_eq!(deleted, 12);
-    for key in losers.into_iter().chain([extract, uncertain]) {
+    assert_eq!(deleted, 13);
+    for key in losers
+        .into_iter()
+        .chain([extract, uncertain, abandoned_batch])
+    {
         assert!(matches!(storage.head(&key).await, Err(Error::NotFound(_))));
     }
-    for key in [winner, canonical, young] {
+    for key in [winner, canonical, young, pending_batch] {
         storage.head(&key).await.unwrap();
     }
     let hit = restarted
@@ -5219,6 +5263,7 @@ const REJECT_ORIGINAL_READ: u8 = 8;
 const REJECT_SECOND_RANGE: u8 = 9;
 const FIRST_RANGE_READ: u8 = 10;
 const CORRUPT_RANGE: u8 = 11;
+const LOSE_PREPARED_EMBEDDING_RESPONSE: u8 = 12;
 
 struct InterruptedRead<'a>(&'a AtomicU8);
 
@@ -5298,6 +5343,19 @@ impl Storage for InterruptAcceptance {
         let version = self.inner.put_control(key, bytes, condition).await?;
         if interrupt == 2 {
             return Err(Error::Busy("envelope write response lost".into()));
+        }
+        if key.as_str().contains("/prepared-embeddings/")
+            && self
+                .interrupt
+                .compare_exchange(
+                    LOSE_PREPARED_EMBEDDING_RESPONSE,
+                    0,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            return Err(Error::Busy("prepared embedding write response lost".into()));
         }
         Ok(version)
     }

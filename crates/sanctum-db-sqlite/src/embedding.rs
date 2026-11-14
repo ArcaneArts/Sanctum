@@ -35,7 +35,7 @@ pub struct PendingEmbedding {
     pub retry: Option<EmbeddingRetry>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
 pub struct EmbeddingRetry {
     attempts: i64,
     at: i64,

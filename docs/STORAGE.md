@@ -375,9 +375,17 @@ worker respects each provider's request batch size and groups completed
 requests in one fenced SQLite publication. Its preparation budget is
 120 seconds per group, including chunk reads and provider calls. If the
 budget expires after some requests finish, the worker publishes those
-results and leaves the remaining inputs pending. A committed step's
-receipt prevents reissuing its provider calls after an envelope write
-fails. When workers complete the same input concurrently, the first
+results and leaves the remaining inputs pending. Upload and profile
+rebuild tasks conditionally create a prepared batch under
+`prepared-embeddings/<batch-id>.json` in the collection's object prefix
+before taking the writer lease. The batch ID stays the same across
+deliveries of the same step and profile. A retry on another instance
+uses the staged results when no committed receipt exists. Two requests
+can still make provider calls before either stages results. A committed
+step's SQLite receipt takes precedence if an envelope write fails.
+The worker removes staged results after publication. The scheduled
+upload sweep reclaims abandoned batches after 45 days. When workers
+complete the same input concurrently, the first
 committed valid vector is kept for that input and profile. A failure
 only updates the retry state the worker observed when it selected the
 input. The reconciler can recover a missing delivery. Embedding and rebuild
