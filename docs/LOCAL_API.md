@@ -75,6 +75,9 @@ A source name ending in `.rtf` selects streaming RTF text extraction. Uploads
 and directory imports use text-only retention by default. Set
 `retain_original` in the request or pass `--retain-original` to keep the
 uploaded RTF alongside the searchable text.
+For a local text-only upload, if the server cannot remove the original
+after publishing the canonical text, the job still reaches `TEXT_READY`.
+The durable cleanup queue retries removal of the original across restarts.
 
 ```sh
 cargo run --locked -p sanctum-cli -- upload notes report.rtf --retain-original

@@ -49,20 +49,26 @@ impl Service {
             scope: job.scope.clone(),
             source: job.source,
             revision: job.revision,
+            original_only: false,
         })
     }
 
     pub(crate) fn reclaim_staged_input(&self, pending: &StagedCleanup) -> Result<()> {
-        let result = self
-            .files
-            .discard_text(&pending.scope, pending.source, pending.revision);
+        let result = if pending.original_only {
+            self.files
+                .discard_original(&pending.scope, pending.source, pending.revision)
+        } else {
+            self.files
+                .discard_text(&pending.scope, pending.source, pending.revision)
+        };
         if let Err(error) = &result {
             tracing::warn!(
                 %error,
                 tenant = %pending.scope.tenant,
                 collection = %pending.scope.collection,
                 operation = %pending.operation,
-                "could not reclaim unpublished local input"
+                original_only = pending.original_only,
+                "could not reclaim staged local input"
             );
         }
         self.queue.record_cleanup(pending.operation, result.is_ok())
@@ -114,17 +120,20 @@ impl Service {
     fn process_claim(&self, job: &Job, stopping: &impl Fn() -> bool) -> Result<&'static str> {
         match self.index_job(job, stopping) {
             Ok(revision) => {
-                if job.extract_rtf
+                let original_cleanup_pending = if job.extract_rtf
                     && !job.retain_original
                     && let Err(error) =
                         self.files
                             .discard_original(&job.scope, job.source, job.revision)
                 {
-                    self.queue
-                        .fail(job.id, "retryable", "could not remove the staged original")?;
-                    return Err(error);
-                }
-                self.queue.ready(job.id, &revision)?;
+                    tracing::warn!(%error, tenant = %job.scope.tenant, collection = %job.scope.collection,
+                        operation = %job.id, "could not discard original RTF after publication");
+                    true
+                } else {
+                    false
+                };
+                self.queue
+                    .ready(job.id, &revision, original_cleanup_pending)?;
                 Ok("text_ready")
             }
             // Startup recovers interrupted claims from the queue and collection receipts.

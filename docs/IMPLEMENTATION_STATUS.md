@@ -213,6 +213,14 @@ Merged in [PR #6](https://github.com/ArcaneArts/Sanctum/pull/6).
 - Accepted input remains durable until the lexical commit. Recovery can
   complete from that commit after original cleanup. Retained originals are
   reclaimed with their revisions.
+- A failed attempt to delete a local text-only RTF original leaves the
+  published job ready and schedules original-only cleanup. An upgrade
+  requeues legacy failures that were recorded after publication so the
+  worker can recover their receipts. The gRPC regression verifies
+  that restart retries deletion while ingestion is paused and preserves
+  the original publication receipt and exact canonical text. The
+  managed server and a generated Python client exercised the same
+  migration and recovery with real files.
 - Parser tests exercise Unicode, split legacy code-page sequences, skipped
   destinations and binary payloads, and malformed input. gRPC tests cover
   restart, retention, exact excerpts, and directory re-import.
