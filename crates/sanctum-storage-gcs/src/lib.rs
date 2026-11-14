@@ -222,7 +222,9 @@ impl GcsStorage {
             result.extend_from_slice(&chunk);
         }
         if result.len() != size {
-            return Err(invalid_response("GCS returned fewer bytes than requested"));
+            return Err(Error::Busy(
+                "GCS byte range response ended before all requested bytes arrived".into(),
+            ));
         }
         Ok(result.freeze())
     }
