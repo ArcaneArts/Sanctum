@@ -121,19 +121,16 @@ async fn minio_concurrent_snapshot_capacity() {
     let (b, _, _) = time_read(&publication, &smaller, &units[1], 2).await;
     assert_marker(&a, 1);
     assert_marker(&b, 2);
-    let (evicted, reload_us, _) = time_read(&publication, &smaller, &units[0], 1).await;
-    assert!(!Arc::ptr_eq(&a, &evicted));
-    assert_eq!(a.generation.id, evicted.generation.id);
-    assert_ne!(a.path(), evicted.path());
-    let retained_reader_bytes: u64 = [&a, &b, &evicted]
+    let (reused, reuse_us, _) = time_read(&publication, &smaller, &units[0], 1).await;
+    assert!(Arc::ptr_eq(&a, &reused));
+    let retained_reader_bytes: u64 = [&a, &b]
         .iter()
         .map(|file| file.path().metadata().unwrap().len())
         .sum();
-    assert_eq!(retained_reader_bytes, left.bytes * 2 + right.bytes);
+    assert_eq!(retained_reader_bytes, combined);
     println!(
-        "concurrent requested_mib_each={size} snapshot_bytes={bytes:?} both_fit_budget={combined} cold_ms={cold:?} warm_us={warm:?} sqlite_open_and_point_query_us={sqlite:?} smaller_budget={} reload_ms={} files_held_by_readers_bytes={retained_reader_bytes}",
+        "concurrent requested_mib_each={size} snapshot_bytes={bytes:?} both_fit_budget={combined} cold_ms={cold:?} warm_us={warm:?} sqlite_open_and_point_query_us={sqlite:?} smaller_budget={} reuse_after_eviction_us={reuse_us} files_held_by_readers_bytes={retained_reader_bytes}",
         combined - 1,
-        reload_us / 1000,
     );
 }
 
@@ -167,14 +164,17 @@ async fn minio_shared_oversized_snapshot_capacity() {
     let path = first.0.path().to_owned();
     let active_bytes = path.metadata().unwrap().len();
     assert_eq!(active_bytes, generation.bytes);
+    let (overlapping, overlapping_us, _) = time_read(&publication, &cache, &unit, 1).await;
+    assert!(Arc::ptr_eq(&first.0, &overlapping));
     drop(first);
     drop(second);
+    drop(overlapping);
     assert!(!path.exists());
     let (next, repeat_us, _) = time_read(&publication, &cache, &unit, 1).await;
     assert_eq!(next.generation, generation);
     assert_ne!(next.path(), path);
     println!(
-        "shared_oversized requested_mib={size} snapshot_bytes={} budget={budget} active_bytes={active_bytes} shared_ms={shared_ms} repeat_ms={}",
+        "shared_oversized requested_mib={size} snapshot_bytes={} budget={budget} active_bytes={active_bytes} shared_ms={shared_ms} overlap_after_download_us={overlapping_us} repeat_ms={}",
         generation.bytes,
         repeat_us / 1000,
     );

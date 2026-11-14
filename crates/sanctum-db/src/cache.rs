@@ -1,11 +1,11 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Weak},
+    sync::{Arc, Mutex, Weak},
 };
 
-use sanctum_core::Result;
+use sanctum_core::{Error, Result};
 use sanctum_storage::Key;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::OnceCell;
 
 use crate::{Generation, Materialized, Publication, Unit};
 
@@ -21,7 +21,13 @@ type DownloadSlot = OnceCell<Arc<Materialized>>;
 #[derive(Default)]
 struct CacheState {
     retained: VecDeque<Entry<Arc<DownloadSlot>>>,
-    active: Vec<Entry<Weak<DownloadSlot>>>,
+    active: Vec<Entry<ActiveSnapshot>>,
+}
+
+#[derive(Default)]
+struct ActiveSnapshot {
+    download: Weak<DownloadSlot>,
+    file: Weak<Materialized>,
 }
 
 struct Entry<Slot> {
@@ -64,16 +70,19 @@ impl SnapshotCache {
         unit: &Unit,
         generation: Generation,
     ) -> Result<Arc<Materialized>> {
-        let slot = self.slot(unit, &generation).await;
+        let slot = self.slot(unit, &generation);
         let ready = slot.initialized();
         let mut downloaded = false;
         let file = slot
             .get_or_try_init(|| async {
                 downloaded = true;
-                publication
-                    .materialize(unit, generation, &std::env::temp_dir())
-                    .await
-                    .map(Arc::new)
+                let file = Arc::new(
+                    publication
+                        .materialize(unit, generation, &std::env::temp_dir())
+                        .await?,
+                );
+                self.track_file(unit, &file);
+                Ok::<_, Error>(file)
             })
             .await?;
         tracing::debug!(
@@ -92,52 +101,84 @@ impl SnapshotCache {
         self.max_bytes != 0 && generation.bytes <= self.max_bytes
     }
 
-    pub(crate) async fn remember(&self, unit: &Unit, snapshot: Materialized) {
+    pub(crate) fn remember(&self, unit: &Unit, snapshot: Materialized) {
         if !self.retains(&snapshot.generation) {
             return;
         }
-        let slot = self.slot(unit, &snapshot.generation).await;
-        let _ = slot.set(Arc::new(snapshot));
+        let mut state = self
+            .state
+            .lock()
+            .expect("snapshot cache mutex was poisoned");
+        let slot = state.slot(self.max_bytes, unit, &snapshot.generation);
+        let file = Arc::new(snapshot);
+        if slot.set(file.clone()).is_ok() {
+            state.track_file(unit, &file);
+        }
     }
 
-    async fn slot(&self, unit: &Unit, generation: &Generation) -> Arc<DownloadSlot> {
-        let mut state = self.state.lock().await;
-        state.active.retain(|entry| entry.slot.strong_count() > 0);
-        if let Some(index) = state
+    fn track_file(&self, unit: &Unit, file: &Arc<Materialized>) {
+        self.state
+            .lock()
+            .expect("snapshot cache mutex was poisoned")
+            .track_file(unit, file);
+    }
+
+    fn slot(&self, unit: &Unit, generation: &Generation) -> Arc<DownloadSlot> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("snapshot cache mutex was poisoned");
+        state.slot(self.max_bytes, unit, generation)
+    }
+}
+
+impl CacheState {
+    fn slot(&mut self, max_bytes: u64, unit: &Unit, generation: &Generation) -> Arc<DownloadSlot> {
+        self.active.retain(|entry| {
+            entry.slot.download.strong_count() > 0 || entry.slot.file.strong_count() > 0
+        });
+        if let Some(index) = self
             .retained
             .iter()
             .position(|entry| entry.matches(unit, generation))
         {
-            let entry = state
+            let entry = self
                 .retained
                 .remove(index)
                 .expect("entry was found under the same lock");
             let slot = entry.slot.clone();
-            state.retained.push_back(entry);
+            self.retained.push_back(entry);
             return slot;
         }
-        let slot = state
+        let active = if let Some(index) = self
             .active
             .iter()
-            .filter(|entry| entry.matches(unit, generation))
-            .find_map(|entry| entry.slot.upgrade())
-            .unwrap_or_else(|| {
-                let slot = Arc::new(OnceCell::new());
-                // An active transfer can outlive LRU eviction or exceed the
-                // byte budget. Waiters own the slot in both cases.
-                state.active.push(Entry {
-                    unit: unit.prefix.clone(),
-                    generation: generation.clone(),
-                    slot: Arc::downgrade(&slot),
-                });
-                slot
+            .position(|entry| entry.matches(unit, generation))
+        {
+            &mut self.active[index].slot
+        } else {
+            self.active.push(Entry {
+                unit: unit.prefix.clone(),
+                generation: generation.clone(),
+                slot: ActiveSnapshot::default(),
             });
-        if self.retains(generation) {
-            let entries = &mut state.retained;
+            &mut self
+                .active
+                .last_mut()
+                .expect("entry was just inserted")
+                .slot
+        };
+        // Waiters own the slot while it downloads. Once it is gone, readers
+        // can still share the verified file without retaining it in the LRU.
+        let slot = active.download.upgrade().unwrap_or_else(|| {
+            let slot = Arc::new(OnceCell::new_with(active.file.upgrade()));
+            active.download = Arc::downgrade(&slot);
+            slot
+        });
+        if max_bytes != 0 && generation.bytes <= max_bytes {
+            let entries = &mut self.retained;
             let mut occupied: u64 = entries.iter().map(|entry| entry.generation.bytes).sum();
-            while occupied > self.max_bytes - generation.bytes
-                || entries.len() >= MAX_CACHED_SNAPSHOTS
-            {
+            while occupied > max_bytes - generation.bytes || entries.len() >= MAX_CACHED_SNAPSHOTS {
                 let retired = entries
                     .pop_front()
                     .expect("capacity can only be exhausted by retained entries");
@@ -150,5 +191,14 @@ impl SnapshotCache {
             });
         }
         slot
+    }
+
+    fn track_file(&mut self, unit: &Unit, file: &Arc<Materialized>) {
+        let entry = self
+            .active
+            .iter_mut()
+            .find(|entry| entry.matches(unit, &file.generation))
+            .expect("the caller still owns the download slot");
+        entry.slot.file = Arc::downgrade(file);
     }
 }

@@ -165,10 +165,13 @@ cache and checks that they share the verified files from the cold reads.
 The test times opening SQLite and reading the marker separately.
 
 The last pass sets a budget one byte below the combined database sizes.
-It keeps a reader open for each collection, reloads the evicted snapshot,
-and measures the temporary file lengths. The held copies can consume
+It keeps a reader open for each collection, reads the evicted generation
+again, and measures the temporary file lengths. The held copies can consume
 space beyond the configured retention budget. The synthetic data measures
 snapshot I/O. Query scoring and source range retrieval are measured below.
+
+The following measurements were recorded before reuse extended to files
+that were still held by readers after eviction.
 
 | Measurement | Two 1 GiB snapshots | Two 2 GiB snapshots |
 | --- | ---: | ---: |
@@ -188,6 +191,12 @@ snapshots exceeded the ten-second target on every cold sample. The same
 cache budget cannot serve as a Cloud Run memory limit, where the retained
 copies and in-flight files also use instance memory. Live Cloud Run sizing
 and ingress timing remain open.
+
+In a later run with two 1,075,167,232-byte snapshots, the lookup of the
+evicted generation took 7.175 ms while its original reader held it.
+The readers held two files totaling 2,150,334,464 bytes. A fresh download
+would have added another 1,075,167,232-byte copy. The run used loopback
+MinIO on the Apple M4 Max alongside the oversized snapshot benchmarks.
 
 ### Concurrent gRPC search on 1 GiB FTS snapshots
 
@@ -277,8 +286,10 @@ network, memory, and publication measurements.
 The release benchmark publishes 2,048 MiB of synthetic SQLite payload and
 starts two reads of the same collection with the default 2 GiB cache budget.
 The resulting snapshot is 2,150,313,984 bytes. Both readers verify the marker
-in the same materialized file. The benchmark releases both readers, checks
-that the temporary file was removed, then reads the collection again.
+in the same materialized file. A third read arrives after the download,
+while the first readers still hold the file. The benchmark then releases
+all readers, checks that the temporary file was removed, and reads the
+collection again.
 
 ```sh
 SANCTUM_CONCURRENT_SNAPSHOT_MIB=2048 \
@@ -291,6 +302,14 @@ in 11.93 s and used one 2,150,313,984-byte temporary file. A later request
 materialized a fresh copy in 10.26 s. These are single-sample snapshot
 resolution timings. Cloud Run ingress and instance memory remain unmeasured
 for this workload. [Snapshot cache behavior](STORAGE.md#hosted-snapshot-reuse).
+
+With reuse of materialized files enabled, the third lookup reused the
+same 2,150,313,984-byte temporary file in 5.89–53.99 ms across two runs.
+The cold pairs took 29.14–34.47 s, and the post-release reads took
+30.64–40.01 s. Both runs used the same host with an amd64 MinIO development
+container on Docker Desktop and other benchmarks running concurrently.
+The measured lookups include the HEAD request. The benchmark opens SQLite
+and checks the marker after timing the lookup.
 
 ## Exact vector ranking in SQLite
 

@@ -727,9 +727,7 @@ impl Lease {
         head.generation = Some(generation.clone());
         self.write(head).await?;
         if let Some(snapshots) = &self.publication.snapshots {
-            snapshots
-                .remember(&self.unit, Materialized::new(generation.clone(), staged))
-                .await;
+            snapshots.remember(&self.unit, Materialized::new(generation.clone(), staged));
         }
         tracing::debug!(
             event = "snapshot_publish",
