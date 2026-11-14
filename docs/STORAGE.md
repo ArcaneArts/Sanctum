@@ -364,7 +364,9 @@ Configure the scheduler frequency against the measured queue depth.
 Once the collection manifest is retired, repair removes its upload and
 rebuild hints, including hints whose operation envelopes were already
 reclaimed. A late delivery to a retired collection is acknowledged
-without publishing anything. New upload hints include the staged attempt
+without publishing anything. A preparation delivery that observes the
+retired manifest skips extraction even if the input is still retained.
+New upload hints include the staged attempt
 UUID. Repair keeps a fresh hint while admission writes its envelope. After
 15 minutes, repair can fence an unaccepted envelope and remove that attempt's
 hint. If another attempt already won, repair removes only the losing attempt's
@@ -627,8 +629,12 @@ Terminal operations require a new submission to try again.
 The upload sweep compacts terminal envelopes after 45 days without an
 envelope update. A compact record reserves the old request UUID and
 keeps the input locator if that input serves published UTF-8 text or
-a retained original. Status and worker calls treat the old operation
-as absent. A new submission must use a new UUID.
+a retained original. Job status treats the operation as absent and
+a new submission must use a new UUID. The private worker acknowledges
+late upload deliveries with HTTP 204 when that compact record exists.
+For an active collection, an envelope lookup that finds no record or
+only an admission fence still returns HTTP 404.
+[Cloud Tasks acknowledgments](https://docs.cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks#HttpRequest).
 
 Dispatch repair and the standalone worker settle pending uploads once
 their 30-day processing window ends. The upload sweep also handles pending

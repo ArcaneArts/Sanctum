@@ -6529,6 +6529,18 @@ async fn hosted_upload_retention_rejects_old_work_and_preserves_published_bytes(
     assert_eq!(report.expired, 2);
     assert_eq!(service.sweep_abandoned_uploads().await.unwrap().expired, 0);
     let published = published.unwrap();
+    assert!(
+        service
+            .discard_obsolete_upload_task(&scope, published.operation)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !service
+            .discard_obsolete_upload_task(&scope, pending.operation)
+            .await
+            .unwrap()
+    );
     assert!(matches!(
         service.ingestion_job(&scope, published.operation).await,
         Err(Error::NotFound(_))

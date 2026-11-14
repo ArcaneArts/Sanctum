@@ -255,15 +255,6 @@ impl HostedCatalog {
         Ok(report)
     }
 
-    /// Clears the dispatch hint when a late upload task reaches a retired collection.
-    pub async fn discard_retired_upload_task(
-        &self,
-        scope: &Scope,
-        operation: Uuid,
-    ) -> Result<bool> {
-        self.clear_retired_dispatch(scope, operation, false).await
-    }
-
     pub(crate) async fn clear_retired_dispatch(
         &self,
         scope: &Scope,
