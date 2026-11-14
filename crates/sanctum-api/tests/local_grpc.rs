@@ -3696,6 +3696,117 @@ async fn retry_preserves_the_operation_and_revision_after_a_storage_failure() {
 }
 
 #[tokio::test]
+async fn maintenance_reclaims_failed_replacements_superseded_before_publication() {
+    let dir = TempDir::new().unwrap();
+    let mut api = Running::start(&dir).await;
+    create(&mut api.client, "default").await;
+    let original = upload(&mut api.client, header("default"), b"current quartz").await;
+    api.stop().await;
+
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    let mut first = replacement(Some(&original.source_id), Some(&original.revision_id));
+    if let Some(Frame::Header(header)) = first.frame.as_mut() {
+        header.request_id = Some(uuid::Uuid::new_v4().to_string());
+    }
+    let frames = || tokio_stream::iter([first.clone(), data(b"old garnet"), end()]);
+    let failed = api.client.submit_text(frames()).await.unwrap().into_inner();
+    let request = job_request(failed.operation_id.clone());
+    let input = text_path(&dir, &failed.source_id, &failed.revision_id);
+    std::fs::remove_file(&input).unwrap();
+    assert!(api.service.process_next().is_err());
+    std::fs::write(&input, b"old garnet").unwrap();
+    let job = await_failure(&mut api.client, request.clone()).await;
+    assert_eq!(job.error_code.as_deref(), Some("retryable"));
+
+    let latest = api
+        .client
+        .submit_text(tokio_stream::iter([
+            replacement(Some(&original.source_id), Some(&original.revision_id)),
+            data(b"new tourmaline"),
+            end(),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(latest.update_sequence > failed.update_sequence);
+    api.service.pause_queue(true).unwrap();
+    api.stop().await;
+
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    let retired = api
+        .client
+        .get_ingestion_job(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retired.error_code.as_deref(), Some("conflict"));
+    assert_eq!(retired.attempts, 1);
+    assert!(!input.parent().unwrap().exists());
+    assert_eq!(
+        api.client
+            .retry_ingestion_job(request)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    let replay = api.client.submit_text(frames()).await.unwrap().into_inner();
+    assert_eq!(replay, retired);
+    assert_eq!(
+        search(&mut api.client, "default", "quartz").await[0].excerpt,
+        "current quartz"
+    );
+
+    api.service.pause_queue(false).unwrap();
+    assert!(api.service.process_next().unwrap());
+    let latest_request = job_request(latest.operation_id);
+    let ready = await_ready(&mut api.client, latest_request.clone()).await;
+    assert_eq!(ready.revision_id, latest.revision_id);
+    assert_eq!(
+        search(&mut api.client, "default", "tourmaline").await[0].excerpt,
+        "new tourmaline"
+    );
+    api.client
+        .submit_text(tokio_stream::iter([
+            replacement(Some(&original.source_id), Some(&ready.revision_id)),
+            data(b"pending beryl"),
+            end(),
+        ]))
+        .await
+        .unwrap();
+    api.stop().await;
+
+    // Model a retryable failure after the collection committed, before the
+    // queue stored its receipt. A newer intent does not invalidate that commit.
+    let runtime = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
+    assert_eq!(
+        runtime.execute(
+            "UPDATE ingestion_jobs SET status = 'failed', error_code = 'retryable',
+                error_message = 'receipt interrupted', content_hash = NULL, chunks = NULL, created_at = 0
+             WHERE operation_id = ?1 AND publication_started = 1",
+            [&latest_request.operation_id],
+        ).unwrap(),
+        1,
+    );
+    drop(runtime);
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    let awaiting_receipt = await_failure(&mut api.client, latest_request.clone()).await;
+    assert_eq!(awaiting_receipt.error_code.as_deref(), Some("retryable"));
+    assert_eq!(
+        search(&mut api.client, "default", "tourmaline").await[0].excerpt,
+        "new tourmaline"
+    );
+    api.client
+        .retry_ingestion_job(latest_request.clone())
+        .await
+        .unwrap();
+    assert!(api.service.process_next().unwrap());
+    let replayed = await_ready(&mut api.client, latest_request).await;
+    assert_eq!(replayed.text_revision, ready.text_revision);
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn local_upload_rejects_same_size_staged_changes_after_restart() {
     let dir = TempDir::new().unwrap();
     let mut api = Running::start_with_workers(&dir, None, false).await;
@@ -3806,6 +3917,12 @@ async fn replacement_preserves_identity_and_the_latest_intent_wins() {
     assert_eq!(old_candidate.source_id, original.source_id);
     assert_eq!(latest.source_id, original.source_id);
     assert!(latest.update_sequence > old_candidate.update_sequence);
+    std::fs::remove_file(text_path(
+        &dir,
+        &old_candidate.source_id,
+        &old_candidate.revision_id,
+    ))
+    .unwrap();
     assert_eq!(
         search(&mut running.client, "default", "agate").await.len(),
         1
