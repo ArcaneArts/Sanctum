@@ -1717,3 +1717,23 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   new request or snapshot. A generated Python gRPC client verified coverage
   and fetched the exact cited UTF-8 bytes from semantic search.
   [Embedding batches](STORAGE.md#hosted-embedding-batches).
+
+## Hosted uploads past the processing window
+
+- Dispatch repair, the standalone worker, and the scheduled upload sweep
+  settle expired pending stages through the fenced ingestion path. Failed
+  uploads release their external ID and unreferenced input. Indexing
+  recovers published content from the exact revision if the receipt has
+  aged out. Settled records follow terminal retention.
+- The filesystem regression interrupted the indexing checkpoint, removed
+  its receipt, and verified that a fresh worker recovered committed text.
+  It also exercised registration and indexing expiry, an embedding step
+  with future backoff, dispatch hint removal, external ID reuse, and
+  replay after the terminal envelope was compacted.
+- A generated Python gRPC client with live MinIO verified the standalone
+  restart path. A registered unpublished upload became failed and left
+  zero input objects. A committed upload with a stale envelope recovered
+  as text-ready, kept its one canonical object, and returned byte-exact
+  UTF-8 from lexical search. Both old dispatch hints were removed. The
+  live Cloud Tasks and Scheduler checks remain open.
+  [Hosted operation retention](STORAGE.md#hosted-operation-retention).

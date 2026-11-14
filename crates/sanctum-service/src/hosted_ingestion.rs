@@ -5,7 +5,9 @@ use std::{
 
 use sanctum_core::{ChunkSettings, Error, ExternalSource, Result, Scope};
 use sanctum_db::{Command, Unit, collection_prefix, command_receipt};
-use sanctum_db_sqlite::hosted::{Registration, RevisionIntent, Target, register_revision};
+use sanctum_db_sqlite::hosted::{
+    Registration, RevisionIntent, Target, register_revision, release_canceled_intent,
+};
 use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES, Version};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -250,9 +252,7 @@ impl HostedCatalog {
         let start = Instant::now();
         let unit = Unit::collection(self.prefix.as_ref(), scope)?;
         let intent = record.revision_intent()?;
-        let expires_at = record
-            .created_at
-            .saturating_add(REGISTRATION_WINDOW.as_secs());
+        let expires_at = record.expires_at();
         let mut writer = self.publication.acquire(&unit).await?;
         let result = writer
             .apply(
@@ -265,6 +265,9 @@ impl HostedCatalog {
                     let outcome = if cancellation::index_was_canceled(canceled.as_deref())? {
                         RegistrationOutcome::Canceled
                     } else if unix_seconds()? >= expires_at {
+                        if let Target::Create(source) = intent.target {
+                            release_canceled_intent(tx, operation, intent.revision, source)?;
+                        }
                         RegistrationOutcome::Failed {
                             code: "expired".into(),
                             message: "registration window expired".into(),
@@ -300,6 +303,9 @@ impl HostedCatalog {
                 registration: None,
             },
         };
+        if matches!(record.stage, Stage::Failed { .. }) {
+            self.discard_input(&prefix, &record).await?;
+        }
         let job = self
             .checkpoint(&prefix, record, version, |stage| {
                 matches!(stage, Stage::PendingRegistration)
@@ -342,18 +348,10 @@ impl HostedCatalog {
         self.require_collection(scope).await?;
         let prefix = self.operation_prefix(scope, operation)?;
         let (mut record, version) = self.require_operation(&prefix, operation).await?;
-        if !matches!(
-            record.stage,
-            Stage::PendingRegistration
-                | Stage::PendingIndexing { .. }
-                | Stage::TextReady {
-                    embedding: Some(_),
-                    ..
-                }
-        ) {
+        if !record.is_pending() {
             return Err(Error::Conflict("operation has no retryable work".into()));
         }
-        if unix_seconds()?.saturating_sub(record.created_at) >= REGISTRATION_WINDOW.as_secs() {
+        if unix_seconds()? >= record.expires_at() {
             return Err(Error::Conflict("the upload retry window expired".into()));
         }
         record.dispatch_retry = record
@@ -397,9 +395,7 @@ impl HostedCatalog {
         let Some((mut record, version)) = self.read_operation(&prefix, operation).await? else {
             return Ok(false);
         };
-        let Some((stage, not_before)) = self
-            .pending_upload_task(scope, operation, &prefix, &record)
-            .await?
+        let Some((stage, not_before)) = self.pending_upload_task(scope, operation, &record).await?
         else {
             return Ok(false);
         };
@@ -471,9 +467,7 @@ impl HostedCatalog {
         let Some((record, _)) = self.read_operation(&prefix, operation).await? else {
             return Ok(false);
         };
-        let Some((stage, not_before)) = self
-            .pending_upload_task(scope, operation, &prefix, &record)
-            .await?
+        let Some((stage, not_before)) = self.pending_upload_task(scope, operation, &record).await?
         else {
             return Ok(false);
         };
@@ -502,9 +496,13 @@ impl HostedCatalog {
         &self,
         scope: &Scope,
         operation: Uuid,
-        prefix: &Key,
         record: &Operation,
     ) -> Result<Option<(TaskStage, Option<u64>)>> {
+        if record.is_pending() && unix_seconds()? >= record.expires_at() {
+            self.settle_expired_upload(scope, operation, &record.stage)
+                .await?;
+            return Ok(None);
+        }
         let task = match record.stage {
             Stage::PendingRegistration => (TaskStage::Register, None),
             Stage::PendingIndexing {
@@ -525,9 +523,6 @@ impl HostedCatalog {
             }
             | Stage::Canceled { .. }
             | Stage::Failed { .. } => {
-                if matches!(record.stage, Stage::Canceled { .. } | Stage::Failed { .. }) {
-                    self.discard_input(prefix, record).await?;
-                }
                 self.clear_dispatch_hint(scope, operation).await?;
                 return Ok(None);
             }
@@ -540,6 +535,36 @@ impl HostedCatalog {
             Ok(()) | Err(Error::NotFound(_)) => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    async fn expired_input_is_referenced(
+        &self,
+        scope: &Scope,
+        prefix: &Key,
+        record: &Operation,
+    ) -> Result<bool> {
+        let Stage::Failed {
+            code,
+            registration: Some(registration),
+            ..
+        } = &record.stage
+        else {
+            return Ok(false);
+        };
+        if code != "expired" {
+            return Ok(false);
+        }
+        // The revision and receipt can both have aged out while the source
+        // sweep still holds the input for readers of the previous generation.
+        let key = record.input_key(prefix)?.to_string();
+        let source = registration.source;
+        let revision = record.revision;
+        let (referenced, _) = self
+            .with_collection(scope, move |db| {
+                db.has_hosted_revision_object(source, revision, &key)
+            })
+            .await?;
+        Ok(referenced)
     }
 
     fn operation_prefix(&self, scope: &Scope, operation: Uuid) -> Result<Key> {
@@ -733,6 +758,23 @@ fn envelope_key(prefix: &Key) -> Result<Key> {
 }
 
 impl Operation {
+    fn is_pending(&self) -> bool {
+        matches!(
+            self.stage,
+            Stage::PendingRegistration
+                | Stage::PendingIndexing { .. }
+                | Stage::TextReady {
+                    embedding: Some(_),
+                    ..
+                }
+        )
+    }
+
+    fn expires_at(&self) -> u64 {
+        self.created_at
+            .saturating_add(REGISTRATION_WINDOW.as_secs())
+    }
+
     fn input_key(&self, prefix: &Key) -> Result<Key> {
         Key::parse(format!("{prefix}/inputs/{}", self.attempt))
     }

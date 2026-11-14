@@ -7,8 +7,8 @@ use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use super::{
-    AcceptanceFence, Envelope, ExpiredOperation, HostedCatalog, REGISTRATION_WINDOW, Stage,
-    envelope_key, unix_seconds,
+    AcceptanceFence, Envelope, ExpiredOperation, HostedCatalog, HostedJobState,
+    REGISTRATION_WINDOW, Stage, envelope_key, unix_seconds,
 };
 
 const READER_GRACE: Duration = Duration::from_secs(900);
@@ -148,11 +148,10 @@ impl HostedCatalog {
 
     async fn expire_operation(&self, scope: &Scope, object: &Key, operation: Uuid) -> Result<bool> {
         let head = self.storage.head(object).await?;
-        if !old_enough(
-            &head,
-            &Candidate::Operation { operation },
-            SystemTime::now(),
-        ) {
+        let age = SystemTime::now()
+            .duration_since(head.modified_at)
+            .unwrap_or_default();
+        if age < REGISTRATION_WINDOW {
             return Ok(false);
         }
         let prefix = self.operation_prefix(scope, operation)?;
@@ -164,12 +163,30 @@ impl HostedCatalog {
         if version != head.version {
             return Ok(false);
         }
+        if record.is_pending() {
+            if unix_seconds()? >= record.expires_at() {
+                self.settle_expired_upload(scope, operation, &record.stage)
+                    .await?;
+            }
+            return Ok(false);
+        }
+        if age < OPERATION_RETENTION {
+            return Ok(false);
+        }
         let retained_attempt = match record.stage {
             Stage::TextReady {
                 embedding: None, ..
             } => (!is_rtf(&record.upload.name) || record.upload.retain_original)
                 .then_some(record.attempt),
-            Stage::Canceled { .. } | Stage::Failed { .. } => None,
+            Stage::Canceled { .. } | Stage::Failed { .. } => {
+                let referenced = self
+                    .expired_input_is_referenced(scope, &prefix, &record)
+                    .await?;
+                if !referenced {
+                    self.discard_input(&prefix, &record).await?;
+                }
+                referenced.then_some(record.attempt)
+            }
             _ => return Ok(false),
         };
         self.clear_dispatch_hint(scope, operation).await?;
@@ -189,6 +206,38 @@ impl HostedCatalog {
             Err(Error::Conflict(_)) => Ok(false),
             Err(error) => Err(error),
         }
+    }
+
+    pub(super) async fn settle_expired_upload(
+        &self,
+        scope: &Scope,
+        operation: Uuid,
+        stage: &Stage,
+    ) -> Result<()> {
+        let job = match stage {
+            Stage::PendingRegistration => {
+                let registered = self.register_upload(scope, operation).await?;
+                if matches!(registered.state, HostedJobState::Registered) {
+                    self.index_upload(scope, operation).await?
+                } else {
+                    registered
+                }
+            }
+            Stage::PendingIndexing { .. } => self.index_upload(scope, operation).await?,
+            Stage::TextReady {
+                embedding: Some(step),
+                ..
+            } => {
+                self.embed_upload(scope, operation, step.step).await?;
+                self.clear_dispatch_hint(scope, operation).await?;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        if job.embedding_work.is_none() {
+            self.clear_dispatch_hint(scope, operation).await?;
+        }
+        Ok(())
     }
 
     async fn reclaim_candidate(
@@ -240,7 +289,7 @@ impl HostedCatalog {
                 let object = object.to_string();
                 let (referenced, _) = self
                     .with_collection(scope, move |database| {
-                        database.has_hosted_text_object(source, revision, &object)
+                        database.has_hosted_revision_object(source, revision, &object)
                     })
                     .await?;
                 !referenced
@@ -256,7 +305,8 @@ impl HostedCatalog {
 fn old_enough(object: &Object, candidate: &Candidate, now: SystemTime) -> bool {
     let minimum = match candidate {
         Candidate::Input { .. } => READER_GRACE,
-        Candidate::Operation { .. } | Candidate::PreparedEmbedding => OPERATION_RETENTION,
+        Candidate::Operation { .. } => REGISTRATION_WINDOW,
+        Candidate::PreparedEmbedding => OPERATION_RETENTION,
         // Registration starts before extraction. Even a delayed index writer has
         // expired by now and cannot introduce this locator into a new snapshot.
         Candidate::Extracted { .. } => REGISTRATION_WINDOW + READER_GRACE,

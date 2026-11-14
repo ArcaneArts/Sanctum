@@ -7,7 +7,8 @@ use sanctum_chunk::index_utf8_with_settings;
 use sanctum_core::{ChunkSettings, Error, Result, Scope, is_rtf};
 use sanctum_db::{Command, Unit, collection_prefix};
 use sanctum_db_sqlite::hosted::{
-    Registration, RevisionObjects, is_registered, publish_revision, release_intent,
+    Registration, RevisionObjects, is_registered, publish_revision, published_revision,
+    release_canceled_intent, release_intent,
 };
 use sanctum_extract::{RTF_EXTRACTOR, rtf_to_utf8};
 use sanctum_storage::Key;
@@ -16,9 +17,7 @@ use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
-use super::{
-    EmbeddingStep, HostedCatalog, HostedJob, Operation, REGISTRATION_WINDOW, Stage, unix_seconds,
-};
+use super::{EmbeddingStep, HostedCatalog, HostedJob, Operation, Stage, unix_seconds};
 use crate::{ChunkRef, Revision, RevisionContent, telemetry};
 
 pub(super) const INDEX_STAGE: &str = "index";
@@ -65,7 +64,7 @@ impl HostedCatalog {
             _ => return Ok(record.job()),
         };
         let start = Instant::now();
-        if unix_seconds()? >= index_expiry(&record) {
+        if unix_seconds()? >= record.expires_at() {
             return self.index_upload(scope, operation).await;
         }
         let prepared = match self
@@ -147,19 +146,20 @@ impl HostedCatalog {
             job.log_stage(scope, "index", start);
             return Ok(job);
         }
+        let schedule_embedding = self.embedding.is_some() && unix_seconds()? < record.expires_at();
         let Stage::PendingIndexing { registration, .. } = record.stage else {
             unreachable!("stage was checked above");
         };
         record.dispatched_at = None;
         record.stage = match outcome {
             Outcome::Ready(content) => {
-                if self.embedding.is_some() {
+                if schedule_embedding {
                     self.record_dispatch_hint(scope, operation).await?;
                 }
                 Stage::TextReady {
                     registration,
                     content,
-                    embedding: self.embedding.as_ref().map(|_| EmbeddingStep {
+                    embedding: schedule_embedding.then_some(EmbeddingStep {
                         step: 0,
                         not_before: None,
                     }),
@@ -172,8 +172,17 @@ impl HostedCatalog {
                 registration: Some(registration),
             },
         };
-        let discard_input = matches!(&record.stage, Stage::Failed { .. })
-            || (is_rtf(&record.upload.name) && !record.upload.retain_original);
+        let discard_input = match &record.stage {
+            Stage::Failed { .. } => {
+                !self
+                    .expired_input_is_referenced(scope, &prefix, &record)
+                    .await?
+            }
+            Stage::TextReady { .. } => {
+                is_rtf(&record.upload.name) && !record.upload.retain_original
+            }
+            _ => false,
+        };
         if discard_input {
             self.discard_input(&prefix, &record).await?;
         }
@@ -200,7 +209,7 @@ impl HostedCatalog {
         else {
             unreachable!("stage was checked above");
         };
-        let expires_at = index_expiry(record);
+        let expires_at = record.expires_at();
         let replacement = record.upload.replacement.is_some();
         let prepared = if unix_seconds()? >= expires_at {
             Err(Outcome::Failed {
@@ -251,16 +260,23 @@ impl HostedCatalog {
                     payload: prepared,
                 }],
                 move |tx, prepared| {
-                    let outcome = if !is_registered(tx, operation, revision, &registration)? {
+                    let outcome = if unix_seconds()? >= expires_at {
+                        // A committed revision can outlive its publication receipt.
+                        if let Some(content) =
+                            published_revision(tx, registration.source, revision)?
+                        {
+                            Outcome::Ready(Box::new(content))
+                        } else {
+                            release_canceled_intent(tx, operation, revision, registration.source)?;
+                            Outcome::Failed {
+                                code: "expired".into(),
+                                message: "indexing window expired".into(),
+                            }
+                        }
+                    } else if !is_registered(tx, operation, revision, &registration)? {
                         Outcome::Failed {
                             code: "stale_revision".into(),
                             message: "a newer operation superseded this revision".into(),
-                        }
-                    } else if unix_seconds()? >= expires_at {
-                        release_intent(tx, registration.source)?;
-                        Outcome::Failed {
-                            code: "expired".into(),
-                            message: "indexing window expired".into(),
                         }
                     } else {
                         match prepared {
@@ -472,12 +488,6 @@ impl HostedCatalog {
         );
         Ok(staged)
     }
-}
-
-fn index_expiry(record: &Operation) -> u64 {
-    record
-        .created_at
-        .saturating_add(REGISTRATION_WINDOW.as_secs())
 }
 
 fn prepare_text(
