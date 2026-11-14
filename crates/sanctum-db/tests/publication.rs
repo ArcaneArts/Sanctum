@@ -38,6 +38,112 @@ fn minio_storage() -> Arc<dyn Storage> {
 }
 
 #[tokio::test]
+async fn filesystem_active_writer_renews_through_slow_io() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = sanctum_storage_fs::FileStorage::open(directory.path()).unwrap();
+    verify_active_writer(Arc::new(storage), "slow-publication").await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live MinIO bucket and S3 credentials"]
+async fn minio_active_writer_renews_through_slow_io() {
+    let prefix = format!("slow-publication-{}", Uuid::new_v4());
+    verify_active_writer(minio_storage(), &prefix).await;
+}
+
+async fn verify_active_writer(storage: Arc<dyn Storage>, prefix: &str) {
+    let prefix = Key::parse(prefix).unwrap();
+    let unit = Unit::catalog(Some(&prefix), &"default".parse().unwrap()).unwrap();
+    let ttl = Duration::from_millis(700);
+    let slow = Duration::from_millis(1050);
+    let store = Arc::new(PublicationStorage::new(storage.clone()));
+    let writer = Publication::new(store.clone(), ttl).unwrap();
+    let reader = Publication::new(storage.clone(), Duration::from_secs(15)).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let mut first = reader.acquire(&unit).await.unwrap();
+    let (initial, _) = first
+        .apply(vec![command(Uuid::new_v4(), 7)], apply_value)
+        .await
+        .unwrap();
+    first.release().await.unwrap();
+    let mut lease = writer.acquire(&unit).await.unwrap();
+    store.transfer_delay_ms.store(
+        slow.as_millis() as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let (finish, final_upload) = tokio::sync::oneshot::channel();
+    *store.upload_hold.lock().unwrap() = Some(final_upload);
+    let writing = tokio::spawn(async move {
+        let result = lease
+            .apply(vec![command(Uuid::new_v4(), 5)], move |tx, value| {
+                std::thread::sleep(slow);
+                apply_value(tx, value)
+            })
+            .await;
+        lease.release().await.unwrap();
+        result
+    });
+    // Each of the download, SQLite, and upload phases exceeds the lease.
+    for _ in 0..3 {
+        tokio::time::sleep(ttl + Duration::from_millis(30)).await;
+        assert_eq!(
+            reader.generation(&unit).await.unwrap(),
+            Some(initial.clone())
+        );
+        assert!(matches!(reader.acquire(&unit).await, Err(Error::Busy(_))));
+    }
+    finish.send(()).unwrap();
+    let (published, receipts) = writing.await.unwrap().unwrap();
+    assert_eq!(receipts[0].outcome, "12");
+    assert_eq!(reader.generation(&unit).await.unwrap(), Some(published));
+    assert_eq!(
+        value(
+            reader
+                .read(&unit, scratch.path())
+                .await
+                .unwrap()
+                .unwrap()
+                .path()
+        ),
+        12
+    );
+    delete_prefix(storage.as_ref(), &prefix).await;
+}
+
+#[tokio::test]
+async fn late_renewal_response_requires_reacquiring_the_lease() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(PublicationStorage::new(Arc::new(
+        sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+    )));
+    let unit = Unit::catalog(None, &"default".parse().unwrap()).unwrap();
+    let ttl = Duration::from_millis(250);
+    let publication = Publication::new(store.clone(), ttl).unwrap();
+    let mut lease = publication.acquire(&unit).await.unwrap();
+    let (finish, late_reply) = tokio::sync::oneshot::channel();
+    *store.control_reply_hold.lock().unwrap() = Some(late_reply);
+    let operation = Uuid::new_v4();
+    assert!(matches!(
+        lease.apply(vec![command(operation, 4)], apply_value).await,
+        Err(Error::StaleRevision(_))
+    ));
+    assert!(finish.send(()).is_err());
+    assert!(matches!(lease.renew().await, Err(Error::StaleRevision(_))));
+    assert!(publication.generation(&unit).await.unwrap().is_none());
+
+    // The timed-out renewal may have committed. Let its ownership expire.
+    tokio::time::sleep(ttl).await;
+    let next = Publication::new(store, Duration::from_secs(15)).unwrap();
+    let mut winner = next.acquire(&unit).await.unwrap();
+    let (_, receipts) = winner
+        .apply(vec![command(operation, 4)], apply_value)
+        .await
+        .unwrap();
+    assert_eq!(receipts[0].outcome, "4");
+    winner.release().await.unwrap();
+}
+
+#[tokio::test]
 async fn filesystem_snapshot_delta_contract() {
     let directory = tempfile::tempdir().unwrap();
     let storage = sanctum_storage_fs::FileStorage::open(directory.path()).unwrap();
@@ -194,13 +300,12 @@ async fn verify_deltas(
 #[tokio::test]
 async fn recovering_from_a_lost_publish_response_reuses_its_receipt() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(LosePublishResponse {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        lose: std::sync::atomic::AtomicBool::new(true),
-        snapshot_gets: std::sync::atomic::AtomicUsize::new(0),
-        fail_delta: std::sync::atomic::AtomicBool::new(false),
-        fail_only_delta_head: std::sync::atomic::AtomicBool::new(false),
-    });
+    let storage = Arc::new(PublicationStorage::new(Arc::new(
+        sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+    )));
+    storage
+        .lose
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let unit = Unit::catalog(None, &"default".parse().unwrap()).unwrap();
     let cache = Arc::new(sanctum_db::SnapshotCache::new(1024 * 1024));
     let short = Publication::new(storage.clone(), Duration::from_millis(400))
@@ -284,13 +389,9 @@ async fn snapshot_cache_reuses_verified_files_and_preserves_active_readers() {
 #[tokio::test]
 async fn publication_reuses_immutable_snapshots_for_receipts_and_subsequent_writes() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(LosePublishResponse {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        lose: std::sync::atomic::AtomicBool::new(false),
-        snapshot_gets: std::sync::atomic::AtomicUsize::new(0),
-        fail_delta: std::sync::atomic::AtomicBool::new(false),
-        fail_only_delta_head: std::sync::atomic::AtomicBool::new(false),
-    });
+    let storage = Arc::new(PublicationStorage::new(Arc::new(
+        sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+    )));
     let unit = Unit::catalog(None, &"default".parse().unwrap()).unwrap();
     let cache = Arc::new(sanctum_db::SnapshotCache::new(1024 * 1024));
     let publication = Publication::new(storage.clone(), Duration::from_secs(15))
@@ -346,16 +447,43 @@ async fn publication_reuses_immutable_snapshots_for_receipts_and_subsequent_writ
     assert_eq!(gets(), 2);
 }
 
-struct LosePublishResponse {
-    inner: sanctum_storage_fs::FileStorage,
+struct PublicationStorage {
+    inner: Arc<dyn Storage>,
+    transfer_delay_ms: std::sync::atomic::AtomicUsize,
+    upload_hold: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    control_reply_hold: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     lose: std::sync::atomic::AtomicBool,
     snapshot_gets: std::sync::atomic::AtomicUsize,
     fail_delta: std::sync::atomic::AtomicBool,
     fail_only_delta_head: std::sync::atomic::AtomicBool,
 }
 
+impl PublicationStorage {
+    fn new(inner: Arc<dyn Storage>) -> Self {
+        Self {
+            inner,
+            transfer_delay_ms: Default::default(),
+            upload_hold: Default::default(),
+            control_reply_hold: Default::default(),
+            lose: Default::default(),
+            snapshot_gets: Default::default(),
+            fail_delta: Default::default(),
+            fail_only_delta_head: Default::default(),
+        }
+    }
+
+    async fn delay_transfer(&self) {
+        let delay = self
+            .transfer_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if delay != 0 {
+            tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+        }
+    }
+}
+
 #[async_trait::async_trait]
-impl Storage for LosePublishResponse {
+impl Storage for PublicationStorage {
     async fn head(
         &self,
         key: &sanctum_storage::Key,
@@ -370,6 +498,7 @@ impl Storage for LosePublishResponse {
         if key.as_str().contains("/snapshots/") {
             self.snapshot_gets
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.delay_transfer().await;
         }
         self.inner.get(key).await
     }
@@ -388,6 +517,11 @@ impl Storage for LosePublishResponse {
         reader: sanctum_storage::Reader,
         length: u64,
     ) -> sanctum_core::Result<sanctum_storage::Version> {
+        self.delay_transfer().await;
+        let hold = self.upload_hold.lock().unwrap().take();
+        if let Some(hold) = hold {
+            hold.await.unwrap();
+        }
         let version = self.inner.put_stream(key, reader, length).await?;
         if key.as_str().ends_with("/pages.delta")
             && self
@@ -432,6 +566,10 @@ impl Storage for LosePublishResponse {
             None => false,
         };
         let version = self.inner.put_control(key, bytes, condition).await?;
+        let hold = self.control_reply_hold.lock().unwrap().take();
+        if let Some(hold) = hold {
+            hold.await.unwrap();
+        }
         if published && self.lose.swap(false, std::sync::atomic::Ordering::Relaxed) {
             return Err(Error::Busy("publication response lost".into()));
         }
@@ -492,17 +630,18 @@ async fn verify(storage: Arc<dyn Storage>, prefix: &str, local_root: Option<&std
     let stale_id = Uuid::new_v4();
     let (entered, prepare_started) = tokio::sync::oneshot::channel();
     let (resume, prepared) = std::sync::mpsc::channel();
-    let stale = tokio::spawn(async move {
-        let mut entered = Some(entered);
-        abandoned
-            .apply(vec![command(stale_id, 100)], move |tx, value| {
-                entered.take().unwrap().send(()).unwrap();
-                prepared.recv_timeout(Duration::from_secs(15)).unwrap();
-                apply_value(tx, value)
-            })
-            .await
+    let mut entered = Some(entered);
+    let stale = abandoned.apply(vec![command(stale_id, 100)], move |tx, value| {
+        entered.take().unwrap().send(()).unwrap();
+        prepared.recv_timeout(Duration::from_secs(15)).unwrap();
+        apply_value(tx, value)
     });
-    prepare_started.await.unwrap();
+    tokio::pin!(stale);
+    tokio::select! {
+        result = &mut stale => panic!("preparation finished early: {result:?}"),
+        started = prepare_started => started.unwrap(),
+    }
+    // Stop polling the owner, including its renewal timer, before taking over.
     tokio::time::sleep(Duration::from_millis(700)).await;
     let mut winner = long.acquire(&unit).await.unwrap();
     assert_eq!(winner.epoch(), 3);
@@ -526,7 +665,7 @@ async fn verify(storage: Arc<dyn Storage>, prefix: &str, local_root: Option<&std
         ["7", "11", "11"]
     );
     resume.send(()).unwrap();
-    assert!(matches!(stale.await.unwrap(), Err(Error::StaleRevision(_))));
+    assert!(matches!(stale.await, Err(Error::StaleRevision(_))));
     let (duplicate, receipts) = winner
         .apply(vec![command(next_id, 500)], apply_value)
         .await
@@ -644,13 +783,9 @@ async fn unpublished_delta_and_lost_manifest_response_preserve_commit_state() {
     use std::sync::atomic::Ordering;
 
     let root = tempfile::tempdir().unwrap();
-    let storage = Arc::new(LosePublishResponse {
-        inner: sanctum_storage_fs::FileStorage::open(root.path()).unwrap(),
-        lose: std::sync::atomic::AtomicBool::new(false),
-        snapshot_gets: std::sync::atomic::AtomicUsize::new(0),
-        fail_delta: std::sync::atomic::AtomicBool::new(false),
-        fail_only_delta_head: std::sync::atomic::AtomicBool::new(false),
-    });
+    let storage = Arc::new(PublicationStorage::new(Arc::new(
+        sanctum_storage_fs::FileStorage::open(root.path()).unwrap(),
+    )));
     let unit = Unit::catalog(None, &"default".parse().unwrap()).unwrap();
     let writer = Publication::new(storage.clone(), Duration::from_millis(500))
         .unwrap()
