@@ -886,6 +886,22 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   retaining the same write and attachment restrictions.
 - Delivered in [PR #43](https://github.com/ArcaneArts/Sanctum/pull/43).
 
+### Interrupted snapshot exports
+
+- `DownloadDatabase` signals `UNAVAILABLE` when shutdown interrupts the
+  stream and `DATA_LOSS` when the snapshot ends short. Successful streams
+  deliver the byte count advertised by the session.
+  [Export contract](LOCAL_API.md#read-only-sql-sessions-and-snapshots).
+- The gRPC regression test cancels an in-progress export and completes it
+  on a second hosted instance. A stream test verifies the `DATA_LOSS` status
+  using a truncated file.
+- A generated Python gRPC client against live MinIO received `UNAVAILABLE`
+  after 1,310,720 bytes when the first standalone server received `SIGTERM`.
+  It retried the same session on a new process, received all 12,197,888 bytes,
+  matched the SHA-256 of the MinIO snapshot, and passed SQLite integrity and
+  source-count checks. `pnpm check` passed with 141 tests and 13 opt-in tests
+  skipped.
+
 ## Abandoned upload candidates
 
 - The worker upload sweep persists a bounded cursor. It reclaims

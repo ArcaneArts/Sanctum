@@ -1,4 +1,6 @@
-use std::time::SystemTime;
+use std::{pin::Pin, time::SystemTime};
+
+use futures::{Stream, stream};
 
 use sanctum_core::{Error, Result, UPLOAD_FRAME_BYTES};
 use sanctum_proto::v1::{self, sql_value::Value};
@@ -6,8 +8,7 @@ use sanctum_service::{
     DatabaseTarget,
     database_snapshot::{self, Description, SqlValue},
 };
-use tokio::{io::AsyncReadExt, sync::mpsc};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::{fs::File, io::AsyncReadExt};
 use tokio_util::sync::CancellationToken;
 use tonic::{Response, Status};
 use uuid::Uuid;
@@ -158,13 +159,16 @@ pub(super) async fn query(
     }))
 }
 
+pub(super) type DownloadStream =
+    Pin<Box<dyn Stream<Item = std::result::Result<v1::DatabaseFrame, Status>> + Send>>;
+
 pub(super) async fn download(
     backend: &Backend,
     shutdown: CancellationToken,
     request: v1::DatabaseSessionRef,
-) -> Reply<ReceiverStream<std::result::Result<v1::DatabaseFrame, Status>>> {
+) -> Reply<DownloadStream> {
     let (target, generation) = parse_session(Some(request)).map_err(status)?;
-    let (session, file): (Box<dyn Send>, _) = match backend {
+    let (session, file, remaining): (Box<dyn Send>, _, _) = match backend {
         Backend::Local(service) => {
             let service = service.clone();
             let (session, file) = work(move || {
@@ -173,7 +177,8 @@ pub(super) async fn download(
                 Ok((session, file))
             })
             .await?;
-            (Box::new(session), file)
+            let bytes = session.bytes;
+            (Box::new(session), file, bytes)
         }
         Backend::Hosted(catalog) => {
             let session = catalog
@@ -181,38 +186,54 @@ pub(super) async fn download(
                 .await
                 .map_err(status)?;
             let file = session.reopen().map_err(status)?;
-            (Box::new(session), file)
+            let bytes = session.generation.bytes;
+            (Box::new(session), file, bytes)
         }
     };
-    let (sender, receiver) = mpsc::channel(2);
-    tokio::spawn(async move {
-        // Retain the snapshot until the stream is done, including on Windows.
-        let _session = session;
-        let stream = async {
-            let mut file = tokio::fs::File::from_std(file);
-            let mut buffer = vec![0; UPLOAD_FRAME_BYTES];
-            loop {
-                let Ok(permit) = sender.reserve().await else {
-                    break;
-                };
-                match file.read(&mut buffer).await {
-                    Ok(0) => break,
-                    Ok(bytes) => permit.send(Ok(v1::DatabaseFrame {
-                        data: buffer[..bytes].to_vec(),
-                    })),
-                    Err(error) => {
-                        permit.send(Err(status(error.into())));
-                        break;
-                    }
-                }
-            }
-        };
-        tokio::select! {
-            _ = shutdown.cancelled() => {}
-            _ = stream => {}
+    let download = DatabaseDownload {
+        file: File::from_std(file),
+        _session: session,
+        remaining,
+        shutdown,
+    };
+    Ok(Response::new(Box::pin(stream::try_unfold(
+        download,
+        DatabaseDownload::read_frame,
+    ))))
+}
+
+struct DatabaseDownload {
+    file: File,
+    // Keep the session alive until the file is closed, including when the client disconnects.
+    _session: Box<dyn Send>,
+    remaining: u64,
+    shutdown: CancellationToken,
+}
+
+impl DatabaseDownload {
+    async fn read_frame(
+        mut self,
+    ) -> std::result::Result<Option<(v1::DatabaseFrame, Self)>, Status> {
+        if self.remaining == 0 {
+            return Ok(None);
         }
-    });
-    Ok(Response::new(ReceiverStream::new(receiver)))
+        let mut data = vec![0; self.remaining.min(UPLOAD_FRAME_BYTES as u64) as usize];
+        let read = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => {
+                return Err(Status::unavailable("database export interrupted by server shutdown"));
+            }
+            read = self.file.read(&mut data) => read.map_err(|error| status(error.into()))?,
+        };
+        if read == 0 {
+            return Err(Status::data_loss(
+                "database export ended before the advertised size",
+            ));
+        }
+        data.truncate(read);
+        self.remaining -= read as u64;
+        Ok(Some((v1::DatabaseFrame { data }, self)))
+    }
 }
 
 pub(super) async fn close(backend: &Backend, request: v1::DatabaseSessionRef) -> Reply<v1::Empty> {
@@ -271,5 +292,29 @@ fn wire_value(value: SqlValue) -> v1::SqlValue {
             SqlValue::Text(value) => Value::Text(value),
             SqlValue::Blob(value) => Value::Blob(value),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::TryStreamExt;
+
+    #[tokio::test]
+    async fn download_reports_a_snapshot_shorter_than_the_advertised_size() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"short file").unwrap();
+        let download = DatabaseDownload {
+            file: File::from_std(file.reopen().unwrap()),
+            _session: Box::new(file),
+            remaining: 24,
+            shutdown: CancellationToken::new(),
+        };
+        let frames = stream::try_unfold(download, DatabaseDownload::read_frame);
+        let mut frames = std::pin::pin!(frames);
+        let first = frames.try_next().await.unwrap().unwrap();
+        assert_eq!(first.data, b"short file");
+        let error = frames.try_next().await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DataLoss);
     }
 }

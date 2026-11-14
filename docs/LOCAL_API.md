@@ -890,8 +890,12 @@ for subsequent pages. SQL execution has a five-second budget and responds
 to gRPC cancellation.
 
 `DownloadDatabase` streams the same SQLite file in frames of at most 256 KiB.
-Use the advertised byte count to detect interrupted downloads. Each session
-expires after five minutes and is tied to its original scope. Close it early
+Keep the download once the RPC succeeds and its byte count matches the
+advertised size. If server shutdown interrupts the stream, it returns
+`UNAVAILABLE`. If the snapshot ends before the advertised size, it returns
+`DATA_LOSS`. Discard any partial copy and retry from the beginning. A valid
+hosted session can be retried on another instance. Each session expires after
+five minutes and is tied to its original scope. Close it early
 with `CloseDatabaseSession`. On a filesystem-backed server, up to four snapshot
 copies may exist in the process, including copies held by active queries or
 downloads. A hosted session can move between API processes. Its response

@@ -8,6 +8,7 @@ rust-version.workspace = true
 sanctum-core = { path = "../sanctum-core" }
 sanctum-proto = { path = "../sanctum-proto" }
 sanctum-service = { path = "../sanctum-service" }
+futures.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 tokio = { workspace = true }
