@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Weak},
+};
 
 use sanctum_core::Result;
 use sanctum_storage::Key;
@@ -10,20 +13,34 @@ const MAX_CACHED_SNAPSHOTS: usize = 16;
 
 pub struct SnapshotCache {
     max_bytes: u64,
-    entries: Mutex<VecDeque<Entry>>,
+    state: Mutex<CacheState>,
 }
 
-struct Entry {
+type DownloadSlot = OnceCell<Arc<Materialized>>;
+
+#[derive(Default)]
+struct CacheState {
+    retained: VecDeque<Entry<Arc<DownloadSlot>>>,
+    active: Vec<Entry<Weak<DownloadSlot>>>,
+}
+
+struct Entry<Slot> {
     unit: Key,
     generation: Generation,
-    file: Arc<OnceCell<Arc<Materialized>>>,
+    slot: Slot,
+}
+
+impl<Slot> Entry<Slot> {
+    fn matches(&self, unit: &Unit, generation: &Generation) -> bool {
+        self.unit == unit.prefix && self.generation == *generation
+    }
 }
 
 impl SnapshotCache {
     pub fn new(max_bytes: u64) -> Self {
         Self {
             max_bytes,
-            entries: Mutex::new(VecDeque::new()),
+            state: Mutex::default(),
         }
     }
 
@@ -47,16 +64,12 @@ impl SnapshotCache {
         unit: &Unit,
         generation: Generation,
     ) -> Result<Arc<Materialized>> {
-        if !self.retains(&generation) {
-            let file = publication
-                .materialize(unit, generation, &std::env::temp_dir())
-                .await?;
-            return Ok(Arc::new(file));
-        }
         let slot = self.slot(unit, &generation).await;
         let ready = slot.initialized();
+        let mut downloaded = false;
         let file = slot
             .get_or_try_init(|| async {
+                downloaded = true;
                 publication
                     .materialize(unit, generation, &std::env::temp_dir())
                     .await
@@ -69,6 +82,7 @@ impl SnapshotCache {
             generation = %file.generation.id,
             snapshot_bytes = file.generation.bytes,
             cached = ready,
+            shared_transfer = !ready && !downloaded,
             "resolved hosted snapshot"
         );
         Ok(file.clone())
@@ -86,34 +100,55 @@ impl SnapshotCache {
         let _ = slot.set(Arc::new(snapshot));
     }
 
-    async fn slot(&self, unit: &Unit, generation: &Generation) -> Arc<OnceCell<Arc<Materialized>>> {
-        let mut entries = self.entries.lock().await;
-        if let Some(index) = entries
+    async fn slot(&self, unit: &Unit, generation: &Generation) -> Arc<DownloadSlot> {
+        let mut state = self.state.lock().await;
+        state.active.retain(|entry| entry.slot.strong_count() > 0);
+        if let Some(index) = state
+            .retained
             .iter()
-            .position(|entry| entry.unit == unit.prefix && entry.generation == *generation)
+            .position(|entry| entry.matches(unit, generation))
         {
-            let entry = entries
+            let entry = state
+                .retained
                 .remove(index)
                 .expect("entry was found under the same lock");
-            let slot = entry.file.clone();
-            entries.push_back(entry);
+            let slot = entry.slot.clone();
+            state.retained.push_back(entry);
             return slot;
         }
-
-        let mut occupied: u64 = entries.iter().map(|entry| entry.generation.bytes).sum();
-        while occupied > self.max_bytes - generation.bytes || entries.len() >= MAX_CACHED_SNAPSHOTS
-        {
-            let retired = entries
-                .pop_front()
-                .expect("capacity can only be exhausted by retained entries");
-            occupied -= retired.generation.bytes;
+        let slot = state
+            .active
+            .iter()
+            .filter(|entry| entry.matches(unit, generation))
+            .find_map(|entry| entry.slot.upgrade())
+            .unwrap_or_else(|| {
+                let slot = Arc::new(OnceCell::new());
+                // An active transfer can outlive LRU eviction or exceed the
+                // byte budget. Waiters own the slot in both cases.
+                state.active.push(Entry {
+                    unit: unit.prefix.clone(),
+                    generation: generation.clone(),
+                    slot: Arc::downgrade(&slot),
+                });
+                slot
+            });
+        if self.retains(generation) {
+            let entries = &mut state.retained;
+            let mut occupied: u64 = entries.iter().map(|entry| entry.generation.bytes).sum();
+            while occupied > self.max_bytes - generation.bytes
+                || entries.len() >= MAX_CACHED_SNAPSHOTS
+            {
+                let retired = entries
+                    .pop_front()
+                    .expect("capacity can only be exhausted by retained entries");
+                occupied -= retired.generation.bytes;
+            }
+            entries.push_back(Entry {
+                unit: unit.prefix.clone(),
+                generation: generation.clone(),
+                slot: slot.clone(),
+            });
         }
-        let slot = Arc::new(OnceCell::new());
-        entries.push_back(Entry {
-            unit: unit.prefix.clone(),
-            generation: generation.clone(),
-            file: slot.clone(),
-        });
         slot
     }
 }

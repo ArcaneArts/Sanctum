@@ -545,6 +545,96 @@ async fn snapshot_cache_reuses_verified_files_and_preserves_active_readers() {
 }
 
 #[tokio::test]
+async fn oversized_snapshot_reads_share_the_transfer_without_retaining_the_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(PublicationStorage::new(Arc::new(
+        sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+    )));
+    let publication = Publication::new(storage.clone(), Duration::from_secs(15)).unwrap();
+    let unit = Unit::catalog(None, &"default".parse().unwrap()).unwrap();
+    let mut writer = publication.acquire(&unit).await.unwrap();
+    let (generation, _) = writer
+        .apply(vec![command(Uuid::new_v4(), 7)], apply_value)
+        .await
+        .unwrap();
+    writer.release().await.unwrap();
+    storage.transfer_delay_ms.store(50, Ordering::Relaxed);
+    let cache = sanctum_db::SnapshotCache::new(generation.bytes - 1);
+    let (first, second) = tokio::join!(
+        cache.read_generation(&publication, &unit, generation.clone()),
+        cache.read_generation(&publication, &unit, generation.clone()),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(value(first.path()), 7);
+    assert_eq!(storage.snapshot_gets.load(Ordering::Relaxed), 1);
+
+    let next = cache
+        .read_generation(&publication, &unit, generation)
+        .await
+        .unwrap();
+    assert!(!Arc::ptr_eq(&first, &next));
+    assert_eq!(value(first.path()), 7);
+    assert_eq!(value(next.path()), 7);
+    assert_eq!(storage.snapshot_gets.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn an_evicted_transfer_can_be_joined_and_a_canceled_leader_can_be_replaced() {
+    use std::{
+        future::{Future, poll_fn},
+        task::Poll,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(PublicationStorage::new(Arc::new(
+        sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+    )));
+    let publication = Publication::new(storage.clone(), Duration::from_secs(15)).unwrap();
+    let units =
+        ["first", "second"].map(|tenant| Unit::catalog(None, &tenant.parse().unwrap()).unwrap());
+    let mut generations = Vec::new();
+    for (index, unit) in units.iter().enumerate() {
+        let mut writer = publication.acquire(unit).await.unwrap();
+        let (generation, _) = writer
+            .apply(vec![command(Uuid::new_v4(), index as i64 + 1)], apply_value)
+            .await
+            .unwrap();
+        writer.release().await.unwrap();
+        generations.push(generation);
+    }
+    assert_eq!(generations[0].bytes, generations[1].bytes);
+    let cache = sanctum_db::SnapshotCache::new(generations[0].bytes);
+    let read = |index: usize| {
+        cache.read_generation(&publication, &units[index], generations[index].clone())
+    };
+    storage.transfer_delay_ms.store(3_000, Ordering::Relaxed);
+    let mut first = Box::pin(read(0));
+    let mut other = Box::pin(read(1));
+    let mut follower = Box::pin(read(0));
+    poll_fn(|cx| {
+        // Poll all three while storage is stalled. The second lookup
+        // evicts the first before the follower attempts to join it.
+        assert!(first.as_mut().poll(cx).is_pending());
+        assert!(other.as_mut().poll(cx).is_pending());
+        assert!(follower.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert_eq!(storage.snapshot_gets.load(Ordering::Relaxed), 2);
+    drop(first);
+    drop(other);
+    storage.transfer_delay_ms.store(0, Ordering::Relaxed);
+    let data = follower.await.unwrap();
+    assert_eq!(value(data.path()), 1);
+    assert_eq!(storage.snapshot_gets.load(Ordering::Relaxed), 3);
+    let retained = read(0).await.unwrap();
+    assert!(Arc::ptr_eq(&data, &retained));
+    assert_eq!(storage.snapshot_gets.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
 async fn publication_reuses_immutable_snapshots_for_receipts_and_subsequent_writes() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(PublicationStorage::new(Arc::new(

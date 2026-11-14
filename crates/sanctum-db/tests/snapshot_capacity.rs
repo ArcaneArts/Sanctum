@@ -137,6 +137,49 @@ async fn minio_concurrent_snapshot_capacity() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "publishes a multi-GiB fixture to a dedicated MinIO benchmark prefix"]
+async fn minio_shared_oversized_snapshot_capacity() {
+    let (store, prefix) = storage();
+    let size = std::env::var("SANCTUM_CONCURRENT_SNAPSHOT_MIB")
+        .map(|size| size.parse::<u32>().unwrap())
+        .unwrap_or(2048);
+    let publication = Publication::new(store, Duration::from_secs(300)).unwrap();
+    let scope = Scope {
+        tenant: "benchmark".parse().unwrap(),
+        collection: "shared-snapshot".parse().unwrap(),
+    };
+    let unit = Unit::collection(Some(&prefix), &scope).unwrap();
+    let generation = publish_fixture(&publication, &unit, size, 1).await;
+    let budget = generation
+        .bytes
+        .saturating_sub(1)
+        .min(2 * 1024 * 1024 * 1024);
+    let cache = SnapshotCache::new(budget);
+    let start = Instant::now();
+    let (first, second) = tokio::join!(
+        time_read(&publication, &cache, &unit, 1),
+        time_read(&publication, &cache, &unit, 1),
+    );
+    let shared_ms = start.elapsed().as_millis();
+    assert_eq!(first.0.generation, generation);
+    assert!(Arc::ptr_eq(&first.0, &second.0));
+    let path = first.0.path().to_owned();
+    let active_bytes = path.metadata().unwrap().len();
+    assert_eq!(active_bytes, generation.bytes);
+    drop(first);
+    drop(second);
+    assert!(!path.exists());
+    let (next, repeat_us, _) = time_read(&publication, &cache, &unit, 1).await;
+    assert_eq!(next.generation, generation);
+    assert_ne!(next.path(), path);
+    println!(
+        "shared_oversized requested_mib={size} snapshot_bytes={} budget={budget} active_bytes={active_bytes} shared_ms={shared_ms} repeat_ms={}",
+        generation.bytes,
+        repeat_us / 1000,
+    );
+}
+
 async fn time_read(
     publication: &Publication,
     cache: &SnapshotCache,

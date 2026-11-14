@@ -1682,6 +1682,18 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   reader opened its own handle. The filesystem MCP HTTP and stdio smoke
   also passed. [Snapshot cache behavior](STORAGE.md#hosted-snapshot-reuse).
 
+### Concurrent downloads of one oversized generation
+
+- Concurrent readers share a verified transfer for the same generation even if
+  the snapshot exceeds the cache budget or another file evicts an active entry.
+  The configured limits still govern retention between transfers.
+- Filesystem publication tests count storage downloads and verify that a caller
+  can take over from a canceled downloader after cache eviction. The MinIO
+  release benchmark showed two readers sharing one 2,150,313,984-byte SQLite
+  file under the default 2 GiB budget. The file disappeared when both readers
+  finished, and the subsequent request downloaded a fresh copy.
+  [Benchmark and timings](CAPACITY.md#concurrent-reads-of-one-oversized-sqlite-snapshot).
+
 ## Shared range reads for hosted search excerpts
 
 - Hosted search reads touching excerpts from one immutable source in one
