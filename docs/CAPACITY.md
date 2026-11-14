@@ -306,3 +306,49 @@ Ollama received 11 document inputs on initial ingestion and one on
 replacement, avoiding ten input embeddings. Each took one batched
 request. Time from upload start to complete embeddings was 1.69 s
 initially and 1.18 s after the edit, including the polling interval.
+
+## SQLite page changes during a source replacement
+
+Use the [delta measurement script](../scripts/measure-snapshot-delta.py)
+with two closed SQLite backups from the same collection. The script
+compares aligned pages, writes changed pages in order, and reconstructs
+the second snapshot from a private copy of the first. It checks the
+result byte for byte. The reported replay time includes copying the base
+database and applying the delta. It excludes the final comparison,
+object transfer, and SQLite queries.
+
+```sh
+python3 scripts/measure-snapshot-delta.py /path/to/before.db /path/to/after.db
+```
+
+The experiment records complete SQLite pages and their page numbers.
+A result can grow or shrink, and an unchanged pair needs only the
+16-byte header. The script measures a possible publication format.
+The hosted server continues to publish full snapshots.
+
+The MinIO rerun used the same 12-source, 2.34 GiB collection described
+above. The edit took 30.00 s to reach text readiness and returned the
+exact 3,557-byte MCP range. The final three object versions were checked
+against the applied-command receipts to identify the base, registration,
+and indexing generations.
+
+| Transition | Full snapshot bytes | Changed 4 KiB pages | Delta bytes | Encode | Copy and replay |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Register the replacement | 687,362,048 | 3 | 12,328 | 0.098 s | 0.112 s |
+| Publish its lexical index | 745,467,904 | 35,413 | 145,334,968 | 0.392 s | 0.273 s |
+
+Both reconstructions matched the actual published SQLite backup byte for
+byte. The two raw delta files totaled 145,347,296 bytes, or 10.14% of the
+1,432,829,952 bytes of new SQLite snapshot data. The measurement concerns
+database publication. The upload still sent the whole 200 MiB source.
+The encode and replay figures are one local run with the OS cache as observed.
+The first six source insertions in the run also took 10.82–30.44 s apiece,
+so the hosted edit timing varies across runs.
+
+Registration has the smallest change, while indexing rebuilds the
+replacement's lexical state and changes substantially more pages.
+A bounded page-delta chain is a candidate for reducing both writes.
+A production implementation needs the same conditional HEAD publication,
+digest verification, bounded replay, and retirement grace for every
+generation used as a base. It also needs a full-snapshot path when the
+change or accumulated chain approaches the size of the next backup.

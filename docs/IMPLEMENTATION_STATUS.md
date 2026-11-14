@@ -1133,3 +1133,15 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   checksum-verified Microsoft media into Windows Setup. Installing the
   app and exercising the tray, sidecar lifecycle, and WebView2 still
   require a licensed Windows environment. [Build commands](DESKTOP.md#native-packages).
+
+## SQLite page-delta feasibility
+
+- The release MinIO benchmark repeated the eight-byte replacement with
+  2.34 GiB of current source text. The latest three SQLite snapshots
+  identified the prior generation and the two replacement stages.
+- Registration changed three pages. Indexing changed 35,413 pages.
+  The offline delta script reconstructed both snapshots byte for byte.
+  Together the two delta files were 10.14% of the published snapshot bytes.
+- This measurement supports trying bounded delta publication with fenced
+  commits, verified replay, and dependency-aware retirement.
+  [Method and results](CAPACITY.md#sqlite-page-changes-during-a-source-replacement).
