@@ -110,6 +110,19 @@ accounts for temporary database and upload files in instance memory. Adjust
 memory, timeouts, and concurrency after measuring the actual workload.
 [Cloud Run service identity](https://docs.cloud.google.com/run/docs/authenticating/service-to-service), [Cloud Run file system](https://docs.cloud.google.com/run/docs/container-contract#file_system_access).
 
+Cloud Tasks dispatches each worker task with a 600-second deadline. The
+worker gives task routes 570 seconds and returns HTTP 503 to request
+redelivery when a handler exceeds that budget. Keep the Cloud Run worker
+request timeout at 600 seconds or higher. Look for
+`event="hosted_task_deadline"` in worker logs.
+[Cloud Run request timeouts](https://docs.cloud.google.com/run/docs/configuring/request-timeout), [Cloud Tasks dispatch deadlines](https://docs.cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks).
+
+A redelivery resumes from the durable ingestion checkpoint or the SQLite
+receipt if publication committed before the operation checkpoint. A timeout
+during publication can leave a writer lease active until it expires. Any
+already-committed writes remain visible. Cloud Scheduler sets its own
+request deadlines for the maintenance routes.
+
 ## Schedule dispatch repair
 
 Create one HTTP job per shard. Each call scans one bounded page and advances
