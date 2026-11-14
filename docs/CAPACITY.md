@@ -207,6 +207,23 @@ during page replay. The timings come from local Docker and MinIO. Live
 Cloud Run measurements at 1 GiB and 2 GiB still need the authorized
 deployment.
 
+### Hosted excerpt reads with injected latency
+
+Two macOS debug builds queried the same warm SQLite generation through
+MinIO. A loopback proxy delayed each source range request by 30 ms. The
+generated Python gRPC client made seven measured searches per build.
+Each search returned twelve hits from separate UTF-8 sources and checked
+their order, ranges, and excerpt bytes against the serial build.
+
+| Range scheduling | Median | Measured range | Peak in flight | Bytes per search |
+| --- | ---: | ---: | ---: | ---: |
+| Serial | 457.5 ms | 446.6–539.7 ms | 1 | 336 |
+| Bounded concurrency | 152.5 ms | 130.2–165.1 ms | 4 | 336 |
+
+Both builds made twelve range requests per search. The measurements isolate
+warm retrieval with an artificial delay and small excerpts. Cold snapshot
+reads are measured separately on the GiB-scale fixtures.
+
 ### Concurrent gRPC search on 2 GiB FTS snapshots
 
 The same benchmark published 39 sources of 200 MiB per collection, with

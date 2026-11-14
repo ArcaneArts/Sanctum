@@ -800,7 +800,9 @@ timings and counts for an existing log pipeline:
 | `cleanup_pass` | Reclaimed entries, failures and further work when available |
 
 Use `sanctum_service=trace` to include `source_range_read` events for
-hosted excerpt reads. `requested_bytes` sums the individual excerpt sizes,
+hosted excerpt reads. A hosted search allows up to four independent
+range reads in flight and returns verified excerpts in ranked order.
+`requested_bytes` sums the individual excerpt sizes,
 `bytes` measures the combined transfer, and `excerpts` counts the excerpts
 covered by that read. Measurements include work completed at the event's boundary,
 so an upload that later fails can still produce a transfer event. Scoped

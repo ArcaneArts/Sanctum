@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use futures::{StreamExt, TryStreamExt, stream};
 use sanctum_core::{ByteRange, Error, Result, Scope};
 use sanctum_storage::{Key, range_len};
 use uuid::Uuid;
@@ -9,6 +10,7 @@ use crate::{
 };
 
 const MAX_COMBINED_RANGE: u64 = 64 * 1024;
+const CONCURRENT_RANGE_READS: usize = 4;
 
 pub(crate) struct RankedHit {
     pub(crate) scope: Scope,
@@ -39,8 +41,8 @@ impl HostedCatalog {
                 .then_with(|| left.chunk.range.start.cmp(&right.chunk.range.start))
         });
         let mut ordered = ordered.into_iter().peekable();
-        let mut results = Vec::with_capacity(ordered.len());
-        while let Some((key, rank, hit)) = ordered.next() {
+        let groups = std::iter::from_fn(move || {
+            let (key, rank, hit) = ordered.next()?;
             let mut range = hit.chunk.range;
             let mut group = vec![(rank, hit)];
             while let Some((next_key, _, next)) = ordered.peek()
@@ -51,8 +53,13 @@ impl HostedCatalog {
                 group.push((rank, hit));
                 range = combined;
             }
-            results.extend(self.read_hit_range(&key, range, group).await?);
-        }
+            Some((key, range, group))
+        });
+        let mut results = stream::iter(groups)
+            .map(|(key, range, group)| async move { self.read_hit_range(&key, range, group).await })
+            .buffer_unordered(CONCURRENT_RANGE_READS)
+            .try_concat()
+            .await?;
         results.sort_unstable_by_key(|(rank, _)| *rank);
         Ok(results.into_iter().map(|(_, hit)| hit).collect())
     }
