@@ -142,6 +142,9 @@ impl CloudTasks {
             use std::fmt::Write;
             write!(identity, "\n{}", task.retry).expect("writing to a string cannot fail");
         }
+        if task.expired {
+            identity.push_str("\nexpired");
+        }
         let id = blake3::hash(identity.as_bytes());
         let mut body = json!({
             "tenant": task.scope.tenant.as_str(),
@@ -264,6 +267,7 @@ mod tests {
             profile: None,
             window,
             retry: 0,
+            expired: false,
             not_before: None,
         };
         dispatcher
@@ -320,6 +324,19 @@ mod tests {
             })
             .unwrap();
         assert_ne!(scheduled["task"]["name"], different_profile["task"]["name"]);
+
+        let expired = dispatcher
+            .payload(Task {
+                expired: true,
+                ..task(TaskStage::Register, 1)
+            })
+            .unwrap();
+        let original = dispatcher.payload(task(TaskStage::Register, 1)).unwrap();
+        assert_ne!(expired["task"]["name"], original["task"]["name"]);
+        assert_eq!(
+            expired["task"]["httpRequest"],
+            original["task"]["httpRequest"]
+        );
 
         let retry = dispatcher
             .payload(Task {

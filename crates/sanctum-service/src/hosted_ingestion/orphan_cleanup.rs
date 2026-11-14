@@ -181,7 +181,13 @@ impl HostedCatalog {
         }
         if record.is_pending() {
             if unix_seconds()? >= record.expires_at() {
-                self.settle_expired_upload(scope, &record).await?;
+                if self.dispatcher.is_some() {
+                    self.record_dispatch_hint(scope, operation, record.attempt)
+                        .await?;
+                    self.dispatch_pending(scope, operation, None).await?;
+                } else {
+                    self.settle_expired_upload(scope, &record).await?;
+                }
             }
             return Ok(false);
         }

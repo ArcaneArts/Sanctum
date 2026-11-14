@@ -2215,16 +2215,21 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 
 ## Hosted uploads past the processing window
 
-- Dispatch repair, the standalone worker, and the scheduled upload sweep
-  settle expired pending stages through the fenced ingestion path. Failed
-  uploads release their external ID and unreferenced input. Indexing
-  recovers published content from the exact revision if the receipt has
-  aged out. Settled records follow terminal retention.
+- Dispatch repair hands off expired stages to the regular task worker so
+  SQLite recovery can use its full task deadline. The upload sweep repairs
+  missing hints. The standalone worker can settle expired work directly.
+  Failed uploads release their external ID and unreferenced input, and
+  settled records follow terminal retention.
 - The filesystem regression interrupted the indexing checkpoint, removed
-  its receipt, and verified that a fresh worker recovered committed text.
-  It also exercised registration and indexing expiry, an embedding step
-  with future backoff, dispatch hint removal, external ID reuse, and
-  replay after the terminal envelope was compacted.
+  its receipt, and verified that the worker recovered committed text from
+  the exact revision. It exercised registration and indexing expiry,
+  embedding expiry with future backoff and no provider, missing hint
+  repair, external ID reuse, and replay after compaction.
+- Filesystem and live MinIO worker tests verified that repair enqueues a
+  different task name for an expired upload while leaving the SQLite
+  generation unchanged. A fresh worker accepted duplicate deliveries,
+  recorded the expired outcome, and removed the staged input. The test
+  used a loopback Cloud Tasks fixture.
 - A generated Python gRPC client with live MinIO verified the standalone
   restart path. A registered unpublished upload became failed and left
   zero input objects. A committed upload with a stale envelope recovered

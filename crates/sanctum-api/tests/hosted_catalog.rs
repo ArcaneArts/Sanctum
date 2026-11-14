@@ -6743,24 +6743,73 @@ async fn hosted_expiration_settles_pending_stages_and_preserves_committed_text()
     }
     dispatch.delivered.lock().unwrap().clear();
 
-    let restarted = catalog();
-    let report = restarted
-        .reconcile_shard(redispatch.operation.as_bytes()[0] % 16)
+    // Recovery must also dispatch the expiration of a pending embedding
+    // batch when the current worker has embeddings disabled.
+    let restarted = catalog().with_embedding(None);
+    let report = restarted.reconcile_shard(0).await.unwrap();
+    assert_eq!((report.dispatched, report.failed), (1, 0));
+    assert!(matches!(
+        restarted
+            .ingestion_job(&scope, redispatch.operation)
+            .await
+            .unwrap()
+            .state,
+        sanctum_service::HostedJobState::Accepted
+    ));
+
+    // The aged envelopes are still recoverable if an old worker lost a hint.
+    let download = storage.get(&envelope(abandoned.operation)).await.unwrap();
+    let mut bytes = Vec::new();
+    download
+        .reader
+        .take(1024 * 1024)
+        .read_to_end(&mut bytes)
         .await
         .unwrap();
-    assert_eq!(report.failed, 0);
-    assert!(
-        !dispatch
-            .delivered
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(id, _, _)| *id == redispatch.operation)
-    );
-
+    let abandoned_attempt =
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["attempt"].clone();
+    let abandoned_hint = Key::parse(format!(
+        "_dispatch/01/pending/{}/{}/{}.{}",
+        scope.tenant,
+        scope.collection,
+        abandoned.operation,
+        abandoned_attempt.as_str().unwrap(),
+    ))
+    .unwrap();
+    storage.delete(&abandoned_hint).await.unwrap();
     let report = restarted.sweep_abandoned_uploads().await.unwrap();
-    assert_eq!(report.failed, 0);
-    assert_eq!(report.expired, 0);
+    assert_eq!((report.failed, report.expired), (0, 0));
+    storage.head(&abandoned_hint).await.unwrap();
+
+    let mut delivered = dispatch.delivered.lock().unwrap().clone();
+    delivered.sort_unstable_by_key(|(operation, _, _)| *operation);
+    assert_eq!(
+        delivered,
+        vec![
+            (redispatch.operation, TaskStage::Register, None),
+            (abandoned.operation, TaskStage::Index, None),
+            (published.operation, TaskStage::Index, None),
+            (embedding.operation, TaskStage::Embed { step: 0 }, None),
+        ]
+    );
+    for (operation, stage, _) in delivered {
+        match stage {
+            TaskStage::Register => {
+                restarted.register_upload(&scope, operation).await.unwrap();
+            }
+            TaskStage::Index => {
+                restarted.index_upload(&scope, operation).await.unwrap();
+            }
+            TaskStage::Embed { step } => {
+                restarted
+                    .deliver_embedding_upload(&scope, operation, step, None)
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!("expired operations use their settlement stages"),
+        }
+        restarted.try_dispatch(&scope, operation).await;
+    }
     for job in [&redispatch, &abandoned] {
         let status = restarted
             .ingestion_job(&scope, job.operation)

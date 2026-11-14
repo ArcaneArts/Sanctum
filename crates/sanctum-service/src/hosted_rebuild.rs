@@ -347,6 +347,7 @@ impl HostedCatalog {
                 profile: self.embedding_profile(),
                 window,
                 retry: 0,
+                expired: false,
                 not_before: record.not_before,
             })
             .await?;
