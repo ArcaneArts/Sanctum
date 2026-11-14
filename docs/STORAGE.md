@@ -338,6 +338,9 @@ before building the index and checks the indexed digest, length, and chunk
 count before publication. A missing object or digest mismatch leaves a
 current operation registered for retry. Invalid source errors describe input
 that matches the accepted upload.
+Storage requests rejected during source reads or while writing extracted
+RTF also leave the operation registered for retry. Restoring storage
+access lets the worker resume the same revision.
 If a saved RTF extraction is missing or fails verification, the worker rebuilds
 it from the accepted RTF. It publishes a fresh object only if the reconstructed
 text and processing metadata match the recorded extraction.
