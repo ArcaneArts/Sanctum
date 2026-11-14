@@ -4135,6 +4135,69 @@ async fn local_upload_rejects_same_size_staged_changes_after_restart() {
 }
 
 #[tokio::test]
+async fn local_upload_can_retry_after_staged_bytes_become_malformed() {
+    for (header, original, bad_offset, name, expected) in [
+        (
+            header("default"),
+            format!("recoverable quartz\n{}", "text\n".repeat(2_000)),
+            8_500,
+            "text.utf8",
+            "recoverable quartz",
+        ),
+        (
+            rtf_header(false, "malformed-staging"),
+            format!(r"{{\rtf1 recoverable spinel}}{}", " ".repeat(10_000)),
+            0,
+            "original",
+            "recoverable spinel",
+        ),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let mut api = Running::start_with_workers(&dir, None, false).await;
+        create(&mut api.client, "default").await;
+        let accepted = api
+            .client
+            .submit_text(tokio_stream::iter([
+                header,
+                data(original.as_bytes()),
+                end(),
+            ]))
+            .await
+            .unwrap()
+            .into_inner();
+        let request = job_request(accepted.operation_id);
+        let path = text_path(&dir, &accepted.source_id, &accepted.revision_id).with_file_name(name);
+        let mut damaged = original.as_bytes().to_vec();
+        damaged[bad_offset] = 0xff;
+        std::fs::write(&path, &damaged).unwrap();
+        api.stop().await;
+
+        let mut api = Running::start(&dir).await;
+        let failed = await_failure(&mut api.client, request.clone()).await;
+        assert_eq!(failed.error_code.as_deref(), Some("retryable"), "{name}");
+        assert!(failed.text_revision.is_none());
+        assert!(
+            search(&mut api.client, "default", "recoverable")
+                .await
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), damaged);
+        std::fs::write(path, original).unwrap();
+        api.client
+            .retry_ingestion_job(request.clone())
+            .await
+            .unwrap();
+        let ready = await_ready(&mut api.client, request).await;
+        assert_eq!(ready.revision_id, accepted.revision_id);
+        assert_eq!(ready.attempts, 2);
+        let hits = search(&mut api.client, "default", "recoverable").await;
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].excerpt.starts_with(expected));
+        api.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn replacement_preserves_identity_and_the_latest_intent_wins() {
     let dir = TempDir::new().unwrap();
     let mut running = Running::start(&dir).await;

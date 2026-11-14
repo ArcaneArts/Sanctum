@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    io::{self, BufReader, BufWriter, Read, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, Write},
     time::Instant,
 };
 
@@ -200,10 +200,10 @@ impl Service {
                 })?;
         }
         self.require_latest_update(job)?;
-        let input = self.files.open_text(&job.scope, job.source, job.revision)?;
+        let mut input = self.files.open_text(&job.scope, job.source, job.revision)?;
         let mut ordinal = 0;
         let mut last_progress = 0;
-        let indexed = index_utf8_with_settings(input, job.chunking, |range, text| {
+        let indexed = index_utf8_with_settings(&mut input, job.chunking, |range, text| {
             IngestionShutdown::check(stopping)?;
             if !job.extract_rtf && range.end - last_progress >= PROGRESS_STEP {
                 if !self.queue.progress(job.id, range.end)? {
@@ -224,26 +224,19 @@ impl Service {
             )?;
             ordinal += 1;
             Ok(())
-        })?;
-        if !job.extract_rtf && indexed.bytes != job.bytes {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "queued input no longer matches its accepted size",
-            )));
-        }
-        if extracted.as_ref().is_some_and(|input| {
-            input.canonical_hash != indexed.hash || input.canonical_bytes != indexed.bytes
-        }) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "saved RTF text changed during indexing",
-            )
-            .into());
-        }
+        });
+        let indexed = match indexed {
+            Err(error @ Error::Invalid(_)) => {
+                drop(writer);
+                verify_input_after_parse_error(input, job, extracted.as_ref(), stopping)?;
+                return Err(error);
+            }
+            result => result?,
+        };
+        verify_staged_input(job, extracted.as_ref(), indexed.bytes, &indexed.hash)?;
         let original_hash = extracted
             .as_ref()
             .map_or(&indexed.hash, |input| &input.original_hash);
-        verify_original_digest(job, original_hash)?;
         let content = RevisionContent {
             original_hash: original_hash.clone(),
             hash: indexed.hash,
@@ -364,20 +357,17 @@ impl Service {
             stopping,
         });
         let encoding = match rtf_to_utf8(input, BufWriter::new(&mut output)) {
+            Err(error @ Error::Invalid(_)) => {
+                verify_input_after_parse_error(reader.inner, job, None, stopping)?;
+                return Err(error);
+            }
             Err(Error::Io(ref error)) if error.kind() == io::ErrorKind::ConnectionAborted => {
                 return Err(Error::Conflict("extraction canceled".into()));
             }
             result => result?,
         };
         let original_hash = reader.hash.finalize().to_hex().to_string();
-        if reader.bytes != job.bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "queued RTF no longer matches its accepted size",
-            )
-            .into());
-        }
-        verify_original_digest(job, &original_hash)?;
+        verify_staged_input(job, None, reader.bytes, &original_hash)?;
         let preparation = RtfPreparation {
             original_hash,
             canonical_hash: output.hash.finalize().to_hex().to_string(),
@@ -392,6 +382,54 @@ impl Service {
         }
         Ok(preparation)
     }
+}
+
+fn verify_input_after_parse_error(
+    mut input: std::fs::File,
+    job: &Job,
+    prepared: Option<&RtfPreparation>,
+    stopping: &impl Fn() -> bool,
+) -> Result<()> {
+    // A parser can reject input before reading enough bytes to verify it.
+    input.rewind()?;
+    let expected_bytes = prepared.map_or(job.bytes, |input| input.canonical_bytes);
+    let mut hash = blake3::Hasher::new();
+    hash.update_reader(IngestionReader {
+        inner: input.take(expected_bytes.saturating_add(1)),
+        stopping,
+    })?;
+    verify_staged_input(
+        job,
+        prepared,
+        hash.count(),
+        hash.finalize().to_hex().as_str(),
+    )
+}
+
+fn verify_staged_input(
+    job: &Job,
+    prepared: Option<&RtfPreparation>,
+    bytes: u64,
+    digest: &str,
+) -> Result<()> {
+    if let Some(prepared) = prepared {
+        if prepared.canonical_hash != digest || prepared.canonical_bytes != bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "saved RTF text changed during indexing",
+            )
+            .into());
+        }
+        return verify_original_digest(job, &prepared.original_hash);
+    }
+    if bytes != job.bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "queued input no longer matches its accepted size",
+        )
+        .into());
+    }
+    verify_original_digest(job, digest)
 }
 
 fn verify_original_digest(job: &Job, digest: &str) -> Result<()> {

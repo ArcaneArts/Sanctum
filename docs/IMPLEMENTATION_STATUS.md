@@ -134,6 +134,16 @@ Merged in [PR #3](https://github.com/ArcaneArts/Sanctum/pull/3).
   published the same revision IDs and replayed the RTF request receipt.
   [200 MiB ingestion measurements](CAPACITY.md#local-uploads-with-acceptance-digests),
   [PR #138](https://github.com/ArcaneArts/Sanctum/pull/138).
+- When UTF-8 decoding or RTF extraction rejects a staged file, the local
+  worker verifies the saved length and digest before reporting
+  `invalid_source`. The gRPC regression changes an accepted upload into
+  same-size malformed content, verifies that no text becomes searchable,
+  and restores the input. Both formats publish under the original
+  revision ID after retry. A generated Python gRPC client verified the
+  same recovery after `SIGKILL`, replayed both original request IDs, and
+  fetched exact UTF-8 ranges with multibyte text. Malformed inputs
+  submitted intact still returned `invalid_source`.
+  [Local upload recovery](LOCAL_API.md#text-uploads).
 - Startup settles recorded pre-publication cancellations before workers
   claim jobs. The local gRPC regression verified terminal status, removal of
   staged RTF and queued metadata, and replay of the canceled receipt while
