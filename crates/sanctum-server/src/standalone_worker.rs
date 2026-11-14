@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use sanctum_service::{DISPATCH_SHARDS, HostedCatalog};
+use sanctum_service::{DISPATCH_SHARDS, HOSTED_STAGE_TIMEOUT, HostedCatalog};
 use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -8,16 +8,25 @@ const IDLE_INTERVAL: Duration = Duration::from_secs(10);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(crate) async fn run(catalog: HostedCatalog, wake: Arc<Notify>, stop: CancellationToken) {
+    run_with_stage_timeout(catalog, wake, stop, HOSTED_STAGE_TIMEOUT).await;
+}
+
+pub(crate) async fn run_with_stage_timeout(
+    catalog: HostedCatalog,
+    wake: Arc<Notify>,
+    stop: CancellationToken,
+    stage_timeout: Duration,
+) {
     // Dropping the in-flight stage leaves its durable hint and any committed
     // receipt available for the next worker.
     tokio::select! {
         biased;
         _ = stop.cancelled() => {}
-        _ = run_worker(catalog, wake) => {}
+        _ = run_worker(catalog, wake, stage_timeout) => {}
     }
 }
 
-async fn run_worker(catalog: HostedCatalog, wake: Arc<Notify>) {
+async fn run_worker(catalog: HostedCatalog, wake: Arc<Notify>, stage_timeout: Duration) {
     let mut next_maintenance = Instant::now();
     let mut discover_profile = true;
     loop {
@@ -27,7 +36,7 @@ async fn run_worker(catalog: HostedCatalog, wake: Arc<Notify>) {
                 Err(error) => tracing::warn!(%error, "standalone profile discovery will retry"),
             }
         }
-        let worked = scan(&catalog).await;
+        let worked = scan(&catalog, stage_timeout).await;
         if Instant::now() >= next_maintenance {
             maintenance(&catalog).await;
             next_maintenance = Instant::now() + MAINTENANCE_INTERVAL;
@@ -41,7 +50,7 @@ async fn run_worker(catalog: HostedCatalog, wake: Arc<Notify>) {
     }
 }
 
-async fn scan(catalog: &HostedCatalog) -> bool {
+async fn scan(catalog: &HostedCatalog, stage_timeout: Duration) -> bool {
     let mut cursors: [Option<String>; DISPATCH_SHARDS as usize] = Default::default();
     let mut finished = [false; DISPATCH_SHARDS as usize];
     let mut worked = false;
@@ -51,7 +60,9 @@ async fn scan(catalog: &HostedCatalog) -> bool {
                 continue;
             }
             match catalog
-                .work_standalone_shard(shard, cursor.as_deref(), || false)
+                .work_standalone_shard_with_timeout(shard, cursor.as_deref(), stage_timeout, || {
+                    false
+                })
                 .await
             {
                 Ok(page) => {

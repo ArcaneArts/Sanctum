@@ -1576,6 +1576,15 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 
 ## Standalone object-backed worker
 
+- The embedded worker now bounds a stage attempt and continues scanning the
+  shard after a deadline. The regression stalls the registration checkpoint
+  after SQLite publishes the intent, then lets the stage deadline expire.
+  The running worker processes both uploads and gRPC returns their original
+  revision IDs, one registration sequence each, and exact UTF-8 excerpts.
+  The regression passed against filesystem storage and live MinIO using
+  a shortened stage deadline. The MinIO test removed its isolated prefix.
+  [Standalone worker behavior](STORAGE.md#hosted-server-configuration).
+
 - Set `standalone_object_worker` to process durable object-backed uploads in
   the same server as gRPC and MCP. The worker uses the existing publication
   fences and stage receipts, runs embedding profile discovery and maintenance,

@@ -229,6 +229,12 @@ for pending work after restart. It shares the server's gRPC/MCP listener
 configuration and needs no worker HTTP listener. Use a dedicated prefix for
 this setup. Cloud Run and Cloud Tasks have their own worker configuration.
 
+The embedded worker gives each stage up to 570 seconds. If the deadline
+elapses, it drops the pending attempt and continues through the other
+hints. The next scan can retry the timed-out operation from its durable
+hint and any committed receipt. An existing writer lease may need to
+expire before another attempt can acquire it.
+
 On shutdown, the embedded worker stops waiting for in-flight work. A
 fresh worker resumes from the persisted hint and any committed stage
 receipt. If shutdown interrupts a stage holding a writer lease, the
