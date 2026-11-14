@@ -4,7 +4,6 @@ import contextlib
 import json
 import os
 from pathlib import Path
-import re
 import signal
 import socket
 import subprocess
@@ -47,8 +46,9 @@ class Rpc:
 
 
 class Http:
-    def __init__(self, endpoint):
+    def __init__(self, endpoint, headers=None):
         self.endpoint = endpoint
+        self.headers = headers or {}
         self.session = None
 
     def post(self, message, **extra_headers):
@@ -58,7 +58,7 @@ class Http:
         if self.session:
             headers["Mcp-Session-Id"] = self.session
         request = urllib.request.Request(self.endpoint, json.dumps(message).encode(),
-                                         headers=headers | extra_headers)
+                                         headers=headers | self.headers | extra_headers)
         return urllib.request.urlopen(request, timeout=10)
 
     def __call__(self, message):
@@ -116,18 +116,22 @@ def check(bin_dir):
             "mcp_listen": "127.0.0.1:0",
         })
         log_path = path / "server.log"
+        env = os.environ | {
+            "SANCTUM_CONFIG_JSON": config, "SANCTUM_MANAGED_STDIO": "1", "NO_COLOR": "1",
+        }
         with log_path.open("w") as log, child(
-            [server_bin], stderr=log, env=os.environ | {"SANCTUM_CONFIG_JSON": config, "NO_COLOR": "1"},
+            [server_bin], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
+            text=True, env=env,
         ) as server:
-            for _ in range(100):
-                logs = log_path.read_text()
-                addresses = dict(re.findall(r"Sanctum (MCP|gRPC) listening.*?address=(127\.0\.0\.1:\d+)", logs))
-                if len(addresses) == 2:
-                    break
-                assert server.poll() is None, logs
-                time.sleep(.05)
-            assert len(addresses) == 2, logs
-            endpoint = f"http://{addresses['MCP']}/mcp"
+            timer = threading.Timer(10, server.kill)
+            timer.start()
+            try:
+                addresses = json.loads(server.stdout.readline())
+            except json.JSONDecodeError as error:
+                raise RuntimeError(log_path.read_text()) from error
+            finally:
+                timer.cancel()
+            endpoint = f"http://{addresses['mcp']}/mcp"
 
             transport = Http(endpoint)
             initial = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
@@ -213,10 +217,13 @@ def check(bin_dir):
                 assert bridge.wait(timeout=10) == 0
                 timer.cancel()
             grpc = subprocess.run(
-                [cli_bin, "--endpoint", f"http://{addresses['gRPC']}", "search", "notes", "quartz"],
+                [cli_bin, "--endpoint", f"http://{addresses['grpc']}", "search", "notes", "quartz"],
                 check=True, capture_output=True, text=True, timeout=10,
             )
             assert content in grpc.stdout, grpc.stdout
+            server.stdin.close()
+            assert server.wait(timeout=10) == 0
+
     print("MCP HTTP and stdio shared the gRPC data, with metadata, exact UTF-8 ranges, and tenant scope verified.")
 
 
