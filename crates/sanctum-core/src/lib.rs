@@ -122,6 +122,8 @@ pub struct GitProvenance {
 pub struct ChunkSettings {
     pub window_bytes: u32,
     pub overlap_bytes: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 impl Default for ChunkSettings {
@@ -129,6 +131,7 @@ impl Default for ChunkSettings {
         Self {
             window_bytes: 4096,
             overlap_bytes: 400,
+            max_tokens: None,
         }
     }
 }
@@ -143,10 +146,24 @@ impl ChunkSettings {
                     .into(),
             ));
         }
+        if self
+            .max_tokens
+            .is_some_and(|limit| !(16..=16_384).contains(&limit))
+        {
+            return Err(Error::Invalid(
+                "chunk token budget must be 16 to 16384".into(),
+            ));
+        }
         Ok(())
     }
 
     pub fn identifier(self) -> String {
+        if let Some(tokens) = self.max_tokens {
+            return format!(
+                "utf8-overlap-estimated-tokens-v1/{}/{}/{tokens}",
+                self.window_bytes, self.overlap_bytes
+            );
+        }
         if self == Self::default() {
             return "utf8-overlap-v1".into();
         }

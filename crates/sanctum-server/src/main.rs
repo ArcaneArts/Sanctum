@@ -131,6 +131,7 @@ fn runtime_info(
         max_source_bytes: config.max_source_bytes,
         chunk_window_bytes: config.chunking.window_bytes,
         chunk_overlap_bytes: config.chunking.overlap_bytes,
+        chunk_max_tokens: config.chunking.max_tokens,
         embedding_profile_id: embedding.map(|provider| provider.profile_id().to_owned()),
         embedding_dimensions: embedding.and_then(|provider| provider.dimensions().try_into().ok()),
         storage: "filesystem".into(),

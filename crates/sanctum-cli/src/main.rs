@@ -476,6 +476,9 @@ async fn main() -> anyhow::Result<()> {
                 "Chunk window: {} bytes, {} bytes overlap",
                 info.chunk_window_bytes, info.chunk_overlap_bytes
             );
+            if let Some(tokens) = info.chunk_max_tokens {
+                println!("Chunk token budget: {tokens} estimated tokens");
+            }
             if let Some(concurrency) = info.local_worker_concurrency {
                 println!("Local workers: {concurrency}");
             }

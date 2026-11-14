@@ -80,6 +80,7 @@ message RuntimeInfo {
   uint32 chunk_window_bytes = 14;
   uint32 chunk_overlap_bytes = 15;
   bool standalone_object_worker = 16;
+  optional uint32 chunk_max_tokens = 17;
 }
 
 message DatabaseTarget {

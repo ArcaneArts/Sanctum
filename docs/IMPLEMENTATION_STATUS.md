@@ -1444,3 +1444,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   using the returned operation ID, resumed the local queue, and replayed
   the same upload successfully. [Error contract](LOCAL_API.md#grpc-error-details),
   [Python example](../examples/python/README.md#read-structured-errors).
+
+## Estimated token budget for chunking
+
+- `chunking.max_tokens` adds a model-independent estimated token limit
+  alongside the byte cap. Revision identifiers record the estimator and
+  its settings. Local queued jobs and hosted envelopes persist the
+  limit they accepted. Existing operations and omitted settings retain
+  the byte-only chunker.
+- `pnpm check` and locked release builds passed. Local and hosted tests
+  resumed accepted jobs with a different runtime configuration and
+  retained the original budget. A generated Python client checked 15
+  exact multibyte excerpts against live MinIO after worker restart.
+- A release filesystem server indexed a 200 MiB file with a 1,000-token
+  estimate in 7.061 s at 29,114,368 bytes peak sampled process RSS.
+  The final MCP excerpt matched the source bytes. Provider token limits
+  remain model-specific. [Capacity results](CAPACITY.md#estimated-token-budget).

@@ -273,6 +273,7 @@ async fn local_upload_keeps_accepted_chunk_settings_across_restart() {
         .with_chunking(sanctum_core::ChunkSettings {
             window_bytes: 256,
             overlap_bytes: 32,
+            max_tokens: Some(32),
         })
         .unwrap();
     let mut api = Running::with_service(configured, false).await;
@@ -296,8 +297,11 @@ async fn local_upload_keeps_accepted_chunk_settings_across_restart() {
     let mut api = Running::start(&dir).await;
     let result = await_ready(&mut api.client, job_request(accepted.operation_id)).await;
     let revision = result.text_revision.unwrap();
-    assert_eq!(revision.chunker, "utf8-overlap-v1/256/32");
-    assert!(revision.chunks > 1);
+    assert_eq!(
+        revision.chunker,
+        "utf8-overlap-estimated-tokens-v1/256/32/32"
+    );
+    assert_eq!(revision.chunks, 11);
     api.stop().await;
 }
 

@@ -1021,6 +1021,7 @@ async fn hosted_upload_keeps_accepted_chunk_settings_across_worker_restart() {
         .with_chunking(sanctum_core::ChunkSettings {
             window_bytes: 257,
             overlap_bytes: 33,
+            max_tokens: Some(32),
         })
         .unwrap();
     let scope = sanctum_core::Scope {
@@ -1057,7 +1058,10 @@ async fn hosted_upload_keeps_accepted_chunk_settings_across_worker_restart() {
         .await
         .unwrap();
     let content = result.content.unwrap();
-    assert_eq!(content.chunker, "utf8-overlap-v1/257/33");
+    assert_eq!(
+        content.chunker,
+        "utf8-overlap-estimated-tokens-v1/257/33/32"
+    );
     assert!(content.chunks > 1);
     let reference = sanctum_service::ChunkRef {
         source: result.source.unwrap(),
@@ -1069,7 +1073,7 @@ async fn hosted_upload_keeps_accepted_chunk_settings_across_worker_restart() {
         hit.excerpt,
         text[hit.chunk.range.start as usize..hit.chunk.range.end as usize]
     );
-    assert!(hit.excerpt.len() <= 257);
+    assert!(hit.excerpt.len() <= 128);
     let (stored, _) = worker
         .source(&scope, result.source.unwrap(), None)
         .await
@@ -2053,6 +2057,7 @@ async fn hosted_lexical_search_coalesces_overlapping_excerpts_in_rank_order() {
         .with_chunking(sanctum_core::ChunkSettings {
             window_bytes: 1024,
             overlap_bytes: 512,
+            max_tokens: None,
         })
         .unwrap();
     let scope = sanctum_core::Scope {
