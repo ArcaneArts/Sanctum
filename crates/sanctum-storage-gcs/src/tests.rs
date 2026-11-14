@@ -59,6 +59,7 @@ async fn upload(
     body: Bytes,
 ) -> axum::response::Response {
     assert_credentials(&headers);
+    assert_eq!(query["fields"], "name,size,etag,generation,updated");
     let generation = &query["ifGenerationMatch"];
     fixture.writes.lock().unwrap().push(generation.clone());
     let key = &query["name"];
@@ -113,6 +114,10 @@ async fn list(
     headers: HeaderMap,
 ) -> axum::response::Response {
     assert_credentials(&headers);
+    assert_eq!(
+        query["fields"],
+        "nextPageToken,items(name,size,etag,generation,updated)"
+    );
     let token = query.get("pageToken");
     let attempt = {
         let mut requests = fixture.lists.lock().unwrap();
@@ -149,6 +154,19 @@ async fn list(
             _ => panic!("unexpected usage list attempt {attempt}"),
         };
     }
+    if query["prefix"] == "maximum/" {
+        assert_eq!(query["maxResults"], "1000");
+        let segment = "a".repeat(250);
+        let last = "z".repeat(8);
+        let items: Vec<_> = (0..1000)
+            .map(|id| {
+                let key = format!("maximum/{segment}/{segment}/{segment}/{segment}/{id:04}{last}");
+                assert_eq!(key.len(), 1024);
+                metadata(&key, 1, id + 1)
+            })
+            .collect();
+        return Json(json!({ "items": items, "nextPageToken": "more/+ =token" })).into_response();
+    }
     assert_eq!(query["prefix"], "default/notes/");
     assert_eq!(query["maxResults"], "1");
     match token.map(String::as_str) {
@@ -159,11 +177,24 @@ async fn list(
         Some("opaque-token") => Json(json!({})).into_response(),
         Some("unavailable") => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Some("forbidden") => StatusCode::FORBIDDEN.into_response(),
+        Some("oversized") => oversized_metadata(LIST_PAGE_OVERHEAD_BYTES + LIST_ITEM_BYTES),
+        Some("too-many") => Json(json!({
+            "items": [metadata("default/notes/a", 4, 9), metadata("default/notes/b", 6, 10)]
+        }))
+        .into_response(),
         Some("invalid") => "{\"items\":[".into_response(),
         Some("stalled") if attempt == 1 => std::future::pending().await,
         Some("stalled") => Json(json!({})).into_response(),
         _ => StatusCode::BAD_REQUEST.into_response(),
     }
+}
+
+fn oversized_metadata(limit: usize) -> axum::response::Response {
+    let chunks = stream::iter(
+        (0..=limit / 1024).map(|_| Ok::<_, io::Error>(Bytes::from_static(&[b' '; 1024]))),
+    )
+    .chain(stream::pending());
+    Body::from_stream(chunks).into_response()
 }
 
 async fn object(
@@ -173,6 +204,14 @@ async fn object(
     headers: HeaderMap,
 ) -> axum::response::Response {
     assert_credentials(&headers);
+    if !query.contains_key("alt") {
+        assert_eq!(query["fields"], "name,size,etag,generation,updated");
+        if key.ends_with("/oversized") {
+            return oversized_metadata(MAX_CONTROL_BYTES);
+        }
+    } else {
+        assert!(!query.contains_key("fields"));
+    }
     if let Some(scenario) = key.strip_prefix("default/notes/resume-") {
         return download_object(&fixture, &key, scenario, &query, &headers);
     }
@@ -532,15 +571,54 @@ async fn list_page_bounds_retries_and_preserves_permanent_errors() {
 }
 
 #[tokio::test]
+async fn gcs_metadata_is_bounded_and_preserves_valid_maximum_pages() {
+    let (storage, fixture, server) = start().await;
+    let prefix = Key::parse("maximum").unwrap();
+    let page = storage.list(Some(&prefix), None, 1000).await.unwrap();
+    assert_eq!(page.objects.len(), 1000);
+    assert_eq!(
+        page.objects[999].version.generation.as_deref(),
+        Some("1000")
+    );
+    assert_eq!(page.next_cursor.as_deref(), Some("more/+ =token"));
+
+    let prefix = Key::parse("default/notes").unwrap();
+    for token in ["oversized", "too-many"] {
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            storage.list(Some(&prefix), Some(token), 1),
+        )
+        .await
+        .expect("respond without waiting for the oversized stream to close");
+        assert!(matches!(result,
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+    assert_eq!(
+        *fixture.lists.lock().unwrap(),
+        [None, Some("oversized".into()), Some("too-many".into())],
+    );
+    let key = Key::parse("default/notes/oversized").unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(3), storage.head(&key))
+        .await
+        .expect("stop reading oversized object metadata");
+    assert!(matches!(result,
+        Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+    ));
+    server.abort();
+}
+
+#[tokio::test]
 async fn list_page_retries_a_stalled_response() {
     let (storage, fixture, server) = start().await;
     let mut url = storage.objects_url(false, None);
     url.query_pairs_mut()
         .append_pair("prefix", "default/notes/")
         .append_pair("maxResults", "1")
+        .append_pair("fields", LIST_FIELDS)
         .append_pair("pageToken", "stalled");
     let page = storage
-        .list_page(url, Duration::from_millis(250))
+        .list_page(url, 1, Duration::from_millis(250))
         .await
         .unwrap();
     assert!(page.objects.is_empty() && page.next_cursor.is_none());
@@ -807,6 +885,7 @@ async fn start_session(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     assert_credentials(&headers);
+    assert_eq!(query["fields"], "name,size,etag,generation,updated");
     assert_eq!(query["ifGenerationMatch"], "0");
     assert_eq!(query["name"], "default/notes/bulk");
     assert_eq!(query["uploadType"], "resumable");

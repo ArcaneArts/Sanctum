@@ -35,6 +35,12 @@ const RANGE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const RANGE_DEADLINE: Duration = Duration::from_secs(15);
 const MAX_LIST_ATTEMPTS: u32 = 3;
 const LIST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const OBJECT_FIELDS: &str = "name,size,etag,generation,updated";
+const LIST_FIELDS: &str = "nextPageToken,items(name,size,etag,generation,updated)";
+// Managed names can be up to 1 KiB of ASCII. Leave room per item for
+// generation, size, etag, timestamp, and JSON overhead, plus a page token.
+const LIST_ITEM_BYTES: usize = 2 * 1024;
+const LIST_PAGE_OVERHEAD_BYTES: usize = 16 * 1024;
 
 #[async_trait::async_trait]
 trait Credential: Send + Sync {
@@ -223,7 +229,8 @@ impl GcsStorage {
         url.query_pairs_mut()
             .append_pair("name", key.as_str())
             .append_pair("uploadType", "media")
-            .append_pair("ifGenerationMatch", generation);
+            .append_pair("ifGenerationMatch", generation)
+            .append_pair("fields", OBJECT_FIELDS);
         let length = bytes.len() as u64;
         let response = self
             .request(Method::POST, url)
@@ -234,13 +241,7 @@ impl GcsStorage {
             .await
             .map_err(transfer_error)?;
         check(response.status())?;
-        let object: ObjectMetadata = response.json().await.map_err(transfer_error)?;
-        if object.name != key.as_str() || object.size()? != length {
-            return Err(invalid_response(
-                "GCS uploaded object differs from its request",
-            ));
-        }
-        object.version()
+        upload_version(response, key, length).await
     }
 
     async fn upload_part(&self, session: &Url, range: String, bytes: Bytes) -> Result<Response> {
@@ -266,7 +267,8 @@ impl GcsStorage {
         url.query_pairs_mut()
             .append_pair("name", key.as_str())
             .append_pair("uploadType", "resumable")
-            .append_pair("ifGenerationMatch", "0");
+            .append_pair("ifGenerationMatch", "0")
+            .append_pair("fields", OBJECT_FIELDS);
         let response = self
             .request(Method::POST, url)
             .await?
@@ -397,21 +399,28 @@ fn upload_offset(headers: &HeaderMap) -> Result<u64> {
         .ok_or_else(|| invalid_response("GCS returned an invalid upload range"))
 }
 
-async fn upload_version(response: Response, key: &Key, length: u64) -> Result<Version> {
+async fn read_metadata<T: serde::de::DeserializeOwned>(
+    response: Response,
+    max_bytes: usize,
+) -> Result<T> {
     let mut bytes = BytesMut::new();
     let mut body = response.bytes_stream();
     while let Some(chunk) = body
         .try_next()
         .await
-        .map_err(|_| Error::Busy("GCS resumable upload response was interrupted".into()))?
+        .map_err(|_| Error::Busy("GCS metadata response was interrupted".into()))?
     {
-        if chunk.len() > MAX_CONTROL_BYTES - bytes.len() {
-            return Err(invalid_response("GCS returned oversized upload metadata"));
+        if chunk.len() > max_bytes - bytes.len() {
+            return Err(invalid_response("GCS returned oversized metadata"));
         }
         bytes.extend_from_slice(&chunk);
     }
-    let uploaded: ObjectMetadata = serde_json::from_slice(&bytes)
-        .map_err(|_| invalid_response("GCS returned invalid upload metadata"))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| invalid_response("GCS returned invalid object metadata"))
+}
+
+async fn upload_version(response: Response, key: &Key, length: u64) -> Result<Version> {
+    let uploaded: ObjectMetadata = read_metadata(response, MAX_CONTROL_BYTES).await?;
     if uploaded.size()? != length || uploaded.name != key.as_str() {
         return Err(invalid_response(
             "GCS uploaded object differs from its request",
@@ -423,17 +432,17 @@ async fn upload_version(response: Response, key: &Key, length: u64) -> Result<Ve
 #[async_trait::async_trait]
 impl Storage for GcsStorage {
     async fn head(&self, key: &Key) -> Result<Object> {
+        let mut url = self.objects_url(false, Some(key));
+        url.query_pairs_mut().append_pair("fields", OBJECT_FIELDS);
         let response = self
-            .request(Method::GET, self.objects_url(false, Some(key)))
+            .request(Method::GET, url)
             .await?
             .send()
             .await
             .map_err(transfer_error)?;
         check(response.status())?;
-        let object = response
-            .json::<ObjectMetadata>()
-            .await
-            .map_err(transfer_error)?
+        let object = read_metadata::<ObjectMetadata>(response, MAX_CONTROL_BYTES)
+            .await?
             .object()?;
         if &object.key != key {
             return Err(invalid_response("GCS metadata returned a different object"));
@@ -518,10 +527,13 @@ impl Storage for GcsStorage {
         cursor: Option<&str>,
         limit: u32,
     ) -> Result<ListPage> {
+        let limit = list_limit(limit)?;
         let mut url = self.objects_url(false, None);
         {
             let mut query = url.query_pairs_mut();
-            query.append_pair("maxResults", &list_limit(limit)?.to_string());
+            query
+                .append_pair("maxResults", &limit.to_string())
+                .append_pair("fields", LIST_FIELDS);
             if let Some(prefix) = prefix {
                 query.append_pair("prefix", &format!("{prefix}/"));
             }
@@ -529,7 +541,7 @@ impl Storage for GcsStorage {
                 query.append_pair("pageToken", cursor);
             }
         }
-        self.list_page(url, LIST_ATTEMPT_TIMEOUT).await
+        self.list_page(url, limit, LIST_ATTEMPT_TIMEOUT).await
     }
 
     async fn delete(&self, key: &Key) -> Result<()> {
@@ -548,7 +560,13 @@ impl Storage for GcsStorage {
 }
 
 impl GcsStorage {
-    async fn list_page(&self, url: Url, attempt_timeout: Duration) -> Result<ListPage> {
+    async fn list_page(
+        &self,
+        url: Url,
+        limit: usize,
+        attempt_timeout: Duration,
+    ) -> Result<ListPage> {
+        let max_bytes = LIST_PAGE_OVERHEAD_BYTES + limit * LIST_ITEM_BYTES;
         let mut attempt = 1;
         loop {
             let result = tokio::time::timeout(attempt_timeout, async {
@@ -559,12 +577,12 @@ impl GcsStorage {
                     .await
                     .map_err(transfer_error)?;
                 check(response.status())?;
-                let body = response
-                    .bytes()
-                    .await
-                    .map_err(|_| Error::Busy("GCS listing response was interrupted".into()))?;
-                let page: Page = serde_json::from_slice(&body)
-                    .map_err(|_| invalid_response("GCS returned invalid listing metadata"))?;
+                let page: Page = read_metadata(response, max_bytes).await?;
+                if page.items.len() > limit {
+                    return Err(invalid_response(
+                        "GCS listing exceeded its requested page size",
+                    ));
+                }
                 let objects = page
                     .items
                     .into_iter()
