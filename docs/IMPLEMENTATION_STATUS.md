@@ -2025,6 +2025,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   immediate errors for HTTP 403 and malformed JSON. Live bucket validation
   remains open. [Storage behavior](STORAGE.md#google-cloud-storage-adapter).
 
+## Bounded GCS metadata responses
+
+- The native adapter requests only the GCS metadata fields needed for
+  object identity, generation fencing, byte accounting, and pagination.
+  It caps buffered response data before JSON decoding. Interrupted
+  listing bodies still retry at the same page token.
+- The loopback fixture verified the metadata selectors on list, object,
+  and upload requests. It accepted a 1,000-item page containing 1,024-byte
+  object keys and preserved an opaque continuation token. It rejected
+  oversized listing and object responses without waiting for EOF and
+  rejected a response containing more items than requested.
+  [GCS storage adapter](STORAGE.md#google-cloud-storage-adapter).
+
 ## GCS resumable transfer recovery
 
 - The native adapter retains a bounded upload part and probes the same

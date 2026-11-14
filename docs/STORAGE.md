@@ -138,8 +138,14 @@ Object listing retries the same prefix and page token after a transient HTTP
 error, interrupted response body, or timeout. Each page has up to three attempts
 of ten seconds each, plus backoff. The adapter returns only a complete,
 validated page, so a failed attempt contributes no objects to usage totals or
-maintenance scans. Authorization errors and malformed JSON end the request.
-[GCS list pagination](https://docs.cloud.google.com/storage/docs/json_api/v1/objects/list).
+maintenance scans. Listing requests select only the continuation token and
+the name, size, ETag, generation, and update time for each object. The response
+buffer allows 2 KiB per requested item plus 16 KiB for the page envelope and
+token. Single-object metadata and upload confirmations have a 1 MiB response
+limit. Authorization errors, malformed JSON, and oversized responses end the
+request.
+[GCS list pagination](https://docs.cloud.google.com/storage/docs/json_api/v1/objects/list),
+[GCS partial responses](https://docs.cloud.google.com/storage/docs/json_api#partial-response).
 
 Bulk transfers use bounded 8 MiB parts in a GCS resumable upload
 session. After an interrupted request or retryable HTTP failure,
