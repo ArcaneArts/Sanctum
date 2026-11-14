@@ -53,7 +53,7 @@ pub struct Revision {
     pub content: RevisionContent,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct RevisionContent {
     pub bytes: u64,
     pub chunks: u64,

@@ -6,13 +6,14 @@ use axum::{
     routing::post,
 };
 use sanctum_core::{Error, Scope};
-use sanctum_service::HostedCatalog;
+use sanctum_service::{HostedCatalog, TaskStage};
 use serde::Deserialize;
 use uuid::Uuid;
 
 pub(crate) fn router(service: HostedCatalog) -> Router {
     Router::new()
         .route("/internal/tasks/register-upload", post(register))
+        .route("/internal/tasks/prepare-upload", post(prepare))
         .route("/internal/tasks/index-upload", post(index))
         .route("/internal/tasks/embed-collection", post(embed))
         .route("/internal/tasks/embed-upload", post(embed_upload))
@@ -47,17 +48,24 @@ async fn register(
     State(service): State<HostedCatalog>,
     Json(task): Json<RegisterUpload>,
 ) -> StatusCode {
-    apply(service, task, false).await
+    apply(service, task, TaskStage::Register).await
+}
+
+async fn prepare(
+    State(service): State<HostedCatalog>,
+    Json(task): Json<RegisterUpload>,
+) -> StatusCode {
+    apply(service, task, TaskStage::Prepare).await
 }
 
 async fn index(
     State(service): State<HostedCatalog>,
     Json(task): Json<RegisterUpload>,
 ) -> StatusCode {
-    apply(service, task, true).await
+    apply(service, task, TaskStage::Index).await
 }
 
-async fn apply(service: HostedCatalog, task: RegisterUpload, indexing: bool) -> StatusCode {
+async fn apply(service: HostedCatalog, task: RegisterUpload, stage: TaskStage) -> StatusCode {
     let (Ok(tenant), Ok(collection)) = (task.tenant.parse(), task.collection.parse()) else {
         return StatusCode::BAD_REQUEST;
     };
@@ -65,10 +73,11 @@ async fn apply(service: HostedCatalog, task: RegisterUpload, indexing: bool) -> 
         return StatusCode::BAD_REQUEST;
     }
     let scope = Scope { tenant, collection };
-    let result = if indexing {
-        service.index_upload(&scope, task.operation_id).await
-    } else {
-        service.register_upload(&scope, task.operation_id).await
+    let result = match stage {
+        TaskStage::Register => service.register_upload(&scope, task.operation_id).await,
+        TaskStage::Prepare => service.prepare_upload(&scope, task.operation_id).await,
+        TaskStage::Index => service.index_upload(&scope, task.operation_id).await,
+        _ => unreachable!("embedding tasks use separate handlers"),
     };
     match result {
         Ok(_) => {
@@ -79,7 +88,7 @@ async fn apply(service: HostedCatalog, task: RegisterUpload, indexing: bool) -> 
         Err(error) => {
             tracing::warn!(
                 %error, tenant = %scope.tenant, collection = %scope.collection,
-                operation = %task.operation_id, indexing, "hosted task will need a retry"
+                operation = %task.operation_id, ?stage, "hosted task will need a retry"
             );
             StatusCode::SERVICE_UNAVAILABLE
         }

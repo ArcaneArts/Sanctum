@@ -31,6 +31,19 @@ pub(super) enum Outcome {
     Failed { code: String, message: String },
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Preparation {
+    Ready(Box<Canonical>),
+    Invalid(String),
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct Canonical {
+    content: RevisionContent,
+    extracted: Option<Uuid>,
+}
+
 struct Prepared {
     file: NamedTempFile,
     revision: Revision,
@@ -38,16 +51,73 @@ struct Prepared {
 }
 
 impl HostedCatalog {
-    pub async fn index_upload(&self, scope: &Scope, operation: Uuid) -> Result<HostedJob> {
+    pub async fn prepare_upload(&self, scope: &Scope, operation: Uuid) -> Result<HostedJob> {
         let prefix = self.operation_prefix(scope, operation)?;
         let (mut record, version) = self.require_operation(&prefix, operation).await?;
         let registration = match &record.stage {
             Stage::PendingRegistration => {
                 return Err(Error::Busy("upload awaits registration".into()));
             }
-            Stage::PendingIndexing { registration } => registration,
+            Stage::PendingIndexing {
+                registration,
+                preparation: None,
+            } => registration,
             _ => return Ok(record.job()),
         };
+        let start = Instant::now();
+        if unix_seconds()? >= index_expiry(&record) {
+            return self.index_upload(scope, operation).await;
+        }
+        let prepared = match self
+            .prepare_source(scope, &prefix, &record, registration)
+            .await
+        {
+            Ok((_, canonical)) => Preparation::Ready(Box::new(canonical)),
+            Err(Error::Invalid(message)) => Preparation::Invalid(message),
+            Err(Error::NotFound(_)) => {
+                let unit = Unit::collection(self.prefix.as_ref(), scope)?;
+                if self
+                    .publication
+                    .stage_receipt(&unit, operation, INDEX_STAGE)
+                    .await?
+                    .is_some()
+                {
+                    return self.index_upload(scope, operation).await;
+                }
+                return Err(Error::Busy("registered input is unavailable".into()));
+            }
+            Err(error) => return Err(error),
+        };
+        let Stage::PendingIndexing { preparation, .. } = &mut record.stage else {
+            unreachable!("stage was checked above");
+        };
+        *preparation = Some(prepared);
+        record.dispatched_at = None;
+        let job = self
+            .checkpoint(&prefix, record, version, |stage| {
+                matches!(
+                    stage,
+                    Stage::PendingIndexing {
+                        preparation: None,
+                        ..
+                    }
+                )
+            })
+            .await?;
+        job.log_stage(scope, "prepare", start);
+        Ok(job)
+    }
+
+    pub async fn index_upload(&self, scope: &Scope, operation: Uuid) -> Result<HostedJob> {
+        let prefix = self.operation_prefix(scope, operation)?;
+        let (mut record, version) = self.require_operation(&prefix, operation).await?;
+        match &record.stage {
+            Stage::PendingRegistration => {
+                return Err(Error::Busy("upload awaits registration".into()));
+            }
+            Stage::PendingIndexing { .. } => {}
+            _ => return Ok(record.job()),
+        }
         let start = Instant::now();
         let unit = Unit::collection(self.prefix.as_ref(), scope)?;
         let receipt = self
@@ -56,10 +126,7 @@ impl HostedCatalog {
             .await?;
         let outcome = match receipt {
             Some(receipt) => decode(&receipt)?,
-            None => match self
-                .index_registered(scope, &unit, &prefix, &record, registration)
-                .await
-            {
+            None => match self.index_registered(scope, &unit, &prefix, &record).await {
                 Ok(outcome) => outcome,
                 Err(Error::NotFound(_)) => {
                     // A competing index delivery may have committed and removed its RTF input.
@@ -80,7 +147,7 @@ impl HostedCatalog {
             job.log_stage(scope, "index", start);
             return Ok(job);
         }
-        let Stage::PendingIndexing { registration } = record.stage else {
+        let Stage::PendingIndexing { registration, .. } = record.stage else {
             unreachable!("stage was checked above");
         };
         record.dispatched_at = None;
@@ -125,11 +192,15 @@ impl HostedCatalog {
         unit: &Unit,
         operation_prefix: &Key,
         record: &Operation,
-        registration: &Registration,
     ) -> Result<Outcome> {
-        let expires_at = record
-            .created_at
-            .saturating_add(REGISTRATION_WINDOW.as_secs());
+        let Stage::PendingIndexing {
+            registration,
+            preparation,
+        } = &record.stage
+        else {
+            unreachable!("stage was checked above");
+        };
+        let expires_at = index_expiry(record);
         let replacement = record.upload.replacement.is_some();
         let prepared = if unix_seconds()? >= expires_at {
             Err(Outcome::Failed {
@@ -138,7 +209,13 @@ impl HostedCatalog {
             })
         } else {
             match self
-                .prepare_revision(scope, operation_prefix, record, registration)
+                .prepare_for_index(
+                    scope,
+                    operation_prefix,
+                    record,
+                    registration,
+                    preparation.as_ref(),
+                )
                 .await
             {
                 Ok(prepared) => Ok(prepared),
@@ -201,7 +278,7 @@ impl HostedCatalog {
                                     (&initial_metadata, &initial_chunk_metadata),
                                     |writer| {
                                         let mut ordinal = 0;
-                                        index_utf8_with_settings(
+                                        let index = index_utf8_with_settings(
                                             BufReader::new(prepared.file.reopen()?),
                                             chunking,
                                             |range, text| {
@@ -220,6 +297,13 @@ impl HostedCatalog {
                                                 Ok(())
                                             },
                                         )?;
+                                        let expected = &prepared.revision.content;
+                                        if index.hash != expected.hash
+                                            || index.bytes != expected.bytes
+                                            || index.chunks != expected.chunks
+                                        {
+                                            return Err(invalid_input());
+                                        }
                                         Ok(())
                                     },
                                 )?;
@@ -252,41 +336,17 @@ impl HostedCatalog {
         decode(&receipts[0].outcome)
     }
 
-    async fn prepare_revision(
+    async fn prepare_source(
         &self,
         scope: &Scope,
         prefix: &Key,
         record: &Operation,
         registration: &Registration,
-    ) -> Result<Prepared> {
-        let download_started = Instant::now();
-        let input_key = record.input_key(prefix)?;
-        let input = self.storage.get(&input_key).await?;
-        if input.object.length != record.bytes {
-            return Err(invalid_input());
-        }
-        let staged = NamedTempFile::new()?;
-        let mut output = tokio::fs::File::from_std(staged.reopen()?);
-        let copied = tokio::io::copy(
-            &mut input.reader.take(record.bytes.saturating_add(1)),
-            &mut output,
-        )
-        .await?;
-        output.flush().await?;
-        drop(output);
-        if copied != record.bytes {
-            return Err(invalid_input());
-        }
-        tracing::debug!(
-            event = "hosted_input_transfer",
-            tenant = %scope.tenant,
-            collection = %scope.collection,
-            operation = %record.operation,
-            direction = "download",
-            bytes = copied,
-            duration_ms = download_started.elapsed().as_secs_f64() * 1_000.0,
-            "downloaded a staged source"
-        );
+    ) -> Result<(NamedTempFile, Canonical)> {
+        let input = record.input_key(prefix)?;
+        let staged = self
+            .download_source(scope, record.operation, &input, record.bytes)
+            .await?;
         let is_rtf = is_rtf(&record.upload.name);
         let expected = record.blake3.clone();
         let chunking = record.chunking;
@@ -299,25 +359,56 @@ impl HostedCatalog {
             content.chunks,
         )?;
         content.retain_original = record.upload.retain_original;
-        let mut objects = RevisionObjects {
-            text_key: input_key.to_string(),
-            original_key: None,
-        };
-        if is_rtf {
-            let collection = collection_prefix(self.prefix.as_ref(), scope)?;
-            let key = Key::parse(format!(
-                "{collection}/sources/{}/{}/objects/{}/text.utf8",
-                registration.source,
-                record.revision,
-                Uuid::new_v4(),
-            ))?;
+        let extracted = if is_rtf {
+            let attempt = Uuid::new_v4();
+            let key = self.extracted_key(scope, record, registration, attempt)?;
             let reader = tokio::fs::File::from_std(file.reopen()?);
             self.storage
                 .put_stream(&key, Box::pin(reader), content.bytes)
                 .await?;
-            objects.text_key = key.to_string();
-            objects.original_key = record.upload.retain_original.then(|| input_key.to_string());
-        }
+            Some(attempt)
+        } else {
+            None
+        };
+        Ok((file, Canonical { content, extracted }))
+    }
+
+    async fn prepare_for_index(
+        &self,
+        scope: &Scope,
+        prefix: &Key,
+        record: &Operation,
+        registration: &Registration,
+        preparation: Option<&Preparation>,
+    ) -> Result<Prepared> {
+        let (local, content, extracted) = match preparation {
+            Some(Preparation::Ready(canonical)) => {
+                (None, canonical.content.clone(), canonical.extracted)
+            }
+            Some(Preparation::Invalid(message)) => return Err(Error::Invalid(message.clone())),
+            None => {
+                // Index deliveries queued before the preparation stage still work.
+                let (file, canonical) = self
+                    .prepare_source(scope, prefix, record, registration)
+                    .await?;
+                (Some(file), canonical.content, canonical.extracted)
+            }
+        };
+        let input = record.input_key(prefix)?;
+        let (text, original) = match extracted {
+            Some(attempt) => (
+                self.extracted_key(scope, record, registration, attempt)?,
+                record.upload.retain_original.then(|| input.to_string()),
+            ),
+            None => (input, None),
+        };
+        let file = match local {
+            Some(file) => file,
+            None => {
+                self.download_source(scope, record.operation, &text, content.bytes)
+                    .await?
+            }
+        };
         Ok(Prepared {
             file,
             revision: Revision {
@@ -327,9 +418,66 @@ impl HostedCatalog {
                 external: registration.external.clone(),
                 content,
             },
-            objects,
+            objects: RevisionObjects {
+                text_key: text.to_string(),
+                original_key: original,
+            },
         })
     }
+
+    fn extracted_key(
+        &self,
+        scope: &Scope,
+        record: &Operation,
+        registration: &Registration,
+        attempt: Uuid,
+    ) -> Result<Key> {
+        let collection = collection_prefix(self.prefix.as_ref(), scope)?;
+        Key::parse(format!(
+            "{collection}/sources/{}/{}/objects/{attempt}/text.utf8",
+            registration.source, record.revision,
+        ))
+    }
+
+    async fn download_source(
+        &self,
+        scope: &Scope,
+        operation: Uuid,
+        key: &Key,
+        bytes: u64,
+    ) -> Result<NamedTempFile> {
+        let download_started = Instant::now();
+        let input = self.storage.get(key).await?;
+        if input.object.length != bytes {
+            return Err(invalid_input());
+        }
+        let staged = NamedTempFile::new()?;
+        let mut output = tokio::fs::File::from_std(staged.reopen()?);
+        let copied =
+            tokio::io::copy(&mut input.reader.take(bytes.saturating_add(1)), &mut output).await?;
+        output.flush().await?;
+        drop(output);
+        if copied != bytes {
+            return Err(invalid_input());
+        }
+        tracing::debug!(
+            event = "hosted_input_transfer",
+            tenant = %scope.tenant,
+            collection = %scope.collection,
+            %operation,
+            direction = "download",
+            bytes = copied,
+            duration_ms = download_started.elapsed().as_secs_f64() * 1_000.0,
+            "downloaded a staged source"
+        );
+        Ok(staged)
+    }
+}
+
+fn index_expiry(record: &Operation) -> u64 {
+    record
+        .created_at
+        .saturating_add(REGISTRATION_WINDOW.as_secs())
 }
 
 fn prepare_text(

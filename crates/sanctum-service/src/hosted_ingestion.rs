@@ -89,6 +89,8 @@ enum Stage {
     PendingRegistration,
     PendingIndexing {
         registration: Registration,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preparation: Option<indexing::Preparation>,
     },
     TextReady {
         registration: Registration,
@@ -139,6 +141,8 @@ struct Operation {
     dispatched_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dispatched_embedding_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    dispatched_preparation: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     dispatch_retry: u32,
     #[serde(flatten)]
@@ -279,9 +283,10 @@ impl HostedCatalog {
         let outcome = decode_registration(&receipts[0].outcome)?;
         record.dispatched_at = None;
         record.stage = match outcome {
-            RegistrationOutcome::Registered(registration) => {
-                Stage::PendingIndexing { registration }
-            }
+            RegistrationOutcome::Registered(registration) => Stage::PendingIndexing {
+                registration,
+                preparation: None,
+            },
             RegistrationOutcome::Canceled => {
                 let job = self
                     .checkpoint_canceled(scope, &prefix, record, version, None)
@@ -406,7 +411,9 @@ impl HostedCatalog {
             },
             _ => None,
         };
-        if record.dispatched_embedding_profile.as_deref() == profile
+        let preparing = stage == TaskStage::Prepare;
+        if record.dispatched_preparation == preparing
+            && record.dispatched_embedding_profile.as_deref() == profile
             && record.dispatched_at.is_some_and(|dispatched| {
                 dispatched / crate::hosted_dispatch::DISPATCH_WINDOW_SECONDS >= window
             })
@@ -426,6 +433,7 @@ impl HostedCatalog {
             .await?;
         record.dispatched_at = Some(not_before.unwrap_or(now).max(now));
         record.dispatched_embedding_profile = profile.map(str::to_owned);
+        record.dispatched_preparation = preparing;
         let key = envelope_key(&prefix)?;
         let body = serde_json::to_vec(&record).map_err(|error| Error::Internal(Box::new(error)))?;
         match self
@@ -465,6 +473,9 @@ impl HostedCatalog {
             TaskStage::Index => {
                 self.index_upload(scope, operation).await?;
             }
+            TaskStage::Prepare => {
+                self.prepare_upload(scope, operation).await?;
+            }
             TaskStage::Embed { step } => self.embed_upload(scope, operation, step).await?,
             TaskStage::Rebuild { .. } => unreachable!("rebuilds use separate records"),
         }
@@ -480,6 +491,9 @@ impl HostedCatalog {
     ) -> Result<Option<(TaskStage, Option<u64>)>> {
         let task = match record.stage {
             Stage::PendingRegistration => (TaskStage::Register, None),
+            Stage::PendingIndexing {
+                preparation: None, ..
+            } if self.dispatcher.is_some() => (TaskStage::Prepare, None),
             Stage::PendingIndexing { .. } => (TaskStage::Index, None),
             Stage::TextReady {
                 embedding: Some(embedding),
@@ -615,6 +629,7 @@ impl HostedUpload {
             created_at: unix_seconds()?,
             dispatched_at: None,
             dispatched_embedding_profile: None,
+            dispatched_preparation: false,
             dispatch_retry: 0,
             stage: Stage::PendingRegistration,
         };
@@ -738,7 +753,7 @@ impl Operation {
         };
         let (state, registration, content) = match self.stage {
             Stage::PendingRegistration => (HostedJobState::Accepted, None, None),
-            Stage::PendingIndexing { registration } => {
+            Stage::PendingIndexing { registration, .. } => {
                 (HostedJobState::Registered, Some(registration), None)
             }
             Stage::TextReady {

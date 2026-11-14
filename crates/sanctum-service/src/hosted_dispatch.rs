@@ -19,6 +19,7 @@ struct Cursor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskStage {
     Register,
+    Prepare,
     Index,
     Embed { step: u32 },
     Rebuild { step: u32 },

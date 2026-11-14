@@ -232,10 +232,17 @@ A recorded outcome can be replayed while its database receipt is retained.
 
 ### Hosted lexical publication
 
-After registration, deliver the same reference to
-`/internal/tasks/index-upload`. The worker verifies the accepted input,
-extracts canonical UTF-8 for RTF, and indexes overlapping chunks. It
-checks the registered sequence inside the publishing transaction.
+Cloud Tasks sends the registered operation to `/internal/tasks/prepare-upload`.
+The worker verifies the accepted input, counts overlapping chunks, and writes
+canonical UTF-8 for RTF to an immutable object. A conditional write records the
+canonical digest, length, and locator in the operation envelope. A retry can
+resume from this checkpoint on another worker. Plain text preparation refers
+to the accepted input object.
+
+The next task delivers the same operation reference to
+`/internal/tasks/index-upload`. It indexes overlapping chunks from the
+canonical object and verifies its digest, length, and chunk count as it reads.
+The worker checks the registered sequence inside the publishing transaction.
 An older replacement cannot displace a newer registered revision.
 The snapshot commits text-object locators, the lexical index, and the
 indexing receipt together. Replaying a published receipt avoids rebuilding
@@ -284,8 +291,11 @@ the same task name within a six-hour window. A later window uses a new
 name so repair can recover tasks that exhausted their queue retries.
 Configure the scheduler frequency against the measured queue depth.
 
-Manual registration and indexing remain available with the private listener
-when `cloud_tasks` is omitted. Operations accepted before dispatch hints were
+The private listener accepts manual registration, preparation, and indexing
+when `cloud_tasks` is omitted. Index deliveries queued before this change and
+the standalone object worker can still prepare and index in one request.
+During an upgrade, deploy the worker with the preparation endpoint before
+deploying the API. Operations accepted before dispatch hints were
 introduced can be resubmitted with the same request ID and input to record
 a hint. Live Google Cloud deployment verification remains open.
 
