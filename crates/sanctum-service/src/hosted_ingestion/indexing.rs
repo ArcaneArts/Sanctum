@@ -109,9 +109,9 @@ impl HostedCatalog {
         *preparation = Some(prepared);
         record.dispatched_at = None;
         let job = self
-            .checkpoint(&prefix, record, version, |stage| {
+            .checkpoint(&prefix, record, version, |current| {
                 matches!(
-                    stage,
+                    current.stage,
                     Stage::PendingIndexing {
                         preparation: None,
                         ..
@@ -191,8 +191,8 @@ impl HostedCatalog {
             },
         };
         let record = self
-            .checkpoint(&prefix, record, version, |stage| {
-                matches!(stage, Stage::PendingIndexing { .. })
+            .checkpoint(&prefix, record, version, |current| {
+                matches!(current.stage, Stage::PendingIndexing { .. })
             })
             .await?;
         self.try_discard_completed_input(scope, &prefix, &record)

@@ -334,8 +334,8 @@ impl HostedCatalog {
             },
         };
         let record = self
-            .checkpoint(&prefix, record, version, |stage| {
-                matches!(stage, Stage::PendingRegistration)
+            .checkpoint(&prefix, record, version, |current| {
+                matches!(current.stage, Stage::PendingRegistration)
             })
             .await?;
         self.try_discard_completed_input(scope, &prefix, &record)
@@ -350,7 +350,7 @@ impl HostedCatalog {
         prefix: &Key,
         record: Operation,
         version: Version,
-        still_pending: impl FnOnce(&Stage) -> bool,
+        still_pending: impl FnOnce(&Operation) -> bool,
     ) -> Result<Operation> {
         let envelope = envelope_key(prefix)?;
         let body = serde_json::to_vec(&record).map_err(|error| Error::Internal(Box::new(error)))?;
@@ -367,7 +367,7 @@ impl HostedCatalog {
                 let conflict = matches!(error, Error::Conflict(_));
                 match self.require_operation(prefix, record.operation).await {
                     Ok((current, _))
-                        if current.attempt == record.attempt && !still_pending(&current.stage) =>
+                        if current.attempt == record.attempt && !still_pending(&current) =>
                     {
                         Ok(current)
                     }
@@ -401,27 +401,14 @@ impl HostedCatalog {
         // Write the hint first so a stop after the checkpoint cannot strand the request.
         self.record_dispatch_hint(scope, operation, record.attempt)
             .await?;
-        let key = envelope_key(&prefix)?;
-        let body = serde_json::to_vec(&record).map_err(|error| Error::Internal(Box::new(error)))?;
-        match self
-            .storage
-            .put_control(&key, body.into(), Condition::Match(version))
-            .await
-        {
-            Ok(_) => {
-                self.try_dispatch(scope, operation).await;
-                Ok(record.job())
-            }
-            Err(Error::Conflict(_)) => {
-                let (current, _) = self.require_operation(&prefix, operation).await?;
-                if current.dispatch_retry >= record.dispatch_retry {
-                    Ok(current.job())
-                } else {
-                    Err(Error::Busy("ingestion stage changed during retry".into()))
-                }
-            }
-            Err(error) => Err(error),
-        }
+        let retry = record.dispatch_retry;
+        let saved = self
+            .checkpoint(&prefix, record, version, |current| {
+                current.dispatch_retry < retry
+            })
+            .await?;
+        self.try_dispatch(scope, operation).await;
+        Ok(saved.job())
     }
 
     /// A late task can be acknowledged once retirement or compaction is durable.

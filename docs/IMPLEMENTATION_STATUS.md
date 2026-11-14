@@ -2386,6 +2386,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   refused task handoff after restart and fetched the exact extracted text.
   [Hosted uploads](STORAGE.md#hosted-uploads).
 
+## Hosted manual retry checkpoints with lost responses
+
+- The retry RPC checks the stored checkpoint after an ambiguous write.
+  A matching upload attempt and retry counter let it return the saved
+  job and attempt dispatch. An uncommitted counter leaves the previous
+  delivery in place.
+- The filesystem gRPC regression covered failures before and after the
+  checkpoint commit and repaired a refused handoff after restart.
+  The live MinIO test verified that a lost reply still returns the
+  original job, that the retry has a distinct task name, and that repair
+  preserves the retry counter and registration payload.
+  [Hosted upload retry](STORAGE.md#hosted-upload-retry).
+
 ## Profile rebuild checkpoints with lost responses
 
 - Hosted rebuild workers recover a lost checkpoint reply when the saved

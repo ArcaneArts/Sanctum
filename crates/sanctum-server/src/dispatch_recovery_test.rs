@@ -548,6 +548,29 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
     );
     assert_eq!(queue.refused.lock().unwrap().len(), 1);
     assert!(queue.accepted.lock().unwrap().is_empty());
+    *api_storage.lose_control_reply.lock().unwrap() = Some("/operation.json");
+    let retried = api
+        .retry_ingestion_job(job.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(retried, accepted);
+    assert!(api_storage.lose_control_reply.lock().unwrap().is_none());
+    let envelope = scoped_key(
+        prefix.as_ref(),
+        &format!("default/collections/repair/operations/{operation}/operation.json"),
+    );
+    let (saved, _) = read_control(storage.as_ref(), &envelope).await;
+    assert_eq!(saved["dispatch_retry"], 1);
+    {
+        let refused = queue.refused.lock().unwrap();
+        assert_eq!(refused.len(), 2);
+        assert_ne!(refused[0]["task"]["name"], refused[1]["task"]["name"]);
+        assert_eq!(
+            refused[0]["task"]["httpRequest"],
+            refused[1]["task"]["httpRequest"]
+        );
+    }
     drop(api);
     api_server.abort();
     assert!(api_server.await.unwrap_err().is_cancelled());
@@ -581,9 +604,11 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
     );
     assert_eq!(
         queue.accepted.lock().unwrap()[0]["task"]["httpRequest"],
-        queue.refused.lock().unwrap()[0]["task"]["httpRequest"],
-        "repair must enqueue the original registration task",
+        queue.refused.lock().unwrap()[1]["task"]["httpRequest"],
+        "repair must preserve the registration task body",
     );
+    let (dispatched, _) = read_control(storage.as_ref(), &envelope).await;
+    assert_eq!(dispatched["dispatch_retry"], 1);
     assert_eq!(
         reconcile(&http, &worker, shard).await,
         json!({"dispatched": 0, "failed": 0, "more": false}),

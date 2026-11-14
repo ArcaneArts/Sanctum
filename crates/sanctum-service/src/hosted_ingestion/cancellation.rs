@@ -81,9 +81,9 @@ impl HostedCatalog {
         record.dispatched_at = None;
         record.stage = Stage::Canceled { registration };
         let record = self
-            .checkpoint(prefix, record, version, |stage| {
+            .checkpoint(prefix, record, version, |current| {
                 matches!(
-                    stage,
+                    current.stage,
                     Stage::PendingRegistration | Stage::PendingIndexing { .. }
                 )
             })

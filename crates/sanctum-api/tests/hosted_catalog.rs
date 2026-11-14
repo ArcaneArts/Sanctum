@@ -3979,7 +3979,7 @@ async fn hosted_manual_retry_restores_a_dispatch_after_restart() {
         &[(TaskStage::Register, 0)]
     );
 
-    storage.interrupt.store(2, Ordering::Relaxed);
+    storage.interrupt.store(1, Ordering::Relaxed);
     assert_eq!(
         server
             .client
@@ -3989,6 +3989,22 @@ async fn hosted_manual_retry_restores_a_dispatch_after_restart() {
             .code(),
         Code::Unavailable
     );
+    assert_eq!(
+        &*dispatch.delivered.lock().unwrap(),
+        &[(TaskStage::Register, 0)]
+    );
+    assert_eq!(service.reconcile_shard(0).await.unwrap().dispatched, 0);
+
+    dispatch.reject_next.store(true, Ordering::Relaxed);
+    storage.interrupt.store(2, Ordering::Relaxed);
+    let saved = server
+        .client
+        .retry_ingestion_job(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(saved, accepted);
+    assert!(!dispatch.reject_next.load(Ordering::Relaxed));
     server.stop().await;
     let restarted = catalog();
     let report = restarted.reconcile_shard(0).await.unwrap();
@@ -4034,12 +4050,17 @@ async fn hosted_manual_retry_restores_a_dispatch_after_restart() {
 
 #[derive(Default)]
 struct RetryDispatch {
+    reject_next: std::sync::atomic::AtomicBool,
     delivered: std::sync::Mutex<Vec<(TaskStage, u32)>>,
 }
 
 #[async_trait::async_trait]
 impl sanctum_service::Dispatch for RetryDispatch {
     async fn send(&self, task: sanctum_service::Task<'_>) -> StorageResult<()> {
+        if self.reject_next.swap(false, Ordering::Relaxed) {
+            assert_eq!((task.stage, task.retry), (TaskStage::Register, 1));
+            return Err(Error::Busy("test refused retry handoff".into()));
+        }
         self.delivered
             .lock()
             .unwrap()
