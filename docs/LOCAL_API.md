@@ -764,7 +764,7 @@ line. To collect the same events locally, start the server with:
 
 ```sh
 SANCTUM_LOG_FORMAT=json \
-RUST_LOG=info,sanctum_service=debug,sanctum_db=debug \
+RUST_LOG=info,sanctum_server=debug,sanctum_service=debug,sanctum_db=debug \
 cargo run --locked -p sanctum-server 2>sanctum.jsonl
 ```
 
@@ -776,6 +776,8 @@ timings and counts for an existing log pipeline:
 | --- | --- |
 | `local_job_claimed` | Queue age since acceptance and attempt number |
 | `ingestion_stage` | Scoped operation age, stage duration, input bytes, and outcome |
+| `upload_task_dispatched` | Tenant, collection, operation ID, stage, dispatch window, and manual retry number after a successful task handoff |
+| `dispatch_reconcile` | Dispatch shard, number of successful task handoffs and failures, and whether the scan has another page |
 | `embedding_request` | Profile ID, document/query purpose, input count, elapsed time, and outcome class |
 | `vector_reuse` | Published chunk count and count covered by an existing vector at publication |
 | `search` | Served search mode, elapsed time, hits, embedding coverage, and degradation reason when present |

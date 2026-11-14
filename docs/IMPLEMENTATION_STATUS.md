@@ -1532,3 +1532,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   untrusted certificate. The check passed on macOS ARM64 and Debian
   ARM64. `pnpm check` passed.
   [Configuration and reproduction](LOCAL_API.md#git-imports).
+
+## Repair after task creation fails
+
+- The worker logs dispatch scan results and successful upload task handoffs.
+  The deployment check includes the operation's dispatch shard so operators
+  can correlate Scheduler, worker, and queue evidence.
+- The filesystem and live MinIO regression used the production gRPC
+  service, worker routes, and Cloud Tasks request formatting against a
+  local HTTP task endpoint. An upload remained accepted after task creation
+  returned HTTP 503. An early index delivery returned HTTP 503, and a repair
+  pass recorded the failed handoff. After restart, the next repair enqueued
+  registration, and delivered stages published the exact UTF-8 text. Repeat
+  scans and task deliveries preserved the source revision and generation.
+- The live runbook stages an actual task creation failure on a dedicated
+  deployment and checks that an authenticated Scheduler invocation creates
+  the missing task. It still needs an authorized Google Cloud project.
+  [Dispatch repair exercise](CLOUD_RUN.md#repair-an-upload-that-never-reached-the-queue).

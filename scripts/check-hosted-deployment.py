@@ -218,6 +218,7 @@ def main():
     report = {
         "started_at": utc_now(), "operation": str(operation), "tenant": scope.tenant,
         "collection": scope.collection, "bytes": len(data[1]) + data[2], "phase": args.phase,
+        "dispatch_shard": operation.bytes[0] % 16,
     }
     if args.expect_private and not token:
         parser.error(f"--expect-private requires {ENDPOINT_TOKEN}")
