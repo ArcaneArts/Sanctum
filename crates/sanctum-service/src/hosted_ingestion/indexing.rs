@@ -114,7 +114,8 @@ impl HostedCatalog {
                     }
                 )
             })
-            .await?;
+            .await?
+            .job();
         job.log_stage(scope, "prepare", start);
         Ok(job)
     }
@@ -185,25 +186,14 @@ impl HostedCatalog {
                 registration: Some(registration),
             },
         };
-        let discard_input = match &record.stage {
-            Stage::Failed { .. } => {
-                !self
-                    .expired_input_is_referenced(scope, &prefix, &record)
-                    .await?
-            }
-            Stage::TextReady { .. } => {
-                is_rtf(&record.upload.name) && !record.upload.retain_original
-            }
-            _ => false,
-        };
-        if discard_input {
-            self.discard_input(&prefix, &record).await?;
-        }
-        let job = self
+        let record = self
             .checkpoint(&prefix, record, version, |stage| {
                 matches!(stage, Stage::PendingIndexing { .. })
             })
             .await?;
+        self.try_discard_completed_input(scope, &prefix, &record)
+            .await;
+        let job = record.job();
         job.log_stage(scope, "index", start);
         Ok(job)
     }

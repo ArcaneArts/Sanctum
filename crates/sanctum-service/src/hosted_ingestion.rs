@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use sanctum_core::{ChunkSettings, Error, ExternalSource, Result, Scope};
+use sanctum_core::{ChunkSettings, Error, ExternalSource, Result, Scope, is_rtf};
 use sanctum_db::{Command, Unit, collection_prefix, command_receipt};
 use sanctum_db_sqlite::hosted::{
     Registration, RevisionIntent, Target, register_revision, release_canceled_intent,
@@ -331,14 +331,14 @@ impl HostedCatalog {
                 registration: None,
             },
         };
-        if matches!(record.stage, Stage::Failed { .. }) {
-            self.discard_input(&prefix, &record).await?;
-        }
-        let job = self
+        let record = self
             .checkpoint(&prefix, record, version, |stage| {
                 matches!(stage, Stage::PendingRegistration)
             })
             .await?;
+        self.try_discard_completed_input(scope, &prefix, &record)
+            .await;
+        let job = record.job();
         job.log_stage(scope, "register", start);
         Ok(job)
     }
@@ -349,7 +349,7 @@ impl HostedCatalog {
         record: Operation,
         version: Version,
         still_pending: impl FnOnce(&Stage) -> bool,
-    ) -> Result<HostedJob> {
+    ) -> Result<Operation> {
         let envelope = envelope_key(prefix)?;
         let body = serde_json::to_vec(&record).map_err(|error| Error::Internal(Box::new(error)))?;
         match self
@@ -357,7 +357,7 @@ impl HostedCatalog {
             .put_control(&envelope, body.into(), Condition::Match(version))
             .await
         {
-            Ok(_) => Ok(record.job()),
+            Ok(_) => Ok(record),
             Err(Error::Conflict(_)) => {
                 let (current, _) = self.require_operation(prefix, record.operation).await?;
                 if still_pending(&current.stage) {
@@ -365,7 +365,7 @@ impl HostedCatalog {
                         "ingestion envelope changed during checkpoint".into(),
                     ));
                 }
-                Ok(current.job())
+                Ok(current)
             }
             Err(error) => Err(error),
         }
@@ -579,6 +579,40 @@ impl HostedCatalog {
         match self.storage.delete(&record.input_key(prefix)?).await {
             Ok(()) | Err(Error::NotFound(_)) => Ok(()),
             Err(error) => Err(error),
+        }
+    }
+
+    async fn try_discard_completed_input(&self, scope: &Scope, prefix: &Key, record: &Operation) {
+        let cleanup = async {
+            if self.can_discard_input(scope, prefix, record).await? {
+                self.discard_input(prefix, record).await?;
+            }
+            Ok::<(), Error>(())
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), cleanup)
+            .await
+            .unwrap_or_else(|_| Err(Error::Busy("upload input cleanup timed out".into())));
+        if let Err(error) = result {
+            tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
+                operation = %record.operation, "upload sweep will retry staged input cleanup");
+        }
+    }
+
+    async fn can_discard_input(
+        &self,
+        scope: &Scope,
+        prefix: &Key,
+        record: &Operation,
+    ) -> Result<bool> {
+        match record.stage {
+            Stage::Canceled { .. } => Ok(true),
+            Stage::Failed { .. } => Ok(!self
+                .expired_input_is_referenced(scope, prefix, record)
+                .await?),
+            Stage::TextReady { .. } => {
+                Ok(is_rtf(&record.upload.name) && !record.upload.retain_original)
+            }
+            _ => Ok(false),
         }
     }
 

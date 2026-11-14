@@ -272,7 +272,10 @@ impl HostedCatalog {
             Candidate::Input { operation, attempt } => {
                 let prefix = self.operation_prefix(scope, operation)?;
                 match self.read_envelope(&prefix, operation).await? {
-                    Some((Envelope::Accepted(record), _)) => record.attempt != attempt,
+                    Some((Envelope::Accepted(record), _)) => {
+                        record.attempt != attempt
+                            || self.can_discard_input(scope, &prefix, &record).await?
+                    }
                     Some((Envelope::Expired(record), _)) => {
                         record.retained_attempt != Some(attempt)
                     }
