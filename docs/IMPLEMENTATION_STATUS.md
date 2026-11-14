@@ -2344,6 +2344,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   and Scheduler delivery remain open.
   [Snapshot maintenance](STORAGE.md#scheduled-snapshot-reclamation).
 
+## Hosted source uploads with lost responses
+
+- The hosted server verifies the stored length and BLAKE3 digest after an
+  ambiguous upload of the original source or extracted RTF text. A
+  verified object can advance acceptance or preparation. A same-length
+  corrupt input leaves the envelope and dispatch intent unwritten.
+- Filesystem and live MinIO worker tests lost the original and canonical
+  responses after their respective objects committed. They verified
+  registration, the durable preparation checkpoint, and exact UTF-8
+  retrieval through gRPC. The filesystem acceptance test also verified
+  a successful retry with the same request ID after rejecting corrupt input.
+  [Hosted uploads](STORAGE.md#hosted-uploads).
+
 ## SQLite snapshot uploads with lost responses
 
 - A writer can publish a snapshot or page delta whose upload reply was

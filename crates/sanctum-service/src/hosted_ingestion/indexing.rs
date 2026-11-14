@@ -11,7 +11,7 @@ use sanctum_db_sqlite::hosted::{
     release_canceled_intent, release_intent,
 };
 use sanctum_extract::{RTF_EXTRACTOR, rtf_to_utf8};
-use sanctum_storage::Key;
+use sanctum_storage::{Key, Reader};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -370,7 +370,7 @@ impl HostedCatalog {
         let (file, content) = self.extract_source(scope, prefix, record).await?;
         let extracted = if is_rtf(&record.upload.name) {
             Some(
-                self.store_extraction(scope, record, registration, &file, content.bytes)
+                self.store_extraction(scope, record, registration, &file, &content)
                     .await?
                     .0,
             )
@@ -418,13 +418,12 @@ impl HostedCatalog {
         record: &Operation,
         registration: &Registration,
         file: &NamedTempFile,
-        bytes: u64,
+        content: &RevisionContent,
     ) -> Result<(Uuid, Key)> {
         let attempt = Uuid::new_v4();
         let key = self.extracted_key(scope, record, registration, attempt)?;
         let reader = tokio::fs::File::from_std(file.reopen()?);
-        self.storage
-            .put_stream(&key, Box::pin(reader), bytes)
+        self.upload_verified_source(&key, Box::pin(reader), content.bytes, &content.hash)
             .await?;
         Ok((attempt, key))
     }
@@ -530,7 +529,7 @@ impl HostedCatalog {
             return Err(invalid_input());
         }
         let (_, replacement) = self
-            .store_extraction(scope, record, registration, &file, rebuilt.bytes)
+            .store_extraction(scope, record, registration, &file, &rebuilt)
             .await?;
         tracing::debug!(
             event = "hosted_extraction_recovered",
@@ -544,9 +543,7 @@ impl HostedCatalog {
     }
 
     async fn verify_retained_original(&self, record: &Operation, key: &Key) -> Result<()> {
-        let reader = self.open_source(key, record.bytes).await?;
-        copy_verified(reader, tokio::io::sink(), record.bytes, &record.blake3).await?;
-        Ok(())
+        self.verify_source(key, record.bytes, &record.blake3).await
     }
 
     pub(super) fn prepared_rtf_text(
@@ -603,6 +600,36 @@ impl HostedCatalog {
             "downloaded a staged source"
         );
         Ok(staged)
+    }
+
+    // The caller allocates a fresh object key before this upload.
+    pub(super) async fn upload_verified_source(
+        &self,
+        key: &Key,
+        reader: Reader,
+        bytes: u64,
+        digest: &str,
+    ) -> Result<()> {
+        let error = match self.storage.put_stream(key, reader, bytes).await {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        };
+        match self.verify_source(key, bytes, digest).await {
+            Ok(()) => {
+                tracing::debug!(%key, %error, "recovered a committed source upload");
+                Ok(())
+            }
+            Err(Error::NotFound(_)) => Err(error),
+            Err(verification) => {
+                tracing::warn!(%key, %error, "could not verify the source upload");
+                Err(verification)
+            }
+        }
+    }
+
+    async fn verify_source(&self, key: &Key, bytes: u64, digest: &str) -> Result<()> {
+        let reader = self.open_source(key, bytes).await?;
+        copy_verified(reader, tokio::io::sink(), bytes, digest).await
     }
 
     async fn open_source(

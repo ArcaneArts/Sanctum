@@ -853,7 +853,9 @@ impl HostedUpload {
         let store = self.service.storage.as_ref();
         let reader = tokio::fs::File::from_std(self.file.reopen()?);
         let upload_started = Instant::now();
-        store.put_stream(&input, Box::pin(reader), bytes).await?;
+        self.service
+            .upload_verified_source(&input, Box::pin(reader), bytes, &candidate.blake3)
+            .await?;
         tracing::debug!(
             event = "hosted_input_transfer",
             tenant = %self.scope.tenant,

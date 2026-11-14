@@ -7112,6 +7112,88 @@ async fn hosted_submissions_recover_from_interrupted_acceptance() {
     server.stop().await;
 }
 
+#[tokio::test]
+async fn hosted_acceptance_rejects_corrupt_input_after_a_lost_upload_response() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
+    let catalog = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let mut server = start(catalog).await;
+    let scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    server
+        .client
+        .create_collection(v1::CreateCollectionRequest {
+            scope: Some(scope.clone()),
+            request_id: None,
+        })
+        .await
+        .unwrap();
+    let operation = uuid::Uuid::new_v4().to_string();
+    let header = v1::UploadTextHeader {
+        scope: Some(scope.clone()),
+        name: "notes.txt".into(),
+        request_id: Some(operation.clone()),
+        ..Default::default()
+    };
+    let request = v1::IngestionJobRequest {
+        scope: Some(scope),
+        operation_id: operation.clone(),
+    };
+    let input = [b"durable UTF-8 source".as_slice()];
+    storage
+        .interrupt
+        .store(CORRUPT_ACCEPTANCE_INPUT, Ordering::Relaxed);
+    assert!(
+        server
+            .client
+            .submit_text(upload_frames(&header, input))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        server
+            .client
+            .get_ingestion_job(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound,
+    );
+    let dispatch = Key::parse("_dispatch").unwrap();
+    assert!(
+        storage
+            .list(Some(&dispatch), None, 10)
+            .await
+            .unwrap()
+            .objects
+            .is_empty()
+    );
+    let prefix = Key::parse(format!("default/collections/notes/operations/{operation}")).unwrap();
+    let abandoned = storage.list(Some(&prefix), None, 10).await.unwrap().objects;
+    assert_eq!(abandoned.len(), 1);
+    assert_eq!(abandoned[0].length, input[0].len() as u64);
+
+    let accepted = server
+        .client
+        .submit_text(upload_frames(&header, input))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(accepted.state(), v1::IngestionState::Accepted);
+    assert_eq!(
+        server
+            .client
+            .get_ingestion_job(request)
+            .await
+            .unwrap()
+            .into_inner(),
+        accepted,
+    );
+    server.stop().await;
+}
+
 const BLOCK_SCAN_RANGE: u8 = 5;
 const SCAN_RANGE_BLOCKED: u8 = 6;
 const SCAN_RANGE_DROPPED: u8 = 7;
@@ -7126,6 +7208,7 @@ const LOSE_SOURCE_SWEEP_CHECKPOINT_RESPONSE: u8 = 15;
 const REJECT_SOURCE_SWEEP_RELIST: u8 = 16;
 const REJECT_PROFILE_REBUILD: u8 = 17;
 const REJECT_UPLOAD_INPUT_DELETE: u8 = 18;
+const CORRUPT_ACCEPTANCE_INPUT: u8 = 19;
 const PARALLEL_RANGE_START: u8 = 40;
 const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
 const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
@@ -7222,6 +7305,26 @@ impl Storage for InterruptAcceptance {
     }
 
     async fn put_stream(&self, key: &Key, reader: Reader, length: u64) -> StorageResult<Version> {
+        if key.as_str().contains("/inputs/")
+            && self
+                .interrupt
+                .compare_exchange(
+                    CORRUPT_ACCEPTANCE_INPUT,
+                    0,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            let mut contents = Vec::new();
+            reader.take(length + 1).read_to_end(&mut contents).await?;
+            assert_eq!(contents.len() as u64, length);
+            contents[0] ^= 1;
+            self.inner
+                .put_stream(key, Box::pin(std::io::Cursor::new(contents)), length)
+                .await?;
+            return Err(Error::Busy("corrupt input upload response lost".into()));
+        }
         self.inner.put_stream(key, reader, length).await
     }
 
