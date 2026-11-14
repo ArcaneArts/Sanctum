@@ -15,11 +15,14 @@ use sanctum_service::{
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tonic::{Request, Response, Status, Streaming};
+use tonic::{Code, Request, Response, Status, Streaming};
 
 mod database;
+mod error;
 mod metadata_filter;
 mod metadata_indexes;
+
+use error::{from_error, invalid_argument, operation_status, status};
 
 pub fn grpc(service: Service, shutdown: CancellationToken) -> SanctumServer<Grpc> {
     let runtime = v1::RuntimeInfo {
@@ -164,7 +167,7 @@ impl Sanctum for Grpc {
             }
             Some(WireScope::Tenant(tenant)) => UsageScope::Tenant(tenant.parse().map_err(status)?),
             Some(WireScope::Cluster(_)) => UsageScope::Cluster,
-            None => return Err(Status::invalid_argument("storage usage scope is required")),
+            None => return Err(invalid_argument("scope", "storage usage scope is required")),
         };
         let measured = if let Backend::Hosted(catalog) = &self.0 {
             catalog.storage_usage(&scope).await.map_err(status)?
@@ -203,7 +206,7 @@ impl Sanctum for Grpc {
         let (scope, target) = metadata_target(
             request
                 .target
-                .ok_or_else(|| Status::invalid_argument("metadata target is required"))?,
+                .ok_or_else(|| invalid_argument("target", "metadata target is required"))?,
         )?;
         let edits = metadata_edits(request.edits)?;
         let entries = match &self.0 {
@@ -394,7 +397,7 @@ impl Sanctum for Grpc {
                 GitRepository::Local(path.into())
             }
             Some(Repository::HttpsUrl(url)) if !url.is_empty() => GitRepository::Remote(url),
-            _ => return Err(Status::invalid_argument("Git repository is required")),
+            _ => return Err(invalid_argument("repository", "Git repository is required")),
         };
         let options = ImportOptions {
             include: request.include,
@@ -440,7 +443,7 @@ impl Sanctum for Grpc {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
         if request.path.is_empty() {
-            return Err(Status::invalid_argument("import path is required"));
+            return Err(invalid_argument("path", "import path is required"));
         }
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         let service = self.local()?.clone();
@@ -501,7 +504,11 @@ impl Sanctum for Grpc {
     ) -> Reply<v1::ListWatchedFoldersResponse> {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
-        let after = parse_optional_id(request.after_id, "invalid watched folder cursor")?;
+        let after = parse_optional_id(
+            request.after_id,
+            "after_id",
+            "invalid watched folder cursor",
+        )?;
         let service = self.local()?.clone();
         work(move || {
             let (folders, next) =
@@ -521,7 +528,7 @@ impl Sanctum for Grpc {
         let id = request
             .id
             .parse()
-            .map_err(|_| Status::invalid_argument("invalid watched folder ID"))?;
+            .map_err(|_| invalid_argument("id", "invalid watched folder ID"))?;
         let service = self.local()?.clone();
         work(move || {
             service.unwatch_folder(&scope, id)?;
@@ -537,7 +544,11 @@ impl Sanctum for Grpc {
     ) -> Reply<v1::Collection> {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
-        let operation = parse_optional_id(request.request_id, "request ID must be a UUID")?;
+        let operation = parse_optional_id(
+            request.request_id,
+            "request_id",
+            "request ID must be a UUID",
+        )?;
         if let Backend::Hosted(catalog) = &self.0 {
             catalog
                 .create_collection(&scope, operation)
@@ -580,7 +591,11 @@ impl Sanctum for Grpc {
     ) -> Reply<v1::Empty> {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
-        let operation = parse_optional_id(request.request_id, "request ID must be a UUID")?;
+        let operation = parse_optional_id(
+            request.request_id,
+            "request_id",
+            "request ID must be a UUID",
+        )?;
         match &self.0 {
             Backend::Hosted(catalog) => catalog
                 .delete_collection(&scope, operation)
@@ -588,7 +603,8 @@ impl Sanctum for Grpc {
                 .map_err(status)?,
             Backend::Local(service) => {
                 if operation.is_some() {
-                    return Err(Status::invalid_argument(
+                    return Err(invalid_argument(
+                        "request_id",
                         "deletion request IDs are supported by hosted storage",
                     ));
                 }
@@ -616,7 +632,8 @@ impl Sanctum for Grpc {
             || request.limit.is_some();
         let limit = request.limit.unwrap_or(50);
         if !(1..=99).contains(&limit) {
-            return Err(Status::invalid_argument(
+            return Err(invalid_argument(
+                "limit",
                 "collection page limit must be between 1 and 99",
             ));
         }
@@ -669,36 +686,56 @@ impl Sanctum for Grpc {
             }
         };
         let mut job = submit_local(service, stream).await?;
+        let operation = job.id;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             match job.state {
                 JobState::TextReady => {
                     return text_revision(&job)
                         .map(Response::new)
-                        .ok_or_else(|| Status::internal("completed revision receipt is missing"));
+                        .ok_or_else(|| missing_upload_receipt(operation));
                 }
                 JobState::Failed => {
-                    let failure = job
-                        .failure
-                        .ok_or_else(|| Status::internal("ingestion failed"))?;
-                    return Err(match failure.code.as_str() {
-                        "invalid_source" => Status::invalid_argument(failure.message),
-                        "conflict" => Status::already_exists(failure.message),
-                        _ => Status::unavailable(failure.message),
-                    });
+                    let failure = job.failure.ok_or_else(|| {
+                        operation_status(
+                            Code::Internal,
+                            "ingestion failed",
+                            "internal",
+                            false,
+                            operation,
+                        )
+                    })?;
+                    let code = match failure.code.as_str() {
+                        "invalid_source" => Code::InvalidArgument,
+                        "conflict" => Code::AlreadyExists,
+                        _ => Code::Unavailable,
+                    };
+                    return Err(operation_status(
+                        code,
+                        failure.message,
+                        &failure.code,
+                        failure.code == "retryable",
+                        operation,
+                    ));
                 }
-                JobState::Canceled => return Err(Status::cancelled("ingestion canceled")),
+                JobState::Canceled => {
+                    return Err(operation_status(
+                        Code::Cancelled,
+                        "ingestion canceled",
+                        "canceled",
+                        false,
+                        operation,
+                    ));
+                }
                 _ => {}
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(Status::deadline_exceeded(format!(
-                    "upload is still processing; query operation {}",
-                    job.id
-                )));
+                return Err(upload_wait_expired(operation));
             }
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             let service = service.clone();
-            job = work(move || service.job(&job.scope, job.id)).await?;
+            job = work_for_operation(Some(operation), move || service.job(&job.scope, operation))
+                .await?;
         }
     }
 
@@ -724,7 +761,10 @@ impl Sanctum for Grpc {
         let request = request.into_inner();
         if let Backend::Hosted(catalog) = &self.0 {
             let (scope, id) = job_target(request)?;
-            let accepted = catalog.ingestion_job(&scope, id).await.map_err(status)?;
+            let accepted = catalog
+                .ingestion_job(&scope, id)
+                .await
+                .map_err(|error| from_error(error, Some(id)))?;
             return Ok(Response::new(wire_hosted_job(&scope, accepted)));
         }
         job_action(self.local()?, request, Service::job).await
@@ -746,7 +786,10 @@ impl Sanctum for Grpc {
         let response = match &self.0 {
             Backend::Hosted(catalog) => {
                 if request.before_operation_id.is_some() {
-                    return Err(Status::invalid_argument("hosted activity uses page_token"));
+                    return Err(invalid_argument(
+                        "before_operation_id",
+                        "hosted activity uses page_token",
+                    ));
                 }
                 let page = catalog
                     .ingestion_activity(
@@ -769,12 +812,16 @@ impl Sanctum for Grpc {
             }
             Backend::Local(service) => {
                 if request.page_token.is_some() {
-                    return Err(Status::invalid_argument(
+                    return Err(invalid_argument(
+                        "page_token",
                         "local activity uses before_operation_id",
                     ));
                 }
-                let before =
-                    parse_optional_id(request.before_operation_id, "invalid activity cursor")?;
+                let before = parse_optional_id(
+                    request.before_operation_id,
+                    "before_operation_id",
+                    "invalid activity cursor",
+                )?;
                 let service = service.clone();
                 let (jobs, next) =
                     work(move || service.activity(&tenant, collection.as_ref(), before, limit))
@@ -795,8 +842,9 @@ impl Sanctum for Grpc {
     ) -> Reply<v1::EmbeddingStatus> {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
-        let source = parse_optional_id(request.source_id, "invalid source ID")?;
-        let revision = parse_optional_id(request.revision_id, "invalid revision ID")?;
+        let source = parse_optional_id(request.source_id, "source_id", "invalid source ID")?;
+        let revision =
+            parse_optional_id(request.revision_id, "revision_id", "invalid revision ID")?;
         let target = match (source, revision) {
             (None, None) => None,
             (Some(source), Some(revision)) => Some((source, revision)),
@@ -836,7 +884,10 @@ impl Sanctum for Grpc {
         let request = request.into_inner();
         if let Backend::Hosted(catalog) = &self.0 {
             let (scope, id) = job_target(request)?;
-            let job = catalog.cancel_upload(&scope, id).await.map_err(status)?;
+            let job = catalog
+                .cancel_upload(&scope, id)
+                .await
+                .map_err(|error| from_error(error, Some(id)))?;
             return Ok(Response::new(wire_hosted_job(&scope, job)));
         }
         job_action(self.local()?, request, Service::cancel_job).await
@@ -849,7 +900,10 @@ impl Sanctum for Grpc {
         let request = request.into_inner();
         if let Backend::Hosted(catalog) = &self.0 {
             let (scope, id) = job_target(request)?;
-            let job = catalog.retry_upload(&scope, id).await.map_err(status)?;
+            let job = catalog
+                .retry_upload(&scope, id)
+                .await
+                .map_err(|error| from_error(error, Some(id)))?;
             return Ok(Response::new(wire_hosted_job(&scope, job)));
         }
         job_action(self.local()?, request, Service::retry_job).await
@@ -892,7 +946,7 @@ impl Sanctum for Grpc {
         let (scope, operation) = job_target(
             request
                 .job
-                .ok_or_else(|| Status::invalid_argument("job is required"))?,
+                .ok_or_else(|| invalid_argument("job", "job is required"))?,
         )?;
         let options = ScanOptions::new(
             request.literal,
@@ -904,12 +958,15 @@ impl Sanctum for Grpc {
             Backend::Local(service) => {
                 let service = service.clone();
                 let scope = scope.clone();
-                work(move || service.pending_text(&scope, operation)).await?
+                work_for_operation(Some(operation), move || {
+                    service.pending_text(&scope, operation)
+                })
+                .await?
             }
             Backend::Hosted(catalog) => catalog
                 .pending_text(&scope, operation)
                 .await
-                .map_err(status)?,
+                .map_err(|error| from_error(error, Some(operation)))?,
         };
         let source = Event::Source(v1::PendingTextScanSource {
             scope: Some(wire_scope(&scope)),
@@ -954,7 +1011,7 @@ impl Sanctum for Grpc {
                 } => result,
             };
             if let Err(error) = result {
-                let _ = sender.send(Err(status(error))).await;
+                let _ = sender.send(Err(from_error(error, Some(operation)))).await;
             }
         });
         Ok(Response::new(ReceiverStream::new(receiver)))
@@ -1098,10 +1155,15 @@ impl Sanctum for Grpc {
     ) -> Reply<v1::ListSourcesResponse> {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
-        let after = parse_optional_id(request.after_source_id, "invalid source cursor")?;
+        let after = parse_optional_id(
+            request.after_source_id,
+            "after_source_id",
+            "invalid source cursor",
+        )?;
         let limit = request.limit.unwrap_or(25);
         if !(1..=100).contains(&limit) {
-            return Err(Status::invalid_argument(
+            return Err(invalid_argument(
+                "limit",
                 "source page limit must be between 1 and 100",
             ));
         }
@@ -1147,9 +1209,12 @@ impl Sanctum for Grpc {
         let source = request
             .source_id
             .parse()
-            .map_err(|_| Status::invalid_argument("invalid source ID"))?;
-        let expected =
-            parse_optional_id(request.expected_revision_id, "invalid expected revision ID")?;
+            .map_err(|_| invalid_argument("source_id", "invalid source ID"))?;
+        let expected = parse_optional_id(
+            request.expected_revision_id,
+            "expected_revision_id",
+            "invalid expected revision ID",
+        )?;
         let (revision, generation) = match &self.0 {
             Backend::Local(service) => {
                 let service = service.clone();
@@ -1182,14 +1247,18 @@ impl Sanctum for Grpc {
         let source = request
             .source_id
             .parse()
-            .map_err(|_| Status::invalid_argument("invalid source ID"))?;
-        let expected =
-            parse_optional_id(request.expected_revision_id, "invalid expected revision ID")?;
-        let request_id = parse_optional_id(request.request_id, "invalid request ID")?;
+            .map_err(|_| invalid_argument("source_id", "invalid source ID"))?;
+        let expected = parse_optional_id(
+            request.expected_revision_id,
+            "expected_revision_id",
+            "invalid expected revision ID",
+        )?;
+        let request_id = parse_optional_id(request.request_id, "request_id", "invalid request ID")?;
         let revision = match &self.0 {
             Backend::Local(service) => {
                 if request_id.is_some() {
-                    return Err(Status::invalid_argument(
+                    return Err(invalid_argument(
+                        "request_id",
                         "deletion request IDs are supported by hosted storage",
                     ));
                 }
@@ -1222,14 +1291,14 @@ async fn submit_local(
     let (scope, upload, request_id) = read_upload_header(&mut stream).await?;
     let service = service.clone();
     let max_bytes = service.max_source_bytes();
-    let (staged, file) = work(move || {
+    let (staged, file) = work_for_operation(request_id, move || {
         let staged = service.stage_upload(scope, upload)?;
         let file = staged.reopen()?;
         Ok((staged, file))
     })
     .await?;
     receive_upload(&mut stream, file, max_bytes).await?;
-    work(move || staged.enqueue_with_request(request_id)).await
+    work_for_operation(request_id, move || staged.enqueue_with_request(request_id)).await
 }
 
 async fn submit_hosted(
@@ -1240,10 +1309,15 @@ async fn submit_hosted(
     let staged = catalog
         .stage_upload(scope.clone(), upload, operation)
         .await
-        .map_err(status)?;
-    let file = staged.reopen().map_err(status)?;
+        .map_err(|error| from_error(error, operation))?;
+    let file = staged
+        .reopen()
+        .map_err(|error| from_error(error, operation))?;
     receive_upload(&mut stream, file, catalog.max_source_bytes()).await?;
-    let accepted = staged.enqueue().await.map_err(status)?;
+    let accepted = staged
+        .enqueue()
+        .await
+        .map_err(|error| from_error(error, operation))?;
     Ok((scope, accepted))
 }
 
@@ -1260,21 +1334,26 @@ async fn wait_hosted_upload(
             HostedJobState::TextReady => {
                 return wire_hosted_job(scope, job)
                     .text_revision
-                    .ok_or_else(|| Status::internal("completed revision receipt is missing"));
+                    .ok_or_else(|| missing_upload_receipt(operation));
             }
             HostedJobState::Failed { code, message } => {
-                let failure = match code.as_str() {
-                    "invalid_source" | "invalid_argument" => Status::invalid_argument(message),
-                    "conflict" => Status::already_exists(message),
-                    "not_found" => Status::not_found(message),
-                    "stale_revision" | "expired" => Status::failed_precondition(message),
-                    _ => Status::unavailable(message),
+                let grpc_code = match code.as_str() {
+                    "invalid_source" | "invalid_argument" => Code::InvalidArgument,
+                    "conflict" => Code::AlreadyExists,
+                    "not_found" => Code::NotFound,
+                    "stale_revision" | "expired" => Code::FailedPrecondition,
+                    _ => Code::Unavailable,
                 };
-                return Err(with_operation_id(failure, operation));
+                return Err(operation_status(
+                    grpc_code, message, &code, false, operation,
+                ));
             }
             HostedJobState::Canceled => {
-                return Err(with_operation_id(
-                    Status::cancelled("upload was canceled"),
+                return Err(operation_status(
+                    Code::Cancelled,
+                    "upload was canceled",
+                    "canceled",
+                    false,
                     operation,
                 ));
             }
@@ -1286,25 +1365,30 @@ async fn wait_hosted_upload(
         };
         job = match tokio::time::timeout_at(deadline, pending).await {
             Ok(Ok(job)) => job,
-            Ok(Err(error)) => return Err(with_operation_id(status(error), operation)),
-            Err(_) => {
-                return Err(with_operation_id(
-                    Status::deadline_exceeded(format!(
-                        "upload is still processing; query operation {operation}"
-                    )),
-                    operation,
-                ));
-            }
+            Ok(Err(error)) => return Err(from_error(error, Some(operation))),
+            Err(_) => return Err(upload_wait_expired(operation)),
         };
     }
 }
 
-fn with_operation_id(mut status: Status, operation: uuid::Uuid) -> Status {
-    let value = tonic::metadata::MetadataValue::from_bytes(operation.as_bytes());
-    status
-        .metadata_mut()
-        .insert_bin("sanctum-operation-id-bin", value);
-    status
+fn upload_wait_expired(operation: uuid::Uuid) -> Status {
+    operation_status(
+        Code::DeadlineExceeded,
+        format!("upload is still processing; query operation {operation}"),
+        "upload_pending",
+        true,
+        operation,
+    )
+}
+
+fn missing_upload_receipt(operation: uuid::Uuid) -> Status {
+    operation_status(
+        Code::Internal,
+        "completed revision receipt is missing",
+        "internal",
+        false,
+        operation,
+    )
 }
 
 async fn read_upload_header(
@@ -1313,17 +1397,28 @@ async fn read_upload_header(
     let header = match stream.message().await?.and_then(|message| message.frame) {
         Some(Frame::Header(header)) => header,
         _ => {
-            return Err(Status::invalid_argument(
+            return Err(invalid_argument(
+                "frame",
                 "first upload frame must be a header",
             ));
         }
     };
-    let scope = parse_scope(header.scope)?;
+    let scope = parse_scope_fields(
+        header.scope,
+        "header.scope",
+        "header.scope.tenant",
+        "header.scope.collection",
+    )?;
     let replacement = if let Some(replacement) = header.replacement {
         Some(Replacement {
-            source: parse_optional_id(replacement.source_id, "invalid source ID")?,
+            source: parse_optional_id(
+                replacement.source_id,
+                "header.replacement.source_id",
+                "invalid source ID",
+            )?,
             expected_revision: parse_optional_id(
                 replacement.expected_revision_id,
+                "header.replacement.expected_revision_id",
                 "invalid expected revision ID",
             )?,
         })
@@ -1350,7 +1445,8 @@ async fn read_upload_header(
             })
             .collect::<std::result::Result<_, Status>>()?,
     };
-    let request_id = parse_optional_id(header.request_id, "invalid request ID")?;
+    let request_id =
+        parse_optional_id(header.request_id, "header.request_id", "invalid request ID")?;
     Ok((scope, upload, request_id))
 }
 
@@ -1382,26 +1478,26 @@ async fn receive_upload(
             Some(Frame::Data(data)) => data,
             Some(Frame::End(_)) => break,
             _ => {
-                return Err(Status::invalid_argument(
+                return Err(invalid_argument(
+                    "frame",
                     "expected data or explicit upload end",
                 ));
             }
         };
         if data.len() > UPLOAD_FRAME_BYTES {
-            return Err(Status::invalid_argument("upload frame exceeds 256 KiB"));
+            return Err(invalid_argument("data", "upload frame exceeds 256 KiB"));
         }
         written = written
             .checked_add(data.len() as u64)
             .filter(|&bytes| bytes <= max_bytes)
-            .ok_or_else(|| {
-                Status::resource_exhausted("source exceeds the configured upload limit")
-            })?;
+            .ok_or_else(error::upload_limit)?;
         file.write_all(&data)
             .await
             .map_err(|error| status(error.into()))?;
     }
     if stream.message().await?.is_some() {
-        return Err(Status::invalid_argument(
+        return Err(invalid_argument(
+            "frame",
             "unexpected frame after upload end",
         ));
     }
@@ -1415,7 +1511,7 @@ async fn job_action(
 ) -> Reply<v1::IngestionJob> {
     let (scope, id) = job_target(request)?;
     let service = service.clone();
-    work(move || action(&service, &scope, id))
+    work_for_operation(Some(id), move || action(&service, &scope, id))
         .await
         .map(wire_job)
         .map(Response::new)
@@ -1429,7 +1525,7 @@ fn job_target(
     let id = request
         .operation_id
         .parse()
-        .map_err(|_| Status::invalid_argument("invalid operation ID"))?;
+        .map_err(|_| invalid_argument("operation_id", "invalid operation ID"))?;
     Ok((scope, id))
 }
 
@@ -1608,7 +1704,7 @@ fn search_mode(
         Ok(v1::SearchMode::Lexical) => Ok(SearchMode::Lexical),
         Ok(v1::SearchMode::Semantic) => Ok(SearchMode::Semantic),
         Ok(v1::SearchMode::Hybrid) => Ok(SearchMode::Hybrid),
-        Err(_) => Err(Status::invalid_argument("unknown search mode")),
+        Err(_) => Err(invalid_argument("mode", "unknown search mode")),
     }
 }
 
@@ -1741,21 +1837,34 @@ async fn changes_page(
 async fn work<T: Send + 'static>(
     operation: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> std::result::Result<T, Status> {
+    work_for_operation(None, operation).await
+}
+
+async fn work_for_operation<T: Send + 'static>(
+    id: Option<uuid::Uuid>,
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> std::result::Result<T, Status> {
     tokio::task::spawn_blocking(operation)
         .await
         .map_err(|error| {
             tracing::error!(%error, "blocking operation failed");
             Status::internal("server operation failed")
         })?
-        .map_err(status)
+        .map_err(|error| from_error(error, id))
 }
 
 #[allow(clippy::result_large_err)]
 fn parse_chunk(reference: Option<v1::ChunkRef>) -> std::result::Result<(Scope, ChunkRef), Status> {
-    let reference = reference.ok_or_else(|| Status::invalid_argument("chunk is required"))?;
-    let scope = parse_scope(reference.scope)?;
+    let reference = reference.ok_or_else(|| invalid_argument("chunk", "chunk is required"))?;
+    let scope = parse_scope_fields(
+        reference.scope,
+        "chunk.scope",
+        "chunk.scope.tenant",
+        "chunk.scope.collection",
+    )?;
     if reference.ordinal > i64::MAX as u64 {
-        return Err(Status::invalid_argument(
+        return Err(invalid_argument(
+            "chunk.ordinal",
             "chunk ordinal exceeds the supported range",
         ));
     }
@@ -1763,11 +1872,11 @@ fn parse_chunk(reference: Option<v1::ChunkRef>) -> std::result::Result<(Scope, C
         source: reference
             .source_id
             .parse()
-            .map_err(|_| Status::invalid_argument("invalid source ID"))?,
+            .map_err(|_| invalid_argument("chunk.source_id", "invalid source ID"))?,
         revision: reference
             .revision_id
             .parse()
-            .map_err(|_| Status::invalid_argument("invalid revision ID"))?,
+            .map_err(|_| invalid_argument("chunk.revision_id", "invalid revision ID"))?,
         ordinal: reference.ordinal,
     };
     Ok((scope, reference))
@@ -1775,10 +1884,26 @@ fn parse_chunk(reference: Option<v1::ChunkRef>) -> std::result::Result<(Scope, C
 
 #[allow(clippy::result_large_err)]
 fn parse_scope(scope: Option<v1::Scope>) -> std::result::Result<Scope, Status> {
-    let scope = scope.ok_or_else(|| Status::invalid_argument("scope is required"))?;
+    parse_scope_fields(scope, "scope", "scope.tenant", "scope.collection")
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_scope_fields(
+    scope: Option<v1::Scope>,
+    field: &str,
+    tenant_field: &str,
+    collection_field: &str,
+) -> std::result::Result<Scope, Status> {
+    let scope = scope.ok_or_else(|| invalid_argument(field, "scope is required"))?;
     Ok(Scope {
-        tenant: scope.tenant.parse().map_err(status)?,
-        collection: scope.collection.parse().map_err(status)?,
+        tenant: scope
+            .tenant
+            .parse()
+            .map_err(|error: Error| invalid_argument(tenant_field, error.to_string()))?,
+        collection: scope
+            .collection
+            .parse()
+            .map_err(|error: Error| invalid_argument(collection_field, error.to_string()))?,
     })
 }
 
@@ -1864,27 +1989,14 @@ fn wire_hit(scope: &Scope, hit: Hit) -> v1::TextHit {
     }
 }
 
-fn status(error: Error) -> Status {
-    match error {
-        Error::Invalid(message) => Status::invalid_argument(message),
-        Error::NotFound(message) => Status::not_found(message),
-        Error::Conflict(message) => Status::already_exists(message),
-        Error::StaleRevision(message) => Status::failed_precondition(message),
-        Error::Busy(message) => Status::unavailable(message),
-        Error::Io(_) | Error::Internal(_) => {
-            tracing::error!(%error, "application operation failed");
-            Status::internal("storage or database operation failed")
-        }
-    }
-}
-
 #[allow(clippy::result_large_err)]
 fn parse_optional_id(
     value: Option<String>,
+    field: &'static str,
     error: &'static str,
 ) -> std::result::Result<Option<uuid::Uuid>, Status> {
     value
-        .map(|id| id.parse().map_err(|_| Status::invalid_argument(error)))
+        .map(|id| id.parse().map_err(|_| invalid_argument(field, error)))
         .transpose()
 }
 
@@ -1893,8 +2005,8 @@ fn metadata_target(
     target: v1::MetadataTarget,
 ) -> std::result::Result<(Scope, Option<sanctum_service::RevisionTarget>), Status> {
     let scope = parse_scope(target.scope)?;
-    let source = parse_optional_id(target.source_id, "invalid source ID")?;
-    let revision = parse_optional_id(target.revision_id, "invalid revision ID")?;
+    let source = parse_optional_id(target.source_id, "source_id", "invalid source ID")?;
+    let revision = parse_optional_id(target.revision_id, "revision_id", "invalid revision ID")?;
     match (source, revision, target.chunk_ordinal) {
         (None, None, None) => Ok((scope, None)),
         (Some(source), Some(revision), ordinal) => Ok((
@@ -1928,7 +2040,7 @@ fn metadata_edits(
             Some(Edit::SetJson(json)) => MetadataEdit::Set(parse_metadata_json(&json)?),
             Some(Edit::MergePatchJson(json)) => MetadataEdit::Patch(parse_metadata_json(&json)?),
             Some(Edit::Remove(_)) => MetadataEdit::Remove,
-            None => return Err(Status::invalid_argument("metadata edit is required")),
+            None => return Err(invalid_argument("edits.edit", "metadata edit is required")),
         };
         result.push(sanctum_service::MetadataMutation {
             namespace: edit.namespace,

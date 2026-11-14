@@ -1430,3 +1430,17 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   UTF-8 chunks in one 3,240-byte range request. Six individual fetches
   returned identical excerpts and would total 5,795 bytes. The test
   removed its fixture prefix. [Range behavior](STORAGE.md#hosted-lexical-publication).
+
+## Structured gRPC errors
+
+- gRPC application errors include a versioned Protobuf detail with a
+  reason, retryability, and the relevant operation ID or request field
+  where available. Existing status codes and messages and the hosted
+  binary operation-ID trailer remain compatible.
+- Local and hosted Rust gRPC tests verified validation fields,
+  failed-source receipts, and the legacy trailer. A generated Python
+  client unpacked the same detail from the filesystem server and the
+  MinIO-backed API. It recovered a real 30-second upload wait timeout
+  using the returned operation ID, resumed the local queue, and replayed
+  the same upload successfully. [Error contract](LOCAL_API.md#grpc-error-details),
+  [Python example](../examples/python/README.md#read-structured-errors).

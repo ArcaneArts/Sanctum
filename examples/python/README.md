@@ -21,3 +21,27 @@ It creates a collection if needed, streams the file into the durable
 queue, waits for lexical publication, reads its change event, and
 searches the collection. Run it against a dedicated collection since it
 creates a new source on each run. [gRPC Python quickstart](https://grpc.io/docs/languages/python/quickstart/).
+
+## Read structured errors
+
+Install `grpcio-status==1.73.0` into the same environment. Unpack Sanctum's
+detail with the generated Protobuf class:
+
+```python
+from grpc_status import rpc_status
+from sanctum.v1 import sanctum_pb2 as pb
+
+
+def sanctum_error(error):
+    envelope = rpc_status.from_call(error)
+    if envelope is not None:
+        for payload in envelope.details:
+            detail = pb.RpcError()
+            if payload.Unpack(detail):
+                return detail
+    return None
+```
+
+For an `UploadText` error with reason `upload_pending`, use the returned
+operation ID to check `GetIngestionJob` in the original scope.
+[Error details contract](../../docs/LOCAL_API.md#grpc-error-details).

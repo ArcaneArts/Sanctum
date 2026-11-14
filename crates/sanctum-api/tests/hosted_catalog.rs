@@ -3,6 +3,7 @@ use std::sync::{
     atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 
+use prost::Message;
 use sanctum_core::{ByteRange, Error, Result as StorageResult};
 use sanctum_proto::v1::{self, sanctum_client::SanctumClient, upload_text_frame::Frame};
 use sanctum_service::{HostedCatalog, TaskStage};
@@ -1297,6 +1298,17 @@ async fn hosted_synchronous_upload_waits_for_worker_and_replays() {
             for result in [response, replay] {
                 let failure = result.unwrap_err();
                 assert_eq!(failure.code(), Code::InvalidArgument);
+                let envelope = tonic_types::Status::decode(failure.details()).unwrap();
+                assert_eq!(envelope.code, Code::InvalidArgument as i32);
+                let payload = &envelope.details[0];
+                assert_eq!(payload.type_url, "type.googleapis.com/sanctum.v1.RpcError");
+                let detail = v1::RpcError::decode(payload.value.as_slice()).unwrap();
+                assert_eq!(detail.reason, "invalid_source");
+                assert_eq!(
+                    detail.operation_id.as_deref(),
+                    Some(operation.to_string().as_str())
+                );
+                assert!(!detail.retryable);
                 let stored = failure
                     .metadata()
                     .get_bin("sanctum-operation-id-bin")
