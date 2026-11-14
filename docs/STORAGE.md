@@ -306,7 +306,9 @@ A dispatch error leaves accepted work discoverable in object storage. Invoke
 shard from 0 through 15 with an authorized Cloud Scheduler identity. Each
 request processes at most 16 hints, persists the continuation, and reports
 `dispatched`, `failed`, and `more`. The next invocation continues the scan
-or begins a new pass when the previous pass ended. Dispatch retries keep
+or begins a new pass when the previous pass ended. Independent hints can
+run concurrently. A hint that exceeds its request budget counts as failed
+for this page and stays available for the next pass. Dispatch retries keep
 the same task name within a six-hour window. A later window uses a new
 name so repair can recover tasks that exhausted their queue retries.
 Configure the scheduler frequency against the measured queue depth.
