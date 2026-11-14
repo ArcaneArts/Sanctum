@@ -44,8 +44,13 @@ Tenant catalogs use `<tenant>/catalog` and collection databases use
 snapshot, writer token, lease expiry, epoch, and a unique update ID.
 
 Writers acquire, renew, publish, and release through conditional writes
-on that same object. A lease verifies snapshot length and BLAKE3 after
-downloading a generation. The executor applies at most 64 prepared
+on that same object. While downloading, preparing, or uploading a
+snapshot, the executor renews at half the lease interval. The same task
+serializes renewal and publication. If renewal misses the deadline or
+loses its conditional write, the attempt cannot publish. Once a worker
+stops, another worker can acquire the unit after the last renewal
+expires. Snapshot downloads verify length and BLAKE3. The executor
+applies at most 64 prepared
 commands and their receipts in one SQLite transaction. It uploads a
 consistent SQLite backup under a fresh key before attempting to publish
 it. Replaying a batch of previously applied commands returns the saved

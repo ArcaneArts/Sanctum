@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     path::Path,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -520,9 +521,32 @@ impl Lease {
             .expect("live lease has an owner")
             .expires_at_ms = unix_ms()? + self.publication.ttl.as_millis() as u64;
         let deadline = Instant::now() + self.publication.ttl;
-        self.write(head).await?;
+        let previous_deadline = self.deadline;
+        tokio::time::timeout_at(previous_deadline.into(), self.write(head))
+            .await
+            .map_err(|_| {
+                Error::StaleRevision("database writer renewal exceeded its lease".into())
+            })??;
         self.deadline = deadline;
-        Ok(())
+        self.ensure_live()
+    }
+
+    // Only this task mutates HEAD. Pending I/O and blocking SQLite preparation
+    // can outlast the original lease, so interleave renewals while they run.
+    async fn while_renewing<T>(&mut self, work: impl Future<Output = Result<T>>) -> Result<T> {
+        tokio::pin!(work);
+        loop {
+            self.ensure_live()?;
+            let renew_at = self.deadline - self.publication.ttl / 2;
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(renew_at.into()) => self.renew().await?,
+                result = &mut work => {
+                    self.ensure_live()?;
+                    return result;
+                }
+            }
+        }
     }
 
     pub async fn release(mut self) -> Result<()> {
@@ -565,45 +589,50 @@ impl Lease {
         }
         let start = Instant::now();
         self.renew().await?;
-        let directory = tempfile::tempdir()?;
-        let (source, shared) = match (self.head.generation.clone(), &self.publication.snapshots) {
-            (Some(generation), Some(snapshots)) if snapshots.retains(&generation) => (
-                Some(
-                    snapshots
-                        .read_generation(&self.publication, &self.unit, generation)
-                        .await?,
-                ),
-                true,
-            ),
-            (Some(generation), _) => (
-                Some(Arc::new(
-                    self.publication
-                        .materialize(&self.unit, generation, directory.path())
-                        .await?,
-                )),
-                false,
-            ),
-            (None, _) => (None, false),
-        };
-        let delta_bytes = self
-            .publication
-            .page_deltas
-            .then(|| source.as_ref()?.generation.chain_bytes())
-            .flatten();
-        let prepared = tokio::task::spawn_blocking(move || {
-            apply_snapshot(
-                directory,
-                source,
-                shared || delta_bytes.is_some(),
-                delta_bytes,
-                stage,
-                commands,
-                apply,
-            )
-        })
-        .await
-        .map_err(|error| Error::Internal(Box::new(error)))??;
-        self.ensure_live()?;
+        let publication = self.publication.clone();
+        let unit = self.unit.clone();
+        let current = self.head.generation.clone();
+        let prepared = self
+            .while_renewing(async move {
+                let directory = tempfile::tempdir()?;
+                let (source, shared) = match (current, &publication.snapshots) {
+                    (Some(generation), Some(snapshots)) if snapshots.retains(&generation) => (
+                        Some(
+                            snapshots
+                                .read_generation(&publication, &unit, generation)
+                                .await?,
+                        ),
+                        true,
+                    ),
+                    (Some(generation), _) => (
+                        Some(Arc::new(
+                            publication
+                                .materialize(&unit, generation, directory.path())
+                                .await?,
+                        )),
+                        false,
+                    ),
+                    (None, _) => (None, false),
+                };
+                let delta_bytes = publication
+                    .page_deltas
+                    .then(|| source.as_ref()?.generation.chain_bytes())
+                    .flatten();
+                tokio::task::spawn_blocking(move || {
+                    apply_snapshot(
+                        directory,
+                        source,
+                        shared || delta_bytes.is_some(),
+                        delta_bytes,
+                        stage,
+                        commands,
+                        apply,
+                    )
+                })
+                .await
+                .map_err(|error| Error::Internal(Box::new(error)))?
+            })
+            .await?;
         let (staged, generation, receipts, delta) = match prepared {
             Prepared::Changed {
                 file,
@@ -622,15 +651,17 @@ impl Lease {
             None => (self.unit.snapshot(generation.id)?, staged.reopen()?),
         };
         let uploaded_bytes = file.metadata()?.len();
-        self.publication
-            .storage
-            .put_stream(
-                &key,
-                Box::pin(tokio::fs::File::from_std(file)),
-                uploaded_bytes,
-            )
-            .await?;
-        self.ensure_live()?;
+        let storage = self.publication.storage.clone();
+        self.while_renewing(async move {
+            storage
+                .put_stream(
+                    &key,
+                    Box::pin(tokio::fs::File::from_std(file)),
+                    uploaded_bytes,
+                )
+                .await
+        })
+        .await?;
         let mut head = self.head.clone();
         head.format = if delta.is_some() {
             DELTA_FORMAT
@@ -820,24 +851,23 @@ impl Lease {
 
     async fn write(&mut self, mut head: Head) -> Result<()> {
         head.update = Uuid::new_v4();
+        let key = self.unit.head()?;
+        let bytes = encode(&head)?;
+        // Dropping a pending CAS can hide a successful HEAD update.
+        self.lost = true;
         let result = self
             .publication
             .storage
-            .put_control(
-                &self.unit.head()?,
-                encode(&head)?,
-                Condition::Match(self.version.clone()),
-            )
+            .put_control(&key, bytes, Condition::Match(self.version.clone()))
             .await;
         match result {
             Ok(version) => {
                 self.version = version;
                 self.head = head;
+                self.lost = false;
                 Ok(())
             }
             Err(error) => {
-                // A network failure can hide a successful CAS. Stop using this lease.
-                self.lost = true;
                 if matches!(error, Error::Conflict(_) | Error::NotFound(_)) {
                     Err(Error::StaleRevision(
                         "database writer lost ownership".into(),

@@ -1223,3 +1223,18 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   restart, and one reused vector on each replacement. The fixture's
   source text, filename, and query were absent from the logs.
   [Event reference](LOCAL_API.md#server-diagnostics).
+
+## Hosted writer renewal during publication
+
+- The publication executor renews ownership while downloading a snapshot,
+  preparing a SQLite backup, or uploading it. The same task serializes
+  renewal with publication. A renewal that exceeds its deadline or loses
+  its conditional write stops that attempt from publishing.
+- Filesystem and live MinIO tests delayed each publication phase past the
+  original lease. A competing owner remained fenced until release. A
+  separate fault test withheld a successful renewal response and verified
+  that the timed-out writer could only proceed by reacquiring ownership.
+  The suspended-owner test still verifies takeover and stale rejection.
+- `pnpm check` passed on rerun. Two local polling tests timed out on the
+  first run and passed on the rerun. All 11 publication tests passed with
+  the live MinIO cases enabled.
