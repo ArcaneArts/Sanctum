@@ -114,10 +114,13 @@ memory, timeouts, and concurrency after measuring the actual workload.
 [Cloud Run service identity](https://docs.cloud.google.com/run/docs/authenticating/service-to-service), [Cloud Run file system](https://docs.cloud.google.com/run/docs/container-contract#file_system_access).
 
 Cloud Tasks dispatches each worker task with a 600-second deadline. The
-worker gives task routes 570 seconds and returns HTTP 503 to request
-redelivery when a handler exceeds that budget. Keep the Cloud Run worker
-request timeout at 600 seconds or higher. Look for
-`event="hosted_task_deadline"` in worker logs.
+worker gives the stage up to 570 seconds. It returns HTTP 503 when the
+stage exceeds that budget. After a durable checkpoint, the worker gives
+immediate follow-up dispatch up to 15 more seconds. If dispatch times
+out, the worker acknowledges the completed stage and leaves its hint
+for scheduled repair. Keep the Cloud Run worker request timeout at 600
+seconds or higher. Worker logs record `hosted_task_deadline` and
+`hosted_follow_up_deadline`.
 [Cloud Run request timeouts](https://docs.cloud.google.com/run/docs/configuring/request-timeout), [Cloud Tasks dispatch deadlines](https://docs.cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks).
 
 A redelivery resumes from the durable ingestion checkpoint or the SQLite

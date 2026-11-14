@@ -14,13 +14,18 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 pub(crate) fn router(service: HostedCatalog) -> Router {
-    router_with_task_deadline(
+    router_with_task_budgets(
         service,
         Duration::from_secs(crate::cloud_tasks::DISPATCH_DEADLINE_SECONDS - 30),
+        Duration::from_secs(15),
     )
 }
 
-pub(super) fn router_with_task_deadline(service: HostedCatalog, deadline: Duration) -> Router {
+pub(super) fn router_with_task_budgets(
+    service: HostedCatalog,
+    stage_budget: Duration,
+    dispatch_budget: Duration,
+) -> Router {
     Router::new()
         .route("/internal/tasks/register-upload", post(register))
         .route("/internal/tasks/prepare-upload", post(prepare))
@@ -31,21 +36,43 @@ pub(super) fn router_with_task_deadline(service: HostedCatalog, deadline: Durati
             "/internal/tasks/rebuild-collection",
             post(rebuild_collection),
         )
-        .route_layer(middleware::from_fn(
-            move |request: Request, next: Next| async move {
+        .route_layer(middleware::from_fn_with_state(
+            service.clone(),
+            move |State(service): State<HostedCatalog>, request: Request, next: Next| async move {
                 let path = request.extensions().get::<MatchedPath>().cloned();
-                match tokio::time::timeout(deadline, next.run(request)).await {
+                let mut response = match tokio::time::timeout(stage_budget, next.run(request)).await
+                {
                     Ok(response) => response,
                     Err(_) => {
                         tracing::warn!(
                             event = "hosted_task_deadline",
                             route = path.as_ref().map(MatchedPath::as_str),
-                            timeout_ms = deadline.as_millis() as u64,
-                            "hosted task exceeded its request budget"
+                            timeout_ms = stage_budget.as_millis() as u64,
+                            "hosted task exceeded its stage budget"
                         );
-                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                };
+                if let Some(dispatch) = response.extensions_mut().remove::<FollowUp>() {
+                    let result = tokio::time::timeout(dispatch_budget, async {
+                        match dispatch {
+                            FollowUp::Upload(scope, id) => service.try_dispatch(&scope, id).await,
+                            FollowUp::Rebuild(scope, id) => {
+                                service.try_dispatch_rebuild(&scope, id).await;
+                            }
+                        }
+                    })
+                    .await;
+                    if result.is_err() {
+                        tracing::warn!(
+                            event = "hosted_follow_up_deadline",
+                            route = path.as_ref().map(MatchedPath::as_str),
+                            timeout_ms = dispatch_budget.as_millis() as u64,
+                            "scheduled repair will revisit the pending dispatch"
+                        );
                     }
                 }
+                response
             },
         ))
         .route(
@@ -63,6 +90,22 @@ pub(super) fn router_with_task_deadline(service: HostedCatalog, deadline: Durati
         .with_state(service)
 }
 
+// Stage handlers request immediate dispatch only after they have saved
+// the result or the checkpoint the repair scan uses to find the next task.
+#[derive(Clone)]
+enum FollowUp {
+    Upload(Scope, Uuid),
+    Rebuild(Scope, Uuid),
+}
+
+impl FollowUp {
+    fn acknowledge(self) -> Response {
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        response.extensions_mut().insert(self);
+        response
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegisterUpload {
@@ -74,30 +117,27 @@ struct RegisterUpload {
 async fn register(
     State(service): State<HostedCatalog>,
     Json(task): Json<RegisterUpload>,
-) -> StatusCode {
+) -> Response {
     apply(service, task, TaskStage::Register).await
 }
 
 async fn prepare(
     State(service): State<HostedCatalog>,
     Json(task): Json<RegisterUpload>,
-) -> StatusCode {
+) -> Response {
     apply(service, task, TaskStage::Prepare).await
 }
 
-async fn index(
-    State(service): State<HostedCatalog>,
-    Json(task): Json<RegisterUpload>,
-) -> StatusCode {
+async fn index(State(service): State<HostedCatalog>, Json(task): Json<RegisterUpload>) -> Response {
     apply(service, task, TaskStage::Index).await
 }
 
-async fn apply(service: HostedCatalog, task: RegisterUpload, stage: TaskStage) -> StatusCode {
+async fn apply(service: HostedCatalog, task: RegisterUpload, stage: TaskStage) -> Response {
     let (Ok(tenant), Ok(collection)) = (task.tenant.parse(), task.collection.parse()) else {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     };
     if task.operation_id.is_nil() {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     }
     let scope = Scope { tenant, collection };
     let result = match stage {
@@ -107,11 +147,10 @@ async fn apply(service: HostedCatalog, task: RegisterUpload, stage: TaskStage) -
         _ => unreachable!("embedding tasks use separate handlers"),
     };
     match result {
-        Ok(_) => {
-            service.try_dispatch(&scope, task.operation_id).await;
-            StatusCode::NO_CONTENT
-        }
-        Err(error) => failed_upload(&service, &scope, task.operation_id, stage, error).await,
+        Ok(_) => FollowUp::Upload(scope, task.operation_id).acknowledge(),
+        Err(error) => failed_upload(&service, &scope, task.operation_id, stage, error)
+            .await
+            .into_response(),
     }
 }
 
@@ -202,12 +241,12 @@ struct EmbedUpload {
 async fn embed_upload(
     State(service): State<HostedCatalog>,
     Json(task): Json<EmbedUpload>,
-) -> StatusCode {
+) -> Response {
     let (Ok(tenant), Ok(collection)) = (task.tenant.parse(), task.collection.parse()) else {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     };
     if task.operation_id.is_nil() {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     }
     let scope = Scope { tenant, collection };
     match service
@@ -219,20 +258,16 @@ async fn embed_upload(
         )
         .await
     {
-        Ok(()) => {
-            service.try_dispatch(&scope, task.operation_id).await;
-            StatusCode::NO_CONTENT
-        }
-        Err(error) => {
-            failed_upload(
-                &service,
-                &scope,
-                task.operation_id,
-                TaskStage::Embed { step: task.step },
-                error,
-            )
-            .await
-        }
+        Ok(()) => FollowUp::Upload(scope, task.operation_id).acknowledge(),
+        Err(error) => failed_upload(
+            &service,
+            &scope,
+            task.operation_id,
+            TaskStage::Embed { step: task.step },
+            error,
+        )
+        .await
+        .into_response(),
     }
 }
 
@@ -254,12 +289,12 @@ async fn discover_profile(State(service): State<HostedCatalog>) -> Response {
 async fn rebuild_collection(
     State(service): State<HostedCatalog>,
     Json(task): Json<EmbedUpload>,
-) -> StatusCode {
+) -> Response {
     let (Ok(tenant), Ok(collection)) = (task.tenant.parse(), task.collection.parse()) else {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     };
     if task.operation_id.is_nil() {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     }
     let scope = Scope { tenant, collection };
     match service
@@ -271,16 +306,11 @@ async fn rebuild_collection(
         )
         .await
     {
-        Ok(()) => {
-            service
-                .try_dispatch_rebuild(&scope, task.operation_id)
-                .await;
-            StatusCode::NO_CONTENT
-        }
+        Ok(()) => FollowUp::Rebuild(scope, task.operation_id).acknowledge(),
         Err(error) => {
             tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
                 operation = %task.operation_id, step = task.step, "profile rebuild will need a retry");
-            StatusCode::SERVICE_UNAVAILABLE
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
 }
