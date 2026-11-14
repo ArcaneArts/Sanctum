@@ -111,7 +111,8 @@ publish. The original remains searchable until its replacement is indexed.
 ```sh
 cargo run --locked -p sanctum-cli -- upload notes /path/to/notes.md \
   --replace-source SOURCE_ID --expected-revision REVISION_ID
-cargo run --locked -p sanctum-cli -- delete notes SOURCE_ID --expected-revision REVISION_ID
+cargo run --locked -p sanctum-cli -- delete notes SOURCE_ID \
+  --expected-revision REVISION_ID --request-id UUID
 ```
 
 For an external target, pass `--replace-external --namespace NAME --external-id ID`.
@@ -119,7 +120,15 @@ Deletion immediately removes the source from search and prevents queued
 replacements from publishing. For replacement, a five-minute grace period
 starts after the new revision is ready for lexical search and all of its
 chunks have embeddings for the configured profile, if enabled. Fetching a reclaimed revision
-returns `FAILED_PRECONDITION` while the source or its deletion receipt is known.
+returns `FAILED_PRECONDITION` while the source or its deletion marker is known.
+
+To retry a source deletion after losing the response, pass a nonzero UUID in
+`DeleteSource.request_id` or use `--request-id`. Replay with the same collection,
+source ID, and expected revision returns the original deleted revision, even
+after its files are reclaimed. Reusing the ID for a different source or
+expected revision in the same collection returns `ALREADY_EXISTS`. Local
+receipts become eligible for cleanup after 45 days. Use a fresh ID for each
+new deletion.
 
 Use `SubmitText` for background ingestion. It returns a durable operation
 ID and source and revision IDs once the input and queue record are stored.

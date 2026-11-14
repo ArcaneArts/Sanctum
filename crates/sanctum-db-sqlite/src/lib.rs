@@ -51,6 +51,7 @@ const COLLECTION_MIGRATIONS: &[&str] = &[
     include_str!("metadata_indexes.sql"),
     include_str!("collection_v12.sql"),
     include_str!("collection_v13.sql"),
+    include_str!("collection_v14.sql"),
 ];
 
 #[derive(Debug)]

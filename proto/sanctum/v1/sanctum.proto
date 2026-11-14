@@ -511,7 +511,7 @@ message DeleteSourceRequest {
   Scope scope = 1;
   string source_id = 2;
   optional string expected_revision_id = 3;
-  // Optional idempotency key for a hosted deletion.
+  // Optional nonzero UUID scoped to source deletions in this collection.
   optional string request_id = 4;
 }
 

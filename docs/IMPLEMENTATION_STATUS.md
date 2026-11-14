@@ -149,6 +149,16 @@ Merged in [PR #4](https://github.com/ArcaneArts/Sanctum/pull/4).
 - Deletion hides the source immediately. The worker rejects pending writes to
   deleted or superseded sources. A short grace period protects old fetch handles
   during lexical replacement, and the cleanup queue persists across restarts.
+- Local source deletion accepts an optional request UUID. The collection
+  commits its receipt with the tombstone and change event. The gRPC
+  regression covers concurrent replay, stale preconditions, conflicting
+  reuse, independent tenant scope, restart, file reclamation, and receipt
+  expiry. A standalone server migrated a version 13 collection. A
+  failed receipt insert rolled back the deletion, and a generated
+  Python client and the CLI recovered the original receipt after the
+  old files were reclaimed. Local maintenance prunes receipts after
+  45 days.
+  [Deletion request contract](LOCAL_API.md#text-uploads).
 - Startup reclaims abandoned uploads while preserving committed revisions and
   queued or retryable inputs. Existing v1 databases migrate in place.
 - The local gRPC tests cover both replacement targets, stale expected revisions,
