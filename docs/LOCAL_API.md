@@ -769,6 +769,9 @@ the repository, ref, commit, path, and blob that produced that revision.
 An import reports selected paths missing from the new commit. Use
 `--prune-missing` to delete them and supersede their pending operations. Pruning
 runs after the tree is read successfully and all selected blobs are accepted.
+To check which paths disappeared, the server records the selected paths in a
+temporary SQLite file with a small page cache. The temporary directory needs
+space for that index and, for HTTPS, the temporary Git repository.
 Includes and excludes use the same globs as local directory imports.
 
 The local HTTPS integration check uses a temporary Git repository and

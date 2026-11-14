@@ -8,6 +8,7 @@ use std::{
 };
 
 use sanctum_core::{Error, ExternalSource, GitProvenance, Result, Scope};
+use sanctum_db_sqlite::import_paths::ImportPaths;
 use tempfile::TempDir;
 
 use crate::{
@@ -116,7 +117,7 @@ impl Service {
             .map_err(git_spawn_error)?;
         let mut tree_output = tree.stdout();
         let mut blobs = None;
-        let mut seen = BTreeSet::new();
+        let seen = ImportPaths::open()?;
         let mut had_errors = false;
         while let Some(record) = read_record(&mut tree_output, 0, 8192)? {
             if stopped() {
@@ -128,7 +129,7 @@ impl Service {
             if !select.file_selected(Path::new(file)) {
                 continue;
             }
-            seen.insert(file.to_owned());
+            seen.record(file)?;
             let provenance = GitProvenance {
                 repository: identity.into(),
                 reference: reference.into(),
@@ -199,6 +200,7 @@ impl Service {
         if had_errors {
             return Ok(());
         }
+        seen.finish()?;
         let mut cursor = String::new();
         loop {
             let active = self
@@ -215,8 +217,8 @@ impl Service {
                 if stopped() {
                     return Ok(());
                 }
-                if !seen.contains(&file)
-                    && select.file_selected(Path::new(&file))
+                if select.file_selected(Path::new(&file))
+                    && !seen.contains(&file)?
                     && let Some(import) =
                         self.missing_import(scope, &namespace, &file, select.prune_missing)?
                     && !emit(GitImportEvent { import, git: None })

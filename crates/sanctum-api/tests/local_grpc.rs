@@ -1510,6 +1510,97 @@ async fn git_import_reads_committed_text_and_reconciles_each_ref() {
     running.stop().await;
 }
 
+#[tokio::test]
+async fn git_import_prunes_missing_paths_across_reconciliation_pages() {
+    use v1::{ImportState, import_git_request::Repository};
+
+    let repo = TempDir::new().unwrap();
+    let root = repo.path();
+    git_fixture(root, &["init", "-b", "main"]);
+    std::fs::write(root.join("z-active.md"), "Diopside was published.").unwrap();
+    git_fixture(root, &["add", "."]);
+    git_fixture(root, &["commit", "-m", "Active source"]);
+
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start_with_workers(&dir, None, false).await;
+    create(&mut running.client, "default").await;
+    let mut request = v1::ImportGitRequest {
+        scope: scope("default"),
+        repository: Some(Repository::LocalPath(root.to_str().unwrap().into())),
+        ..Default::default()
+    };
+    let events = git_events(&mut running.client, request.clone()).await;
+    assert_eq!(
+        events[0].file.as_ref().unwrap().state(),
+        ImportState::Queued
+    );
+    assert!(running.service.process_next().unwrap());
+    assert_eq!(
+        search(&mut running.client, "default", "diopside")
+            .await
+            .len(),
+        1
+    );
+
+    std::fs::create_dir(root.join("notes")).unwrap();
+    for ordinal in 0..128 {
+        std::fs::write(root.join(format!("notes/{ordinal:03}.md")), "Keep.").unwrap();
+    }
+    std::fs::write(root.join("notes-café.md"), "Also keep.").unwrap();
+    std::fs::write(root.join("z-pending.md"), "Pending removal.").unwrap();
+    std::fs::write(root.join("z-excluded.md"), "Outside the later selection.").unwrap();
+    git_fixture(root, &["add", "."]);
+    git_fixture(root, &["commit", "-m", "Enqueue pending sources"]);
+    let events = git_events(&mut running.client, request.clone()).await;
+    let operation_for = |path| {
+        events
+            .iter()
+            .filter_map(|event| event.file.as_ref())
+            .find(|file| file.path == path)
+            .unwrap()
+            .operation_id
+            .clone()
+    };
+
+    git_fixture(
+        root,
+        &["rm", "z-active.md", "z-pending.md", "z-excluded.md"],
+    );
+    git_fixture(root, &["commit", "-m", "Remove sources"]);
+    request.prune_missing = true;
+    request.exclude = vec!["z-excluded.md".into()];
+    let reconciled = git_events(&mut running.client, request).await;
+    let (present, removed): (Vec<_>, Vec<_>) =
+        reconciled.iter().partition(|event| event.git.is_some());
+    assert_eq!(present.len(), 129);
+    assert!(present.iter().all(|event| {
+        let file = event.file.as_ref().unwrap();
+        file.state() == ImportState::Pending
+            && file.operation_id == operation_for(file.path.as_str())
+    }));
+    let removed: Vec<_> = removed
+        .iter()
+        .map(|event| {
+            let file = event.file.as_ref().unwrap();
+            assert_eq!(file.state(), ImportState::Deleted);
+            (file.path.as_str(), file.operation_id.clone())
+        })
+        .collect();
+    assert_eq!(
+        removed,
+        [
+            ("z-active.md", None),
+            ("z-pending.md", operation_for("z-pending.md"))
+        ]
+    );
+    assert!(
+        search(&mut running.client, "default", "diopside")
+            .await
+            .is_empty()
+    );
+    running.stop().await;
+}
+
 async fn git_events(
     client: &mut SanctumClient<Channel>,
     request: v1::ImportGitRequest,
