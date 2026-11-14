@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use super::{
     CATALOG_MIGRATIONS, COLLECTION_MIGRATIONS, activate_collection, collection_deleted,
-    database_error, migrate, open, query_all, read_initialized_catalog,
+    database_error, delete_catalog_collection, migrate, open, query_all, read_initialized_catalog,
 };
 
 const RECEIPT_AGE_SECONDS: i64 = 45 * 24 * 3600;
@@ -43,6 +43,62 @@ pub fn pending(path: &Path) -> Result<Vec<String>> {
 
 pub fn recover(catalog_path: &Path, db_path: &Path, collection: &str) -> Result<()> {
     finish(&mut open(catalog_path, false)?, db_path, collection)
+}
+
+/// Records the tombstone and optional replay receipt together. Returns whether
+/// the collection files and queue entries still need to be reclaimed.
+pub fn retire(path: &Path, collection: &str, request: Option<Uuid>) -> Result<bool> {
+    if !path.try_exists()? {
+        return Err(Error::NotFound("tenant catalog was not found".into()));
+    }
+    let mut catalog = open(path, false)?;
+    migrate(&mut catalog, CATALOG_MIGRATIONS)?;
+    let tx = catalog
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database_error)?;
+    tx.execute(
+        "DELETE FROM local_collection_deletions WHERE request_id IN (
+            SELECT request_id FROM local_collection_deletions
+            WHERE recorded_at <= unixepoch() - ?1
+            ORDER BY recorded_at LIMIT 256
+        )",
+        [RECEIPT_AGE_SECONDS],
+    )
+    .map_err(database_error)?;
+    let request = request.map(|id| id.to_string());
+    if let Some(request) = &request {
+        let saved: Option<String> = tx
+            .query_row(
+                "SELECT collection FROM local_collection_deletions WHERE request_id = ?1",
+                [request],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error)?;
+        if saved.is_some_and(|saved| saved != collection) {
+            return Err(Error::Conflict(
+                "request ID already applies to another collection".into(),
+            ));
+        }
+    }
+    delete_catalog_collection(&tx, collection)?;
+    if let Some(request) = &request {
+        tx.execute(
+            "INSERT OR IGNORE INTO local_collection_deletions (request_id, collection)
+             VALUES (?1, ?2)",
+            params![request, collection],
+        )
+        .map_err(database_error)?;
+    }
+    let pending = tx
+        .query_row(
+            "SELECT reclaimed = 0 FROM deleted_collections WHERE id = ?1",
+            [collection],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    tx.commit().map_err(database_error)?;
+    Ok(pending)
 }
 
 fn begin(catalog: &mut Connection, collection: &str, request: Option<Uuid>) -> Result<bool> {

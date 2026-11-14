@@ -405,6 +405,7 @@ message CreateCollectionRequest {
 
 message DeleteCollectionRequest {
   Scope scope = 1;
+  // Replay a deletion with the same nonzero UUID and collection.
   optional string request_id = 2;
 }
 

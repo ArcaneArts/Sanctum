@@ -36,15 +36,29 @@ impl Service {
     }
 
     pub fn delete_collection(&self, scope: &Scope) -> Result<()> {
+        self.delete_collection_with_request(scope, None)
+    }
+
+    pub fn delete_collection_with_request(
+        &self,
+        scope: &Scope,
+        request: Option<Uuid>,
+    ) -> Result<()> {
+        if request.is_some_and(|id| id.is_nil()) {
+            return Err(Error::Invalid("request ID must be a nonzero UUID".into()));
+        }
         let _exclusive = self
             .retrieval
             .write()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
-        db::retire_local_collection(
+        if db::local_collections::retire(
             &self.files.catalog_path(&scope.tenant),
             scope.collection.as_str(),
-        )?;
-        self.purge_collection(scope)
+            request,
+        )? {
+            self.purge_collection(scope)?;
+        }
+        Ok(())
     }
 
     fn purge_collection(&self, scope: &Scope) -> Result<()> {
@@ -62,11 +76,24 @@ impl Service {
             .write()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         for tenant in self.files.tenants()? {
-            for collection in db::deleted_catalog_collections(&self.files.catalog_path(&tenant))? {
-                self.purge_collection(&Scope {
-                    tenant: tenant.clone(),
-                    collection: collection.parse()?,
-                })?;
+            let pending = match db::deleted_catalog_collections(&self.files.catalog_path(&tenant)) {
+                Ok(pending) => pending,
+                Err(error) => {
+                    tracing::warn!(%error, %tenant, "could not enumerate deleted local collections");
+                    continue;
+                }
+            };
+            for collection in pending {
+                let reclaim = || {
+                    let scope = Scope {
+                        tenant: tenant.clone(),
+                        collection: collection.parse()?,
+                    };
+                    self.purge_collection(&scope)
+                };
+                if let Err(error) = reclaim() {
+                    tracing::warn!(%error, %tenant, %collection, "could not reclaim deleted local collection");
+                }
             }
         }
         Ok(())

@@ -75,13 +75,15 @@ impl LocalFiles {
     pub fn purge_collection(&self, scope: &Scope) -> Result<()> {
         let path = self.collection_path(scope);
         match fs::remove_dir_all(&path) {
-            Ok(()) => sync_dirs(
-                path.parent().expect("collection has a tenant directory"),
-                &self.root,
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
+        // A previous attempt may have stopped after unlinking the directory.
+        sync_dirs(
+            path.parent().expect("collection has a tenant directory"),
+            &self.root,
+        )
     }
 
     pub fn clear_staging(&self, scope: &Scope) -> Result<()> {
