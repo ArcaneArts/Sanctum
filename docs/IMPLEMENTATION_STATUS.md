@@ -2052,6 +2052,13 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   and Application Default Credentials.
   [GCS storage contract](STORAGE.md#google-cloud-storage-adapter).
 
+- Dropping an in-flight transfer now sends a bounded cancellation request
+  to its GCS session while the worker runtime is available. The loopback
+  test acknowledged the first part, stalled the second part, and verified
+  a single session DELETE after the upload future was dropped. Completed
+  uploads and lost-response recovery still return the verified generation.
+  [GCS storage adapter](STORAGE.md#google-cloud-storage-adapter).
+
 ## Consistent reads during GCS manifest replacement
 
 - Full reads restart with fresh metadata when a concurrent write changes
