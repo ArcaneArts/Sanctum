@@ -491,10 +491,12 @@ unchanged file using its content digest. An edit keeps the source ID and
 queues a replacement. Each queued event includes an operation ID for
 `sanctum-cli job` or `GetIngestionJob`.
 
-Missing files are reported and kept in search by default. Pass
-`--prune-missing` on a directory import to delete missing sources selected
-by the current filters and supersede their pending imports. A scan with
-file or traversal errors skips missing-file reconciliation.
+Missing files are reported and kept in search by default. A previously
+imported path also counts as missing if it becomes a directory or
+symbolic link, or if a parent is replaced by a symlink or regular file.
+Pass `--prune-missing` on a directory import to delete these sources
+when selected by the current filters and supersede their pending imports.
+A scan with file or traversal errors skips missing-file reconciliation.
 
 ## Watched folders
 
@@ -514,8 +516,9 @@ uses content hashes. Pausing the local queue prevents new scans. Scans
 already in progress may finish after pause or removal.
 
 Missing files are reported by default. Use `--prune-missing` to delete
-selected sources whose files disappeared. An unavailable root or an
-incomplete scan preserves sources and records the error. Removing a watch
+selected sources whose files disappeared or stopped being regular files.
+An unavailable root or an incomplete scan preserves sources and records the
+error. Removing a watch
 leaves existing source data and accepted jobs available. `ListWatchedFolders`
 reports the most recent scan outcome and returns an `after_id` cursor for
 pagination.

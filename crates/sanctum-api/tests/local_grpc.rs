@@ -3027,6 +3027,18 @@ async fn folder_watch_reconciles_offline_edits_and_prunes_explicitly() {
             .await
             .is_empty()
     );
+    std::fs::remove_file(&first).unwrap();
+    std::fs::create_dir(&first).unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while !search(&mut running.client, "default", "andalusite")
+            .await
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
     // The hour-long reconciliation interval cannot discover this run of edits.
     let nested = files.path().join("nested");
     std::fs::create_dir(&nested).unwrap();
@@ -3091,7 +3103,7 @@ async fn folder_watch_reconciles_offline_edits_and_prunes_explicitly() {
             .is_empty()
     );
     assert_eq!(
-        search(&mut running.client, "default", "andalusite")
+        search(&mut running.client, "default", "diopside")
             .await
             .len(),
         1
@@ -3277,6 +3289,143 @@ async fn import(
         events.push(event);
     }
     events
+}
+
+#[tokio::test]
+async fn directory_import_reconciles_paths_that_stop_being_regular_files() {
+    let dir = TempDir::new().unwrap();
+    let input = TempDir::new().unwrap();
+    let root = input.path().join("library");
+    std::fs::create_dir_all(root.join("nested")).unwrap();
+    std::fs::create_dir(root.join("now-file")).unwrap();
+    std::fs::write(root.join("former.md"), "olivine").unwrap();
+    std::fs::write(root.join("nested/notes.md"), "sodalite").unwrap();
+    std::fs::write(root.join("pending.md"), "malachite").unwrap();
+    std::fs::write(root.join("now-file/notes.md"), "labradorite").unwrap();
+    #[cfg(unix)]
+    std::fs::write(root.join("link.md"), "obsidian").unwrap();
+
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    let request = v1::ImportLocalRequest {
+        scope: scope("default"),
+        path: root.to_str().unwrap().into(),
+        ..Default::default()
+    };
+    for item in import(&mut running.client, request.clone()).await {
+        await_ready(&mut running.client, job_request(item.operation_id.unwrap())).await;
+    }
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: true })
+        .await
+        .unwrap();
+    std::fs::write(root.join("pending.md"), "rhodochrosite").unwrap();
+    let pending = import(&mut running.client, request.clone())
+        .await
+        .into_iter()
+        .find(|item| item.path == "pending.md")
+        .unwrap();
+    assert_eq!(pending.state(), v1::ImportState::Queued);
+
+    std::fs::remove_file(root.join("former.md")).unwrap();
+    std::fs::create_dir(root.join("former.md")).unwrap();
+    std::fs::remove_file(root.join("pending.md")).unwrap();
+    std::fs::create_dir(root.join("pending.md")).unwrap();
+    std::fs::rename(root.join("nested"), input.path().join("outside")).unwrap();
+    std::fs::remove_dir_all(root.join("now-file")).unwrap();
+    std::fs::write(root.join("now-file"), "directory replaced by a file").unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(input.path().join("outside"), root.join("nested")).unwrap();
+        std::fs::remove_file(root.join("link.md")).unwrap();
+        std::os::unix::fs::symlink(input.path().join("outside/notes.md"), root.join("link.md"))
+            .unwrap();
+    }
+    #[cfg(not(unix))]
+    std::fs::write(root.join("nested"), "directory replaced by a file").unwrap();
+
+    let missing = import(&mut running.client, request.clone()).await;
+    let mut expected = vec![
+        "former.md",
+        "nested/notes.md",
+        "now-file/notes.md",
+        "pending.md",
+    ];
+    if cfg!(unix) {
+        expected.insert(1, "link.md");
+    }
+    assert_eq!(
+        missing
+            .iter()
+            .map(|item| item.path.as_str())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(
+        missing
+            .iter()
+            .all(|item| item.state() == v1::ImportState::Missing)
+    );
+    assert_eq!(
+        search(&mut running.client, "default", "olivine")
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(
+        search(&mut running.client, "default", "sodalite")
+            .await
+            .len(),
+        1
+    );
+
+    let pruned = import(
+        &mut running.client,
+        v1::ImportLocalRequest {
+            prune_missing: true,
+            ..request.clone()
+        },
+    )
+    .await;
+    assert_eq!(
+        pruned
+            .iter()
+            .map(|item| item.path.as_str())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(
+        pruned
+            .iter()
+            .all(|item| item.state() == v1::ImportState::Deleted)
+    );
+    running
+        .client
+        .set_local_queue(v1::SetLocalQueueRequest { paused: false })
+        .await
+        .unwrap();
+    await_failure(
+        &mut running.client,
+        job_request(pending.operation_id.unwrap()),
+    )
+    .await;
+    for word in [
+        "olivine",
+        "sodalite",
+        "malachite",
+        "rhodochrosite",
+        "obsidian",
+        "labradorite",
+    ] {
+        assert!(
+            search(&mut running.client, "default", word)
+                .await
+                .is_empty()
+        );
+    }
+    assert!(import(&mut running.client, request).await.is_empty());
+    running.stop().await;
 }
 
 #[tokio::test]
