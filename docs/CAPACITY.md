@@ -36,6 +36,17 @@ vocabulary is small, so index sizes and timings depend on the workload.
 Vector work, GB-scale collections, and Cloud Run memory remain separate
 measurements.
 
+### Estimated token budget
+
+A second release filesystem run used the same 200 MiB fixture with
+`chunking.max_tokens` set to 1,000 alongside the 4,096-byte window and
+400-byte overlap. It reached text readiness in 7.061 s with a sampled
+peak RSS of 29,114,368 bytes. It emitted 97,949 chunks and stored
+287,895,552 bytes for the collection. The final MCP excerpt matched
+all 1,404 bytes at the end of the input. The two filesystem timings
+are individual runs, and both used lexical indexing without embeddings.
+[Chunk settings](LOCAL_API.md#chunk-configuration).
+
 ## SQLite snapshot transfer and publication
 
 The MinIO benchmark publishes synthetic SQLite databases with about 1 GiB

@@ -83,7 +83,7 @@ const COLUMNS: &str = "operation_id, tenant, collection, source_id, revision_id,
     name, external_namespace, external_id, total_bytes, processed_bytes,
     attempts, status, error_code, error_message, content_hash, chunks,
     replacement, update_sequence, import_hash, extract_rtf, retain_original, extracting,
-    canonical_bytes, original_hash, source_encoding, extractor, created_at, url_provenance, git_provenance, chunk_window_bytes, chunk_overlap_bytes, initial_metadata, initial_chunk_metadata";
+    canonical_bytes, original_hash, source_encoding, extractor, created_at, url_provenance, git_provenance, chunk_window_bytes, chunk_overlap_bytes, initial_metadata, initial_chunk_metadata, chunk_max_tokens";
 
 impl LocalQueue {
     /// The caller holds the storage owner's exclusive lock for this queue.
@@ -105,6 +105,7 @@ impl LocalQueue {
                 include_str!("runtime_v11.sql"),
                 include_str!("runtime_v12.sql"),
                 include_str!("runtime_v13.sql"),
+                include_str!("runtime_v14.sql"),
             ],
         )?;
         connection
@@ -257,8 +258,8 @@ impl LocalQueue {
             .query_row(
                 "INSERT INTO ingestion_jobs (operation_id, tenant, collection, source_id,
                 revision_id, name, external_namespace, external_id, total_bytes,
-                replacement, update_sequence, import_hash, extract_rtf, retain_original, url_provenance, git_provenance, chunk_window_bytes, chunk_overlap_bytes, initial_metadata, initial_chunk_metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                replacement, update_sequence, import_hash, extract_rtf, retain_original, url_provenance, git_provenance, chunk_window_bytes, chunk_overlap_bytes, initial_metadata, initial_chunk_metadata, chunk_max_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
              RETURNING created_at",
                 params![
                     job.id.to_string(),
@@ -281,6 +282,7 @@ impl LocalQueue {
                     job.chunking.overlap_bytes,
                     write_json((!job.initial_metadata.is_empty()).then_some(&job.initial_metadata))?,
                     write_json((!job.initial_chunk_metadata.is_empty()).then_some(&job.initial_chunk_metadata))?,
+                    job.chunking.max_tokens,
                 ],
                 |row| unsigned_column(row, 0),
             )
@@ -698,6 +700,7 @@ fn map_job(row: &Row<'_>) -> rusqlite::Result<Job> {
         chunking: ChunkSettings {
             window_bytes: row.get(29)?,
             overlap_bytes: row.get(30)?,
+            max_tokens: row.get(33)?,
         },
         initial_metadata: read_json(row, 31)?.unwrap_or_default(),
         initial_chunk_metadata: read_json(row, 32)?.unwrap_or_default(),

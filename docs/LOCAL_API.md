@@ -221,10 +221,23 @@ defaults are 4096 and 400 bytes. Windows can be 256 to 16384 bytes.
 Overlap can be zero through half the window. Boundaries follow UTF-8
 code points and prefer nearby newlines.
 
+Set `chunking.max_tokens` to add an estimated token budget. For example,
+`"chunking":{"window_bytes":4096,"overlap_bytes":400,"max_tokens":1000}`
+limits both byte length and estimated token density. The budget accepts
+16–16,384 estimated tokens. The estimate counts runs of up to four ASCII
+letters, digits, or horizontal whitespace characters and counts each
+punctuation character, newline, or non-ASCII Unicode scalar separately.
+For a shortened window, overlap is capped at half that window.
+
+The estimate is shared across providers. Leave room for document prefixes
+and model-specific tokenization when configuring it. An omitted token
+budget uses byte-only chunking. Embedding providers still enforce their
+own input limits.
+
 Accepted uploads retain their chunk settings through retries and
 worker restarts. Existing published revisions keep their byte ranges.
 A replacement uses the settings effective at its acceptance. Revision
-inspection reports the algorithm identifier with custom byte settings
+inspection reports the algorithm identifier and the configured budget
 when applicable. `GetRuntimeInfo` reports the current defaults.
 
 ## Runtime information
