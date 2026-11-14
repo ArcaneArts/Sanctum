@@ -255,7 +255,10 @@ batch number and its earliest eligible dispatch time, when scheduled.
 Use `GetEmbeddingStatus` for vector coverage and failures.
 `SearchText` serves collection-scoped lexical hits, including hybrid
 requests when hosted embeddings are unavailable. `FetchChunk` reads
-the hit's exact byte range and verifies its fingerprint. Hosted
+the hit's exact byte range and verifies its fingerprint. Search can read
+overlapping or adjacent excerpts from the same immutable source object in
+one range request of up to 64 KiB. It verifies each fingerprint separately
+and preserves the ranked order. Hosted
 `SearchCollections` accepts one to eight collections in a tenant and
 returns the aggregate coverage and scoped references. The pending literal
 scan uses bounded range reads on the staged input object and reports the

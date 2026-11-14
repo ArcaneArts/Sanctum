@@ -709,8 +709,9 @@ timings and counts for an existing log pipeline:
 | `cleanup_pass` | Reclaimed entries, failures and further work when available |
 
 Use `sanctum_service=trace` to include `source_range_read` events for
-individual verified hosted excerpts. The byte counts refer to the source
-ranges read. Measurements include work completed at the event's boundary,
+hosted excerpt reads. `requested_bytes` sums the individual excerpt sizes,
+`bytes` measures the combined transfer, and `excerpts` counts the excerpts
+covered by that read. Measurements include work completed at the event's boundary,
 so an upload that later fails can still produce a transfer event. Scoped
 events use IDs and counters. Provider events omit response bodies and
 credentials, and search events omit query and source text.
