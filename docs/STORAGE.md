@@ -331,8 +331,14 @@ schedules retryable provider work at its recorded retry time. The
 reconciler can recover a missing delivery. The scheduled embedding
 profile endpoint scans one page of object keys after a profile change
 and queues collections from their manifests. A persisted cursor resumes
-discovery on the next invocation. Workers rebuild each collection in
-bounded steps and ignore old run IDs. See the
+discovery on the next invocation. Once a worker starts discovery for the
+configured profile, a search can enqueue a collection with incomplete
+coverage before the discovery cursor reaches it. It persists the same
+repair hint and rebuild record as scheduled discovery. Search gives
+each collection's enqueue attempt up to one second and can return its
+normal result if that attempt fails. Strict semantic search still
+requires compatible vectors. Workers rebuild each collection in bounded
+steps and ignore old run IDs. See the
 [Cloud Run schedule](CLOUD_RUN.md#schedule-dispatch-repair).
 
 ### Hosted source deletion and reclamation

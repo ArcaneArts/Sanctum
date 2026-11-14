@@ -5,7 +5,7 @@ use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use crate::{
-    HostedCatalog, Task, TaskStage, hosted_dispatch::DISPATCH_WINDOW_SECONDS,
+    HostedCatalog, Task, TaskStage, embedding::Coverage, hosted_dispatch::DISPATCH_WINDOW_SECONDS,
     hosted_ingestion::unix_seconds,
 };
 
@@ -43,10 +43,7 @@ impl HostedCatalog {
                 complete: true,
             });
         }
-        let profile = self
-            .embedding
-            .as_ref()
-            .map(|provider| provider.profile_id());
+        let profile = self.embedding_profile();
         let key = self.discovery_key()?;
         let existing = self.read_rebuild_record::<Discovery>(&key).await?;
         let (mut discovery, version) = match existing {
@@ -105,6 +102,55 @@ impl HostedCatalog {
         })
     }
 
+    pub(crate) async fn schedule_rebuild_on_access(
+        &self,
+        scope: &Scope,
+        profile: Option<&str>,
+        coverage: Coverage,
+    ) {
+        let Some(profile) = profile else {
+            return;
+        };
+        if coverage.total <= coverage.embedded
+            || (self.dispatcher.is_none() && self.standalone_wake.is_none())
+        {
+            return;
+        }
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            self.schedule_accessed_collection(scope, profile),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
+                "profile rebuild will be retried by discovery")
+            }
+            Err(_) => tracing::debug!(tenant = %scope.tenant, collection = %scope.collection,
+                "profile rebuild scheduling deferred to discovery"),
+        }
+    }
+
+    async fn schedule_accessed_collection(&self, scope: &Scope, profile: &str) -> Result<()> {
+        let Some((discovery, _)) = self
+            .read_rebuild_record::<Discovery>(&self.discovery_key()?)
+            .await?
+        else {
+            return Ok(());
+        };
+        // Only the worker selects the deployment's active profile. An older
+        // API process can still serve lexical retrieval during a rollout.
+        if discovery.complete || discovery.profile.as_deref() != Some(profile) {
+            return Ok(());
+        }
+        self.ensure_rebuild(scope, discovery.run).await?;
+        if let Some(wake) = &self.standalone_wake {
+            wake.notify_one();
+        }
+        Ok(())
+    }
+
     async fn ensure_rebuild(&self, scope: &Scope, run: Uuid) -> Result<()> {
         let key = self.rebuild_key(scope)?;
         let existing = self.read_rebuild_record::<Rebuild>(&key).await?;
@@ -130,8 +176,20 @@ impl HostedCatalog {
             dispatched_window: None,
         };
         self.record_hint(scope, operation, true).await?;
-        self.write_rebuild_record(&key, &record, condition).await?;
-        Ok(())
+        match self.write_rebuild_record(&key, &record, condition).await {
+            Ok(_) => Ok(()),
+            Err(Error::Conflict(_)) => {
+                let current = self.read_rebuild_record::<Rebuild>(&key).await?;
+                if current.is_some_and(|(current, _)| current.run == run) {
+                    Ok(())
+                } else {
+                    Err(Error::Busy(
+                        "profile rebuild changed during scheduling".into(),
+                    ))
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) async fn dispatch_rebuild(&self, scope: &Scope, operation: Uuid) -> Result<bool> {

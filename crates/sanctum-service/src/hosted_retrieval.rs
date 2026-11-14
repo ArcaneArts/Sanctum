@@ -56,10 +56,13 @@ impl HostedCatalog {
             .await?;
         let profile = prepared.profile.clone();
         let metadata = self.search_metadata(&scope, filter.as_ref()).await?;
-        let ((chunks, coverage, actual_mode, degraded), generation) = self
+        let ((coverage, ranked), generation) = self
             .with_collection(&scope, move |database| {
                 let coverage = database.embedding_coverage(prepared.profile.as_deref())?;
-                let (actual_mode, degraded) = prepared.strategy(mode, coverage)?;
+                let (actual_mode, degraded) = match prepared.strategy(mode, coverage) {
+                    Ok(strategy) => strategy,
+                    Err(error) => return Ok((coverage, Err(error))),
+                };
                 let candidate_limit = if actual_mode == SearchMode::Lexical {
                     limit
                 } else {
@@ -105,9 +108,12 @@ impl HostedCatalog {
                         Ok((locate(database, chunk)?, score, fields, state))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                Ok((chunks, coverage, actual_mode, degraded))
+                Ok((coverage, Ok((chunks, actual_mode, degraded))))
             })
             .await?;
+        self.schedule_rebuild_on_access(&scope, profile.as_deref(), coverage)
+            .await;
+        let (chunks, actual_mode, degraded) = ranked?;
         let mut hits = Vec::with_capacity(chunks.len());
         for (located, score, fields, state) in chunks {
             let mut hit = self.read_hit(&scope, located, state, generation).await?;
@@ -182,6 +188,8 @@ impl HostedCatalog {
                     Ok((located, current))
                 })
                 .await?;
+            self.schedule_rebuild_on_access(&scope, prepared.profile.as_deref(), current)
+                .await;
             coverage.total += current.total;
             coverage.embedded += current.embedded;
             coverage.failed += current.failed;
