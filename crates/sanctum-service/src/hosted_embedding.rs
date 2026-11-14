@@ -18,6 +18,8 @@ use crate::{
 const PUBLICATION_INPUT_LIMIT: u32 = 16;
 const PROVIDER_WINDOW: Duration = Duration::from_secs(120);
 
+mod prepared;
+
 impl HostedCatalog {
     pub async fn embedding_status(
         &self,
@@ -58,15 +60,55 @@ impl HostedCatalog {
             .ok_or_else(|| Error::Invalid("hosted embeddings are disabled".into()))?;
         let profile = provider.profile_id().to_owned();
         let unit = Unit::collection(self.prefix.as_ref(), scope)?;
-        if replay
-            && let Some(receipt) = self
-                .publication
-                .stage_receipt(&unit, batch_id, "embed")
-                .await?
-        {
-            return parse_count(&receipt);
+        let prepared_key = replay
+            .then(|| self.prepared_embedding_key(scope, batch_id))
+            .transpose()?;
+        let outcomes = match &prepared_key {
+            Some(key) => {
+                if let Some(receipt) = self
+                    .publication
+                    .stage_receipt(&unit, batch_id, "embed")
+                    .await?
+                {
+                    self.discard_prepared_embeddings(key).await;
+                    return parse_count(&receipt);
+                }
+                match self
+                    .read_prepared_embeddings(key, provider.as_ref())
+                    .await?
+                {
+                    Some(outcomes) => outcomes,
+                    None => {
+                        let outcomes = self.select_and_embed(scope, provider.as_ref()).await?;
+                        if outcomes.is_empty() {
+                            return Ok(0);
+                        }
+                        self.stage_prepared_embeddings(key, provider.as_ref(), outcomes)
+                            .await?
+                    }
+                }
+            }
+            None => self.select_and_embed(scope, provider.as_ref()).await?,
+        };
+        let count: usize = outcomes.iter().map(|outcome| outcome.inputs.len()).sum();
+        if count == 0 {
+            return Ok(0);
         }
-        let selected = profile.clone();
+        let count = self
+            .publish_embeddings(&unit, batch_id, profile, outcomes, count)
+            .await?;
+        if let Some(key) = prepared_key {
+            self.discard_prepared_embeddings(&key).await;
+        }
+        Ok(count)
+    }
+
+    async fn select_and_embed(
+        &self,
+        scope: &Scope,
+        provider: &dyn sanctum_embedding::Provider,
+    ) -> Result<Vec<BatchOutcome>> {
+        let selected = provider.profile_id().to_owned();
         let (chunks, _) = self
             .with_collection(scope, move |db| {
                 db.pending_embeddings(&selected, PUBLICATION_INPUT_LIMIT)?
@@ -76,21 +118,31 @@ impl HostedCatalog {
             })
             .await?;
         if chunks.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         let outcomes = self
             .prepare_embedding_publication(
                 scope,
-                provider.as_ref(),
+                provider,
                 chunks,
                 Instant::now() + PROVIDER_WINDOW,
             )
             .await?;
-        let count: usize = outcomes.iter().map(|outcome| outcome.inputs.len()).sum();
-        if count == 0 {
+        if outcomes.is_empty() {
             return Err(Error::Busy("hosted embedding preparation timed out".into()));
         }
-        let mut writer = self.publication.acquire(&unit).await?;
+        Ok(outcomes)
+    }
+
+    async fn publish_embeddings(
+        &self,
+        unit: &Unit,
+        batch_id: Uuid,
+        profile: String,
+        outcomes: Vec<BatchOutcome>,
+        count: usize,
+    ) -> Result<usize> {
+        let mut writer = self.publication.acquire(unit).await?;
         let saved = writer
             .apply_stage(
                 "embed",

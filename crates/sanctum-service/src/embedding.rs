@@ -100,7 +100,7 @@ pub(crate) struct Batch {
     pub(crate) texts: Vec<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub(crate) struct BatchInput {
     pub(crate) hash: String,
     pub(crate) retry: Option<EmbeddingRetry>,

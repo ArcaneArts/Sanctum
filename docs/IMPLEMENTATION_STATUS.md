@@ -1695,3 +1695,25 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   client verified unchanged retry status, a cosine score of 1.0 from the
   first vector, and exact UTF-8 text from the cited chunk.
   [Embedding batches](STORAGE.md#hosted-embedding-batches).
+
+## Durable prepared embedding batches
+
+- Upload and profile rebuild tasks conditionally stage their results in object
+  storage under a stable step and profile ID before acquiring the SQLite
+  writer lease. Retries use the prepared results until a committed database
+  receipt is available. Publication removes the staging object. The scheduled
+  upload sweep deletes abandoned batches after 45 days.
+- A filesystem regression lost the response to the staging write, held the
+  writer lease through redelivery, then restarted the worker and interrupted
+  its operation checkpoint after publication. The next delivery used the
+  SQLite receipt. The three provider calls produced one committed snapshot.
+  The sweep regression preserved a 31-day-old batch and removed a 46-day-old
+  batch after resuming its scan.
+- Two deliveries against live MinIO and Ollama returned HTTP 503 while a
+  competing lease held the collection. Ollama embedded three inputs in one
+  request and the worker staged 12,863 bytes. After a restart, the same step
+  published one 167,936-byte SQLite snapshot, removed staging, and made no
+  document embedding requests. A third process replayed the task without a
+  new request or snapshot. A generated Python gRPC client verified coverage
+  and fetched the exact cited UTF-8 bytes from semantic search.
+  [Embedding batches](STORAGE.md#hosted-embedding-batches).

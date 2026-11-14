@@ -33,6 +33,7 @@ enum Candidate {
     Input { operation: Uuid, attempt: Uuid },
     Operation { operation: Uuid },
     Extracted { source: Uuid, revision: Uuid },
+    PreparedEmbedding,
 }
 
 impl HostedCatalog {
@@ -232,6 +233,9 @@ impl HostedCatalog {
                 }
             }
             Candidate::Operation { .. } => return Ok(false),
+            // Completed batches are deleted after publication. Abandoned results
+            // can expire independently because later deliveries can compute again.
+            Candidate::PreparedEmbedding => true,
             Candidate::Extracted { source, revision } => {
                 let object = object.to_string();
                 let (referenced, _) = self
@@ -252,7 +256,7 @@ impl HostedCatalog {
 fn old_enough(object: &Object, candidate: &Candidate, now: SystemTime) -> bool {
     let minimum = match candidate {
         Candidate::Input { .. } => READER_GRACE,
-        Candidate::Operation { .. } => OPERATION_RETENTION,
+        Candidate::Operation { .. } | Candidate::PreparedEmbedding => OPERATION_RETENTION,
         // Registration starts before extraction. Even a delayed index writer has
         // expired by now and cannot introduce this locator into a new snapshot.
         Candidate::Extracted { .. } => REGISTRATION_WINDOW + READER_GRACE,
@@ -298,6 +302,10 @@ fn candidate(prefix: Option<&Key>, key: &Key) -> Option<(Scope, Candidate)> {
                 return None;
             }
             Candidate::Extracted { source, revision }
+        }
+        "prepared-embeddings" => {
+            parts.next()?.strip_suffix(".json")?.parse::<Uuid>().ok()?;
+            Candidate::PreparedEmbedding
         }
         _ => return None,
     };
