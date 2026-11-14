@@ -730,39 +730,97 @@ async fn verify_deltas(
 }
 
 #[tokio::test]
-async fn recovering_from_a_lost_publish_response_reuses_its_receipt() {
+async fn filesystem_writer_confirms_ambiguous_manifest_responses() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = sanctum_storage_fs::FileStorage::open(directory.path()).unwrap();
+    verify_manifest_responses(Arc::new(storage), "manifest-replies").await;
+}
+
+#[tokio::test]
+async fn manifest_readback_does_not_acknowledge_a_filesystem_sync_error() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(PublicationStorage::new(Arc::new(
         sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
     )));
-    storage
-        .lose
-        .store(true, std::sync::atomic::Ordering::Relaxed);
     let unit = Unit::catalog(None, &"default".parse().unwrap()).unwrap();
-    let cache = Arc::new(sanctum_db::SnapshotCache::new(1024 * 1024));
-    let short = Publication::new(storage.clone(), Duration::from_millis(400))
-        .unwrap()
-        .with_snapshot_cache(cache.clone());
-    let long = Publication::new(storage, Duration::from_secs(15))
-        .unwrap()
-        .with_snapshot_cache(cache);
-    let mut writer = short.acquire(&unit).await.unwrap();
+    let publication = Publication::new(storage.clone(), Duration::from_secs(15)).unwrap();
+    let mut writer = publication.acquire(&unit).await.unwrap();
+    *storage.manifest_reply.lock().unwrap() = Some(ManifestReply::SyncError);
+    assert!(matches!(writer.renew().await, Err(Error::Io(_))));
+    assert!(matches!(
+        writer.release().await,
+        Err(Error::StaleRevision(_))
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires a live MinIO bucket and S3 credentials"]
+async fn minio_writer_confirms_ambiguous_manifest_responses() {
+    let prefix = format!("manifest-replies-{}", Uuid::new_v4());
+    verify_manifest_responses(minio_storage(), &prefix).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an authorized GCS test bucket and Application Default Credentials"]
+async fn gcs_writer_confirms_ambiguous_manifest_responses() {
+    let bucket = std::env::var("SANCTUM_GCS_BUCKET").expect("SANCTUM_GCS_BUCKET");
+    let storage = sanctum_storage_gcs::GcsStorage::new(bucket).unwrap();
+    let prefix = format!("manifest-replies-{}", Uuid::new_v4());
+    verify_manifest_responses(Arc::new(storage), &prefix).await;
+}
+
+async fn verify_manifest_responses(storage: Arc<dyn Storage>, prefix: &str) {
+    let prefix = Key::parse(prefix).unwrap();
+    let unit = Unit::catalog(Some(&prefix), &"default".parse().unwrap()).unwrap();
+    let faults = Arc::new(PublicationStorage::new(storage.clone()));
+    let owner = Publication::new(faults.clone(), Duration::from_secs(15)).unwrap();
+    let next = Publication::new(storage.clone(), Duration::from_secs(15)).unwrap();
+    *faults.manifest_reply.lock().unwrap() = Some(ManifestReply::Lost);
+    let mut writer = owner.acquire(&unit).await.unwrap();
+    assert_eq!(writer.epoch(), 1);
+    assert!(matches!(next.acquire(&unit).await, Err(Error::Busy(_))));
+
+    *faults.manifest_reply.lock().unwrap() = Some(ManifestReply::Conflict);
+    writer.renew().await.unwrap();
+    assert!(matches!(next.acquire(&unit).await, Err(Error::Busy(_))));
+
     let operation = Uuid::new_v4();
-    let result = writer.apply(vec![command(operation, 7)], apply_value).await;
-    assert!(matches!(result, Err(Error::Busy(_))));
-    assert!(matches!(writer.renew().await, Err(Error::StaleRevision(_))));
-    let scratch = tempfile::tempdir().unwrap();
-    let committed = long.read(&unit, scratch.path()).await.unwrap().unwrap();
-    assert_eq!(value(committed.path()), 7);
-    tokio::time::sleep(Duration::from_millis(450)).await;
-    let mut retry = long.acquire(&unit).await.unwrap();
-    let (generation, receipt) = retry
-        .apply(vec![command(operation, 999)], apply_value)
+    *faults.manifest_reply.lock().unwrap() = Some(ManifestReply::Lost);
+    let (generation, receipts) = writer
+        .apply(vec![command(operation, 7)], apply_value)
         .await
         .unwrap();
-    assert_eq!(generation, committed.generation);
-    assert_eq!(receipt[0].outcome, "7");
-    retry.release().await.unwrap();
+    assert_eq!(receipts[0].outcome, "7");
+    assert!(matches!(next.acquire(&unit).await, Err(Error::Busy(_))));
+    let scratch = tempfile::tempdir().unwrap();
+    let committed = next.read(&unit, scratch.path()).await.unwrap().unwrap();
+    assert_eq!(committed.generation, generation);
+    assert_eq!(value(committed.path()), 7);
+
+    *faults.manifest_reply.lock().unwrap() = Some(ManifestReply::Lost);
+    writer.release().await.unwrap();
+    let mut retry = owner.acquire(&unit).await.unwrap();
+    assert_eq!(retry.epoch(), 2);
+    let (replayed, receipts) = retry
+        .apply(vec![command(operation, 999)], |_, _| {
+            panic!("the confirmed command must not run again")
+        })
+        .await
+        .unwrap();
+    assert_eq!(replayed, generation);
+    assert_eq!(receipts[0].outcome, "7");
+
+    // A failed CAS leaves a valid HEAD for the same owner and generation,
+    // but its update ID differs from the attempted renewal.
+    *faults.manifest_reply.lock().unwrap() = Some(ManifestReply::BeforeWrite);
+    assert!(matches!(retry.renew().await, Err(Error::StaleRevision(_))));
+    assert!(matches!(
+        retry.release().await,
+        Err(Error::StaleRevision(_))
+    ));
+    assert!(matches!(next.acquire(&unit).await, Err(Error::Busy(_))));
+    assert_eq!(next.generation(&unit).await.unwrap(), Some(generation));
+    delete_prefix(storage.as_ref(), &prefix).await;
 }
 
 #[tokio::test]
@@ -993,17 +1051,23 @@ enum UploadReply {
     Corrupt,
 }
 
+enum ManifestReply {
+    BeforeWrite,
+    Lost,
+    Conflict,
+    SyncError,
+}
+
 struct PublicationStorage {
     inner: Arc<dyn Storage>,
     transfer_delay_ms: std::sync::atomic::AtomicUsize,
     upload_hold: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     control_reply_hold: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     publication_reply_hold: Mutex<Option<oneshot::Receiver<()>>>,
-    lose: std::sync::atomic::AtomicBool,
+    manifest_reply: Mutex<Option<ManifestReply>>,
     snapshot_gets: std::sync::atomic::AtomicUsize,
     fail_delta: std::sync::atomic::AtomicBool,
     upload_reply: Mutex<Option<UploadReply>>,
-    fail_only_delta_head: std::sync::atomic::AtomicBool,
     cleanup_delay_ms: AtomicU64,
     list_started: Mutex<Option<oneshot::Sender<()>>>,
 }
@@ -1016,11 +1080,10 @@ impl PublicationStorage {
             upload_hold: Default::default(),
             control_reply_hold: Default::default(),
             publication_reply_hold: Default::default(),
-            lose: Default::default(),
+            manifest_reply: Default::default(),
             snapshot_gets: Default::default(),
             fail_delta: Default::default(),
             upload_reply: Default::default(),
-            fail_only_delta_head: Default::default(),
             cleanup_delay_ms: Default::default(),
             list_started: Default::default(),
         }
@@ -1110,7 +1173,25 @@ impl Storage for PublicationStorage {
         bytes: bytes::Bytes,
         condition: sanctum_storage::Condition,
     ) -> sanctum_core::Result<sanctum_storage::Version> {
-        let generation = if key.as_str().ends_with("/HEAD.json") {
+        let is_manifest = key.as_str().ends_with("/HEAD.json");
+        let reply = is_manifest
+            .then(|| self.manifest_reply.lock().unwrap().take())
+            .flatten();
+        if matches!(reply, Some(ManifestReply::BeforeWrite)) {
+            return Err(Error::Conflict("manifest precondition failed".into()));
+        }
+        let retry = if matches!(reply, Some(ManifestReply::Conflict)) {
+            let original = match &condition {
+                sanctum_storage::Condition::Create => sanctum_storage::Condition::Create,
+                sanctum_storage::Condition::Match(version) => {
+                    sanctum_storage::Condition::Match(version.clone())
+                }
+            };
+            Some((bytes.clone(), original))
+        } else {
+            None
+        };
+        let generation = if is_manifest {
             Some(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["generation"].clone())
         } else {
             None
@@ -1128,12 +1209,7 @@ impl Storage for PublicationStorage {
                 serde_json::from_slice::<serde_json::Value>(&body).unwrap()["generation"]["id"]
                     != generation["id"]
             }
-            Some(generation) => {
-                generation.is_object()
-                    && !self
-                        .fail_only_delta_head
-                        .load(std::sync::atomic::Ordering::Relaxed)
-            }
+            Some(generation) => generation.is_object(),
             None => false,
         };
         let version = self.inner.put_control(key, bytes, condition).await?;
@@ -1147,8 +1223,16 @@ impl Storage for PublicationStorage {
                 hold.await.unwrap();
             }
         }
-        if published && self.lose.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            return Err(Error::Busy("publication response lost".into()));
+        if let Some((bytes, condition)) = retry {
+            let result = self.inner.put_control(key, bytes, condition).await;
+            assert!(matches!(result, Err(Error::Conflict(_))));
+            return result;
+        }
+        if matches!(reply, Some(ManifestReply::Lost)) {
+            return Err(Error::Busy("manifest response lost".into()));
+        }
+        if matches!(reply, Some(ManifestReply::SyncError)) {
+            return Err(std::io::Error::other("manifest directory sync failed").into());
         }
         Ok(version)
     }
@@ -1374,7 +1458,7 @@ async fn unpublished_delta_and_lost_manifest_response_preserve_commit_state() {
         sanctum_storage_fs::FileStorage::open(root.path()).unwrap(),
     )));
     let unit = Unit::catalog(None, &"default".parse().unwrap()).unwrap();
-    let writer = Publication::new(storage.clone(), Duration::from_millis(500))
+    let writer = Publication::new(storage.clone(), Duration::from_secs(15))
         .unwrap()
         .with_page_deltas(true);
     let scratch = tempfile::tempdir().unwrap();
@@ -1399,21 +1483,20 @@ async fn unpublished_delta_and_lost_manifest_response_preserve_commit_state() {
     assert_eq!(writer.receipt(&unit, operation).await.unwrap(), None);
     lease.release().await.unwrap();
     let mut lease = writer.acquire(&unit).await.unwrap();
-    storage.fail_only_delta_head.store(true, Ordering::Relaxed);
-    storage.lose.store(true, Ordering::Relaxed);
-    let result = lease.apply(vec![command(operation, 3)], apply_value).await;
-    assert!(matches!(result, Err(Error::Busy(_))));
-    assert!(matches!(
-        lease.release().await,
-        Err(Error::StaleRevision(_))
-    ));
+    *storage.manifest_reply.lock().unwrap() = Some(ManifestReply::Lost);
+    let (generation, receipts) = lease
+        .apply(vec![command(operation, 3)], apply_value)
+        .await
+        .unwrap();
+    assert_eq!(receipts[0].outcome, "5");
+    lease.release().await.unwrap();
     let cold = writer.read(&unit, scratch.path()).await.unwrap().unwrap();
+    assert_eq!(cold.generation, generation);
     assert_eq!(value(cold.path()), 5);
     assert_eq!(
         writer.receipt(&unit, operation).await.unwrap().as_deref(),
         Some("5")
     );
-    tokio::time::sleep(Duration::from_millis(550)).await;
     let mut lease = writer.acquire(&unit).await.unwrap();
     let (unchanged, _) = lease
         .apply(vec![command(operation, 99)], apply_value)

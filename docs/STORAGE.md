@@ -52,14 +52,18 @@ Writers acquire, renew, publish, and release through conditional writes
 on that same object. While downloading, preparing, or uploading a
 snapshot, the executor renews at half the lease interval. The same task
 serializes renewal and publication. Acquisition waits at most one lease
-interval for its conditional write. An active writer stops using its
-lease if a HEAD write loses its condition or exceeds the lease deadline.
-A timed-out write can already have committed on the storage server.
-Reacquire ownership and replay the same operation ID to recover any
-committed receipt. Snapshot downloads verify length and BLAKE3. The
-executor applies at most 64 prepared commands and their receipts in one
-SQLite transaction. It uploads a consistent SQLite backup under a fresh
-key before attempting to publish it. If that upload returns an error,
+interval for its conditional write and any readback. After an ambiguous
+response, the executor can confirm the update by reading back the exact
+attempted HEAD, including its unique update ID, with its storage version
+before the original deadline. This covers a storage retry that reports a
+precondition conflict after the first request committed. Filesystem sync
+errors still fail because readable bytes do not prove durability. If
+confirmation fails, the writer stops using the lease. A timed-out write
+can already have committed. Reacquire ownership and replay the same
+operation ID to recover any committed receipt. Snapshot downloads verify
+length and BLAKE3. The executor applies at most 64 prepared commands and
+their receipts in one SQLite transaction. It uploads a consistent SQLite
+backup under a fresh key before attempting to publish it. If that upload fails,
 the writer can recover by streaming the candidate back and verifying its
 exact byte length and BLAKE3 digest under the same lease. This also applies
 to page deltas. Replaying a batch of previously applied commands returns
