@@ -712,6 +712,10 @@ An overlapping import of the same normalized requested URL into the same
 collection returns retryable `UNAVAILABLE`. Retry after the first request
 finishes.
 
+Server shutdown interrupts an active URL download and returns retryable
+`UNAVAILABLE`. Repeat the request to import again. When acceptance already
+finished, the repeated request can reuse the durable work.
+
 Set `url_import_origins` in `SANCTUM_CONFIG_JSON` to restrict requests to
 exact scheme, host, and port combinations. A null value permits that origin
 without credentials. For an HTTPS origin, a string names a server environment
@@ -781,6 +785,11 @@ To check which paths disappeared, the server records the selected paths in a
 temporary SQLite file with a small page cache. The temporary directory needs
 space for that index and, for HTTPS, the temporary Git repository.
 Includes and excludes use the same globs as local directory imports.
+
+Client disconnect or server shutdown stops a Git import between tree
+records and blob copy buffers. A canceled HTTPS fetch also stops its Git
+transport helpers. Accepted files remain in the queue. Server shutdown
+returns retryable `UNAVAILABLE` to the stream.
 
 The local HTTPS integration check uses a temporary Git repository and
 self-signed TLS fixture. It requires Python 3, Git, and OpenSSL.

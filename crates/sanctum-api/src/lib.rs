@@ -413,11 +413,13 @@ impl Sanctum for Grpc {
     ) -> Reply<v1::ImportUrlResponse> {
         let request = request.into_inner();
         let scope = parse_scope(request.scope)?;
-        let (event, url) = self
-            .local()?
-            .import_url(scope, &request.url, request.retain_original)
-            .await
-            .map_err(status)?;
+        let service = self.local()?;
+        let import = service.import_url(scope, &request.url, request.retain_original);
+        let (event, url) = tokio::select! {
+            biased;
+            _ = self.1.cancelled() => return Err(import_shutdown()),
+            result = import => result.map_err(status)?,
+        };
         Ok(Response::new(v1::ImportUrlResponse {
             state: wire_import_state(event.state).into(),
             source_id: event
@@ -433,7 +435,7 @@ impl Sanctum for Grpc {
         }))
     }
 
-    type ImportGitStream = ReceiverStream<std::result::Result<v1::ImportGitEvent, Status>>;
+    type ImportGitStream = ImportStream<v1::ImportGitEvent>;
 
     async fn import_git(
         &self,
@@ -455,36 +457,28 @@ impl Sanctum for Grpc {
             prune_missing: request.prune_missing,
             retain_original: request.retain_original,
         };
-        let (sender, receiver) = tokio::sync::mpsc::channel(8);
         let service = self.local()?.clone();
-        tokio::spawn(async move {
-            let events = sender.clone();
-            let result = work(move || {
+        Ok(Response::new(stream_import(
+            self.1.clone(),
+            move |stopped, emit| {
                 service.import_git(
                     &scope,
                     repository,
                     &request.reference,
                     &options,
-                    || events.is_closed(),
+                    stopped,
                     |event| {
-                        events
-                            .blocking_send(Ok(v1::ImportGitEvent {
-                                file: Some(wire_import(event.import)),
-                                git: event.git.map(wire_git),
-                            }))
-                            .is_ok()
+                        emit(v1::ImportGitEvent {
+                            file: Some(wire_import(event.import)),
+                            git: event.git.map(wire_git),
+                        })
                     },
                 )
-            })
-            .await;
-            if let Err(error) = result {
-                let _ = sender.send(Err(error)).await;
-            }
-        });
-        Ok(Response::new(ReceiverStream::new(receiver)))
+            },
+        )))
     }
 
-    type ImportLocalStream = BoxStream<'static, std::result::Result<v1::ImportLocalEvent, Status>>;
+    type ImportLocalStream = ImportStream<v1::ImportLocalEvent>;
 
     async fn import_local(
         &self,
@@ -495,53 +489,25 @@ impl Sanctum for Grpc {
         if request.path.is_empty() {
             return Err(invalid_argument("path", "import path is required"));
         }
-        let (sender, receiver) = tokio::sync::mpsc::channel(8);
         let service = self.local()?.clone();
-        let shutdown = self.1.clone();
-        let worker_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            let events = sender.clone();
-            let result = work(move || {
+        Ok(Response::new(stream_import(
+            self.1.clone(),
+            move |stopped, emit| {
                 let options = ImportOptions {
                     include: request.include,
                     exclude: request.exclude,
                     prune_missing: request.prune_missing,
                     retain_original: request.retain_original,
                 };
-                let runtime = tokio::runtime::Handle::current();
                 service.import_local_until(
                     &scope,
                     std::path::Path::new(&request.path),
                     &options,
-                    || events.is_closed() || worker_shutdown.is_cancelled(),
-                    |event| {
-                        runtime.block_on(async {
-                            tokio::select! {
-                                biased;
-                                _ = worker_shutdown.cancelled() => false,
-                                result = events.send(Ok(wire_import(event))) => result.is_ok(),
-                            }
-                        })
-                    },
+                    stopped,
+                    |event| emit(wire_import(event)),
                 )
-            })
-            .await;
-            if let Err(error) = result {
-                let _ = sender.send(Err(error)).await;
-            }
-        });
-        let stream = unfold(Some((receiver, shutdown)), |state| async {
-            let (mut receiver, shutdown) = state?;
-            tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => Some((
-                    Err(status(Error::Busy("server is shutting down".into()))),
-                    None,
-                )),
-                event = receiver.recv() => event.map(|event| (event, Some((receiver, shutdown)))),
-            }
-        });
-        Ok(Response::new(Box::pin(stream)))
+            },
+        )))
     }
 
     async fn watch_folder(
@@ -1831,6 +1797,49 @@ fn wire_job(job: Job) -> v1::IngestionJob {
 }
 
 type Reply<T> = std::result::Result<Response<T>, Status>;
+
+type ImportStream<T> = BoxStream<'static, std::result::Result<T, Status>>;
+
+fn import_shutdown() -> Status {
+    status(Error::Busy("server is shutting down".into()))
+}
+
+fn stream_import<T: Send + 'static>(
+    shutdown: CancellationToken,
+    import: impl FnOnce(&dyn Fn() -> bool, &dyn Fn(T) -> bool) -> Result<()> + Send + 'static,
+) -> ImportStream<T> {
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let worker_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let events = sender.clone();
+        let result = work(move || {
+            let runtime = tokio::runtime::Handle::current();
+            let stopped = || events.is_closed() || worker_shutdown.is_cancelled();
+            let emit = |event| {
+                runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = worker_shutdown.cancelled() => false,
+                        result = events.send(Ok(event)) => result.is_ok(),
+                    }
+                })
+            };
+            import(&stopped, &emit)
+        })
+        .await;
+        if let Err(error) = result {
+            let _ = sender.send(Err(error)).await;
+        }
+    });
+    Box::pin(unfold(Some((receiver, shutdown)), |state| async {
+        let (mut receiver, shutdown) = state?;
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => Some((Err(import_shutdown()), None)),
+            event = receiver.recv() => event.map(|event| (event, Some((receiver, shutdown)))),
+        }
+    }))
+}
 
 fn wire_folder(folder: WatchedFolder) -> v1::WatchedFolder {
     v1::WatchedFolder {

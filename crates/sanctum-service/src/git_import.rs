@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use process_wrap::std::CommandWrap;
 use sanctum_core::{Error, ExternalSource, GitProvenance, Result, Scope};
 use sanctum_db_sqlite::import_paths::ImportPaths;
 use tempfile::TempDir;
@@ -74,6 +75,9 @@ impl Service {
         let _active = self
             .imports
             .begin(scope, ImportTarget::Git(namespace.clone()))?;
+        if stopped() {
+            return Ok(());
+        }
 
         let mut temporary = None;
         let (path, revision) = match &repository {
@@ -92,6 +96,9 @@ impl Service {
             }
         };
         let commit = resolve_commit(path, revision)?;
+        if stopped() {
+            return Ok(());
+        }
         let mut tree = git(path)
             .args(["ls-tree", "-r", "-l", "-z", "--full-tree", &commit])
             .stdout(Stdio::piped())
@@ -102,10 +109,9 @@ impl Service {
         let mut blobs = None;
         let seen = ImportPaths::open()?;
         let mut had_errors = false;
-        while let Some(record) = read_record(&mut tree_output, 0, 8192)? {
-            if stopped() {
-                return Ok(());
-            }
+        while !stopped()
+            && let Some(record) = read_record(&mut tree_output, 0, 8192)?
+        {
             let Some((file, blob, size)) = regular_blob(&record)? else {
                 continue;
             };
@@ -160,6 +166,9 @@ impl Service {
                         return Err(error);
                     }
                 };
+                if stopped() {
+                    return Err(Error::Busy("Git import stopped".into()));
+                }
                 staged.enqueue_import(bytes, hash, Some(ImportProvenance::Git(provenance.clone())))
             }) {
                 Ok(event) => event,
@@ -168,12 +177,17 @@ impl Service {
                     ImportEvent::failed(file, &error)
                 }
             };
-            if !emit(GitImportEvent {
-                import,
-                git: Some(provenance),
-            }) {
+            if stopped()
+                || !emit(GitImportEvent {
+                    import,
+                    git: Some(provenance),
+                })
+            {
                 return Ok(());
             }
+        }
+        if stopped() {
+            return Ok(());
         }
         if !tree.wait()?.success() {
             return Err(Error::Invalid(
@@ -185,7 +199,7 @@ impl Service {
         }
         seen.finish()?;
         let mut cursor = String::new();
-        loop {
+        while !stopped() {
             let active = self
                 .database(scope)?
                 .imported_sources(&namespace, &cursor)?;
@@ -211,6 +225,7 @@ impl Service {
                 cursor = file;
             }
         }
+        Ok(())
     }
 }
 
@@ -284,6 +299,9 @@ fn fetch(
             "could not initialize Git import workspace".into(),
         ));
     }
+    if stopped() {
+        return Err(Error::Busy("Git HTTPS fetch stopped".into()));
+    }
     let mut fetch = git(path);
     fetch.args(["-c", "protocol.https.allow=always"]);
     if let Some(ca) = std::env::var_os("GIT_SSL_CAINFO") {
@@ -298,7 +316,7 @@ fn fetch(
                 format!("Authorization: {authorization}"),
             );
     }
-    let mut child = fetch
+    fetch
         .args([
             "fetch",
             "--quiet",
@@ -309,23 +327,34 @@ fn fetch(
             url,
             reference,
         ])
-        .stdout(Stdio::null())
-        .spawn()
-        .map(GitChild)
-        .map_err(git_spawn_error)?;
+        .stdout(Stdio::null());
+    // Fetch launches a transport helper. Stop the whole group before
+    // discarding the temporary repository.
+    let mut fetch = CommandWrap::from(fetch);
+    #[cfg(unix)]
+    fetch.wrap(process_wrap::std::ProcessGroup::leader());
+    #[cfg(windows)]
+    fetch.wrap(process_wrap::std::JobObject);
+    let mut child = fetch.spawn().map_err(git_spawn_error)?;
     let deadline = Instant::now() + FETCH_TIMEOUT;
     loop {
-        if let Some(status) = child.try_wait()? {
-            return if status.success() {
-                Ok(())
-            } else {
-                Err(Error::Busy(format!("Git HTTPS fetch failed ({status})")))
-            };
-        }
-        if stopped() || Instant::now() >= deadline {
-            return Err(Error::Busy("Git HTTPS fetch stopped or timed out".into()));
-        }
-        std::thread::sleep(Duration::from_millis(40));
+        let status = match child.try_wait() {
+            Ok(Some(status)) => status,
+            Ok(None) if !stopped() && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(40));
+                continue;
+            }
+            outcome => {
+                let _ = child.kill();
+                outcome?;
+                return Err(Error::Busy("Git HTTPS fetch stopped or timed out".into()));
+            }
+        };
+        return if status.success() {
+            Ok(())
+        } else {
+            Err(Error::Busy(format!("Git HTTPS fetch failed ({status})")))
+        };
     }
 }
 
@@ -387,13 +416,8 @@ impl GitChild {
     fn stdout(&mut self) -> BufReader<ChildStdout> {
         BufReader::new(self.0.stdout.take().expect("Git stdout is piped"))
     }
-
     fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
         self.0.wait()
-    }
-
-    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
-        self.0.try_wait()
     }
 }
 

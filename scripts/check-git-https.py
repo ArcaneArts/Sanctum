@@ -53,6 +53,8 @@ def origin(directory, cert, key, authorizations):
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.load_cert_chain(cert, key)
     requests = []
+    fetch_waiting = threading.Event()
+    fetch_closed = threading.Event()
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -91,6 +93,18 @@ def origin(directory, cert, key, authorizations):
                 self.begin_response(401, 0)
                 self.send_header("WWW-Authenticate", 'Basic realm="Sanctum fixture"')
                 self.end_headers()
+                return
+            if scheme == "stall":
+                self.connection.settimeout(12)
+                try:
+                    fetch_waiting.set()
+                    if not self.connection.recv(1):
+                        fetch_closed.set()
+                except (ConnectionResetError, ssl.SSLEOFError):
+                    fetch_closed.set()
+                except TimeoutError:
+                    pass
+                self.close_connection = True
                 return
             length = int(self.headers.get("Content-Length", 0))
             env = {
@@ -140,7 +154,7 @@ def origin(directory, cert, key, authorizations):
         for thread in threads:
             thread.start()
         try:
-            yield link(server), link(other), requests
+            yield link(server), link(other), requests, fetch_waiting, fetch_closed
         finally:
             server.shutdown()
             other.shutdown()
@@ -171,9 +185,10 @@ def sanctum(bin_dir, root, origins, ca, token):
         try:
             addresses = json.loads(server.stdout.readline())
             cli = [bin_dir / "sanctum-cli", "--endpoint", f"http://{addresses['grpc']}"]
-            yield cli, f"http://{addresses['mcp']}/mcp"
+            yield cli, f"http://{addresses['mcp']}/mcp", server
         finally:
-            server.stdin.close()
+            if not server.stdin.closed:
+                server.stdin.close()
             assert server.wait(timeout=15) == 0
 
 
@@ -218,11 +233,12 @@ def check(bin_dir, directory):
     root = directory / "storage"
     token = secrets.token_urlsafe()
     basic = "Basic " + base64.b64encode(f"fixture:{token}".encode()).decode()
-    authorizations = {"basic": basic, "bearer": f"Bearer {token}"}
-    with origin(directory, cert, key, authorizations) as (url, other, requests):
+    authorizations = {"basic": basic, "bearer": f"Bearer {token}", "stall": basic}
+    with origin(directory, cert, key, authorizations) as fixture:
+        url, other, requests, fetch_waiting, fetch_closed = fixture
         secrets_in_headers = (token, basic.removeprefix("Basic "))
         basic_config = {url: {"username": "fixture", "password_env": TOKEN_ENV}}
-        with sanctum(bin_dir, root, basic_config, cert, token) as (cli, mcp_url):
+        with sanctum(bin_dir, root, basic_config, cert, token) as (cli, mcp_url, server):
             subprocess.check_call([*cli, "create", COLLECTION], stdout=subprocess.DEVNULL)
             mcp = MCP["Rpc"](MCP["Http"](mcp_url))
             mcp.initialize()
@@ -247,7 +263,24 @@ def check(bin_dir, directory):
                        error="URL import origin is not allowed")
             assert len(requests) == start
 
-        with sanctum(bin_dir, root, {url: None}, cert, token) as (cli, _):
+            for stop in ("disconnect", "shutdown"):
+                fetch_waiting.clear()
+                fetch_closed.clear()
+                command = [*cli, "import-git", COLLECTION, "--https-url", url + "/stall/repo/.git"]
+                with MCP["child"](command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as client:
+                    assert fetch_waiting.wait(5), "Git did not start the HTTPS request"
+                    if stop == "disconnect":
+                        client.kill()
+                        client.wait(timeout=5)
+                    else:
+                        server.stdin.close()
+                        out, error = client.communicate(timeout=5)
+                        assert client.returncode != 0 and not out, (out, error)
+                        assert "server is shutting down" in error, error
+                        assert server.wait(timeout=5) == 0
+                    assert fetch_closed.wait(5), f"Git left the HTTPS connection open after {stop}"
+
+        with sanctum(bin_dir, root, {url: None}, cert, token) as (cli, _, _):
             start = len(requests)
             import_git(cli, url + "/basic/repo/.git", secrets_in_headers,
                        error="Git HTTPS fetch failed")
@@ -256,13 +289,13 @@ def check(bin_dir, directory):
                 for scheme, _, header, valid in requests[start:]
             )
 
-        with sanctum(bin_dir, root, basic_config, None, token) as (cli, _):
+        with sanctum(bin_dir, root, basic_config, None, token) as (cli, _, _):
             start = len(requests)
             import_git(cli, url + "/basic/repo/.git", secrets_in_headers,
                        error="Git HTTPS fetch failed")
             assert len(requests) == start
 
-        with sanctum(bin_dir, root, {url: TOKEN_ENV}, cert, token) as (cli, mcp_url):
+        with sanctum(bin_dir, root, {url: TOKEN_ENV}, cert, token) as (cli, mcp_url, _):
             third_commit = commit(repo, THIRD)
             mcp = MCP["Rpc"](MCP["Http"](mcp_url))
             mcp.initialize()
@@ -282,6 +315,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="sanctum-git-https-") as temp:
         check(args.bin_dir.resolve(), Path(temp))
     print("Private Git HTTPS imports passed with Basic and Bearer credentials.")
+    print("Stalled HTTPS fetches closed on client disconnect and server shutdown.")
 
 
 if __name__ == "__main__":

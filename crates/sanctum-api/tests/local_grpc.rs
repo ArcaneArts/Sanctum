@@ -1640,6 +1640,68 @@ fn git_fixture(path: &std::path::Path, args: &[&str]) -> String {
 }
 
 #[tokio::test]
+async fn shutdown_interrupts_a_url_import_waiting_for_the_origin() {
+    use axum::{Router, body::Body, response::Response, routing::get};
+
+    const PREFIX: &str = "partial upstream body";
+    let document = || async {
+        use futures::StreamExt;
+        let body = futures::stream::iter([Ok::<_, std::io::Error>(PREFIX)])
+            .chain(futures::stream::pending());
+        Response::new(Body::from_stream(body))
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/notes.txt", listener.local_addr().unwrap());
+    let origin = tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/notes.txt", get(document)))
+            .await
+            .unwrap();
+    });
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start_with_workers(&dir, None, false).await;
+    create(&mut running.client, "default").await;
+    let mut client = running.client.clone();
+    let request = tokio::spawn(async move {
+        client
+            .import_url(v1::ImportUrlRequest {
+                scope: scope("default"),
+                url,
+                retain_original: false,
+            })
+            .await
+    });
+    let staging = dir.path().join("default/notes/staging");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::read_dir(&staging).is_ok_and(|mut entries| {
+                entries.any(|entry| {
+                    entry.is_ok_and(|entry| {
+                        entry
+                            .metadata()
+                            .is_ok_and(|file| file.len() == PREFIX.len() as u64)
+                    })
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the upstream prefix should be staged");
+    let (reply, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(request, running.stop())
+    })
+    .await
+    .unwrap();
+    let error = reply.unwrap().unwrap_err();
+    assert_eq!(error.code(), Code::Unavailable);
+    assert_eq!(error.message(), "server is shutting down");
+    assert!(std::fs::read_dir(staging).unwrap().next().is_none());
+    origin.abort();
+}
+
+#[tokio::test]
 async fn url_import_rejects_an_overlapping_fetch_for_the_same_source() {
     use axum::{Router, routing::get};
     use tokio::sync::Notify;
