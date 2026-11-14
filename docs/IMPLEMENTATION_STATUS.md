@@ -1722,6 +1722,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   both revisions to publish using their existing extraction objects. The
   smoke checked original bytes, canonical ranges, and duplicate deliveries.
   [PR #146](https://github.com/ArcaneArts/Sanctum/pull/146).
+- Hosted preparation and indexing verify downloaded UTF-8 against the
+  accepted digest before interpreting source text. The gRPC regression
+  alters bytes before preparation, after a saved checkpoint, and in the
+  older indexing path with no preparation receipt. Each job remains
+  registered across restart and publishes its original revision once the
+  accepted bytes are restored. Fetch returns the exact UTF-8.
+- The release worker and a generated Python gRPC client against live MinIO
+  observed HTTP 503 for both altered deliveries and verified recovery and
+  duplicate indexing. An upload that originally contained invalid UTF-8
+  reported `invalid_source`. A separate 200 MiB UTF-8 upload produced
+  56,862 chunks and an exact search and fetch excerpt. Preparation took
+  9.12 s and indexing took 9.03 s. Peak sampled server RSS was 42,549,248
+  bytes across 204 samples for this single local run.
+  [Storage contract](STORAGE.md#hosted-lexical-publication).
 
 ## Two simultaneous GiB-scale snapshot reads
 

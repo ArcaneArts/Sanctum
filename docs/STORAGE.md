@@ -270,15 +270,19 @@ A recorded outcome can be replayed while its database receipt is retained.
 ### Hosted lexical publication
 
 Cloud Tasks sends the registered operation to `/internal/tasks/prepare-upload`.
-The worker verifies the accepted input, counts overlapping chunks, and writes
+The worker verifies the accepted input length and BLAKE3 digest during
+download before decoding or counting chunks. It writes
 canonical UTF-8 for RTF to an immutable object. A conditional write records the
 canonical digest, length, and locator in the operation envelope. A retry can
 resume from this checkpoint on another worker. Plain text preparation refers
 to the accepted input object.
 
 The next task delivers the same operation reference to
-`/internal/tasks/index-upload`. It indexes overlapping chunks from the
-canonical object and verifies its digest, length, and chunk count as it reads.
+`/internal/tasks/index-upload`. It verifies the downloaded canonical object
+before building the index and checks the indexed digest, length, and chunk
+count before publication. A missing object or digest mismatch leaves the
+operation registered for retry. Invalid source errors describe input that
+matches the accepted upload.
 If a saved RTF extraction is missing or fails verification, the worker rebuilds
 it from the accepted RTF. It publishes a fresh object only if the reconstructed
 text and processing metadata match the recorded extraction.

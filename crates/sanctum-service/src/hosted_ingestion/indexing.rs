@@ -392,8 +392,15 @@ impl HostedCatalog {
         record: &Operation,
     ) -> Result<(NamedTempFile, RevisionContent)> {
         let input = record.input_key(prefix)?;
+        // Verify the accepted bytes before the parser can report a permanent source error.
         let staged = self
-            .download_source(scope, record.operation, &input, record.bytes, None)
+            .download_source(
+                scope,
+                record.operation,
+                &input,
+                record.bytes,
+                &record.blake3,
+            )
             .await?;
         let is_rtf = is_rtf(&record.upload.name);
         let expected = record.blake3.clone();
@@ -449,7 +456,7 @@ impl HostedCatalog {
                             record.operation,
                             &input,
                             canonical.content.bytes,
-                            None,
+                            &canonical.content.hash,
                         )
                         .await?;
                     (file, input.clone())
@@ -501,7 +508,7 @@ impl HostedCatalog {
                 record.operation,
                 &key,
                 expected.bytes,
-                Some(&expected.hash),
+                &expected.hash,
             )
             .await
         {
@@ -581,17 +588,13 @@ impl HostedCatalog {
         operation: Uuid,
         key: &Key,
         bytes: u64,
-        digest: Option<&str>,
+        digest: &str,
     ) -> Result<NamedTempFile> {
         let download_started = Instant::now();
-        let mut reader = self.open_source(key, bytes).await?;
+        let reader = self.open_source(key, bytes).await?;
         let staged = NamedTempFile::new()?;
         let mut output = tokio::fs::File::from_std(staged.reopen()?);
-        if let Some(digest) = digest {
-            copy_verified(reader, &mut output, bytes, digest).await?;
-        } else if tokio::io::copy(&mut reader, &mut output).await? != bytes {
-            return Err(invalid_input());
-        }
+        copy_verified(reader, &mut output, bytes, digest).await?;
         output.flush().await?;
         drop(output);
         tracing::debug!(
@@ -651,11 +654,6 @@ fn prepare_text(
     chunking: ChunkSettings,
 ) -> Result<(NamedTempFile, RevisionContent)> {
     let (file, encoding) = if is_rtf {
-        let mut hash = blake3::Hasher::new();
-        hash.update_reader(input.reopen()?)?;
-        if hash.finalize().to_hex().as_str() != original_hash {
-            return Err(invalid_input());
-        }
         let canonical = NamedTempFile::new()?;
         let mut writer = BufWriter::new(canonical.reopen()?);
         let encoding = rtf_to_utf8(BufReader::new(input.reopen()?), &mut writer)?;
