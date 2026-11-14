@@ -515,6 +515,12 @@ Merged in [PR #18](https://github.com/ArcaneArts/Sanctum/pull/18).
   another due watch, then verified that the deferred watch queued its own
   file without waiting for the configured one-hour interval.
   [Watch scheduling](LOCAL_API.md#watched-folders).
+- A saved watch reports an error if its path starts resolving through a
+  symlink to a different directory. The macOS and Linux ARM64 gRPC tests
+  restarted with a redirected ancestor and verified the watch preserved
+  its existing source. After restoring the path, the new revision used
+  the same source ID. A generated Python client and MCP exercised the
+  same recovery against the standalone macOS server.
 - The gRPC test ran on macOS and in a Linux ARM64 container with a one-hour
   reconciliation interval. It picked up a newly created nested file and
   coalesced three rapid saves into one replacement. The overflow fixture

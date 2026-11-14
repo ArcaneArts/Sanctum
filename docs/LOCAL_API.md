@@ -650,10 +650,11 @@ sooner if its configured interval is shorter.
 Missing files are reported by default. Use `--prune-missing` to delete
 selected sources whose files disappeared or stopped being regular files.
 An unavailable root or an incomplete scan preserves sources and records the
-error. Removing a watch
-leaves existing source data and accepted jobs available. `ListWatchedFolders`
-reports the most recent scan outcome and returns an `after_id` cursor for
-pagination.
+error. If the saved path resolves to a different directory through a new
+symlink, scans and new native subscriptions wait for the saved canonical path
+to become available again. Removing a watch leaves existing source data and
+accepted jobs available. `ListWatchedFolders` reports the most recent scan
+outcome and returns an `after_id` cursor for pagination.
 
 ## Metadata and changes
 

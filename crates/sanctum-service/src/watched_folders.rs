@@ -7,7 +7,10 @@ use uuid::Uuid;
 
 mod notifications;
 
-use crate::{ImportOptions, ImportState, Service, local_import::LocalScan};
+use crate::{
+    ImportOptions, ImportState, Service,
+    local_import::{ImportPath, LocalScan},
+};
 
 const BUSY_RETRY_SECONDS: u32 = 5;
 
@@ -135,7 +138,7 @@ impl Service {
         let mut error = None;
         let scan = self.scan_local_until(
             &folder.scope,
-            Path::new(&folder.path),
+            ImportPath::Watched(Path::new(&folder.path)),
             &folder.options,
             || *stop.borrow(),
             |event| {

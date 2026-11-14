@@ -17,6 +17,8 @@ use sanctum_core::Result;
 use sanctum_db_sqlite::queue::LocalQueue;
 use uuid::Uuid;
 
+use crate::local_import::canonical_watch_root;
+
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const DEBOUNCE: Duration = Duration::from_millis(400);
@@ -216,12 +218,8 @@ impl Notifications {
 
 fn subscribe(watcher: &mut RecommendedWatcher, root: &Path) -> notify::Result<()> {
     // A formerly canonical directory can be replaced while the server is running.
-    if !root.symlink_metadata()?.is_dir() {
-        return Err(notify::Error::generic(
-            "watch root is no longer a directory",
-        ));
-    }
-    watcher.watch(root, RecursiveMode::Recursive)
+    let root = canonical_watch_root(root)?;
+    watcher.watch(&root, RecursiveMode::Recursive)
 }
 
 fn affects(event_path: &Path, folder: &Path) -> bool {
