@@ -108,10 +108,20 @@ impl LocalQueue {
                 include_str!("runtime_v14.sql"),
             ],
         )?;
+        // The previous worker may have stopped after recording a cancellation.
+        // Settle it before startup checks which staged inputs still have owners.
         connection
             .execute(
-                "UPDATE ingestion_jobs
-             SET status = 'accepted', processed_bytes = 0
+                "UPDATE ingestion_jobs SET status = 'canceled', extracting = 0,
+                 finished_at = unixepoch(), initial_metadata = NULL, initial_chunk_metadata = NULL
+             WHERE status IN ('accepted', 'indexing')
+               AND cancel_requested = 1 AND publication_started = 0",
+                [],
+            )
+            .map_err(database_error)?;
+        connection
+            .execute(
+                "UPDATE ingestion_jobs SET status = 'accepted', processed_bytes = 0, extracting = 0
              WHERE status IN ('indexing', 'publishing')",
                 [],
             )
@@ -548,6 +558,7 @@ impl LocalQueue {
             .execute(
                 "UPDATE ingestion_jobs SET
                  status = CASE WHEN cancel_requested = 1 THEN 'canceled' ELSE 'failed' END,
+                 extracting = 0,
                  error_code = CASE WHEN cancel_requested = 0 THEN ?2 END,
                  error_message = CASE WHEN cancel_requested = 0 THEN ?3 END,
                  initial_metadata = CASE WHEN cancel_requested = 0 AND ?2 = 'retryable'

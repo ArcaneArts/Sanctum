@@ -88,6 +88,13 @@ Merged in [PR #3](https://github.com/ArcaneArts/Sanctum/pull/3).
 - The gRPC tests cover persisted pause and acceptance, tenant-scoped cancellation,
   recovery from a missing receipt, and retry after a storage read failure.
 - Caller-provided upload request IDs were added in a later cycle.
+- Startup settles recorded pre-publication cancellations before workers
+  claim jobs. The local gRPC regression verified terminal status, removal of
+  staged RTF and queued metadata, and replay of the canceled receipt while
+  the queue stayed paused. A standalone process check used the public
+  cancellation API at a seeded extraction checkpoint, sent `SIGKILL`, then
+  verified the same status over gRPC and MCP after restart.
+  [PR #134](https://github.com/ArcaneArts/Sanctum/pull/134).
 
 ## Local source lifecycle
 
