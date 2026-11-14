@@ -1,22 +1,43 @@
+use std::time::Duration;
+
+use futures::{StreamExt, stream};
 use sanctum_core::{Error, Result, Scope};
 use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES, Version};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::io::AsyncReadExt;
+use tokio::{io::AsyncReadExt, time::timeout};
 use uuid::Uuid;
 
 use crate::{
-    HostedCatalog, Task, TaskStage, embedding::Coverage, hosted_dispatch::DISPATCH_WINDOW_SECONDS,
+    HostedCatalog, Task, TaskStage,
+    embedding::Coverage,
+    hosted_dispatch::DISPATCH_WINDOW_SECONDS,
     hosted_ingestion::unix_seconds,
+    maintenance_budget::{REQUEST_TIMEOUT, SweepBudget},
 };
 
 const DISCOVERY_PAGE: u32 = 256;
+const DISCOVERY_BATCH: usize = 16;
+const DISCOVERY_CONCURRENCY: usize = 4;
+const DISCOVERY_RETRIES_PER_BATCH: usize = 4;
+const DISCOVERY_RETRY_LIMIT: usize = 256;
+const DISCOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Serialize, Deserialize)]
 struct Discovery {
+    #[serde(default)]
+    checkpoint_version: u8,
     profile: Option<String>,
     run: Uuid,
     cursor: Option<String>,
     complete: bool,
+    #[serde(default)]
+    pending: Vec<String>,
+    #[serde(default)]
+    at_end: bool,
+    #[serde(default)]
+    retries: Vec<String>,
+    #[serde(default)]
+    rescan: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -30,6 +51,7 @@ struct Rebuild {
 
 pub struct RebuildPage {
     pub discovered: usize,
+    pub deferred: usize,
     pub complete: bool,
 }
 
@@ -37,9 +59,19 @@ impl HostedCatalog {
     /// Discover collections from their manifests. The worker resolves the active catalog
     /// and current collection snapshot only when it runs a batch.
     pub async fn discover_profile_rebuild(&self) -> Result<RebuildPage> {
+        timeout(
+            REQUEST_TIMEOUT,
+            self.discover_profile_page(SweepBudget::with_item_timeout(DISCOVERY_ATTEMPT_TIMEOUT)),
+        )
+        .await
+        .map_err(|_| Error::Busy("profile discovery checkpoint timed out".into()))?
+    }
+
+    async fn discover_profile_page(&self, budget: SweepBudget) -> Result<RebuildPage> {
         if self.dispatcher.is_none() && self.standalone_wake.is_none() {
             return Ok(RebuildPage {
                 discovered: 0,
+                deferred: 0,
                 complete: true,
             });
         }
@@ -54,10 +86,15 @@ impl HostedCatalog {
                 let condition =
                     existing.map_or(Condition::Create, |(_, version)| Condition::Match(version));
                 let discovery = Discovery {
+                    checkpoint_version: 1,
                     profile: profile.map(str::to_owned),
                     run: Uuid::new_v4(),
                     cursor: None,
                     complete: profile.is_none(),
+                    pending: Vec::new(),
+                    at_end: false,
+                    retries: Vec::new(),
+                    rescan: false,
                 };
                 let version = self
                     .write_rebuild_record(&key, &discovery, condition)
@@ -65,39 +102,122 @@ impl HostedCatalog {
                 (discovery, version)
             }
         };
-        if discovery.complete {
+        if discovery.checkpoint_version == 0 {
+            // An older worker can overwrite the new checkpoint during rollout.
+            // Re-list with the same run ID to recover work it could not track.
+            discovery.checkpoint_version = 1;
+            discovery.cursor = None;
+            discovery.complete = profile.is_none();
+        } else if discovery.complete {
             return Ok(RebuildPage {
                 discovered: 0,
+                deferred: 0,
                 complete: true,
             });
         }
 
-        let page = self
-            .storage
-            .list(
-                self.prefix.as_ref(),
-                discovery.cursor.as_deref(),
-                DISCOVERY_PAGE,
-            )
-            .await?;
-        if page.next_cursor.is_some() && page.next_cursor == discovery.cursor {
-            return Err(Error::Internal(
-                "profile discovery cursor did not advance".into(),
-            ));
+        if !discovery.complete && discovery.pending.is_empty() && !discovery.at_end {
+            let page = self
+                .storage
+                .list(
+                    self.prefix.as_ref(),
+                    discovery.cursor.as_deref(),
+                    DISCOVERY_PAGE,
+                )
+                .await?;
+            if page.next_cursor.is_some() && page.next_cursor == discovery.cursor {
+                return Err(Error::Internal(
+                    "profile discovery cursor did not advance".into(),
+                ));
+            }
+            discovery.pending = page
+                .objects
+                .into_iter()
+                .filter(|object| {
+                    collection_manifest(self.prefix.as_ref(), &object.key).is_some()
+                        && !discovery
+                            .retries
+                            .iter()
+                            .any(|key| key == object.key.as_str())
+                })
+                .map(|object| object.key.to_string())
+                .collect();
+            discovery.cursor = page.next_cursor;
+            discovery.at_end = discovery.cursor.is_none();
         }
+
+        let reserved_for_new = discovery
+            .pending
+            .len()
+            .min(DISCOVERY_BATCH - DISCOVERY_RETRIES_PER_BATCH);
+        let retry_count = discovery
+            .retries
+            .len()
+            .min(DISCOVERY_BATCH - reserved_for_new);
+        let new_count = discovery.pending.len().min(DISCOVERY_BATCH - retry_count);
+        let candidates = discovery
+            .retries
+            .drain(..retry_count)
+            .chain(discovery.pending.drain(..new_count))
+            .map(|path| {
+                let manifest = Key::parse(&path)?;
+                let scope = collection_manifest(self.prefix.as_ref(), &manifest)
+                    .ok_or_else(|| Error::Internal("invalid profile discovery manifest".into()))?;
+                Ok((path, scope))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let run = discovery.run;
+        let mut attempts = stream::iter(candidates)
+            .map(|(path, scope)| {
+                let budget = &budget;
+                async move {
+                    let result = budget.attempt(self.ensure_rebuild(&scope, run)).await;
+                    (path, scope, result)
+                }
+            })
+            .buffer_unordered(DISCOVERY_CONCURRENCY);
         let mut discovered = 0;
-        for object in page.objects {
-            if let Some(scope) = collection_manifest(self.prefix.as_ref(), &object.key) {
-                self.ensure_rebuild(&scope, discovery.run).await?;
-                discovered += 1;
+        let mut deferred = 0;
+        while let Some((path, scope, result)) = attempts.next().await {
+            match result {
+                Ok(Some(())) => {
+                    discovered += 1;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
+                    "profile rebuild discovery will retry the collection")
+                }
+            }
+            deferred += 1;
+            if discovery.retries.len() < DISCOVERY_RETRY_LIMIT {
+                discovery.retries.push(path);
+            } else {
+                // Bound the control object. Entries past the limit are rediscovered
+                // with the same run ID, so already-scheduled tasks stay reusable.
+                discovery.rescan = true;
             }
         }
-        discovery.complete = page.next_cursor.is_none();
-        discovery.cursor = page.next_cursor;
+        if discovery.at_end && discovery.pending.is_empty() && discovery.rescan {
+            discovery.at_end = false;
+            discovery.rescan = false;
+        }
+        discovery.complete = discovery.complete
+            || (discovery.at_end && discovery.pending.is_empty() && discovery.retries.is_empty());
         self.write_rebuild_record(&key, &discovery, Condition::Match(version))
             .await?;
+        tracing::debug!(
+            event = "embedding_profile_discovery",
+            discovered,
+            deferred,
+            pending = discovery.pending.len(),
+            complete = discovery.complete,
+            "saved hosted profile discovery progress"
+        );
         Ok(RebuildPage {
             discovered,
+            deferred,
             complete: discovery.complete,
         })
     }

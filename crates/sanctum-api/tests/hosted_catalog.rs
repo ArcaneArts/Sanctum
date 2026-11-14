@@ -4341,6 +4341,146 @@ async fn idle_collections_rebuild_after_a_profile_change() {
     );
 }
 
+#[tokio::test]
+async fn profile_discovery_keeps_failed_collections_pending_without_blocking_later_pages() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
+    let dispatch = Arc::new(TestDispatch {
+        fail: AtomicU8::new(0),
+        delivered: std::sync::Mutex::new(Vec::new()),
+    });
+    let catalog = || {
+        HostedCatalog::new(storage.clone(), None, 1024)
+            .unwrap()
+            .with_dispatch(dispatch.clone())
+            .with_embedding(Some(Arc::new(HostedEmbeddingFixture {
+                profile: "fixture-v2",
+                fail: AtomicU8::new(0),
+                queries: AtomicUsize::new(0),
+            })))
+    };
+    let first = catalog();
+    for (tenant, collection) in [("early", "blocked"), ("early", "other"), ("late", "notes")] {
+        first
+            .create_collection(
+                &sanctum_core::Scope {
+                    tenant: tenant.parse().unwrap(),
+                    collection: collection.parse().unwrap(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    for index in 0..256 {
+        let key = Key::parse(format!("filler/{index:03}")).unwrap();
+        storage
+            .put_control(&key, b"{}".as_slice().into(), Condition::Create)
+            .await
+            .unwrap();
+    }
+    storage
+        .interrupt
+        .store(REJECT_PROFILE_REBUILD, Ordering::Relaxed);
+    let page = first.discover_profile_rebuild().await.unwrap();
+    assert_eq!(
+        (page.discovered, page.deferred, page.complete),
+        (1, 1, false)
+    );
+    assert!(
+        storage
+            .head(&Key::parse("_embedding/early/other.json").unwrap())
+            .await
+            .is_ok()
+    );
+    drop(first);
+
+    let restarted = catalog();
+    let page = restarted.discover_profile_rebuild().await.unwrap();
+    assert_eq!(
+        (page.discovered, page.deferred, page.complete),
+        (1, 1, false)
+    );
+    assert!(
+        storage
+            .head(&Key::parse("_embedding/late/notes.json").unwrap())
+            .await
+            .is_ok()
+    );
+    let blocked = Key::parse("_embedding/early/blocked.json").unwrap();
+    assert!(matches!(
+        storage.head(&blocked).await,
+        Err(Error::NotFound(_))
+    ));
+
+    storage.interrupt.store(0, Ordering::Relaxed);
+    let page = restarted.discover_profile_rebuild().await.unwrap();
+    assert_eq!(
+        (page.discovered, page.deferred, page.complete),
+        (1, 0, true)
+    );
+    assert!(storage.head(&blocked).await.is_ok());
+    for shard in 0..sanctum_service::DISPATCH_SHARDS {
+        restarted.reconcile_shard(shard).await.unwrap();
+    }
+    let delivered = dispatch.delivered.lock().unwrap();
+    assert_eq!(delivered.len(), 3);
+    assert!(delivered.iter().all(|(_, stage, profile)| {
+        *stage == TaskStage::Rebuild { step: 0 } && profile.as_deref() == Some("fixture-v2")
+    }));
+}
+
+#[tokio::test]
+async fn profile_discovery_rechecks_an_older_workers_checkpoint_with_the_same_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let catalog = HostedCatalog::new(storage.clone(), None, 1024)
+        .unwrap()
+        .with_standalone_worker(Arc::new(tokio::sync::Notify::new()))
+        .with_embedding(Some(Arc::new(HostedEmbeddingFixture {
+            profile: "fixture-v2",
+            fail: AtomicU8::new(0),
+            queries: AtomicUsize::new(0),
+        })));
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    catalog.create_collection(&scope, None).await.unwrap();
+    let run = uuid::Uuid::new_v4();
+    let discovery = Key::parse("_embedding/discovery.json").unwrap();
+    storage
+        .put_control(
+            &discovery,
+            serde_json::to_vec(&serde_json::json!({
+                "profile": "fixture-v2", "run": run, "cursor": null, "complete": true,
+            }))
+            .unwrap()
+            .into(),
+            Condition::Create,
+        )
+        .await
+        .unwrap();
+
+    let page = catalog.discover_profile_rebuild().await.unwrap();
+    assert_eq!(
+        (page.discovered, page.deferred, page.complete),
+        (1, 0, true)
+    );
+    let rebuild = Key::parse("_embedding/default/notes.json").unwrap();
+    let mut record = storage.get(&rebuild).await.unwrap();
+    let mut bytes = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut record.reader, &mut bytes)
+        .await
+        .unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(record["run"], run.to_string());
+    assert_eq!(
+        catalog.discover_profile_rebuild().await.unwrap().discovered,
+        0
+    );
+}
+
 struct TestDispatch {
     fail: AtomicU8,
     delivered: std::sync::Mutex<Vec<(uuid::Uuid, TaskStage, Option<String>)>>,
@@ -6377,6 +6517,7 @@ const LEAVE_COLLECTION_CREATION_INTENT: u8 = 13;
 const REJECT_RETIRED_SOURCE_DELETE: u8 = 14;
 const LOSE_SOURCE_SWEEP_CHECKPOINT_RESPONSE: u8 = 15;
 const REJECT_SOURCE_SWEEP_RELIST: u8 = 16;
+const REJECT_PROFILE_REBUILD: u8 = 17;
 const PARALLEL_RANGE_START: u8 = 40;
 const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
 const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
@@ -6470,6 +6611,13 @@ impl Storage for InterruptAcceptance {
         bytes: axum::body::Bytes,
         condition: Condition,
     ) -> StorageResult<Version> {
+        if key.as_str() == "_embedding/early/blocked.json"
+            && self.interrupt.load(Ordering::Relaxed) == REJECT_PROFILE_REBUILD
+        {
+            return Err(Error::Busy(
+                "test blocked one profile rebuild record".into(),
+            ));
+        }
         let interrupt = if key.as_str().ends_with("/operation.json") {
             match self.interrupt.load(Ordering::Relaxed) {
                 3 => {

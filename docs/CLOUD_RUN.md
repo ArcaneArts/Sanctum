@@ -191,11 +191,21 @@ full budget is counted as a failure and rediscovered on a future full scan.
 The next invocation drains the saved page before listing again. The
 source sweep response and cleanup log report
 `deferred_objects` when a failed delete has been rescheduled. The worker
-continues with other due objects in that collection. The embedding profile
-job checks the worker's configured profile and
-resumes discovery after a change. It shares the existing dispatch
-shards. Point scheduled requests and task deliveries at the active
-worker revision when updating the embedding configuration.
+continues with other due objects in that collection.
+
+The embedding profile job checks the worker's configured profile and resumes
+its scan after a change. Each invocation attempts up to 16 collections with up
+to four attempts in flight, 30 seconds per attempt, and 240 seconds including
+checkpoint I/O. The checkpoint stores the listing cursor, unvisited collections
+from the current page, and up to 256 deferred collections. Retries share the
+batch with newly discovered collections, so failed writes leave later pages
+reachable. If more failures need to be retained, the scan makes another pass
+under the same rebuild ID. On upgrade, a checkpoint written by an older worker
+also prompts a rescan with the existing ID. Scheduled rebuilds keep their task
+IDs. The route reports `discovered`, `deferred`, and `complete`. Here `complete`
+means discovery has finished scheduling work. Embedding progress is reported
+by `GetEmbeddingStatus`. Point scheduled requests and task deliveries at the
+active worker revision when updating the embedding configuration.
 
 ## Verify a deployment
 

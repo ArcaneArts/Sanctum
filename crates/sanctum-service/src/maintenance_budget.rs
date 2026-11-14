@@ -14,9 +14,13 @@ pub(crate) struct SweepBudget {
 
 impl SweepBudget {
     pub(crate) fn start() -> Self {
+        Self::with_item_timeout(ITEM_TIMEOUT)
+    }
+
+    pub(crate) fn with_item_timeout(item_timeout: Duration) -> Self {
         Self {
             work_deadline: Instant::now() + WORK_TIMEOUT,
-            item_timeout: ITEM_TIMEOUT,
+            item_timeout,
         }
     }
 
