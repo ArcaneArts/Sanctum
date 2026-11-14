@@ -131,6 +131,14 @@ range log counts received body bytes across attempts. Missing objects
 and invalid range responses return immediately.
 [GCS object downloads](https://docs.cloud.google.com/storage/docs/json_api/v1/objects/get),
 [retry behavior](https://docs.cloud.google.com/storage/docs/retry-strategy).
+
+Object listing retries the same prefix and page token after a transient HTTP
+error, interrupted response body, or timeout. Each page has up to three attempts
+of ten seconds each, plus backoff. The adapter returns only a complete,
+validated page, so a failed attempt contributes no objects to usage totals or
+maintenance scans. Authorization errors and malformed JSON end the request.
+[GCS list pagination](https://docs.cloud.google.com/storage/docs/json_api/v1/objects/list).
+
 Bulk transfers use bounded 8 MiB parts in a GCS resumable upload
 session. After an interrupted request or retryable HTTP failure,
 the adapter asks GCS for its persisted offset and resumes from that byte.

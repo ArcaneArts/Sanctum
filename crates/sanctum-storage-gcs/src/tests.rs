@@ -27,6 +27,7 @@ struct Fixture {
     writes: Mutex<Vec<String>>,
     parts: Mutex<Vec<String>>,
     reads: Mutex<Vec<String>>,
+    lists: Mutex<Vec<Option<String>>>,
     interrupt_download: Arc<Notify>,
 }
 
@@ -107,18 +108,60 @@ async fn part(
 }
 
 async fn list(
+    State(fixture): State<Arc<Fixture>>,
     Query(query): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
 ) -> axum::response::Response {
     assert_credentials(&headers);
+    let token = query.get("pageToken");
+    let attempt = {
+        let mut requests = fixture.lists.lock().unwrap();
+        requests.push(token.cloned());
+        requests
+            .iter()
+            .filter(|previous| previous.as_ref() == token)
+            .count()
+    };
+    if query["prefix"] == "usage/" {
+        assert_eq!(query["maxResults"], "1000");
+        return match (token.map(String::as_str), attempt) {
+            (None, 1) => Json(json!({
+                "items": [metadata("usage/a", 4, 9)], "nextPageToken": "opaque/+ token="
+            }))
+            .into_response(),
+            (Some("opaque/+ token="), 1) => StatusCode::TOO_MANY_REQUESTS.into_response(),
+            (Some("opaque/+ token="), 2) => {
+                let body = stream::iter([Ok(Bytes::from_static(b"{\"items\":["))]).chain(
+                    stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        Err(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "listing body interrupted",
+                        ))
+                    }),
+                );
+                Body::from_stream(body).into_response()
+            }
+            (Some("opaque/+ token="), 3) => Json(json!({
+                "items": [metadata("usage/b", 13, 10)]
+            }))
+            .into_response(),
+            _ => panic!("unexpected usage list attempt {attempt}"),
+        };
+    }
     assert_eq!(query["prefix"], "default/notes/");
     assert_eq!(query["maxResults"], "1");
-    match query.get("pageToken").map(String::as_str) {
+    match token.map(String::as_str) {
         None => Json(
             json!({"items": [metadata("default/notes/a", 4, 9)], "nextPageToken": "opaque-token"}),
         )
         .into_response(),
         Some("opaque-token") => Json(json!({})).into_response(),
+        Some("unavailable") => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Some("forbidden") => StatusCode::FORBIDDEN.into_response(),
+        Some("invalid") => "{\"items\":[".into_response(),
+        Some("stalled") if attempt == 1 => std::future::pending().await,
+        Some("stalled") => Json(json!({})).into_response(),
         _ => StatusCode::BAD_REQUEST.into_response(),
     }
 }
@@ -437,6 +480,73 @@ async fn native_downloads_are_generation_fenced_and_ranges_are_exact() {
             .unwrap()
             .next_cursor
             .is_none()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn usage_retries_the_same_gcs_page_without_counting_it_twice() {
+    let (storage, fixture, server) = start().await;
+    let prefix = Key::parse("usage").unwrap();
+    let mut progress = Vec::new();
+    let measured = sanctum_storage::usage_with_progress(&storage, Some(&prefix), |bytes, files| {
+        progress.push((bytes, files));
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(progress, [(4, 1)]);
+    assert_eq!((measured.bytes, measured.files), (17, 2));
+    assert_eq!(
+        *fixture.lists.lock().unwrap(),
+        [
+            None,
+            Some("opaque/+ token=".into()),
+            Some("opaque/+ token=".into()),
+            Some("opaque/+ token=".into())
+        ]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn list_page_bounds_retries_and_preserves_permanent_errors() {
+    let (storage, fixture, server) = start().await;
+    let prefix = Key::parse("default/notes").unwrap();
+    assert!(matches!(
+        storage.list(Some(&prefix), Some("unavailable"), 1).await,
+        Err(Error::Busy(_))
+    ));
+    assert_eq!(fixture.lists.lock().unwrap().len(), 3);
+    assert!(matches!(
+        storage.list(Some(&prefix), Some("forbidden"), 1).await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(fixture.lists.lock().unwrap().len(), 4);
+    assert!(
+        matches!(storage.list(Some(&prefix), Some("invalid"), 1).await,
+        Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidData)
+    );
+    assert_eq!(fixture.lists.lock().unwrap().len(), 5);
+    server.abort();
+}
+
+#[tokio::test]
+async fn list_page_retries_a_stalled_response() {
+    let (storage, fixture, server) = start().await;
+    let mut url = storage.objects_url(false, None);
+    url.query_pairs_mut()
+        .append_pair("prefix", "default/notes/")
+        .append_pair("maxResults", "1")
+        .append_pair("pageToken", "stalled");
+    let page = storage
+        .list_page(url, Duration::from_millis(250))
+        .await
+        .unwrap();
+    assert!(page.objects.is_empty() && page.next_cursor.is_none());
+    assert_eq!(
+        *fixture.lists.lock().unwrap(),
+        [Some("stalled".into()), Some("stalled".into())]
     );
     server.abort();
 }
