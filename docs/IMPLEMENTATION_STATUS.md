@@ -2441,6 +2441,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   tests verify a timed-out writer cannot resume, and that a new writer
   replays a committed receipt. [Database publication](STORAGE.md#object-backed-database-publication).
 
+## Source and snapshot uploads after a filesystem sync error
+
+- Source uploads and SQLite publication preserve an I/O error from the
+  write. Readback verifies bytes after an ambiguous remote reply, while
+  an explicit local sync failure requires a new write.
+- Filesystem regressions injected a sync error with a readable object
+  already in place. The source upload left no accepted operation or
+  dispatch hint. The snapshot upload left no committed generation or
+  receipt. Both succeeded on retry. Live MinIO tests exercised recovery
+  of lost replies for source objects, full snapshots, and page deltas.
+  [Database publication](STORAGE.md#object-backed-database-publication),
+  [Hosted uploads](STORAGE.md#hosted-uploads).
+
 ## SQLite snapshot uploads with lost responses
 
 - A writer can publish a snapshot or page delta whose upload reply was

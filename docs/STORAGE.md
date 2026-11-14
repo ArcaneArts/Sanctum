@@ -63,11 +63,13 @@ can already have committed. Reacquire ownership and replay the same
 operation ID to recover any committed receipt. Snapshot downloads verify
 length and BLAKE3. The executor applies at most 64 prepared commands and
 their receipts in one SQLite transaction. It uploads a consistent SQLite
-backup under a fresh key before attempting to publish it. If that upload fails,
-the writer can recover by streaming the candidate back and verifying its
-exact byte length and BLAKE3 digest under the same lease. This also applies
-to page deltas. Replaying a batch of previously applied commands returns
-the saved outcomes and current generation. Only the successful HEAD write
+backup under a fresh key before attempting to publish it. After an ambiguous
+storage reply, the writer can recover by streaming the candidate back and
+verifying its exact byte length and BLAKE3 digest under the same lease.
+This also applies to page deltas. A filesystem I/O failure aborts
+publication even if the candidate is readable. Replaying a batch of
+previously applied commands returns the saved outcomes and current
+generation. Only the successful HEAD write
 makes a new database visible. [SQLite online backup](https://www.sqlite.org/backup.html).
 
 Cleanup marks a noncurrent snapshot when it first observes it, then
@@ -245,11 +247,13 @@ cargo run --locked -p sanctum-cli -- job notes OPERATION_ID
 The server spools the stream to a temporary file and honors
 `max_source_bytes`. It streams the original bytes to a unique input key under
 `<tenant>/collections/<collection>/operations/<operation>/inputs/`.
-If the upload returns an error, the server can recover by streaming the
+After an ambiguous storage reply, the server can recover by streaming the
 object back and confirming its byte length and BLAKE3 digest before
 acceptance. The same verification applies when uploading canonical RTF
-text before a preparation checkpoint. The sibling `operation.json` is
-created conditionally or replaces an abandoned-input fence by version.
+text before a preparation checkpoint. A filesystem I/O failure still
+fails the upload, even if the object can be read. The sibling
+`operation.json` is created conditionally or replaces an abandoned-input
+fence by version.
 An accepted envelope records the input's length and BLAKE3 digest,
 ingestion options, and pending registration stage. After an ambiguous
 envelope write, the server reads back the accepted operation and checks

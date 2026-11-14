@@ -100,6 +100,7 @@ pub trait Storage: Send + Sync {
 
     /// Stream to a fresh unique key owned by the caller.
     /// On ambiguous failure, retry with a new key or verify the previous object.
+    /// An I/O error can indicate a failed local sync, which readback cannot resolve.
     /// Coordination keys use put_control with a storage-side precondition.
     async fn put_stream(&self, key: &Key, reader: Reader, length: u64) -> Result<Version>;
     async fn put_control(&self, key: &Key, bytes: Bytes, condition: Condition) -> Result<Version>;

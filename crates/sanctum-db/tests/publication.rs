@@ -142,6 +142,57 @@ async fn filesystem_verifies_snapshots_after_a_lost_upload_response() {
 }
 
 #[tokio::test]
+async fn filesystem_snapshot_sync_failure_leaves_the_committed_generation_unchanged() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let faults = Arc::new(PublicationStorage::new(storage.clone()));
+    let publication = Publication::new(faults.clone(), Duration::from_secs(15)).unwrap();
+    let unit = Unit::catalog(None, &"default".parse().unwrap()).unwrap();
+    let operation = Uuid::new_v4();
+    let mut writer = publication.acquire(&unit).await.unwrap();
+    *faults.upload_reply.lock().unwrap() = Some(UploadReply::SyncError);
+
+    assert!(matches!(
+        writer.apply(vec![command(operation, 7)], apply_value).await,
+        Err(Error::Io(error)) if error.to_string() == "snapshot directory sync failed"
+    ));
+    assert_eq!(faults.snapshot_gets.load(Ordering::Relaxed), 0);
+    assert!(publication.generation(&unit).await.unwrap().is_none());
+    assert!(
+        publication
+            .receipt(&unit, operation)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let prefix = Key::parse("default/catalog/snapshots").unwrap();
+    let abandoned = storage.list(Some(&prefix), None, 10).await.unwrap().objects;
+    assert_eq!(abandoned.len(), 1);
+    assert!(abandoned[0].length > 0);
+
+    let (generation, receipts) = writer
+        .apply(vec![command(operation, 7)], apply_value)
+        .await
+        .unwrap();
+    assert!(
+        !abandoned[0]
+            .key
+            .as_str()
+            .contains(&generation.id.to_string())
+    );
+    assert_eq!(receipts[0].outcome, "7");
+    writer.release().await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let visible = publication
+        .read(&unit, scratch.path())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(visible.generation, generation);
+    assert_eq!(value(visible.path()), 7);
+}
+
+#[tokio::test]
 #[ignore = "requires a live MinIO bucket and S3 credentials"]
 async fn minio_verifies_snapshots_after_a_lost_upload_response() {
     let prefix = format!("upload-recovery-{}", Uuid::new_v4());
@@ -1049,6 +1100,7 @@ async fn publication_reuses_immutable_snapshots_for_receipts_and_subsequent_writ
 enum UploadReply {
     Lost,
     Corrupt,
+    SyncError,
 }
 
 enum ManifestReply {
@@ -1161,10 +1213,13 @@ impl Storage for PublicationStorage {
             reader
         };
         let version = self.inner.put_stream(key, reader, length).await?;
-        if reply.is_some() {
-            return Err(Error::Busy("snapshot upload response lost".into()));
+        match reply {
+            Some(UploadReply::SyncError) => {
+                Err(std::io::Error::other("snapshot directory sync failed").into())
+            }
+            Some(_) => Err(Error::Busy("snapshot upload response lost".into())),
+            None => Ok(version),
         }
-        Ok(version)
     }
 
     async fn put_control(

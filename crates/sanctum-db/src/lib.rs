@@ -797,6 +797,8 @@ impl Lease {
                 .await
             {
                 Ok(_) => Ok(()),
+                // A failed local sync can leave readable bytes without durability.
+                Err(error @ (Error::Invalid(_) | Error::Io(_))) => Err(error),
                 Err(error) => {
                     // The upload can commit before its reply reaches the writer.
                     // This is a fresh object key. Verify the candidate by digest
