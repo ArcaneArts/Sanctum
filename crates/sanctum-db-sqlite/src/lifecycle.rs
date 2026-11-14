@@ -33,6 +33,16 @@ impl CollectionDb {
         find_source(&self.0, id, external)
     }
 
+    pub fn has_active_source(&self, source: Uuid) -> Result<bool> {
+        self.0
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sources WHERE id = ?1 AND deleted = 0)",
+                [source.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
+    }
+
     pub fn due_revision_garbage(&self) -> Result<Vec<RevisionKey>> {
         query_all(
             &self.0,

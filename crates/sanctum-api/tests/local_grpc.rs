@@ -4270,6 +4270,120 @@ async fn deletion_blocks_queued_replacement_and_reclaims_all_revisions() {
 }
 
 #[tokio::test]
+async fn deleting_a_local_source_reclaims_its_failed_replacement_while_queue_is_paused() {
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    let first = upload(&mut running.client, header("default"), b"original opal").await;
+    let committed = running
+        .client
+        .submit_text(tokio_stream::iter([
+            replacement(Some(&first.source_id), Some(&first.revision_id)),
+            data(b"published onyx"),
+            end(),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    let committed_request = job_request(committed.operation_id);
+    let committed = await_ready(&mut running.client, committed_request.clone()).await;
+    let original = committed.text_revision.clone().unwrap();
+    running.stop().await;
+
+    let mut running = Running::start_with_workers(&dir, None, false).await;
+    let mut upload = replacement(Some(&original.source_id), Some(&original.revision_id));
+    if let Some(Frame::Header(header)) = &mut upload.frame {
+        header.request_id = Some(uuid::Uuid::new_v4().to_string());
+    }
+    let source_bytes = b"failed tourmaline";
+    let frames = || tokio_stream::iter([upload.clone(), data(source_bytes), end()]);
+    let failed = running
+        .client
+        .submit_text(frames())
+        .await
+        .unwrap()
+        .into_inner();
+    let pending = job_request(failed.operation_id);
+    let staged = text_path(&dir, &failed.source_id, &failed.revision_id);
+    std::fs::remove_file(&staged).unwrap();
+    assert!(running.service.process_next().is_err());
+    std::fs::write(&staged, source_bytes).unwrap();
+    let failure = await_failure(&mut running.client, pending.clone()).await;
+    assert_eq!(failure.error_code.as_deref(), Some("retryable"));
+
+    running.service.pause_queue(true).unwrap();
+    let delete = v1::DeleteSourceRequest {
+        scope: scope("default"),
+        source_id: original.source_id.clone(),
+        expected_revision_id: Some(original.revision_id.clone()),
+        request_id: None,
+    };
+    running.client.delete_source(delete).await.unwrap();
+    running.stop().await;
+
+    // The collection already committed this replacement, but its queue
+    // receipt was lost. Deleting the source must not rewrite its outcome.
+    let runtime = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
+    runtime.execute(
+        "UPDATE ingestion_jobs SET status='failed', error_code='retryable', content_hash=NULL, chunks=NULL
+         WHERE operation_id=?1 AND publication_started=1",
+        [&committed_request.operation_id],
+    ).unwrap();
+    let collection = rusqlite::Connection::open(dir.path().join("default/notes/meta.db")).unwrap();
+    assert!(
+        collection
+            .query_row(
+                "SELECT deleted FROM sources WHERE id=?1",
+                [&original.source_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    );
+    drop(runtime);
+    drop(collection);
+
+    let mut running = Running::start_with_workers(&dir, None, false).await;
+    let recovered = await_ready(&mut running.client, committed_request).await;
+    assert_eq!(recovered.text_revision, committed.text_revision);
+    assert_eq!(recovered.attempts, committed.attempts);
+    expire_and_reclaim(&dir, &running.service);
+    assert!(!text_path(&dir, &original.source_id, &original.revision_id).exists());
+    let settled = await_failure(&mut running.client, pending.clone()).await;
+    assert_eq!(settled.error_code.as_deref(), Some("conflict"));
+    assert_eq!(
+        settled.error_message.as_deref(),
+        Some("the replacement source was deleted")
+    );
+    assert_eq!(settled.attempts, 1);
+    assert!(!staged.parent().unwrap().exists());
+    assert!(running.service.queue_paused().unwrap());
+    assert_eq!(
+        running
+            .client
+            .retry_ingestion_job(pending)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    assert_eq!(
+        running
+            .client
+            .submit_text(frames())
+            .await
+            .unwrap()
+            .into_inner(),
+        settled
+    );
+    assert!(
+        search(&mut running.client, "default", "tourmaline")
+            .await
+            .is_empty()
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn startup_migrates_v1_and_reclaims_files_left_before_acceptance() {
     let dir = TempDir::new().unwrap();
     let store = dir.path().join("default/notes");
