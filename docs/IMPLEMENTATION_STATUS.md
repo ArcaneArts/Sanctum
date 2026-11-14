@@ -1597,3 +1597,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   now be run against an authorized GCS bucket. `pnpm check` and the live
   MinIO publication, renewal, and page-delta tests passed.
   [GCS contract commands](STORAGE.md#google-cloud-storage-adapter).
+
+## Hosted worker task deadlines
+
+- Worker task routes return HTTP 503 after 570 seconds, leaving time to
+  respond before Cloud Tasks and the example Cloud Run worker reach their
+  600-second deadlines. Maintenance routes retain their own scheduler
+  deadlines. [Worker deployment](CLOUD_RUN.md#deploy-the-services).
+- The filesystem and live MinIO regression stalled a registration request
+  after SQLite publication and before the operation checkpoint. The worker
+  canceled the stalled write and returned 503. A fresh worker reused the
+  registration receipt without publishing another database generation.
+  It then delivered preparation and indexing and verified exact UTF-8
+  retrieval through gRPC. This run used a loopback Cloud Tasks fixture.

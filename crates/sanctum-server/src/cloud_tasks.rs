@@ -11,6 +11,7 @@ use tokio::sync::OnceCell;
 
 const ENDPOINT: &str = "https://cloudtasks.googleapis.com/v2/";
 const SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+pub(crate) const DISPATCH_DEADLINE_SECONDS: u64 = 600;
 
 #[cfg(test)]
 #[path = "dispatch_recovery_test.rs"]
@@ -157,7 +158,7 @@ impl CloudTasks {
         let mut payload = json!({
             "task": {
                 "name": format!("{}/tasks/{id}", self.config.queue),
-                "dispatchDeadline": "600s",
+                "dispatchDeadline": format!("{DISPATCH_DEADLINE_SECONDS}s"),
                 "httpRequest": {
                     "httpMethod": "POST",
                     "url": worker.as_str(),

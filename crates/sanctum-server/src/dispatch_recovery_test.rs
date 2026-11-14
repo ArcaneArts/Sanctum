@@ -8,15 +8,17 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     routing::post,
 };
+use sanctum_core::ByteRange;
 use sanctum_proto::v1::{self, sanctum_client::SanctumClient, upload_text_frame::Frame};
 use sanctum_service::HostedCatalog;
-use sanctum_storage::{Key, Storage};
+use sanctum_storage::{Condition, Download, Key, ListPage, Object, Reader, Storage, Version};
 use sanctum_storage_s3::{S3Config, S3Storage};
-use tokio::net::TcpListener;
+use tokio::{io::AsyncReadExt, net::TcpListener, sync::oneshot};
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
@@ -70,6 +72,58 @@ struct FixtureDispatch(CloudTasks);
 impl Dispatch for FixtureDispatch {
     async fn send(&self, task: Task<'_>) -> Result<()> {
         self.0.send_with_token(task, "fixture").await
+    }
+}
+
+struct StalledRegistration {
+    storage: Arc<dyn Storage>,
+    checkpoint: Mutex<Option<oneshot::Sender<oneshot::Receiver<()>>>>,
+}
+
+#[async_trait::async_trait]
+impl Storage for StalledRegistration {
+    async fn head(&self, key: &Key) -> Result<Object> {
+        self.storage.head(key).await
+    }
+
+    async fn get(&self, key: &Key) -> Result<Download> {
+        self.storage.get(key).await
+    }
+
+    async fn read_range(&self, key: &Key, range: ByteRange) -> Result<Bytes> {
+        self.storage.read_range(key, range).await
+    }
+
+    async fn put_stream(&self, key: &Key, reader: Reader, length: u64) -> Result<Version> {
+        self.storage.put_stream(key, reader, length).await
+    }
+
+    async fn put_control(&self, key: &Key, bytes: Bytes, condition: Condition) -> Result<Version> {
+        if key.as_str().ends_with("/operation.json") && matches!(condition, Condition::Match(_)) {
+            let checkpoint = self.checkpoint.lock().unwrap().take();
+            if let Some(checkpoint) = checkpoint {
+                let payload: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(payload["stage"], "pending_indexing");
+                let (in_flight, canceled) = oneshot::channel();
+                checkpoint.send(canceled).unwrap();
+                std::future::pending::<()>().await;
+                drop(in_flight);
+            }
+        }
+        self.storage.put_control(key, bytes, condition).await
+    }
+
+    async fn list(
+        &self,
+        prefix: Option<&Key>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<ListPage> {
+        self.storage.list(prefix, cursor, limit).await
+    }
+
+    async fn delete(&self, key: &Key) -> Result<()> {
+        self.storage.delete(key).await
     }
 }
 
@@ -134,7 +188,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
             .with_state(queue.clone()),
     )
     .await;
-    let make_catalog = || {
+    let catalog_with_storage = |storage| {
         let dispatcher = CloudTasks::with_endpoint(
             CloudTasksConfig {
                 queue: "projects/project/locations/region/queues/repair".into(),
@@ -144,10 +198,11 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
             &format!("{tasks_origin}/v2/"),
         )
         .unwrap();
-        HostedCatalog::new(storage.clone(), prefix.clone(), 1024)
+        HostedCatalog::new(storage, prefix.clone(), 1024)
             .unwrap()
             .with_dispatch(Arc::new(FixtureDispatch(dispatcher)))
     };
+    let make_catalog = || catalog_with_storage(storage.clone());
     let scope = v1::Scope {
         tenant: "default".into(),
         collection: "repair".into(),
@@ -216,7 +271,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
     assert!(first_worker.await.unwrap_err().is_cancelled());
 
     queue.enabled.store(true, Ordering::SeqCst);
-    let (worker, _worker_server) = serve_http(crate::hosted_worker::router(make_catalog())).await;
+    let (worker, repair_server) = serve_http(crate::hosted_worker::router(make_catalog())).await;
     assert_eq!(
         reconcile(&http, &worker, shard).await,
         json!({"dispatched": 1, "failed": 0, "more": false}),
@@ -230,9 +285,54 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         reconcile(&http, &worker, shard).await,
         json!({"dispatched": 0, "failed": 0, "more": false}),
     );
+    repair_server.abort();
+    assert!(repair_server.await.unwrap_err().is_cancelled());
+
+    let before_registration = collection_generation(storage.as_ref(), prefix.as_ref()).await;
+    let (checkpoint, mut reached) = oneshot::channel();
+    let stalled = catalog_with_storage(Arc::new(StalledRegistration {
+        storage: storage.clone(),
+        checkpoint: Mutex::new(Some(checkpoint)),
+    }));
+    let (deadline_worker, deadline_server) = serve_http(
+        crate::hosted_worker::router_with_task_deadline(stalled, Duration::from_secs(2)),
+    )
+    .await;
+    let timeout = http
+        .post(format!("{deadline_worker}/internal/tasks/register-upload"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(timeout.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let mut canceled = reached
+        .try_recv()
+        .expect("registration reached envelope write");
+    assert!(
+        matches!(
+            canceled.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ),
+        "worker dropped the stalled write",
+    );
+    let committed_registration = collection_generation(storage.as_ref(), prefix.as_ref()).await;
+    assert_ne!(before_registration, committed_registration);
+    assert_eq!(queue.accepted.lock().unwrap().len(), 1);
+    deadline_server.abort();
+    assert!(deadline_server.await.unwrap_err().is_cancelled());
+
+    let (mut api, _api_server) = serve_api(make_catalog()).await;
+    let after_timeout = api
+        .get_ingestion_job(job.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(after_timeout.state(), v1::IngestionState::Accepted);
+    let (worker, _worker_server) = serve_http(crate::hosted_worker::router(make_catalog())).await;
     let stages = ["register-upload", "prepare-upload", "index-upload"];
     for (index, stage) in stages.iter().enumerate() {
         let task = queue.accepted.lock().unwrap()[index].clone();
+        assert_eq!(task["task"]["dispatchDeadline"], "600s");
         let request = &task["task"]["httpRequest"];
         let path = format!("/internal/tasks/{stage}");
         assert_eq!(
@@ -250,10 +350,22 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        if index == 0 {
+            assert_eq!(
+                collection_generation(storage.as_ref(), prefix.as_ref()).await,
+                committed_registration,
+                "retry reused the registered revision instead of publishing again",
+            );
+            let registered = api
+                .get_ingestion_job(job.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(registered.state(), v1::IngestionState::Registered);
+        }
     }
     assert_eq!(queue.accepted.lock().unwrap().len(), stages.len());
 
-    let (mut api, _api_server) = serve_api(make_catalog()).await;
     let published = api
         .get_ingestion_job(job.clone())
         .await
@@ -304,6 +416,24 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         after.hits[0].database_generation
     );
     assert_eq!(before.hits[0].chunk, after.hits[0].chunk);
+}
+
+async fn collection_generation(storage: &dyn Storage, prefix: Option<&Key>) -> Uuid {
+    let path = "default/collections/repair/HEAD.json";
+    let key =
+        Key::parse(prefix.map_or_else(|| path.to_owned(), |prefix| format!("{prefix}/{path}")))
+            .unwrap();
+    let mut bytes = Vec::new();
+    storage
+        .get(&key)
+        .await
+        .unwrap()
+        .reader
+        .read_to_end(&mut bytes)
+        .await
+        .unwrap();
+    let head: Value = serde_json::from_slice(&bytes).unwrap();
+    serde_json::from_value(head["generation"]["id"].clone()).unwrap()
 }
 
 async fn reconcile(http: &reqwest::Client, worker: &str, shard: u8) -> Value {

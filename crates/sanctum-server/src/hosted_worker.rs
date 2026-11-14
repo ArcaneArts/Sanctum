@@ -1,7 +1,10 @@
+use std::time::Duration;
+
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, MatchedPath, Path, Request, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -11,6 +14,13 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 pub(crate) fn router(service: HostedCatalog) -> Router {
+    router_with_task_deadline(
+        service,
+        Duration::from_secs(crate::cloud_tasks::DISPATCH_DEADLINE_SECONDS - 30),
+    )
+}
+
+pub(super) fn router_with_task_deadline(service: HostedCatalog, deadline: Duration) -> Router {
     Router::new()
         .route("/internal/tasks/register-upload", post(register))
         .route("/internal/tasks/prepare-upload", post(prepare))
@@ -21,6 +31,23 @@ pub(crate) fn router(service: HostedCatalog) -> Router {
             "/internal/tasks/rebuild-collection",
             post(rebuild_collection),
         )
+        .route_layer(middleware::from_fn(
+            move |request: Request, next: Next| async move {
+                let path = request.extensions().get::<MatchedPath>().cloned();
+                match tokio::time::timeout(deadline, next.run(request)).await {
+                    Ok(response) => response,
+                    Err(_) => {
+                        tracing::warn!(
+                            event = "hosted_task_deadline",
+                            route = path.as_ref().map(MatchedPath::as_str),
+                            timeout_ms = deadline.as_millis() as u64,
+                            "hosted task exceeded its request budget"
+                        );
+                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    }
+                }
+            },
+        ))
         .route(
             "/internal/maintenance/embedding-profile",
             post(discover_profile),
