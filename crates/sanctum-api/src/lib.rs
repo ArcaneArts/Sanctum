@@ -1,3 +1,4 @@
+use futures::stream::{BoxStream, unfold};
 use sanctum_core::{
     ByteRange, Error, ExternalSource, GitProvenance, Result, Scope, UPLOAD_FRAME_BYTES,
     UrlProvenance, UsageMeasurement, UsageScope,
@@ -483,7 +484,7 @@ impl Sanctum for Grpc {
         Ok(Response::new(ReceiverStream::new(receiver)))
     }
 
-    type ImportLocalStream = ReceiverStream<std::result::Result<v1::ImportLocalEvent, Status>>;
+    type ImportLocalStream = BoxStream<'static, std::result::Result<v1::ImportLocalEvent, Status>>;
 
     async fn import_local(
         &self,
@@ -496,6 +497,8 @@ impl Sanctum for Grpc {
         }
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         let service = self.local()?.clone();
+        let shutdown = self.1.clone();
+        let worker_shutdown = shutdown.clone();
         tokio::spawn(async move {
             let events = sender.clone();
             let result = work(move || {
@@ -505,11 +508,21 @@ impl Sanctum for Grpc {
                     prune_missing: request.prune_missing,
                     retain_original: request.retain_original,
                 };
-                service.import_local(
+                let runtime = tokio::runtime::Handle::current();
+                service.import_local_until(
                     &scope,
                     std::path::Path::new(&request.path),
                     &options,
-                    |event| events.blocking_send(Ok(wire_import(event))).is_ok(),
+                    || events.is_closed() || worker_shutdown.is_cancelled(),
+                    |event| {
+                        runtime.block_on(async {
+                            tokio::select! {
+                                biased;
+                                _ = worker_shutdown.cancelled() => false,
+                                result = events.send(Ok(wire_import(event))) => result.is_ok(),
+                            }
+                        })
+                    },
                 )
             })
             .await;
@@ -517,7 +530,18 @@ impl Sanctum for Grpc {
                 let _ = sender.send(Err(error)).await;
             }
         });
-        Ok(Response::new(ReceiverStream::new(receiver)))
+        let stream = unfold(Some((receiver, shutdown)), |state| async {
+            let (mut receiver, shutdown) = state?;
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => Some((
+                    Err(status(Error::Busy("server is shutting down".into()))),
+                    None,
+                )),
+                event = receiver.recv() => event.map(|event| (event, Some((receiver, shutdown)))),
+            }
+        });
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn watch_folder(
