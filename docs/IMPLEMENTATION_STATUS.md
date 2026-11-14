@@ -152,6 +152,11 @@ Merged in [PR #5](https://github.com/ArcaneArts/Sanctum/pull/5).
   pipe. The server shut down cleanly and reported `UNAVAILABLE` for the
   active shutdown stream. After restart the previously accepted operation
   replayed with the same ID and returned exact UTF-8 in search.
+- A manual import and a watched scan share one active scan per canonical
+  root and collection. A regression test verifies alias paths, independent
+  collections, and reuse after cancellation. The standalone server and a
+  generated Python client exercised overlap during a 320 MiB file copy,
+  canceled the first scan, and verified exact UTF-8 after retrying.
 
 ## Streaming RTF and original retention
 
@@ -423,6 +428,12 @@ Merged in [PR #19](https://github.com/ArcaneArts/Sanctum/pull/19).
   tenant isolation, and digest-based replacement. The standalone server and
   CLI also verified exact UTF-8 fetch, recorded ETag, unchanged re-import,
   and a surfaced HTTP 404 against a loopback HTTP server.
+- A second import of the same normalized URL into an active collection
+  scope returns a retryable error before issuing another GET. A gRPC test
+  held the first response, checked that another tenant could import, then
+  verified that only the latest queued revision published in the first
+  tenant. A standalone server run also checked overlap during a streamed
+  HTTP body and retrieved the exact replacement after retry.
 
 ## Git imports
 

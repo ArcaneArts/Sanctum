@@ -554,6 +554,10 @@ unchanged file using its content digest. An edit keeps the source ID and
 queues a replacement. Each queued event includes an operation ID for
 `sanctum-cli job` or `GetIngestionJob`.
 
+Each collection runs one scan per canonical import root at a time. A manual
+import for an active root returns retryable `UNAVAILABLE`. A watched folder
+that finds its root busy retries through its normal scan schedule.
+
 A disconnected gRPC client or server shutdown stops the scan between copy
 buffers. A file still being copied is discarded. Work already accepted by
 the durable queue remains available. Server shutdown returns `UNAVAILABLE`
@@ -703,6 +707,10 @@ Content-Type observed during the fetch when present. The accepted
 operation and published revision retain the provenance of the fetch that
 produced them. Each import performs a complete GET. URLs are stored as
 provenance, so keep secrets out of their query strings.
+
+An overlapping import of the same normalized requested URL into the same
+collection returns retryable `UNAVAILABLE`. Retry after the first request
+finishes.
 
 Set `url_import_origins` in `SANCTUM_CONFIG_JSON` to restrict requests to
 exact scheme, host, and port combinations. A null value permits that origin

@@ -10,7 +10,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::{
     ImportEvent, Service, TextUpload,
-    local_import::{ImportProvenance, default_text},
+    local_import::{ImportProvenance, ImportTarget, default_text},
 };
 
 const MAX_REDIRECTS: usize = 5;
@@ -181,10 +181,14 @@ impl Service {
         })
         .await
         .map_err(task_error)??;
+        let requested_url = requested.to_string();
+        let active = self
+            .imports
+            .begin(&scope, ImportTarget::Url(requested_url.clone()))?;
         let mut response = self.url_importer.get(&requested).await?;
         let headers = response.headers();
         let provenance = UrlProvenance {
-            requested_url: requested.to_string(),
+            requested_url: requested_url.clone(),
             final_url: response.url().to_string(),
             etag: header_text(headers, header::ETAG),
             last_modified: header_text(headers, header::LAST_MODIFIED),
@@ -208,7 +212,7 @@ impl Service {
         }
         let external = ExternalSource {
             namespace: "url".into(),
-            id: requested.to_string(),
+            id: requested_url,
         };
         let service = self.clone();
         let (staged, output) = tokio::task::spawn_blocking(move || {
@@ -243,6 +247,8 @@ impl Service {
         drop(output);
         let saved = provenance.clone();
         let event = tokio::task::spawn_blocking(move || {
+            // Keep the guard until acceptance finishes even if the RPC is dropped.
+            let _active = active;
             staged.enqueue_import(
                 bytes,
                 hasher.finalize().to_hex().to_string(),

@@ -1640,6 +1640,108 @@ fn git_fixture(path: &std::path::Path, args: &[&str]) -> String {
 }
 
 #[tokio::test]
+async fn url_import_rejects_an_overlapping_fetch_for_the_same_source() {
+    use axum::{Router, routing::get};
+    use tokio::sync::Notify;
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let document = {
+        let (entered, release, calls) = (entered.clone(), release.clone(), calls.clone());
+        move || {
+            let (entered, release, calls) = (entered.clone(), release.clone(), calls.clone());
+            async move {
+                match calls.fetch_add(1, Ordering::Relaxed) {
+                    0 => {
+                        entered.notify_one();
+                        release.notified().await;
+                        "Older lapis"
+                    }
+                    _ => "Newer garnet",
+                }
+            }
+        }
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/notes.txt", listener.local_addr().unwrap());
+    let http = tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/notes.txt", get(document)))
+            .await
+            .unwrap();
+    });
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start_with_workers(&dir, None, false).await;
+    create(&mut running.client, "default").await;
+    create(&mut running.client, "other").await;
+    let request = v1::ImportUrlRequest {
+        scope: scope("default"),
+        url: url.clone(),
+        retain_original: false,
+    };
+    let mut client = running.client.clone();
+    let first_request = request.clone();
+    let first = tokio::spawn(async move { client.import_url(first_request).await });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+
+    let error = running
+        .client
+        .import_url(v1::ImportUrlRequest {
+            url: format!("{url}#same-source"),
+            ..request.clone()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::Unavailable);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    let other = running
+        .client
+        .import_url(v1::ImportUrlRequest {
+            scope: scope("other"),
+            ..request.clone()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(other.state(), v1::ImportState::Queued);
+
+    release.notify_one();
+    let first = first.await.unwrap().unwrap().into_inner();
+    assert_eq!(first.state(), v1::ImportState::Queued);
+    let updated = running
+        .client
+        .import_url(request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(updated.state(), v1::ImportState::Queued);
+    assert_eq!(updated.source_id, first.source_id);
+    assert_ne!(updated.revision_id, first.revision_id);
+    assert_ne!(updated.source_id, other.source_id);
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+    assert!(running.service.process_next().unwrap());
+    assert!(running.service.process_next().unwrap());
+    assert!(running.service.process_next().unwrap());
+    assert!(
+        search(&mut running.client, "default", "lapis")
+            .await
+            .is_empty()
+    );
+    let results = search(&mut running.client, "default", "garnet").await;
+    assert_eq!(results[0].excerpt, "Newer garnet");
+    assert_eq!(
+        results[0].chunk.as_ref().unwrap().revision_id,
+        updated.revision_id
+    );
+    running.stop().await;
+    http.abort();
+}
+
+#[tokio::test]
 async fn url_import_tracks_provenance_and_reconciles_content() {
     use axum::{Router, http::header, response::Redirect, routing::get};
 

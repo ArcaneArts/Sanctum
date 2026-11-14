@@ -1,9 +1,8 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::BTreeSet,
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -13,29 +12,11 @@ use tempfile::TempDir;
 
 use crate::{
     ImportEvent, ImportOptions, Service, TextUpload,
-    local_import::{ImportProvenance, Selection},
+    local_import::{ImportProvenance, ImportTarget, Selection},
     url_import::parse_url,
 };
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
-
-type ImportKey = (String, String, String);
-
-#[derive(Clone, Default)]
-pub(crate) struct ActiveImports(Arc<Mutex<HashSet<ImportKey>>>);
-
-struct ActiveImport {
-    imports: ActiveImports,
-    key: ImportKey,
-}
-
-impl Drop for ActiveImport {
-    fn drop(&mut self) {
-        if let Ok(mut imports) = self.imports.0.lock() {
-            imports.remove(&self.key);
-        }
-    }
-}
 
 pub enum GitRepository {
     Local(PathBuf),
@@ -90,7 +71,9 @@ impl Service {
         let identity = repository.identity()?;
         let reference = parse_ref(reference, matches!(repository, Repository::Local(_)))?;
         let namespace = format!("git:{}", git_namespace(identity, reference));
-        let _active = self.begin_git_import(scope, &namespace)?;
+        let _active = self
+            .imports
+            .begin(scope, ImportTarget::Git(namespace.clone()))?;
 
         let mut temporary = None;
         let (path, revision) = match &repository {
@@ -228,28 +211,6 @@ impl Service {
                 cursor = file;
             }
         }
-    }
-
-    fn begin_git_import(&self, scope: &Scope, namespace: &str) -> Result<ActiveImport> {
-        let key = (
-            scope.tenant.to_string(),
-            scope.collection.to_string(),
-            namespace.into(),
-        );
-        let mut imports = self
-            .git_imports
-            .0
-            .lock()
-            .map_err(|_| Error::Busy("Git import coordinator is unavailable".into()))?;
-        if !imports.insert(key.clone()) {
-            return Err(Error::Busy(
-                "this repository and ref are already being imported into the collection".into(),
-            ));
-        }
-        Ok(ActiveImport {
-            imports: self.git_imports.clone(),
-            key,
-        })
     }
 }
 
