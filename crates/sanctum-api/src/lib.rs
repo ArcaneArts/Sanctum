@@ -644,14 +644,8 @@ impl Sanctum for Grpc {
                 .await
                 .map_err(status)?,
             Backend::Local(service) => {
-                if operation.is_some() {
-                    return Err(invalid_argument(
-                        "request_id",
-                        "deletion request IDs are supported by hosted storage",
-                    ));
-                }
                 let service = service.clone();
-                work(move || service.delete_collection(&scope)).await?;
+                work(move || service.delete_collection_with_request(&scope, operation)).await?;
             }
         }
         Ok(Response::new(v1::Empty {}))

@@ -358,7 +358,10 @@ database sessions keep their independent snapshots until expiry.
 cargo run --locked -p sanctum-cli -- delete-collection notes
 ```
 
-For hosted deletion, pass `--request-id` to replay an ambiguous response.
+Pass the same nonzero UUID in `--request-id` to replay an ambiguous response.
+A replay resumes pending cleanup and returns success once it finishes. Reusing
+the ID for a different collection in the same tenant returns a conflict. Local
+deletion receipts become eligible for cleanup after 45 days.
 [Hosted collection lifecycle](STORAGE.md#hosted-collection-deletion).
 
 ## Ollama and search modes

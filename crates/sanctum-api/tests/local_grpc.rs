@@ -832,6 +832,123 @@ async fn local_collection_deletion_purges_jobs_and_recovers_from_a_tombstone() {
 }
 
 #[tokio::test]
+async fn local_collection_deletion_replays_after_a_failed_purge_and_restart() {
+    let dir = TempDir::new().unwrap();
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    create(&mut api.client, "default").await;
+    create(&mut api.client, "other").await;
+    let sibling = v1::Scope {
+        tenant: "default".into(),
+        collection: "sibling".into(),
+    };
+    let queued = api
+        .client
+        .submit_text(tokio_stream::iter([
+            header("default"),
+            data(b"pending quartz"),
+            end(),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    let runtime = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
+    runtime
+        .execute_batch(
+            "CREATE TRIGGER block_purge BEFORE DELETE ON ingestion_jobs
+             WHEN OLD.tenant = 'default'
+             BEGIN SELECT RAISE(ABORT, 'interrupted purge'); END;",
+        )
+        .unwrap();
+    let mut request = v1::DeleteCollectionRequest {
+        scope: scope("default"),
+        request_id: Some(uuid::Uuid::nil().to_string()),
+    };
+    assert_eq!(
+        api.client
+            .delete_collection(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    request.request_id = Some(uuid::Uuid::new_v4().to_string());
+    assert_eq!(
+        api.client
+            .delete_collection(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Internal
+    );
+    let list = v1::ListCollectionsRequest {
+        tenant: "default".into(),
+        ..Default::default()
+    };
+    assert!(
+        api.client
+            .list_collections(list)
+            .await
+            .unwrap()
+            .into_inner()
+            .collections
+            .is_empty()
+    );
+    assert!(dir.path().join("default/notes/meta.db").exists());
+    assert_eq!(
+        api.client
+            .delete_collection(v1::DeleteCollectionRequest {
+                scope: Some(v1::Scope {
+                    tenant: "default".into(),
+                    collection: "unrelated".into(),
+                }),
+                ..request.clone()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    api.client
+        .create_collection(v1::CreateCollectionRequest {
+            scope: Some(sibling),
+            request_id: None,
+        })
+        .await
+        .unwrap();
+    api.stop().await;
+
+    // The notes purge is still failing. Recovery should continue to the next
+    // tombstone in the same catalog.
+    sanctum_db_sqlite::retire_local_collection(&dir.path().join("default/root.db"), "sibling")
+        .unwrap();
+    assert!(dir.path().join("default/sibling/meta.db").exists());
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    assert!(dir.path().join("default/notes/meta.db").exists());
+    assert!(!dir.path().join("default/sibling").exists());
+    assert!(dir.path().join("other/notes/meta.db").exists());
+    runtime.execute_batch("DROP TRIGGER block_purge").unwrap();
+    api.client.delete_collection(request.clone()).await.unwrap();
+    assert!(!dir.path().join("default/notes").exists());
+    assert_eq!(
+        api.client
+            .get_ingestion_job(job_request(queued.operation_id))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+    api.client.delete_collection(request.clone()).await.unwrap();
+    api.client
+        .delete_collection(v1::DeleteCollectionRequest {
+            scope: scope("other"),
+            ..request
+        })
+        .await
+        .unwrap();
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn database_sessions_pin_and_download_a_scoped_read_only_generation() {
     use std::io::Write;
     use v1::sql_value::Value;

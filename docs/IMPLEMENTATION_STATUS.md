@@ -1950,6 +1950,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   UUID and MCP listed the recovered collection.
   [PR #137](https://github.com/ArcaneArts/Sanctum/pull/137).
 
+## Local collection deletion replay
+
+- The local tenant catalog commits the deletion request's UUID and collection
+  tombstone together. A replay finishes pending cleanup or returns success
+  for an already reclaimed collection. The same UUID cannot delete a different
+  collection in that tenant. A failed purge leaves its own tombstone pending
+  while recovery continues with other collections.
+- The local gRPC regression interrupted queue cleanup with a SQLite trigger
+  and exercised restart, cleanup of a sibling collection, and replay. A generated
+  Python client and the standalone CLI verified replay after `SIGKILL`, removal
+  of queued work, and independent reuse of the UUID in another tenant.
+  [Collection deletion](LOCAL_API.md#collection-deletion),
+  [PR #139](https://github.com/ArcaneArts/Sanctum/pull/139).
+
 ## Maintenance recovery for hosted collection creation
 
 - Hosted creation first records a tenant-scoped intent. Scheduled
