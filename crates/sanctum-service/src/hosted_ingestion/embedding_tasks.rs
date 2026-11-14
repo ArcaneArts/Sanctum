@@ -93,7 +93,7 @@ impl HostedCatalog {
         record.dispatched_at = None;
         let job = self.checkpoint(&prefix, record, version, |stage| {
             matches!(stage, Stage::TextReady { embedding: Some(current), .. } if current.step == step)
-        }).await?;
+        }).await?.job();
         job.log_stage(scope, "embedding_batch", start);
         Ok(())
     }

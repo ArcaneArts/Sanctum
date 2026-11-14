@@ -17,6 +17,8 @@ impl HostedCatalog {
         let (record, version) = self.require_operation(&prefix, operation).await?;
         match record.stage {
             Stage::Canceled { .. } => {
+                self.try_discard_completed_input(scope, &prefix, &record)
+                    .await;
                 self.clear_dispatch_hint(scope, operation, record.attempt)
                     .await?;
                 return Ok(record.job());
@@ -76,10 +78,9 @@ impl HostedCatalog {
     ) -> Result<HostedJob> {
         let operation = record.operation;
         let attempt = record.attempt;
-        self.discard_input(prefix, &record).await?;
         record.dispatched_at = None;
         record.stage = Stage::Canceled { registration };
-        let job = self
+        let record = self
             .checkpoint(prefix, record, version, |stage| {
                 matches!(
                     stage,
@@ -87,8 +88,10 @@ impl HostedCatalog {
                 )
             })
             .await?;
+        self.try_discard_completed_input(scope, prefix, &record)
+            .await;
         self.clear_dispatch_hint(scope, operation, attempt).await?;
-        Ok(job)
+        Ok(record.job())
     }
 }
 

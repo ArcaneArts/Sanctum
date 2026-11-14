@@ -1225,6 +1225,21 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   delivery across restart, input reclamation, and refusal after commit.
 - Delivered in [PR #59](https://github.com/ArcaneArts/Sanctum/pull/59).
 
+### Hosted staged input cleanup after publication
+
+- Workers save the committed job outcome before attempting to delete
+  unused staged input. The upload sweep can recover a missed or failed
+  deletion from the saved state after a restart.
+- The gRPC regression blocks staged-input deletion through cancellation,
+  invalid UTF-8 failure, and text-only RTF publication. All three outcomes
+  remain visible while a failed sweep is retried.
+- A generated Python gRPC client and live MinIO verified the same sequence
+  through a proxy that denied input deletes and supplied aged input timestamps
+  for the sweep. Once deletion was allowed, the restarted worker removed
+  three unused inputs and preserved the pending upload, indexed plain text,
+  and retained RTF original. Search and fetch returned the exact canonical
+  excerpt. [Storage contract](STORAGE.md#hosted-upload-cancellation).
+
 ## Hosted upload retry
 
 - Hosted gRPC and CLI can request a fresh dispatch for pending upload work

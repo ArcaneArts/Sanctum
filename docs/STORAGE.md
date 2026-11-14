@@ -536,8 +536,11 @@ reader grace period. Close a session early to release its handle.
 
 The private upload sweep advances a durable scan cursor. It checks up to
 eight candidates per invocation. An input older than 15 minutes is
-eligible when a different attempt won the operation envelope. An RTF
-extraction candidate is eligible after the 30-day indexing window and
+eligible when a different attempt won the operation envelope, or when
+the saved job outcome no longer needs that input. The sweep preserves
+pending inputs, indexed plain text, retained RTF originals, and inputs
+still referenced by published revisions or pending source reclamation.
+An RTF extraction candidate is eligible after the 30-day indexing window and
 15-minute reader grace if it has neither a published locator nor a
 pending source-reclamation entry. To reclaim an input without an accepted
 envelope, the sweep writes a fence to the same key that acceptance uses.
@@ -581,12 +584,17 @@ one SQLite receipt under the collection writer lease. Once text has been
 published, cancellation fails and the revision remains available.
 
 A successful cancellation releases any reserved external ID for a new
-source, discards the staged upload, and returns `CANCELED`. Repeating the
-request returns the same canceled status. If the worker or API stops
+source and returns `CANCELED`. Repeating the request returns the same
+canceled status. If the worker or API stops
 between committing the receipt and updating the operation envelope,
 repeating the request or delivering the next worker task recovers the
 receipt and finishes cancellation. Late tasks cannot publish canceled
 input. Cancellation uses the same 30-day window as indexing.
+
+The worker saves the job outcome before deleting unused staged input.
+Cancellation, permanent failure, and publication of text-only RTF can
+report their committed status even if deletion fails. The upload sweep
+retries cleanup from the saved outcome.
 
 ### Hosted upload retry
 

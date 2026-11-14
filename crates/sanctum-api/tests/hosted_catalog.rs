@@ -1684,6 +1684,150 @@ async fn hosted_submissions_store_exact_bytes_and_replay_after_restart() {
 }
 
 #[tokio::test]
+async fn hosted_job_outcomes_survive_staged_input_cleanup_failure() {
+    use std::time::{Duration, SystemTime};
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance::new(
+        directory.path(),
+        REJECT_UPLOAD_INPUT_DELETE,
+    ));
+    let service = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let catalog = service();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let wire = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    catalog.create_collection(&scope, None).await.unwrap();
+    let mut server = start(catalog.clone()).await;
+    let mut cases = Vec::new();
+    for (name, data, state) in [
+        (
+            "canceled.txt",
+            b"canceled quartz".as_slice(),
+            v1::IngestionState::Canceled,
+        ),
+        ("invalid.txt", &[0xff][..], v1::IngestionState::Failed),
+        (
+            "extract.rtf",
+            br"{\rtf1\ansi extracted caf\'e9}",
+            v1::IngestionState::TextReady,
+        ),
+        (
+            "retain.rtf",
+            br"{\rtf1\ansi retained caf\'e9}",
+            v1::IngestionState::TextReady,
+        ),
+        (
+            "plain.txt",
+            b"published quartz",
+            v1::IngestionState::TextReady,
+        ),
+        (
+            "pending.txt",
+            b"pending quartz",
+            v1::IngestionState::Registered,
+        ),
+    ] {
+        let header = v1::UploadTextHeader {
+            scope: Some(wire.clone()),
+            name: name.into(),
+            retain_original: name == "retain.rtf",
+            ..Default::default()
+        };
+        let job = server
+            .client
+            .submit_text(upload_frames(&header, [data]))
+            .await
+            .unwrap()
+            .into_inner();
+        let operation = job.operation_id.parse().unwrap();
+        let request = v1::IngestionJobRequest {
+            scope: Some(wire.clone()),
+            operation_id: job.operation_id,
+        };
+        catalog.register_upload(&scope, operation).await.unwrap();
+        if state == v1::IngestionState::Canceled {
+            let canceled = server
+                .client
+                .cancel_ingestion_job(request.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(canceled.state(), state);
+        } else if state != v1::IngestionState::Registered {
+            catalog.index_upload(&scope, operation).await.unwrap();
+        }
+        let status = server
+            .client
+            .get_ingestion_job(request.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.state(), state);
+        let key = Key::parse(format!(
+            "default/collections/notes/operations/{operation}/inputs"
+        ))
+        .unwrap();
+        let input = storage
+            .list(Some(&key), None, 10)
+            .await
+            .unwrap()
+            .objects
+            .remove(0)
+            .key;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.path().join(input.as_str()))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(901))
+            .unwrap();
+        cases.push((name, request, state, input));
+    }
+    server.stop().await;
+    drop(catalog);
+
+    let catalog = service();
+    let sweep = catalog.sweep_abandoned_uploads().await.unwrap();
+    assert_eq!((sweep.deleted, sweep.failed), (0, 3));
+    storage.interrupt.store(0, Ordering::Relaxed);
+    let recovered = catalog.sweep_abandoned_uploads().await.unwrap();
+    assert_eq!((recovered.deleted, recovered.failed), (3, 0));
+    let mut server = start(catalog).await;
+    for (name, request, state, input) in cases {
+        let recovered = server
+            .client
+            .get_ingestion_job(request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(recovered.state(), state);
+        assert_eq!(
+            storage.head(&input).await.is_ok(),
+            matches!(name, "retain.rtf" | "plain.txt" | "pending.txt")
+        );
+    }
+    let hits = server
+        .client
+        .search_text(v1::SearchTextRequest {
+            scope: Some(wire),
+            query: "extracted".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .hits;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].excerpt, "extracted café");
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_cancellation_recovers_from_lost_checkpoints_without_publishing() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
@@ -6920,6 +7064,7 @@ const REJECT_RETIRED_SOURCE_DELETE: u8 = 14;
 const LOSE_SOURCE_SWEEP_CHECKPOINT_RESPONSE: u8 = 15;
 const REJECT_SOURCE_SWEEP_RELIST: u8 = 16;
 const REJECT_PROFILE_REBUILD: u8 = 17;
+const REJECT_UPLOAD_INPUT_DELETE: u8 = 18;
 const PARALLEL_RANGE_START: u8 = 40;
 const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
 const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
@@ -7097,6 +7242,11 @@ impl Storage for InterruptAcceptance {
     }
 
     async fn delete(&self, key: &Key) -> StorageResult<()> {
+        if key.as_str().contains("/inputs/")
+            && self.interrupt.load(Ordering::Relaxed) == REJECT_UPLOAD_INPUT_DELETE
+        {
+            return Err(Error::Busy("test blocked staged input cleanup".into()));
+        }
         if key.as_str().ends_with("/retired-00.utf8")
             && self.interrupt.load(Ordering::Relaxed) == REJECT_RETIRED_SOURCE_DELETE
         {
