@@ -3776,33 +3776,146 @@ async fn maintenance_reclaims_failed_replacements_superseded_before_publication(
         .unwrap();
     api.stop().await;
 
-    // Model a retryable failure after the collection committed, before the
-    // queue stored its receipt. A newer intent does not invalidate that commit.
+    // A queue receipt can be missing even though the collection committed.
     let runtime = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
     assert_eq!(
-        runtime.execute(
-            "UPDATE ingestion_jobs SET status = 'failed', error_code = 'retryable',
-                error_message = 'receipt interrupted', content_hash = NULL, chunks = NULL, created_at = 0
+        runtime
+            .execute(
+                "UPDATE ingestion_jobs SET status = 'failed', error_code = 'retryable',
+                error_message = 'receipt interrupted', content_hash = NULL, chunks = NULL
              WHERE operation_id = ?1 AND publication_started = 1",
-            [&latest_request.operation_id],
-        ).unwrap(),
+                [&latest_request.operation_id],
+            )
+            .unwrap(),
         1,
     );
     drop(runtime);
     let mut api = Running::start_with_workers(&dir, None, false).await;
-    let awaiting_receipt = await_failure(&mut api.client, latest_request.clone()).await;
-    assert_eq!(awaiting_receipt.error_code.as_deref(), Some("retryable"));
+    let recovered = await_ready(&mut api.client, latest_request).await;
+    assert_eq!(recovered.attempts, ready.attempts);
+    assert_eq!(recovered.text_revision, ready.text_revision);
     assert_eq!(
         search(&mut api.client, "default", "tourmaline").await[0].excerpt,
         "new tourmaline"
     );
-    api.client
-        .retry_ingestion_job(latest_request.clone())
+    api.stop().await;
+}
+
+#[tokio::test]
+async fn maintenance_reclaims_superseded_replacement_after_its_sqlite_commit_fails() {
+    let dir = TempDir::new().unwrap();
+    let mut api = Running::start(&dir).await;
+    create(&mut api.client, "default").await;
+    let original = upload(&mut api.client, header("default"), b"baseline zircon").await;
+    api.stop().await;
+
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    let header = replacement(Some(&original.source_id), Some(&original.revision_id));
+    let failed = api
+        .client
+        .submit_text(tokio_stream::iter([
+            header.clone(),
+            data(b"old jade"),
+            end(),
+        ]))
         .await
+        .unwrap()
+        .into_inner();
+    let failed_request = job_request(failed.operation_id.clone());
+    let failed_input = text_path(&dir, &failed.source_id, &failed.revision_id);
+    let collection = rusqlite::Connection::open(dir.path().join("default/notes/meta.db")).unwrap();
+    // The INSERT succeeds, then the deferred constraint fails at COMMIT.
+    collection
+        .execute_batch(&format!(
+            "CREATE TABLE commit_probe_parent (id INTEGER PRIMARY KEY);
+         CREATE TABLE commit_probe (
+             ref INTEGER REFERENCES commit_probe_parent(id) DEFERRABLE INITIALLY DEFERRED
+         );
+         CREATE TRIGGER reject_candidate_commit AFTER INSERT ON revisions
+         WHEN NEW.id = '{}' BEGIN INSERT INTO commit_probe VALUES (1); END;",
+            failed.revision_id
+        ))
         .unwrap();
+    assert!(api.service.process_next().is_err());
+    let rejected = await_failure(&mut api.client, failed_request.clone()).await;
+    assert_eq!(rejected.error_code.as_deref(), Some("retryable"));
+    let runtime = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
+    assert_eq!(
+        runtime
+            .query_row(
+                "SELECT publication_started FROM ingestion_jobs WHERE operation_id = ?1",
+                [&failed.operation_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        collection
+            .query_row(
+                "SELECT count(*) FROM revisions WHERE id = ?1",
+                [&failed.revision_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(search(&mut api.client, "default", "zircon").await.len(), 1);
+    drop(runtime);
+    drop(collection);
+    api.stop().await;
+
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    assert_eq!(
+        await_failure(&mut api.client, failed_request.clone())
+            .await
+            .error_code
+            .as_deref(),
+        Some("retryable")
+    );
+    assert!(failed_input.is_file());
+    let latest = api
+        .client
+        .submit_text(tokio_stream::iter([header, data(b"new agate"), end()]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(latest.update_sequence > failed.update_sequence);
     assert!(api.service.process_next().unwrap());
-    let replayed = await_ready(&mut api.client, latest_request).await;
-    assert_eq!(replayed.text_revision, ready.text_revision);
+    // Make the persisted retry due without waiting one minute in this test.
+    let runtime = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
+    assert_eq!(
+        runtime
+            .execute(
+                "UPDATE ingestion_jobs SET reconcile_after = 0
+             WHERE operation_id = ?1 AND reconcile_after > unixepoch()",
+                [&failed.operation_id],
+            )
+            .unwrap(),
+        1,
+    );
+    drop(runtime);
+    api.stop().await;
+
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    let settled = await_failure(&mut api.client, failed_request.clone()).await;
+    assert_eq!(settled.error_code.as_deref(), Some("conflict"));
+    assert_eq!(settled.attempts, 1);
+    assert!(!failed_input.parent().unwrap().exists());
+    assert_eq!(
+        api.client
+            .retry_ingestion_job(failed_request)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    let hits = search(&mut api.client, "default", "agate").await;
+    assert_eq!(hits[0].excerpt, "new agate");
+    assert_eq!(
+        hits[0].chunk.as_ref().unwrap().revision_id,
+        latest.revision_id
+    );
     api.stop().await;
 }
 
@@ -4914,7 +5027,13 @@ async fn local_rtf_original_cleanup_failure_keeps_published_text_ready() {
     // A directory at the original's path makes unlink fail on every platform.
     std::fs::create_dir(&original).unwrap();
     let runtime = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
-    runtime.execute_batch("PRAGMA user_version = 18").unwrap();
+    runtime
+        .execute_batch(
+            "DROP INDEX ingestion_publication_recovery;
+         ALTER TABLE ingestion_jobs DROP COLUMN reconcile_after;
+         PRAGMA user_version = 18;",
+        )
+        .unwrap();
     runtime.execute(
         "UPDATE ingestion_jobs SET status = 'failed', error_code = 'retryable',
              error_message = 'could not remove the staged original', chunks = NULL, content_hash = NULL

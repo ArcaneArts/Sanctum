@@ -104,6 +104,11 @@ const COLUMNS: &str = "operation_id, tenant, collection, source_id, revision_id,
     replacement, update_sequence, import_hash, extract_rtf, retain_original, extracting,
     canonical_bytes, original_hash, source_encoding, extractor, created_at, url_provenance, git_provenance, chunk_window_bytes, chunk_overlap_bytes, initial_metadata, initial_chunk_metadata, chunk_max_tokens, rtf_preparation, upload_hash";
 
+const SUPERSEDED_FAILURE: &str = "UPDATE ingestion_jobs SET error_code = 'conflict',
+    error_message = 'a newer operation superseded this import or replacement',
+    extracting = 0, rtf_preparation = NULL, initial_metadata = NULL,
+    initial_chunk_metadata = NULL, cleanup_after = unixepoch(), finished_at = unixepoch()";
+
 impl LocalQueue {
     /// The caller holds the storage owner's exclusive lock for this queue.
     pub fn open(path: PathBuf) -> Result<Self> {
@@ -130,6 +135,7 @@ impl LocalQueue {
                 include_str!("runtime_v17.sql"),
                 include_str!("runtime_v18.sql"),
                 include_str!("runtime_v19.sql"),
+                include_str!("runtime_v20.sql"),
             ],
         )?;
         // The previous worker may have stopped after recording a cancellation.
@@ -204,23 +210,81 @@ impl LocalQueue {
     pub fn settle_superseded_failures(&self) -> Result<usize> {
         self.connect()?
             .execute(
-                "UPDATE ingestion_jobs SET error_code = 'conflict',
-                    error_message = 'a newer operation superseded this import or replacement',
-                    extracting = 0, rtf_preparation = NULL, initial_metadata = NULL,
-                    initial_chunk_metadata = NULL, cleanup_after = unixepoch(),
-                    finished_at = unixepoch()
-                 WHERE operation_id IN (
-                     SELECT j.operation_id FROM ingestion_jobs j
-                     JOIN replacement_sequences s
-                       ON (s.tenant, s.collection, s.source_id) = (j.tenant, j.collection, j.source_id)
-                     WHERE j.status = 'failed' AND j.error_code = 'retryable'
-                       AND j.publication_started = 0 AND j.update_sequence > 0
-                       AND s.sequence > j.update_sequence
-                     LIMIT 128
-                 )",
+                &format!(
+                    "{SUPERSEDED_FAILURE}
+                     WHERE operation_id IN (
+                         SELECT j.operation_id FROM ingestion_jobs j
+                         JOIN replacement_sequences s
+                           ON (s.tenant, s.collection, s.source_id) = (j.tenant, j.collection, j.source_id)
+                         WHERE j.status = 'failed' AND j.error_code = 'retryable'
+                           AND j.publication_started = 0 AND j.update_sequence > 0
+                           AND s.sequence > j.update_sequence
+                         LIMIT 128
+                     )"
+                ),
                 [],
             )
             .map_err(database_error)
+    }
+
+    pub fn interrupted_publications(&self) -> Result<Vec<Job>> {
+        super::query_all(
+            &self.connect()?,
+            &format!(
+                "SELECT {COLUMNS} FROM ingestion_jobs
+                 WHERE publication_started = 1 AND status = 'failed' AND error_code = 'retryable'
+                   AND reconcile_after <= unixepoch()
+                 ORDER BY reconcile_after, operation_id LIMIT 128"
+            ),
+            [],
+            map_job,
+        )
+    }
+
+    /// A committed revision always wins. An absent revision only settles if the
+    /// intent is superseded, and an operation that was retried is left to its worker.
+    pub fn reconcile_publication(&self, job: &Job, committed: Option<&Revision>) -> Result<()> {
+        if let Some(revision) = committed {
+            return self.save_ready(
+                job.id,
+                revision,
+                (job.extract_rtf && !job.retain_original).then_some(0),
+                Some(job.attempts),
+            );
+        }
+        let settled = self
+            .connect()?
+            .execute(
+                &format!(
+                    "{SUPERSEDED_FAILURE}
+                     WHERE operation_id = ?1 AND attempts = ?2
+                       AND publication_started = 1 AND status = 'failed' AND error_code = 'retryable'
+                       AND update_sequence > 0 AND EXISTS (
+                         SELECT 1 FROM replacement_sequences s
+                         WHERE (s.tenant, s.collection, s.source_id) =
+                           (ingestion_jobs.tenant, ingestion_jobs.collection, ingestion_jobs.source_id)
+                         AND s.sequence > ingestion_jobs.update_sequence
+                     )"
+                ),
+                params![job.id.to_string(), job.attempts],
+            )
+            .map_err(database_error)?;
+        if settled == 0 {
+            self.defer_publication_reconciliation(job)?;
+        }
+        Ok(())
+    }
+
+    pub fn defer_publication_reconciliation(&self, job: &Job) -> Result<()> {
+        self.connect()?
+            .execute(
+                "UPDATE ingestion_jobs SET reconcile_after = unixepoch() + 60
+                 WHERE operation_id = ?1 AND attempts = ?2
+                   AND publication_started = 1 AND status = 'failed' AND error_code = 'retryable'",
+                params![job.id.to_string(), job.attempts],
+            )
+            .map_err(database_error)?;
+        Ok(())
     }
 
     pub fn pending_cleanup(&self) -> Result<Vec<StagedCleanup>> {
@@ -638,6 +702,16 @@ impl LocalQueue {
         revision: &Revision,
         original_cleanup_pending: bool,
     ) -> Result<()> {
+        self.save_ready(id, revision, original_cleanup_pending.then_some(60), None)
+    }
+
+    fn save_ready(
+        &self,
+        id: Uuid,
+        revision: &Revision,
+        original_cleanup_delay: Option<u32>,
+        failed_attempt: Option<u32>,
+    ) -> Result<()> {
         self.connect()?
             .execute(
                 "UPDATE ingestion_jobs
@@ -645,8 +719,13 @@ impl LocalQueue {
                  canonical_bytes = ?4, original_hash = ?5, source_encoding = ?6, extractor = ?7,
                  processed_bytes = total_bytes, error_code = NULL, error_message = NULL,
                  finished_at = unixepoch(), initial_metadata = NULL, initial_chunk_metadata = NULL,
-                 rtf_preparation = NULL, cleanup_after = CASE WHEN ?8 THEN unixepoch() + 60 END
-             WHERE operation_id = ?1 AND status IN ('indexing', 'publishing')",
+                 rtf_preparation = NULL,
+                 cleanup_after = unixepoch() + ?8
+             WHERE operation_id = ?1 AND (
+                 (?9 IS NULL AND status IN ('indexing', 'publishing'))
+                 OR (attempts = ?9 AND publication_started = 1
+                     AND status = 'failed' AND error_code = 'retryable')
+             )",
                 params![
                     id.to_string(),
                     revision.content.hash,
@@ -655,7 +734,8 @@ impl LocalQueue {
                     revision.content.original_hash,
                     revision.content.encoding,
                     revision.content.extractor,
-                    original_cleanup_pending,
+                    original_cleanup_delay,
+                    failed_attempt,
                 ],
             )
             .map_err(database_error)?;
@@ -679,7 +759,7 @@ impl LocalQueue {
                                         THEN rtf_preparation END,
                  cleanup_after = CASE WHEN cancel_requested = 1 OR ?2 <> 'retryable'
                                       THEN unixepoch() END,
-                 finished_at = unixepoch()
+                 finished_at = unixepoch(), reconcile_after = 0
              WHERE operation_id = ?1 AND status IN ('indexing', 'publishing')",
                 params![id.to_string(), code, message],
             )

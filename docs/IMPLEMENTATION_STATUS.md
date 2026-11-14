@@ -175,6 +175,23 @@ Merged in [PR #4](https://github.com/ArcaneArts/Sanctum/pull/4).
   failed deletion retained its retry deadline across restart.
   [Source processing status](LOCAL_API.md#source-inspection).
 
+### Recovery after local publication starts
+
+- Startup and maintenance read the committed revision of a retryable
+  job that reached publication. The queue restores a committed receipt
+  or settles a superseded uncommitted intent with a conflict. Current
+  jobs without a committed revision remain retryable. The queue checks
+  the attempt number before applying the maintenance result.
+- The gRPC regression uses a deferred SQLite constraint to fail the
+  collection transaction at commit. After a newer revision publishes,
+  recovery removes the abandoned input without executing it again.
+  The committed-revision regression restores a missing queue receipt
+  without another worker attempt.
+- A managed server and generated Python gRPC client verified the version
+  19 to 20 runtime migration, both recovery outcomes with ingestion
+  paused, cleanup of the recovered RTF original, and exact UTF-8 retrieval.
+  [Ingestion recovery](LOCAL_API.md#text-uploads).
+
 ## Local file and directory imports
 
 Merged in [PR #5](https://github.com/ArcaneArts/Sanctum/pull/5).

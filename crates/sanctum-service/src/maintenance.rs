@@ -2,7 +2,7 @@ use sanctum_core::{Error, Result, Scope};
 use sanctum_db_sqlite::RevisionKey;
 use uuid::Uuid;
 
-use crate::{Service, db};
+use crate::{Service, db, local_jobs::revision_for};
 
 impl Service {
     pub(crate) fn recover_local_collections(&self) -> Result<()> {
@@ -205,6 +205,27 @@ impl Service {
                 jobs = superseded,
                 "scheduled cleanup for superseded ingestion inputs"
             );
+        }
+        for job in self.queue.interrupted_publications()? {
+            let reconcile = || {
+                self.require_collection(&job.scope)?;
+                // The retrieval guard prevents retirement. If a manual retry
+                // starts during this read, the queue's attempt check wins.
+                let database =
+                    db::CollectionDb::open_read_only(&self.files.database_path(&job.scope))?;
+                let committed = database
+                    .revision_summary(job.source, job.revision)?
+                    .map(|content| revision_for(&job, content));
+                self.queue.reconcile_publication(&job, committed.as_ref())
+            };
+            let settled = reconcile();
+            if let Err(error) = settled {
+                self.queue.defer_publication_reconciliation(&job)?;
+                tracing::warn!(
+                    %error, tenant = %job.scope.tenant, collection = %job.scope.collection,
+                    operation = %job.id, "could not reconcile an interrupted local publication"
+                );
+            }
         }
         for pending in self.queue.pending_cleanup()? {
             if let Err(error) = self.reclaim_staged_input(&pending) {
