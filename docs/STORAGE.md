@@ -8,9 +8,10 @@ written control objects and stream data to caller-owned unique keys.
 
 S3 uses `If-None-Match` for create and `If-Match` with the returned ETag
 for replacement. A control write is limited to 1 MiB. Large immutable
-payloads use sequential 8 MiB multipart writes. An interrupted upload
-can leave incomplete parts, so configure the bucket's incomplete multipart
-upload lifecycle rule. [S3 multipart uploads](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html).
+payloads use sequential 8 MiB multipart writes. The adapter attempts to
+abort the upload ID on failure or when its caller drops the upload, with a
+five-second cleanup budget. The bucket's incomplete multipart upload lifecycle
+rule handles cases where the process exits or storage cannot confirm the abort. [S3 multipart uploads](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html).
 
 Canonical objects use identity encoding. Range reads check the response
 range and body length and cap requested bytes at 4 MiB. After a body
