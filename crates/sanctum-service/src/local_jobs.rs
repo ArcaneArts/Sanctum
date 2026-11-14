@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     io::{self, BufReader, BufWriter, Read, Write},
     time::Instant,
 };
@@ -69,10 +70,17 @@ impl Service {
 
     /// Runs at most one job. The database claim is atomic across local workers.
     pub fn process_next(&self) -> Result<bool> {
+        self.process_next_until_shutdown(|| false)
+    }
+
+    pub(crate) fn process_next_until_shutdown(&self, stopping: impl Fn() -> bool) -> Result<bool> {
         let _reader = self
             .retrieval
             .read()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
+        if stopping() {
+            return Ok(false);
+        }
         let Some(job) = self.queue.claim()? else {
             return Ok(false);
         };
@@ -86,7 +94,7 @@ impl Service {
             queue_age_seconds = telemetry::queue_age(job.created_at),
             "claimed local ingestion work"
         );
-        let result = self.process_claim(&job);
+        let result = self.process_claim(&job, &stopping);
         let outcome = match &result {
             Ok(outcome) => *outcome,
             Err(_) => "error",
@@ -103,8 +111,8 @@ impl Service {
         result.map(|_| true)
     }
 
-    fn process_claim(&self, job: &Job) -> Result<&'static str> {
-        match self.index_job(job) {
+    fn process_claim(&self, job: &Job, stopping: &impl Fn() -> bool) -> Result<&'static str> {
+        match self.index_job(job, stopping) {
             Ok(revision) => {
                 if job.extract_rtf
                     && !job.retain_original
@@ -119,6 +127,8 @@ impl Service {
                 self.queue.ready(job.id, &revision)?;
                 Ok("text_ready")
             }
+            // Startup recovers interrupted claims from the queue and collection receipts.
+            Err(error) if IngestionShutdown::caused(&error) => Ok("interrupted"),
             Err(error) => {
                 let (code, message) = match &error {
                     Error::Invalid(message) => ("invalid_source", message.as_str()),
@@ -141,7 +151,8 @@ impl Service {
         }
     }
 
-    fn index_job(&self, job: &Job) -> Result<Revision> {
+    fn index_job(&self, job: &Job, stopping: &impl Fn() -> bool) -> Result<Revision> {
+        IngestionShutdown::check(stopping)?;
         let mut database = self.database(&job.scope)?;
         if let Some(content) = database.revision_summary(job.source, job.revision)? {
             // The collection commit survived a stop before the queue receipt.
@@ -150,9 +161,12 @@ impl Service {
         if !self.queue.progress(job.id, job.processed_bytes)? {
             return Err(Error::Conflict("indexing canceled".into()));
         }
-        let extracted = job.extract_rtf.then(|| self.prepare_rtf(job)).transpose()?;
+        let extracted = job
+            .extract_rtf
+            .then(|| self.prepare_rtf(job, stopping))
+            .transpose()?;
         self.local_writes.run(&job.scope, || {
-            self.publish_index(job, extracted, &mut database)
+            self.publish_index(job, extracted, &mut database, stopping)
         })
     }
 
@@ -161,7 +175,9 @@ impl Service {
         job: &Job,
         extracted: Option<RtfPreparation>,
         database: &mut crate::db::CollectionDb,
+        stopping: &impl Fn() -> bool,
     ) -> Result<Revision> {
+        IngestionShutdown::check(stopping)?;
         let input = self.files.open_text(&job.scope, job.source, job.revision)?;
         let writer = database.write()?;
         if job.replacement {
@@ -182,6 +198,7 @@ impl Service {
         let mut ordinal = 0;
         let mut last_progress = 0;
         let indexed = index_utf8_with_settings(input, job.chunking, |range, text| {
+            IngestionShutdown::check(stopping)?;
             if !job.extract_rtf && range.end - last_progress >= PROGRESS_STEP {
                 if !self.queue.progress(job.id, range.end)? {
                     return Err(Error::Conflict("indexing canceled".into()));
@@ -245,6 +262,7 @@ impl Service {
             &job.initial_metadata,
             &job.initial_chunk_metadata,
         )?;
+        IngestionShutdown::check(stopping)?;
         if !self.queue.begin_publish(job.id)? {
             return Err(Error::Conflict("indexing canceled".into()));
         }
@@ -262,15 +280,20 @@ impl Service {
         Ok(revision)
     }
 
-    fn prepare_rtf(&self, job: &Job) -> Result<RtfPreparation> {
+    fn prepare_rtf(&self, job: &Job, stopping: &impl Fn() -> bool) -> Result<RtfPreparation> {
         if let Some(prepared) = &job.rtf_preparation {
-            if prepared.extractor == RTF_EXTRACTOR && self.matches_saved_text(job, prepared)? {
+            if prepared.extractor == RTF_EXTRACTOR
+                && self.matches_saved_text(job, prepared, stopping)?
+            {
                 if job.retain_original {
                     let original =
                         self.files
                             .open_original(&job.scope, job.source, job.revision)?;
                     let mut hash = blake3::Hasher::new();
-                    hash.update_reader(original.take(job.bytes.saturating_add(1)))?;
+                    hash.update_reader(IngestionReader {
+                        inner: original.take(job.bytes.saturating_add(1)),
+                        stopping,
+                    })?;
                     verify_original_digest(job, hash.finalize().to_hex().as_str())?;
                 }
                 if job.extracting && !self.queue.extracted(job.id, prepared)? {
@@ -282,21 +305,29 @@ impl Service {
                 return Err(Error::Conflict("extraction canceled".into()));
             }
         }
-        self.extract_rtf(job)
+        self.extract_rtf(job, stopping)
     }
 
-    fn matches_saved_text(&self, job: &Job, prepared: &RtfPreparation) -> Result<bool> {
+    fn matches_saved_text(
+        &self,
+        job: &Job,
+        prepared: &RtfPreparation,
+        stopping: &impl Fn() -> bool,
+    ) -> Result<bool> {
         let file = match self.files.open_text(&job.scope, job.source, job.revision) {
             Ok(file) => file,
             Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         };
         let mut hash = blake3::Hasher::new();
-        hash.update_reader(file.take(prepared.canonical_bytes.saturating_add(1)))?;
+        hash.update_reader(IngestionReader {
+            inner: file.take(prepared.canonical_bytes.saturating_add(1)),
+            stopping,
+        })?;
         Ok(hash.finalize().to_hex().as_str() == prepared.canonical_hash)
     }
 
-    fn extract_rtf(&self, job: &Job) -> Result<RtfPreparation> {
+    fn extract_rtf(&self, job: &Job, stopping: &impl Fn() -> bool) -> Result<RtfPreparation> {
         let original = self
             .files
             .open_original(&job.scope, job.source, job.revision)?;
@@ -313,7 +344,11 @@ impl Service {
             inner: text.as_file(),
             hash: blake3::Hasher::new(),
         };
-        let encoding = match rtf_to_utf8(BufReader::new(&mut reader), BufWriter::new(&mut output)) {
+        let input = BufReader::new(IngestionReader {
+            inner: &mut reader,
+            stopping,
+        });
+        let encoding = match rtf_to_utf8(input, BufWriter::new(&mut output)) {
             Err(Error::Io(ref error)) if error.kind() == io::ErrorKind::ConnectionAborted => {
                 return Err(Error::Conflict("extraction canceled".into()));
             }
@@ -361,6 +396,43 @@ fn verify_original_digest(job: &Job, digest: &str) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct IngestionShutdown;
+
+impl fmt::Display for IngestionShutdown {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("local ingestion interrupted by server shutdown")
+    }
+}
+
+impl std::error::Error for IngestionShutdown {}
+
+impl IngestionShutdown {
+    fn check(stopping: &impl Fn() -> bool) -> io::Result<()> {
+        if stopping() {
+            return Err(io::Error::other(Self));
+        }
+        Ok(())
+    }
+
+    fn caused(error: &Error) -> bool {
+        matches!(error, Error::Io(error)
+            if error.get_ref().is_some_and(|cause| cause.is::<Self>()))
+    }
+}
+
+struct IngestionReader<'a, R, S> {
+    inner: R,
+    stopping: &'a S,
+}
+
+impl<R: Read, S: Fn() -> bool> Read for IngestionReader<'_, R, S> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        IngestionShutdown::check(self.stopping)?;
+        self.inner.read(buffer)
+    }
 }
 
 fn revision_for(job: &Job, content: RevisionContent) -> Revision {
@@ -618,5 +690,116 @@ impl<W: Write> Write for HashingWriter<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+    use crate::TextUpload;
+
+    #[test]
+    fn shutdown_restarts_claimed_text_and_rtf_without_losing_inputs_or_checkpoints() {
+        for (name, keep_checkpoint) in [
+            ("note.txt", false),
+            ("note.rtf", false),
+            ("prepared.rtf", true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let open = || Service::open(directory.path(), 1024 * 1024).unwrap();
+            let service = open();
+            let scope = Scope {
+                tenant: "default".parse().unwrap(),
+                collection: "notes".parse().unwrap(),
+            };
+            service.create_collection(&scope).unwrap();
+            let upload = service
+                .stage_upload(
+                    scope.clone(),
+                    TextUpload {
+                        name: name.into(),
+                        external: None,
+                        replacement: None,
+                        retain_original: false,
+                        initial_metadata: Vec::new(),
+                        initial_chunk_metadata: Vec::new(),
+                    },
+                )
+                .unwrap();
+            let is_rtf = is_rtf(name);
+            let mut file = upload.reopen().unwrap();
+            if is_rtf {
+                file.write_all(br"{\rtf1\ansi ").unwrap();
+            }
+            for _ in 0..4096 {
+                file.write_all(b"amethyst cave\n").unwrap();
+            }
+            if is_rtf {
+                file.write_all(b"}").unwrap();
+            }
+            drop(file);
+            let job = upload.enqueue().unwrap();
+            let checks = Cell::new(0);
+            assert!(
+                service
+                    .process_next_until_shutdown(|| {
+                        checks.set(checks.get() + 1);
+                        if !keep_checkpoint {
+                            return checks.get() >= 6;
+                        }
+                        service
+                            .job(&scope, job.id)
+                            .unwrap()
+                            .rtf_preparation
+                            .is_some()
+                    })
+                    .unwrap()
+            );
+            let interrupted = service.job(&scope, job.id).unwrap();
+            assert_eq!(interrupted.state, JobState::Indexing, "{name}");
+            assert!(interrupted.failure.is_none());
+            assert_eq!(
+                interrupted.rtf_preparation.is_some(),
+                keep_checkpoint,
+                "{name}"
+            );
+            assert!(
+                service
+                    .database(&scope)
+                    .unwrap()
+                    .revision_summary(job.source, job.revision)
+                    .unwrap()
+                    .is_none()
+            );
+            drop(service);
+
+            let restarted = open();
+            let pending = restarted.job(&scope, job.id).unwrap();
+            assert_eq!(pending.state, JobState::Accepted);
+            assert_eq!(pending.revision, job.revision);
+            assert_eq!(
+                pending.rtf_preparation.map(|saved| saved.canonical_hash),
+                interrupted
+                    .rtf_preparation
+                    .map(|saved| saved.canonical_hash),
+            );
+            assert!(restarted.process_next().unwrap());
+            let ready = restarted.job(&scope, job.id).unwrap();
+            assert_eq!(ready.state, JobState::TextReady);
+            assert_eq!(ready.attempts, 2);
+            let hit = restarted
+                .fetch(
+                    &scope,
+                    &ChunkRef {
+                        source: job.source,
+                        revision: job.revision,
+                        ordinal: 0,
+                    },
+                )
+                .unwrap();
+            assert!(hit.excerpt.starts_with("amethyst cave"));
+        }
     }
 }
