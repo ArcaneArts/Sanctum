@@ -328,9 +328,9 @@ to the accepted input object.
 The next task delivers the same operation reference to
 `/internal/tasks/index-upload`. It verifies the downloaded canonical object
 before building the index and checks the indexed digest, length, and chunk
-count before publication. A missing object or digest mismatch leaves the
-operation registered for retry. Invalid source errors describe input that
-matches the accepted upload.
+count before publication. A missing object or digest mismatch leaves a
+current operation registered for retry. Invalid source errors describe input
+that matches the accepted upload.
 If a saved RTF extraction is missing or fails verification, the worker rebuilds
 it from the accepted RTF. It publishes a fresh object only if the reconstructed
 text and processing metadata match the recorded extraction.
@@ -338,7 +338,9 @@ When the request retains its original RTF, the worker verifies those bytes
 before publishing the original locator. A missing or changed original leaves
 the operation registered and retryable.
 The worker checks the registered sequence inside the publishing transaction.
-An older replacement cannot displace a newer registered revision.
+A superseded upload receives `stale_revision` even if its staged input is
+missing or unreadable during preparation or indexing. A previously
+committed indexing or cancellation receipt still takes precedence.
 The snapshot commits text-object locators, the lexical index, and the
 indexing receipt together. Replaying a published receipt avoids rebuilding
 its index.
