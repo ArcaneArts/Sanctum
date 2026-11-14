@@ -474,9 +474,10 @@ requesting another storage page.
 The worker's snapshot sweep scans catalog and collection manifests and
 pending creation intents. Each invocation processes up to eight entries
 and stores the remaining work and pagination cursors. It acquires the
-unit's writer lease to mark snapshots
-that are no longer current. Deletion is eligible after 15 minutes from
-that observation, including for uploaded snapshots that never committed.
+unit's writer lease to mark snapshots that are no longer current. The sweep
+renews the lease during storage operations and stops when renewal fails.
+Deletion is eligible 15 minutes after that observation, including for uploaded
+snapshots that never committed.
 Busy units are revisited on the next pass. The sweep preserves the
 published HEAD generation and leaves already downloaded reader files usable.
 The maintenance response includes `recovered_creations` for creation intents
