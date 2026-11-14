@@ -53,8 +53,10 @@ name. [Embedding provider configuration](LOCAL_API.md#openai-compatible-embeddin
 
 Closing the window leaves the server running. Use **Open Sanctum** in the
 tray menu to show it again. **Quit Sanctum** closes the host's control pipe,
-allows the server to stop, and exits. Accepted work resumes the next time
-Sanctum opens.
+allows the server to stop, and exits. Quit and **Restart server to apply**
+also interrupt a server that is still starting. The host waits for that
+child to exit before starting a replacement. Accepted work resumes the
+next time Sanctum opens.
 
 ## Object storage
 
