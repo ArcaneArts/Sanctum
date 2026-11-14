@@ -9,16 +9,12 @@ use axum::{
     routing::post,
 };
 use sanctum_core::{Error, Scope};
-use sanctum_service::{HostedCatalog, TaskStage};
+use sanctum_service::{HOSTED_STAGE_TIMEOUT, HostedCatalog, TaskStage};
 use serde::Deserialize;
 use uuid::Uuid;
 
 pub(crate) fn router(service: HostedCatalog) -> Router {
-    router_with_task_budgets(
-        service,
-        Duration::from_secs(crate::cloud_tasks::DISPATCH_DEADLINE_SECONDS - 30),
-        Duration::from_secs(15),
-    )
+    router_with_task_budgets(service, HOSTED_STAGE_TIMEOUT, Duration::from_secs(15))
 }
 
 pub(super) fn router_with_task_budgets(

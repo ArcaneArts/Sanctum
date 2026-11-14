@@ -15,6 +15,7 @@ const HINT_PAGE_SIZE: u32 = 16;
 const REPAIR_CONCURRENCY: usize = 4;
 const REPAIR_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 const REPAIR_PAGE_TIMEOUT: Duration = Duration::from_secs(240);
+pub const HOSTED_STAGE_TIMEOUT: Duration = Duration::from_secs(570);
 
 #[derive(Default, Serialize, Deserialize)]
 struct Cursor {
@@ -234,6 +235,17 @@ impl HostedCatalog {
         cursor: Option<&str>,
         stopping: impl Fn() -> bool,
     ) -> Result<ReconcilePage> {
+        self.work_standalone_shard_with_timeout(shard, cursor, HOSTED_STAGE_TIMEOUT, stopping)
+            .await
+    }
+
+    pub async fn work_standalone_shard_with_timeout(
+        &self,
+        shard: u8,
+        cursor: Option<&str>,
+        stage_timeout: Duration,
+        stopping: impl Fn() -> bool,
+    ) -> Result<ReconcilePage> {
         let HintPage { hints, next_cursor } = self.hint_page(shard, cursor).await?;
         let mut report = ReconcilePage {
             dispatched: 0,
@@ -244,13 +256,23 @@ impl HostedCatalog {
             if stopping() {
                 break;
             }
-            let result = match kind {
-                HintKind::Rebuild => self.work_standalone_rebuild(&scope, operation).await,
-                HintKind::Upload(attempt) => {
-                    self.work_standalone_upload(&scope, operation, UploadHint { attempt, object })
+            let stage = async {
+                match kind {
+                    HintKind::Rebuild => self.work_standalone_rebuild(&scope, operation).await,
+                    HintKind::Upload(attempt) => {
+                        self.work_standalone_upload(
+                            &scope,
+                            operation,
+                            UploadHint { attempt, object },
+                        )
                         .await
+                    }
                 }
             };
+            // A timed-out stage keeps its hint and any committed checkpoint.
+            let result = timeout(stage_timeout, stage)
+                .await
+                .unwrap_or_else(|_| Err(Error::Busy("standalone hosted stage timed out".into())));
             report.record(&scope, operation, result);
         }
         Ok(report)

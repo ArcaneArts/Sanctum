@@ -65,6 +65,129 @@ async fn minio_standalone_worker_stops_and_resumes_a_stalled_checkpoint() {
     clear_prefix(storage.as_ref(), &prefix).await;
 }
 
+#[tokio::test]
+async fn filesystem_standalone_worker_continues_after_a_stage_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    verify_standalone_deadline(storage, None).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live MinIO bucket and S3 credentials"]
+async fn minio_standalone_worker_continues_after_a_stage_deadline() {
+    let storage = minio_storage();
+    let prefix = Key::parse(format!("standalone-deadline-{}", Uuid::new_v4())).unwrap();
+    verify_standalone_deadline(storage.clone(), Some(prefix.clone())).await;
+    clear_prefix(storage.as_ref(), &prefix).await;
+}
+
+async fn verify_standalone_deadline(storage: Arc<dyn Storage>, prefix: Option<Key>) {
+    let (checkpoint, reached) = oneshot::channel();
+    let fault = Arc::new(StalledCheckpoint {
+        storage,
+        checkpoint: Mutex::new(Some(checkpoint)),
+        after_dispatch: false,
+        lose_source_reply: None,
+        lose_control_reply: Mutex::new(None),
+    });
+    let scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "repair".into(),
+    };
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let catalog = HostedCatalog::new(fault, prefix, 1024)
+        .unwrap()
+        .with_standalone_worker(wake.clone());
+    let (mut api, _api_server) = serve_api(catalog.clone()).await;
+    api.create_collection(v1::CreateCollectionRequest {
+        scope: Some(scope.clone()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let first = submit_source(&mut api, &scope, Uuid::from_u128(1), "stalled.rtf", RTF).await;
+    let next = submit_source(
+        &mut api,
+        &scope,
+        Uuid::from_u128(2),
+        "next.txt",
+        "Café quartz after the stalled stage.".as_bytes(),
+    )
+    .await;
+    let job = |id: &str| v1::IngestionJobRequest {
+        scope: Some(scope.clone()),
+        operation_id: id.into(),
+    };
+    let stop = CancellationToken::new();
+    let stage_timeout = Duration::from_secs(5);
+    let worker = AbortOnDropHandle::new(tokio::spawn(
+        crate::standalone_worker::run_with_stage_timeout(
+            catalog,
+            wake,
+            stop.clone(),
+            stage_timeout,
+        ),
+    ));
+    let dropped = tokio::time::timeout(Duration::from_secs(10), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        api.get_ingestion_job(job(&next.operation_id))
+            .await
+            .unwrap()
+            .into_inner(),
+        next
+    );
+    assert!(
+        tokio::time::timeout(stage_timeout + Duration::from_secs(2), dropped)
+            .await
+            .expect("the stalled stage must be dropped at its deadline")
+            .is_err()
+    );
+
+    for (accepted, word, text) in [
+        (first, "rhodonite", TEXT),
+        (next, "quartz", "Café quartz after the stalled stage."),
+    ] {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = api
+                    .get_ingestion_job(job(&accepted.operation_id))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                if status.state() == v1::IngestionState::TextReady {
+                    assert_eq!(status.revision_id, accepted.revision_id);
+                    assert_eq!(status.source_id, accepted.source_id);
+                    assert_eq!(status.update_sequence, 1);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let hits = api
+            .search_text(v1::SearchTextRequest {
+                scope: Some(scope.clone()),
+                query: word.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .hits;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].excerpt, text);
+    }
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 async fn verify_standalone_shutdown(storage: Arc<dyn Storage>, prefix: Option<Key>) {
     let (checkpoint, reached) = oneshot::channel();
     let fault = Arc::new(StalledCheckpoint {
