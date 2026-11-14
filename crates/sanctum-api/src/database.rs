@@ -1,4 +1,4 @@
-use std::{pin::Pin, time::SystemTime};
+use std::{future::Future, pin::Pin, time::SystemTime};
 
 use futures::{Stream, stream};
 
@@ -39,10 +39,8 @@ pub(super) async fn open(
             .wire(request, collection)?
         }
         Backend::Hosted(catalog) => {
-            let session = catalog
-                .open_database_session(&target)
-                .await
-                .map_err(status)?;
+            let session =
+                read_hosted_database(&cancellation, catalog.open_database_session(&target)).await?;
             SessionDetails {
                 id: session.id,
                 expires_at: session.expires_at,
@@ -129,10 +127,9 @@ pub(super) async fn query(
             .await?
         }
         Backend::Hosted(catalog) => {
-            let session = catalog
-                .database_session(&target, generation)
-                .await
-                .map_err(status)?;
+            let session =
+                read_hosted_database(&cancellation, catalog.database_session(&target, generation))
+                    .await?;
             work(move || {
                 database_snapshot::query(
                     session.path(),
@@ -181,10 +178,9 @@ pub(super) async fn download(
             (Box::new(session), file, bytes)
         }
         Backend::Hosted(catalog) => {
-            let session = catalog
-                .database_session(&target, generation)
-                .await
-                .map_err(status)?;
+            let session =
+                read_hosted_database(&shutdown, catalog.database_session(&target, generation))
+                    .await?;
             let file = session.reopen().map_err(status)?;
             let bytes = session.generation.bytes;
             (Box::new(session), file, bytes)
@@ -208,6 +204,19 @@ struct DatabaseDownload {
     _session: Box<dyn Send>,
     remaining: u64,
     shutdown: CancellationToken,
+}
+
+async fn read_hosted_database<T>(
+    shutdown: &CancellationToken,
+    read: impl Future<Output = Result<T>>,
+) -> std::result::Result<T, Status> {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => {
+            Err(Status::unavailable("database session request interrupted by server shutdown"))
+        }
+        result = read => result.map_err(status),
+    }
 }
 
 impl DatabaseDownload {

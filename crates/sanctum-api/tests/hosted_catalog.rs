@@ -7531,15 +7531,18 @@ const CHANGE_SESSION_REPLY: u8 = 26;
 const LOSE_SESSION_REPLY: u8 = 27;
 const BLOCK_SESSION_REPLY: u8 = 28;
 const SESSION_REPLY_BLOCKED: u8 = 29;
+const BLOCK_SESSION_SNAPSHOT: u8 = 30;
+const SESSION_SNAPSHOT_BLOCKED: u8 = 31;
+const SESSION_SNAPSHOT_DROPPED: u8 = 32;
 const PARALLEL_RANGE_START: u8 = 40;
 const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
 const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
 
-struct InterruptedRead<'a>(&'a AtomicU8);
+struct InterruptedRead<'a>(&'a AtomicU8, u8);
 
 impl Drop for InterruptedRead<'_> {
     fn drop(&mut self) {
-        self.0.store(SCAN_RANGE_DROPPED, Ordering::Relaxed);
+        self.0.store(self.1, Ordering::Relaxed);
     }
 }
 
@@ -7586,12 +7589,20 @@ impl Storage for InterruptAcceptance {
         {
             return Err(Error::Busy("test blocked original input reads".into()));
         }
+        if key.as_str().ends_with("/meta.db")
+            && self.interrupt.load(Ordering::Relaxed) == BLOCK_SESSION_SNAPSHOT
+        {
+            let _dropped = InterruptedRead(&self.interrupt, SESSION_SNAPSHOT_DROPPED);
+            self.interrupt
+                .store(SESSION_SNAPSHOT_BLOCKED, Ordering::Relaxed);
+            std::future::pending::<()>().await;
+        }
         self.inner.get(key).await
     }
 
     async fn read_range(&self, key: &Key, range: ByteRange) -> StorageResult<axum::body::Bytes> {
         if range.start != 0 && self.interrupt.load(Ordering::Relaxed) == BLOCK_SCAN_RANGE {
-            let _dropped = InterruptedRead(&self.interrupt);
+            let _dropped = InterruptedRead(&self.interrupt, SCAN_RANGE_DROPPED);
             self.interrupt.store(SCAN_RANGE_BLOCKED, Ordering::Relaxed);
             std::future::pending::<()>().await;
         }
@@ -7947,6 +7958,135 @@ async fn start(catalog: HostedCatalog) -> Running {
         stop,
         server,
     }
+}
+
+#[tokio::test]
+async fn hosted_database_requests_stop_during_materialization_and_keep_the_pinned_session() {
+    use std::time::Duration;
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
+    let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let initial = catalog();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    initial.create_collection(&scope, None).await.unwrap();
+    let target = v1::DatabaseTarget {
+        tenant: scope.tenant.to_string(),
+        collection: Some(scope.collection.to_string()),
+    };
+    let mut server = start(initial.clone()).await;
+    let opened = server
+        .client
+        .open_database_session(target.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let handle = opened.session.unwrap();
+    server.stop().await;
+
+    let upload = initial
+        .stage_upload(
+            scope.clone(),
+            sanctum_service::TextUpload {
+                name: "notes.txt".into(),
+                external: None,
+                replacement: None,
+                retain_original: false,
+                initial_metadata: Vec::new(),
+                initial_chunk_metadata: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    std::io::Write::write_all(&mut upload.reopen().unwrap(), b"newer text").unwrap();
+    let job = upload.enqueue().await.unwrap();
+    initial
+        .register_upload(&scope, job.operation)
+        .await
+        .unwrap();
+    initial.index_upload(&scope, job.operation).await.unwrap();
+
+    let query = v1::QueryDatabaseRequest {
+        session: Some(handle.clone()),
+        sql: "SELECT count(*) FROM sources".into(),
+        ..Default::default()
+    };
+    for operation in ["open", "query", "download"] {
+        let server = start(catalog()).await;
+        storage
+            .interrupt
+            .store(BLOCK_SESSION_SNAPSHOT, Ordering::Relaxed);
+        let mut api = server.client.clone();
+        let target = target.clone();
+        let query = query.clone();
+        let handle = handle.clone();
+        let request = tokio::spawn(async move {
+            match operation {
+                "open" => api.open_database_session(target).await.map(|_| ()),
+                "query" => api.query_database(query).await.map(|_| ()),
+                "download" => api.download_database(handle).await.map(|_| ()),
+                _ => unreachable!(),
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while storage.interrupt.load(Ordering::Relaxed) != SESSION_SNAPSHOT_BLOCKED {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        server.stop.cancel();
+        let response = tokio::time::timeout(Duration::from_secs(2), request)
+            .await
+            .unwrap_or_else(|_| panic!("{operation} did not stop during a stalled snapshot read"))
+            .unwrap();
+        assert_eq!(
+            response.unwrap_err().code(),
+            Code::Unavailable,
+            "{operation}"
+        );
+        assert_eq!(
+            storage.interrupt.load(Ordering::Relaxed),
+            SESSION_SNAPSHOT_DROPPED
+        );
+        tokio::time::timeout(Duration::from_secs(2), server.stop())
+            .await
+            .unwrap();
+    }
+
+    let generation = opened.snapshot_generation.unwrap();
+    let key = Key::parse(format!(
+        "default/collections/notes/snapshots/{generation}/meta.db"
+    ))
+    .unwrap();
+    let expected = std::fs::read(directory.path().join(key.as_str())).unwrap();
+    let mut restarted = start(catalog()).await;
+    let result = restarted
+        .client
+        .query_database(query)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        result.rows[0].values[0].value,
+        Some(v1::sql_value::Value::Integer(0))
+    );
+    let mut stream = restarted
+        .client
+        .download_database(handle)
+        .await
+        .unwrap()
+        .into_inner();
+    let mut exported = Vec::new();
+    while let Some(frame) = stream.message().await.unwrap() {
+        exported.extend(frame.data);
+    }
+    assert_eq!(exported, expected);
+    restarted.stop().await;
 }
 
 #[tokio::test]

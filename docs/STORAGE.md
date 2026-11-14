@@ -590,6 +590,9 @@ the same five-minute lifetime. Any API instance with access to the same
 deployment prefix can use the handle. API processes verify the published
 SQLite file against its recorded size and BLAKE3 digest and reuse it
 within the configured snapshot cache budget.
+Hosted session open, query, and export return `UNAVAILABLE` if shutdown
+interrupts snapshot loading. A query or export can retry with the same
+unexpired handle on a fresh instance.
 The regular snapshot sweep removes expired session records after the
 reader grace period. Close a session early to release its handle.
 [Operator SQL and export](LOCAL_API.md#read-only-sql-sessions-and-snapshots).
