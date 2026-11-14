@@ -1,8 +1,9 @@
 """Verify upload and retrieval through an existing Sanctum deployment."""
 
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
+from http.client import HTTPConnection, HTTPSConnection
 import json
 import math
 import os
@@ -11,7 +12,7 @@ import runpy
 import time
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import grpc
 from sanctum.v1 import sanctum_pb2 as pb
@@ -20,8 +21,10 @@ from sanctum.v1 import sanctum_pb2_grpc as rpc
 
 MCP = runpy.run_path(str(Path(__file__).with_name("check-local-mcp.py")))
 ENDPOINT_TOKEN = "SANCTUM_GRPC_ID_TOKEN"
+WORKER_TOKEN = "SANCTUM_WORKER_ID_TOKEN"
 COLLECTION = "deployment-check"
 RPC_TIMEOUT = 20
+UPLOAD_STAGES = ("register", "prepare", "index")
 
 
 def fixture(operation, mib):
@@ -100,9 +103,40 @@ def check_iam(api_url):
     return {"mcp_unauthenticated_status": unauthenticated, "grpc_unauthenticated_status": grpc_denied}
 
 
+def deliver_worker(endpoint, token, scope, operation, stage):
+    connection = HTTPSConnection if endpoint.scheme == "https" else HTTPConnection
+    body = json.dumps({
+        "tenant": scope.tenant, "collection": scope.collection, "operation_id": str(operation),
+    })
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    with closing(connection(endpoint.hostname, endpoint.port, timeout=RPC_TIMEOUT)) as worker:
+        worker.request("POST", f"/internal/tasks/{stage}-upload", body, headers)
+        with worker.getresponse() as response:
+            return response.status
+
+
+def check_worker_deliveries(endpoint, token, scope, operation, stages, expected, private):
+    report = {}
+    if private:
+        status = deliver_worker(endpoint, None, scope, operation, "index")
+        if status not in (401, 403):
+            raise RuntimeError(f"unauthenticated worker request returned HTTP {status}")
+        report["unauthenticated_status"] = status
+    deliveries = {}
+    for stage in stages:
+        status = deliver_worker(endpoint, token, scope, operation, stage)
+        if status != expected:
+            raise RuntimeError(f"worker {stage}-upload returned HTTP {status}, expected {expected}")
+        deliveries[stage] = status
+    return report | {"deliveries": deliveries}
+
+
 def submit(client, scope, operation, data):
+    creation = str(uuid5(operation, "sanctum deployment-check collection"))
     try:
-        client.CreateCollection(pb.CreateCollectionRequest(scope=scope), timeout=RPC_TIMEOUT)
+        client.CreateCollection(pb.CreateCollectionRequest(scope=scope, request_id=creation), timeout=RPC_TIMEOUT)
     except grpc.RpcError as error:
         if error.code() != grpc.StatusCode.ALREADY_EXISTS:
             raise
@@ -115,12 +149,26 @@ def submit(client, scope, operation, data):
     return accepted, elapsed
 
 
+def read_job(client, scope, operation):
+    return client.GetIngestionJob(
+        pb.IngestionJobRequest(scope=scope, operation_id=str(operation)), timeout=RPC_TIMEOUT,
+    )
+
+
+def check_out_of_order(client, endpoint, token, scope, operation, accepted, private):
+    if accepted.state != pb.INGESTION_STATE_ACCEPTED:
+        raise RuntimeError("out-of-order worker check requires an upload awaiting registration; pause task delivery")
+    report = check_worker_deliveries(endpoint, token, scope, operation, ("prepare", "index"), 503, private)
+    if read_job(client, scope, operation) != accepted:
+        raise RuntimeError("out-of-order worker delivery changed the accepted operation")
+    return report | {"state": pb.IngestionState.Name(accepted.state), "revision_id": accepted.revision_id}
+
+
 def wait_for_text(client, scope, operation, timeout):
-    request = pb.IngestionJobRequest(scope=scope, operation_id=str(operation))
     deadline = time.monotonic() + timeout
     states = []
     while True:
-        job = client.GetIngestionJob(request, timeout=RPC_TIMEOUT)
+        job = read_job(client, scope, operation)
         state = job.state
         if not states or states[-1] != state:
             states.append(state)
@@ -206,6 +254,19 @@ def verify_retrieval(client, api_url, token, scope, job, data):
     }
 
 
+def check_replayed_publication(job, after_job, before, after):
+    if (after_job.state, after_job.text_revision) != (job.state, job.text_revision):
+        raise RuntimeError("duplicate worker deliveries changed the published ingestion receipt")
+    identity = ("source_id", "revision_id", "database_generation")
+    for key in identity:
+        if before[key] != after[key]:
+            raise RuntimeError(f"duplicate worker deliveries changed {key}: {before[key]} -> {after[key]}")
+    return {
+        "database_generation_before_replay": before["database_generation"],
+        **{key: after[key] for key in (*identity, "verified_range_bytes")},
+    }
+
+
 def wait_for_vectors(client, scope, job, timeout):
     request = pb.EmbeddingStatusRequest(scope=scope, source_id=job.source_id, revision_id=job.revision_id)
     deadline = time.monotonic() + timeout
@@ -279,6 +340,7 @@ def verify_semantic(client, api_url, token, scope, job, data, dimensions, timeou
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api-url", required=True)
+    parser.add_argument("--worker-url", help="verify worker deliveries using a separate worker origin and identity token")
     parser.add_argument("--operation", type=UUID, default=None)
     parser.add_argument("--mib", type=int, default=0, help="generate an exact-size UTF-8 upload")
     parser.add_argument("--phase", choices=["all", "submit", "verify"], default="all")
@@ -298,6 +360,22 @@ def main():
         parser.error("--api-url must be a service origin")
     if args.expect_private and endpoint.scheme != "https":
         parser.error("--expect-private requires HTTPS")
+    try:
+        worker = urlsplit(args.worker_url) if args.worker_url is not None else None
+        if worker is not None and worker.port == 0:
+            parser.error("--worker-url port must be positive")
+    except ValueError as error:
+        parser.error(f"invalid --worker-url: {error}")
+    worker_token = os.environ.get(WORKER_TOKEN)
+    if worker is not None:
+        if (worker.hostname is None or worker.path not in ("", "/") or worker.query
+                or worker.fragment or worker.username is not None):
+            parser.error("--worker-url must be a service origin")
+        cloud = worker.scheme == "https" and bool(worker_token)
+        loopback = (worker.scheme == "http" and worker.hostname in ("localhost", "127.0.0.1", "::1")
+                    and not worker_token and not args.expect_private)
+        if not (cloud or loopback):
+            parser.error(f"use an HTTPS worker origin with {WORKER_TOKEN}, or unauthenticated loopback HTTP")
     api_url = args.api_url.rstrip("/")
     scope = pb.Scope(tenant=f"verify-{operation.hex[:20]}", collection=COLLECTION)
     data = fixture(operation, args.mib)
@@ -315,14 +393,30 @@ def main():
         if args.phase != "verify":
             accepted, elapsed = submit(client, scope, operation, data)
             report.update(acceptance_ms=elapsed, submission_state=pb.IngestionState.Name(accepted.state))
+            if worker is not None and args.phase == "submit":
+                report["worker"] = check_out_of_order(
+                    client, worker, worker_token, scope, operation, accepted, args.expect_private,
+                )
         if args.phase != "submit":
             result, elapsed = time_call(lambda: wait_for_text(client, scope, operation, args.wait_seconds))
             job, states = result
             report.update(wait_to_text_ready_ms=elapsed, observed_states=states)
-            report.update(verify_retrieval(client, api_url, token, scope, job, data))
+            before = verify_retrieval(client, api_url, token, scope, job, data)
+            report.update(before)
             if args.embedding_dimensions is not None:
                 report["semantic"] = verify_semantic(
                     client, api_url, token, scope, job, data, args.embedding_dimensions, args.wait_seconds,
+                )
+                if worker is not None:
+                    before = verify_retrieval(client, api_url, token, scope, job, data)
+            if worker is not None:
+                deliveries = check_worker_deliveries(
+                    worker, worker_token, scope, operation, UPLOAD_STAGES, 204, args.expect_private,
+                )
+                after_job = read_job(client, scope, operation)
+                after = verify_retrieval(client, api_url, token, scope, after_job, data)
+                report["worker"] = deliveries | check_replayed_publication(
+                    job, after_job, before, after,
                 )
     report["finished_at"] = utc_now()
     print(json.dumps(report, sort_keys=True))

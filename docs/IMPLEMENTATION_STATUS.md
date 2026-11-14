@@ -2013,6 +2013,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   The local MCP check also passed with default logging and with logs
   disabled after switching it to the server's managed startup output.
   [Runbook](CLOUD_RUN.md#repeatable-ingestion-and-range-check).
+- The deployment verifier now accepts a separate worker URL and token.
+  On live MinIO it submitted 200 MiB to the release API, observed HTTP 503
+  for both early stage deliveries, and replayed the submission after
+  `SIGKILL` of the API and worker. The collection catalog generation and
+  accepted revision stayed the same. After manual worker delivery finished
+  the job, the verifier got HTTP 204 for each of the three duplicates and
+  compared the unchanged collection generation, ingestion receipt, and exact
+  3,652-byte excerpts over gRPC and MCP. A loopback TLS worker fixture also
+  verified the second bearer token and unauthenticated rejection. A separate
+  run combined the replay check with strict semantic retrieval through real
+  768-dimensional Ollama embeddings. Cloud Run IAM, Cloud Tasks delivery,
+  and scale-to-zero evidence remain open.
+  [Recovery runbook](CLOUD_RUN.md#recovery-after-scaling-to-zero).
 - The same deployment check can verify document embeddings and strict semantic
   search with `--embedding-dimensions`. On live MinIO and Ollama, split submit
   and verify calls checked complete coverage at 768 dimensions, the same

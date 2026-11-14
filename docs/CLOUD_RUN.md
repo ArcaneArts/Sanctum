@@ -317,8 +317,16 @@ provider.
 ### Recovery after scaling to zero
 
 Run this exercise on a dedicated deployment with its own queue, scheduler
-jobs, and storage prefix. It pauses delivery and creates a task that
-arrives out of order.
+jobs, and storage prefix. Use the lexical-only configuration from the
+deployment example so background embedding writes do not change the
+generation during the comparison. Set `SANCTUM_WORKER_ID_TOKEN` with a
+token for the worker origin using an identity with worker invocation access.
+The caller token for the API and the worker token have separate audiences.
+
+```sh
+export SANCTUM_WORKER_ID_TOKEN="$(gcloud auth print-identity-token \
+  --impersonate-service-account "$TASKS_SA" --audiences "$WORKER_URL")"
+```
 
 1. Set the API and worker minimum instances to zero. Pause the Cloud
    Tasks queue and the deployment's scheduled worker invocations to allow
@@ -328,32 +336,36 @@ arrives out of order.
    ```sh
    operation="$(uuidgen | tr '[:upper:]' '[:lower:]')"
    PYTHONPATH="$generated" python scripts/check-hosted-deployment.py \
-     --api-url "$API_URL" --operation "$operation" --phase submit
+     --api-url "$API_URL" --worker-url "$WORKER_URL" --expect-private \
+     --operation "$operation" --phase submit > accepted.json
    ```
 
-2. Using an identity with worker invocation permission and a token for
-   `WORKER_URL`, POST the report's `tenant`, `collection`, and
-   `operation` as `operation_id` to `/internal/tasks/prepare-upload` or
-   `/internal/tasks/index-upload` before registration.
-   Expect HTTP 503 and confirm the operation remains accepted. Then stop
-   sending requests to both services. Check Cloud Monitoring's
+2. The verifier sends preparation and indexing requests before registration.
+   Its `worker` report records HTTP 503 for both requests and the unchanged
+   accepted receipt. It also checks that the worker denies unauthenticated
+   requests. Stop sending requests to both services. Check Cloud Monitoring's
    container instance count for both active and idle instances and
    record the observed idle interval. If the platform does not show
    the scale transition, record that separately from the application
    recovery result. [Cloud Run monitoring](https://docs.cloud.google.com/run/docs/monitoring),
    [Managing Cloud Tasks queues](https://docs.cloud.google.com/tasks/docs/manage-queues-and-tasks).
-3. Resume the queue and scheduled jobs. Refresh the caller ID token if
-   necessary and run the check with the same operation and size using
-   `--phase verify --wait-seconds 600`. Record Cloud Tasks and worker
-   request logs for registration, preparation, and indexing, then check the operation
-   and source references in the report.
-4. POST the original registration, preparation, and indexing task bodies again using
-   the authorized worker identity. Expect HTTP 204 and verify the same
-   revision and database generation are returned by another
-   `--phase verify` check. Save the relevant instance IDs and generation
-   from both runs. Cloud Run can choose a different instance for each
-   request. The isolated test data stays in its deployment prefix for
-   inspection.
+3. Resume the queue and scheduled jobs and refresh both tokens if necessary.
+   Run the check with the same operation ID and fixture size.
+
+   ```sh
+   PYTHONPATH="$generated" python scripts/check-hosted-deployment.py \
+     --api-url "$API_URL" --worker-url "$WORKER_URL" --expect-private \
+     --operation "$operation" --phase verify --wait-seconds 600 > replayed.json
+   unset SANCTUM_WORKER_ID_TOKEN
+   ```
+
+4. After finding the uploaded text through gRPC and MCP, the verifier replays
+   the registration, preparation, and indexing task bodies. It requires HTTP
+   204 for all three and compares the receipt, exact excerpt bytes, and
+   database generation before and after replay. Save the JSON reports and
+   Cloud Tasks and worker request logs for the original deliveries. Record
+   the relevant instance IDs to establish the observed scale transition.
+   The isolated test data stays in its deployment prefix for inspection.
 
 ### Repair an upload that never reached the queue
 
