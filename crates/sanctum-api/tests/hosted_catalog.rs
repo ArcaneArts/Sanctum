@@ -73,6 +73,17 @@ async fn hosted_activity_pages_resume_across_instances_and_keep_scope() {
             .await
             .unwrap();
     }
+    // Tenant-wide activity must not spend its scan budget on unrelated objects.
+    for index in 0..160 {
+        let key = Key::parse(format!(
+            "managed/default/collections/notes/0-unrelated/{index:03}"
+        ))
+        .unwrap();
+        storage
+            .put_control(&key, b"{}".as_slice().into(), Condition::Create)
+            .await
+            .unwrap();
+    }
     storage.catalog_reads.store(0, Ordering::Relaxed);
     storage.catalog_downloads.store(0, Ordering::Relaxed);
     let mut wide = server
@@ -137,7 +148,7 @@ async fn hosted_activity_pages_resume_across_instances_and_keep_scope() {
     );
     server.stop().await;
     let mut server = start(service()).await;
-    request.page_token = Some(token);
+    request.page_token = Some(token.clone());
     let mut results = Vec::new();
     for _ in 0..10 {
         let page = server
@@ -168,7 +179,7 @@ async fn hosted_activity_pages_resume_across_instances_and_keep_scope() {
     request.collection = Some("reference".into());
     let scoped = server
         .client
-        .list_ingestion_jobs(request)
+        .list_ingestion_jobs(request.clone())
         .await
         .unwrap()
         .into_inner();
@@ -177,6 +188,22 @@ async fn hosted_activity_pages_resume_across_instances_and_keep_scope() {
         "reference"
     );
     assert_eq!(scoped.jobs[0].state(), v1::IngestionState::Canceled);
+    catalog
+        .delete_collection(&scope("notes"), None)
+        .await
+        .unwrap();
+    let resumed = server
+        .client
+        .list_ingestion_jobs(v1::ListIngestionJobsRequest {
+            collection: None,
+            page_token: Some(token),
+            ..request
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resumed.jobs, scoped.jobs);
+    assert!(resumed.next_page_token.is_none());
     server.stop().await;
 }
 
