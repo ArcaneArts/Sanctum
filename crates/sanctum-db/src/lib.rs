@@ -13,9 +13,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 mod cache;
+mod generation;
+mod page_delta;
 pub use cache::SnapshotCache;
+pub use generation::Generation;
+use generation::{DeltaChain, DeltaFile};
 
 const FORMAT: u32 = 1;
+const DELTA_FORMAT: u32 = 2;
 const MAX_BATCH: usize = 64;
 const RECEIPT_RETENTION: Duration = Duration::from_secs(45 * 24 * 3600);
 
@@ -58,6 +63,13 @@ impl Unit {
             self.prefix, self.database
         ))
     }
+
+    fn delta(&self, generation: Uuid) -> Result<Key> {
+        Key::parse(format!(
+            "{}/snapshots/{generation}/pages.delta",
+            self.prefix
+        ))
+    }
 }
 
 pub fn collection_prefix(prefix: Option<&Key>, scope: &Scope) -> Result<Key> {
@@ -73,13 +85,6 @@ pub fn tenant_prefix(prefix: Option<&Key>, tenant: &ScopeId) -> Result<Key> {
 
 fn scoped_key(prefix: Option<&Key>, path: &str) -> Result<Key> {
     Key::parse(prefix.map_or_else(|| path.to_owned(), |prefix| format!("{prefix}/{path}")))
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Generation {
-    pub id: Uuid,
-    pub bytes: u64,
-    pub blake3: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -106,6 +111,7 @@ pub struct Publication {
     storage: Arc<dyn Storage>,
     ttl: Duration,
     snapshots: Option<Arc<SnapshotCache>>,
+    page_deltas: bool,
 }
 
 pub struct Lease {
@@ -159,11 +165,17 @@ impl Publication {
             storage,
             ttl,
             snapshots: None,
+            page_deltas: false,
         })
     }
 
     pub fn with_snapshot_cache(mut self, snapshots: Arc<SnapshotCache>) -> Self {
         self.snapshots = Some(snapshots);
+        self
+    }
+
+    pub fn with_page_deltas(mut self, enabled: bool) -> Self {
+        self.page_deltas = enabled;
         self
     }
 
@@ -367,8 +379,18 @@ impl Publication {
         }
         let head: Head =
             serde_json::from_slice(&bytes).map_err(|error| Error::Internal(Box::new(error)))?;
-        if head.format != FORMAT {
+        if !matches!(head.format, FORMAT | DELTA_FORMAT) {
             return Err(corrupt("unsupported database manifest version"));
+        }
+        if let Some(generation) = &head.generation
+            && let Some(chain) = &generation.chain
+        {
+            if head.format != DELTA_FORMAT {
+                return Err(corrupt(
+                    "snapshot deltas require database manifest format 2",
+                ));
+            }
+            chain.validate(generation)?;
         }
         Ok(Some((head, response.object.version)))
     }
@@ -379,8 +401,67 @@ impl Publication {
         generation: Generation,
         directory: &Path,
     ) -> Result<Materialized> {
-        let response = self.storage.get(&unit.snapshot(generation.id)?).await?;
-        if response.object.length != generation.bytes {
+        let file = if let Some(chain) = &generation.chain {
+            // Database sessions carry their own generation descriptor.
+            chain.validate(&generation)?;
+            let base = &chain.base;
+            let database = self
+                .download_checked(
+                    &unit.snapshot(base.id)?,
+                    base.bytes,
+                    &base.blake3,
+                    directory,
+                )
+                .await?;
+            for delta in &chain.deltas {
+                let patch = self
+                    .download_checked(
+                        &unit.delta(delta.id)?,
+                        delta.bytes,
+                        &delta.blake3,
+                        directory,
+                    )
+                    .await?;
+                let mut writer = database.reopen()?;
+                let bytes = delta.result_bytes;
+                tokio::task::spawn_blocking(move || {
+                    page_delta::apply(&mut writer, patch.reopen()?, bytes)
+                })
+                .await
+                .map_err(|error| Error::Internal(Box::new(error)))??;
+            }
+            let mut contents = database.reopen()?;
+            let expected = generation.blake3.clone();
+            let actual = tokio::task::spawn_blocking(move || hash_file(&mut contents))
+                .await
+                .map_err(|error| Error::Internal(Box::new(error)))??;
+            if actual != expected {
+                return Err(corrupt(
+                    "reconstructed SQLite backup does not match its manifest",
+                ));
+            }
+            database
+        } else {
+            self.download_checked(
+                &unit.snapshot(generation.id)?,
+                generation.bytes,
+                &generation.blake3,
+                directory,
+            )
+            .await?
+        };
+        Ok(Materialized { generation, file })
+    }
+
+    async fn download_checked(
+        &self,
+        key: &Key,
+        length: u64,
+        digest: &str,
+        directory: &Path,
+    ) -> Result<NamedTempFile> {
+        let response = self.storage.get(key).await?;
+        if response.object.length != length {
             return Err(corrupt(
                 "database snapshot length differs from its manifest",
             ));
@@ -397,7 +478,7 @@ impl Publication {
                 break;
             }
             read += bytes as u64;
-            if read > generation.bytes {
+            if read > length {
                 return Err(corrupt(
                     "database snapshot body exceeds its manifest length",
                 ));
@@ -405,11 +486,11 @@ impl Publication {
             hasher.update(&buffer[..bytes]);
             output.write_all(&buffer[..bytes]).await?;
         }
-        if read != generation.bytes || hasher.finalize().to_hex().as_str() != generation.blake3 {
+        if read != length || hasher.finalize().to_hex().as_str() != digest {
             return Err(corrupt("database snapshot does not match its manifest"));
         }
         output.flush().await?;
-        Ok(Materialized { generation, file })
+        Ok(file)
     }
 }
 
@@ -490,32 +571,58 @@ impl Lease {
             ),
             (None, _) => (None, false),
         };
+        let delta_bytes = self
+            .publication
+            .page_deltas
+            .then(|| source.as_ref()?.generation.chain_bytes())
+            .flatten();
         let prepared = tokio::task::spawn_blocking(move || {
-            apply_snapshot(directory, source, shared, stage, commands, apply)
+            apply_snapshot(
+                directory,
+                source,
+                shared || delta_bytes.is_some(),
+                delta_bytes,
+                stage,
+                commands,
+                apply,
+            )
         })
         .await
         .map_err(|error| Error::Internal(Box::new(error)))??;
         self.ensure_live()?;
-        let (staged, generation, receipts) = match prepared {
+        let (staged, generation, receipts, delta) = match prepared {
             Prepared::Changed {
                 file,
                 generation,
                 receipts,
-            } => (file, generation, receipts),
+                delta,
+            } => (file, generation, receipts, delta),
             Prepared::Unchanged {
                 generation,
                 receipts,
             } => return Ok((generation, receipts)),
         };
         self.renew().await?;
-        let file = tokio::fs::File::from_std(staged.reopen()?);
-        let key = self.unit.snapshot(generation.id)?;
+        let (key, file) = match &delta {
+            Some(delta) => (self.unit.delta(generation.id)?, delta.reopen()?),
+            None => (self.unit.snapshot(generation.id)?, staged.reopen()?),
+        };
+        let uploaded_bytes = file.metadata()?.len();
         self.publication
             .storage
-            .put_stream(&key, Box::pin(file), generation.bytes)
+            .put_stream(
+                &key,
+                Box::pin(tokio::fs::File::from_std(file)),
+                uploaded_bytes,
+            )
             .await?;
         self.ensure_live()?;
         let mut head = self.head.clone();
+        head.format = if delta.is_some() {
+            DELTA_FORMAT
+        } else {
+            FORMAT
+        };
         head.generation = Some(generation.clone());
         self.write(head).await?;
         if let Some(snapshots) = &self.publication.snapshots {
@@ -532,6 +639,7 @@ impl Lease {
         tracing::debug!(
             epoch = self.head.epoch,
             snapshot_bytes = generation.bytes,
+            uploaded_bytes,
             commands = receipts.len(),
             "published database snapshot"
         );
@@ -545,12 +653,6 @@ impl Lease {
             .storage
             .list(Some(&prefix), cursor, 128)
             .await?;
-        let current = self
-            .head
-            .generation
-            .as_ref()
-            .map(|generation| self.unit.snapshot(generation.id))
-            .transpose()?;
         let mut deleted = 0;
         let prefix = format!("{prefix}/");
         for object in page.objects {
@@ -578,23 +680,23 @@ impl Lease {
                 continue;
             };
             let is_marker = file == "retired.json";
-            if !is_marker && file != self.unit.database {
+            if !is_marker && file != self.unit.database && file != "pages.delta" {
                 continue;
             }
-            let data = self.unit.snapshot(generation)?;
-            if current.as_ref() == Some(&data) {
+            if self
+                .head
+                .generation
+                .as_ref()
+                .is_some_and(|current| current.uses(generation))
+            {
                 continue;
             }
             let marker = Key::parse(format!("{prefix}{generation}/retired.json"))?;
             self.ensure_live()?;
             if is_marker {
-                match self.publication.storage.head(&data).await {
-                    Err(Error::NotFound(_)) => {
-                        self.ensure_live()?;
-                        self.publication.storage.delete(&marker).await?;
-                    }
-                    Ok(_) => {}
-                    Err(error) => return Err(error),
+                if !self.retired_data_exists(generation).await? {
+                    self.ensure_live()?;
+                    self.publication.storage.delete(&marker).await?;
                 }
                 continue;
             }
@@ -618,7 +720,7 @@ impl Lease {
                         .is_ok_and(|age| age >= grace) =>
                 {
                     self.ensure_live()?;
-                    self.publication.storage.delete(&data).await?;
+                    self.publication.storage.delete(&object.key).await?;
                     deleted += 1;
                     self.publication.storage.delete(&marker).await?;
                 }
@@ -630,6 +732,20 @@ impl Lease {
             deleted,
             next_cursor: page.next_cursor,
         })
+    }
+
+    async fn retired_data_exists(&self, generation: Uuid) -> Result<bool> {
+        for key in [
+            self.unit.snapshot(generation)?,
+            self.unit.delta(generation)?,
+        ] {
+            match self.publication.storage.head(&key).await {
+                Ok(_) => return Ok(true),
+                Err(Error::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
     }
 
     async fn reclaim_retired(
@@ -720,6 +836,7 @@ enum Prepared {
         file: NamedTempFile,
         generation: Generation,
         receipts: Vec<Receipt>,
+        delta: Option<NamedTempFile>,
     },
     Unchanged {
         generation: Generation,
@@ -760,6 +877,7 @@ fn apply_snapshot<T>(
     directory: TempDir,
     source: Option<Arc<Materialized>>,
     shared: bool,
+    delta_bytes: Option<u64>,
     stage: &str,
     commands: Vec<Command<T>>,
     mut apply: impl FnMut(&Transaction<'_>, T) -> Result<String>,
@@ -834,17 +952,59 @@ fn apply_snapshot<T>(
     sanctum_db_sqlite::snapshot::backup(path, snapshot.path(), || false)?;
     let mut reader = snapshot.reopen()?;
     let bytes = reader.metadata()?.len();
-    let mut digest = blake3::Hasher::new();
-    digest.update_reader(&mut reader)?;
+    let mut generation = Generation {
+        id: Uuid::new_v4(),
+        bytes,
+        blake3: hash_file(&mut reader)?,
+        chain: None,
+    };
+    let delta = match (delta_bytes, source) {
+        (Some(chain_bytes), Some(before)) if bytes >= before.generation.bytes => {
+            let limit = (bytes / 2).saturating_sub(chain_bytes);
+            prepare_delta(&before, &snapshot, limit, &mut generation)?
+        }
+        _ => None,
+    };
     Ok(Prepared::Changed {
         file: snapshot,
-        generation: Generation {
-            id: Uuid::new_v4(),
-            bytes,
-            blake3: digest.finalize().to_hex().to_string(),
-        },
+        generation,
         receipts,
+        delta,
     })
+}
+
+fn prepare_delta(
+    before: &Materialized,
+    after: &NamedTempFile,
+    limit: u64,
+    generation: &mut Generation,
+) -> Result<Option<NamedTempFile>> {
+    let Some(patch) = page_delta::encode(before.path(), after.path(), limit)? else {
+        return Ok(None);
+    };
+    let mut file = patch.reopen()?;
+    let mut chain = before
+        .generation
+        .chain
+        .clone()
+        .unwrap_or_else(|| DeltaChain {
+            base: before.generation.file(),
+            deltas: Vec::new(),
+        });
+    chain.deltas.push(DeltaFile {
+        id: generation.id,
+        bytes: file.metadata()?.len(),
+        blake3: hash_file(&mut file)?,
+        result_bytes: generation.bytes,
+    });
+    generation.chain = Some(chain);
+    Ok(Some(patch))
+}
+
+fn hash_file(file: &mut std::fs::File) -> Result<String> {
+    let mut digest = blake3::Hasher::new();
+    digest.update_reader(file)?;
+    Ok(digest.finalize().to_hex().to_string())
 }
 
 fn encode(head: &Head) -> Result<bytes::Bytes> {

@@ -71,6 +71,7 @@ pub(crate) async fn serve(
         config.max_source_bytes,
     )?
     .with_embedding(embedding)
+    .with_snapshot_page_deltas(config.hosted_snapshot_page_deltas)
     .with_chunking(config.chunking)?;
     if let Some(max_bytes) = config.hosted_snapshot_cache_bytes {
         catalog = catalog.with_snapshot_cache_bytes(max_bytes);

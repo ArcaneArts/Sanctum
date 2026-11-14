@@ -68,6 +68,11 @@ impl HostedCatalog {
         self
     }
 
+    pub fn with_snapshot_page_deltas(mut self, enabled: bool) -> Self {
+        self.publication = self.publication.with_page_deltas(enabled);
+        self
+    }
+
     pub async fn create_collection(&self, scope: &Scope, operation: Option<Uuid>) -> Result<()> {
         if operation.is_some_and(|id| id.is_nil()) {
             return Err(Error::Invalid("request ID must be a nonzero UUID".into()));

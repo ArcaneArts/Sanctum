@@ -352,3 +352,29 @@ A production implementation needs the same conditional HEAD publication,
 digest verification, bounded replay, and retirement grace for every
 generation used as a base. It also needs a full-snapshot path when the
 change or accumulated chain approaches the size of the next backup.
+
+### Publishing the deltas on MinIO
+
+With `hosted_snapshot_page_deltas` enabled, the release server ran the
+same 12 × 200 MiB fixture and eight-byte edit. A fresh process read the
+current database before the replacement. A separate MinIO listing
+confirmed the object lengths, and MCP returned the exact 3,557-byte
+range from the new revision.
+
+| Measurement | Full snapshots | Page deltas enabled |
+| --- | ---: | ---: |
+| Twelfth source to text ready | 28.24 s | 19.58 s |
+| Eight-byte edit to text ready | 30.00 s | 20.38 s |
+| Registration database upload | 687,362,048 bytes | 12,328 bytes |
+| Indexing database upload | 745,467,904 bytes | 145,339,072 bytes |
+| Cold search after restart | 2.68 s | 3.71 s |
+| Three warm searches | 10.88–11.18 ms | 12.98–15.65 ms |
+| Database objects retained after the edit | 9,728,167,936 bytes | 3,161,696,896 bytes |
+
+These are single runs on loopback MinIO with the same cache settings.
+The resulting SQLite backups were 745,467,904 and 745,963,520 bytes.
+The delta-enabled run retained eight full backups and 19 deltas. Its
+final HEAD required one 630,095,872-byte base and four deltas for cold
+replay. The source upload still transferred the complete 200 MiB file.
+The runs cover lexical indexing. Live Cloud Run memory and latency
+measurements remain open.

@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use rusqlite::{Connection, Transaction, params};
 use sanctum_core::{Error, Scope};
 use sanctum_db::{Command, Publication, Unit};
-use sanctum_storage::Storage;
+use sanctum_storage::{Key, Storage};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -16,17 +16,179 @@ async fn filesystem_publication_contract() {
 #[tokio::test]
 #[ignore = "requires a live MinIO bucket and S3 credentials"]
 async fn minio_publication_contract() {
-    use sanctum_storage_s3::{S3Config, S3Storage};
-    let storage = S3Storage::new(S3Config {
-        bucket: std::env::var("SANCTUM_MINIO_BUCKET").expect("SANCTUM_MINIO_BUCKET"),
-        region: "us-east-1".into(),
-        endpoint: Some(std::env::var("SANCTUM_MINIO_ENDPOINT").expect("SANCTUM_MINIO_ENDPOINT")),
-        allow_http: true,
-        virtual_hosted_style: false,
-    })
-    .unwrap();
+    let storage = minio_storage();
     let prefix = format!("publication-{}", Uuid::new_v4());
-    verify(Arc::new(storage), &prefix, None).await;
+    verify(storage, &prefix, None).await;
+}
+
+fn minio_storage() -> Arc<dyn Storage> {
+    use sanctum_storage_s3::{S3Config, S3Storage};
+    Arc::new(
+        S3Storage::new(S3Config {
+            bucket: std::env::var("SANCTUM_MINIO_BUCKET").expect("SANCTUM_MINIO_BUCKET"),
+            region: "us-east-1".into(),
+            endpoint: Some(
+                std::env::var("SANCTUM_MINIO_ENDPOINT").expect("SANCTUM_MINIO_ENDPOINT"),
+            ),
+            allow_http: true,
+            virtual_hosted_style: false,
+        })
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn filesystem_snapshot_delta_contract() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = sanctum_storage_fs::FileStorage::open(directory.path()).unwrap();
+    verify_deltas(
+        Arc::new(storage),
+        "delta-publication",
+        Some(directory.path()),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live MinIO bucket and S3 credentials"]
+async fn minio_snapshot_delta_contract() {
+    let prefix = format!("delta-publication-{}", Uuid::new_v4());
+    verify_deltas(minio_storage(), &prefix, None).await;
+}
+
+async fn verify_deltas(
+    storage: Arc<dyn Storage>,
+    prefix: &str,
+    local_root: Option<&std::path::Path>,
+) {
+    let prefix = Key::parse(prefix).unwrap();
+    let unit = Unit::catalog(Some(&prefix), &"default".parse().unwrap()).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let reader = Publication::new(storage.clone(), Duration::from_secs(30)).unwrap();
+    let writer = reader
+        .clone()
+        .with_snapshot_cache(Arc::new(sanctum_db::SnapshotCache::new(1024 * 1024)))
+        .with_page_deltas(true);
+    let mut lease = writer.acquire(&unit).await.unwrap();
+    let (base, _) = lease
+        .apply(vec![command(Uuid::new_v4(), 0)], |tx, _| {
+            tx.execute_batch(
+                "CREATE TABLE padding (body BLOB); INSERT INTO padding VALUES (zeroblob(524288));",
+            )
+            .map_err(|error| Error::Internal(Box::new(error)))?;
+            apply_value(tx, 0)
+        })
+        .await
+        .unwrap();
+    lease.release().await.unwrap();
+
+    let key =
+        |id, file| Key::parse(format!("{prefix}/default/catalog/snapshots/{id}/{file}")).unwrap();
+    assert_eq!(
+        storage.head(&key(base.id, "root.db")).await.unwrap().length,
+        base.bytes
+    );
+    let sessions = sanctum_db::SnapshotCache::new(0);
+    let mut chain = Vec::new();
+    for step in 1..=5 {
+        let operation = Uuid::new_v4();
+        let mut lease = writer.acquire(&unit).await.unwrap();
+        let (generation, _) = lease
+            .apply(vec![command(operation, 1)], apply_value)
+            .await
+            .unwrap();
+        let (replayed, receipts) = lease
+            .apply(vec![command(operation, 1000)], apply_value)
+            .await
+            .unwrap();
+        assert_eq!(replayed, generation);
+        assert_eq!(receipts[0].outcome, step.to_string());
+        lease.release().await.unwrap();
+        if step < 5 {
+            let patch = storage
+                .head(&key(generation.id, "pages.delta"))
+                .await
+                .unwrap();
+            assert!(patch.length < generation.bytes / 2);
+            chain.push(generation.clone());
+        } else {
+            assert_eq!(
+                storage
+                    .head(&key(generation.id, "root.db"))
+                    .await
+                    .unwrap()
+                    .length,
+                generation.bytes
+            );
+        }
+        let cold = reader.read(&unit, scratch.path()).await.unwrap().unwrap();
+        assert_eq!(cold.generation, generation);
+        assert_eq!(value(cold.path()), step);
+
+        let cleanup = reader
+            .reclaim(&unit, Duration::from_secs(300), None)
+            .await
+            .unwrap();
+        assert_eq!(cleanup.deleted, 0);
+        let base_marker = key(base.id, "retired.json");
+        if step < 5 {
+            assert!(matches!(
+                storage.head(&base_marker).await,
+                Err(Error::NotFound(_))
+            ));
+        } else {
+            assert!(storage.head(&base_marker).await.is_ok());
+        }
+    }
+
+    // A session opened before compaction can still replay its own generation.
+    let oldest_delta = sessions
+        .read_generation(&reader, &unit, chain[0].clone())
+        .await
+        .unwrap();
+    assert_eq!(value(oldest_delta.path()), 1);
+    assert_eq!(
+        value(
+            sessions
+                .read_generation(&reader, &unit, chain[3].clone())
+                .await
+                .unwrap()
+                .path()
+        ),
+        4
+    );
+
+    if let Some(root) = local_root {
+        let grace = Duration::from_secs(300);
+        for id in std::iter::once(base.id).chain(chain.iter().map(|item| item.id)) {
+            let marker = key(id, "retired.json");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(root.join(marker.as_str()))
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - grace - Duration::from_secs(1))
+                .unwrap();
+        }
+        let cleanup = reader.reclaim(&unit, grace, None).await.unwrap();
+        assert_eq!(cleanup.deleted, 5);
+        assert!(matches!(
+            storage.head(&key(base.id, "root.db")).await,
+            Err(Error::NotFound(_))
+        ));
+        assert_eq!(value(oldest_delta.path()), 1);
+        assert_eq!(
+            value(
+                reader
+                    .read(&unit, scratch.path())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .path()
+            ),
+            5
+        );
+    }
+    delete_prefix(storage.as_ref(), &prefix).await;
 }
 
 #[tokio::test]
@@ -36,6 +198,8 @@ async fn recovering_from_a_lost_publish_response_reuses_its_receipt() {
         inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
         lose: std::sync::atomic::AtomicBool::new(true),
         snapshot_gets: std::sync::atomic::AtomicUsize::new(0),
+        fail_delta: std::sync::atomic::AtomicBool::new(false),
+        fail_only_delta_head: std::sync::atomic::AtomicBool::new(false),
     });
     let unit = Unit::catalog(None, &"default".parse().unwrap()).unwrap();
     let cache = Arc::new(sanctum_db::SnapshotCache::new(1024 * 1024));
@@ -124,6 +288,8 @@ async fn publication_reuses_immutable_snapshots_for_receipts_and_subsequent_writ
         inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
         lose: std::sync::atomic::AtomicBool::new(false),
         snapshot_gets: std::sync::atomic::AtomicUsize::new(0),
+        fail_delta: std::sync::atomic::AtomicBool::new(false),
+        fail_only_delta_head: std::sync::atomic::AtomicBool::new(false),
     });
     let unit = Unit::catalog(None, &"default".parse().unwrap()).unwrap();
     let cache = Arc::new(sanctum_db::SnapshotCache::new(1024 * 1024));
@@ -184,6 +350,8 @@ struct LosePublishResponse {
     inner: sanctum_storage_fs::FileStorage,
     lose: std::sync::atomic::AtomicBool,
     snapshot_gets: std::sync::atomic::AtomicUsize,
+    fail_delta: std::sync::atomic::AtomicBool,
+    fail_only_delta_head: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -220,7 +388,15 @@ impl Storage for LosePublishResponse {
         reader: sanctum_storage::Reader,
         length: u64,
     ) -> sanctum_core::Result<sanctum_storage::Version> {
-        self.inner.put_stream(key, reader, length).await
+        let version = self.inner.put_stream(key, reader, length).await?;
+        if key.as_str().ends_with("/pages.delta")
+            && self
+                .fail_delta
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(Error::Busy("delta upload response lost".into()));
+        }
+        Ok(version)
     }
 
     async fn put_control(
@@ -229,9 +405,32 @@ impl Storage for LosePublishResponse {
         bytes: bytes::Bytes,
         condition: sanctum_storage::Condition,
     ) -> sanctum_core::Result<sanctum_storage::Version> {
-        let published = key.as_str().ends_with("/HEAD.json")
-            && serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["generation"]
-                .is_object();
+        let generation = if key.as_str().ends_with("/HEAD.json") {
+            Some(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["generation"].clone())
+        } else {
+            None
+        };
+        let published = match &generation {
+            Some(generation) if generation["chain"].is_object() => {
+                let previous = self.inner.get(key).await?;
+                use tokio::io::AsyncReadExt;
+                let mut body = Vec::new();
+                previous
+                    .reader
+                    .take(1024 * 1024)
+                    .read_to_end(&mut body)
+                    .await?;
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["generation"]["id"]
+                    != generation["id"]
+            }
+            Some(generation) => {
+                generation.is_object()
+                    && !self
+                        .fail_only_delta_head
+                        .load(std::sync::atomic::Ordering::Relaxed)
+            }
+            None => false,
+        };
         let version = self.inner.put_control(key, bytes, condition).await?;
         if published && self.lose.swap(false, std::sync::atomic::Ordering::Relaxed) {
             return Err(Error::Busy("publication response lost".into()));
@@ -254,7 +453,6 @@ impl Storage for LosePublishResponse {
 }
 
 async fn verify(storage: Arc<dyn Storage>, prefix: &str, local_root: Option<&std::path::Path>) {
-    use sanctum_storage::Key;
     let prefix = Key::parse(prefix).unwrap();
     let scratch = tempfile::tempdir().unwrap();
     let scope = Scope {
@@ -393,10 +591,14 @@ async fn verify(storage: Arc<dyn Storage>, prefix: &str, local_root: Option<&std
         second
     );
 
+    delete_prefix(storage.as_ref(), &prefix).await;
+}
+
+async fn delete_prefix(storage: &dyn Storage, prefix: &Key) {
     let mut cursor = None;
     loop {
         let page = storage
-            .list(Some(&prefix), cursor.as_deref(), 10)
+            .list(Some(prefix), cursor.as_deref(), 10)
             .await
             .unwrap();
         for object in page.objects {
@@ -435,4 +637,80 @@ fn value(path: &std::path::Path) -> i64 {
         .unwrap()
         .query_row("SELECT value FROM data", [], |row| row.get(0))
         .unwrap()
+}
+
+#[tokio::test]
+async fn unpublished_delta_and_lost_manifest_response_preserve_commit_state() {
+    use std::sync::atomic::Ordering;
+
+    let root = tempfile::tempdir().unwrap();
+    let storage = Arc::new(LosePublishResponse {
+        inner: sanctum_storage_fs::FileStorage::open(root.path()).unwrap(),
+        lose: std::sync::atomic::AtomicBool::new(false),
+        snapshot_gets: std::sync::atomic::AtomicUsize::new(0),
+        fail_delta: std::sync::atomic::AtomicBool::new(false),
+        fail_only_delta_head: std::sync::atomic::AtomicBool::new(false),
+    });
+    let unit = Unit::catalog(None, &"default".parse().unwrap()).unwrap();
+    let writer = Publication::new(storage.clone(), Duration::from_millis(500))
+        .unwrap()
+        .with_page_deltas(true);
+    let scratch = tempfile::tempdir().unwrap();
+    let mut lease = writer.acquire(&unit).await.unwrap();
+    let (base, _) = lease
+        .apply(vec![command(Uuid::new_v4(), 2)], |tx, initial| {
+            tx.execute_batch(
+                "CREATE TABLE padding (body BLOB); INSERT INTO padding VALUES (zeroblob(262144));",
+            )
+            .map_err(|error| Error::Internal(Box::new(error)))?;
+            apply_value(tx, initial)
+        })
+        .await
+        .unwrap();
+    let operation = Uuid::new_v4();
+    storage.fail_delta.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        lease.apply(vec![command(operation, 3)], apply_value).await,
+        Err(Error::Busy(_))
+    ));
+    assert_eq!(writer.generation(&unit).await.unwrap(), Some(base));
+    assert_eq!(writer.receipt(&unit, operation).await.unwrap(), None);
+    lease.release().await.unwrap();
+    let mut lease = writer.acquire(&unit).await.unwrap();
+    storage.fail_only_delta_head.store(true, Ordering::Relaxed);
+    storage.lose.store(true, Ordering::Relaxed);
+    let result = lease.apply(vec![command(operation, 3)], apply_value).await;
+    assert!(matches!(result, Err(Error::Busy(_))));
+    assert!(matches!(
+        lease.release().await,
+        Err(Error::StaleRevision(_))
+    ));
+    let cold = writer.read(&unit, scratch.path()).await.unwrap().unwrap();
+    assert_eq!(value(cold.path()), 5);
+    assert_eq!(
+        writer.receipt(&unit, operation).await.unwrap().as_deref(),
+        Some("5")
+    );
+    tokio::time::sleep(Duration::from_millis(550)).await;
+    let mut lease = writer.acquire(&unit).await.unwrap();
+    let (unchanged, _) = lease
+        .apply(vec![command(operation, 99)], apply_value)
+        .await
+        .unwrap();
+    assert_eq!(unchanged, cold.generation);
+    lease.release().await.unwrap();
+    let key = Key::parse(format!(
+        "default/catalog/snapshots/{}/pages.delta",
+        unchanged.id
+    ))
+    .unwrap();
+    let path = root.path().join(key.as_str());
+    let mut bytes = std::fs::read(&path).unwrap();
+    let last = bytes.last_mut().unwrap();
+    *last ^= 1;
+    std::fs::write(path, bytes).unwrap();
+    assert!(matches!(
+        writer.read(&unit, scratch.path()).await,
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
+    ));
 }
