@@ -654,10 +654,12 @@ six-hour dispatch window. The worker keeps the same input and publication
 receipt, so an earlier delivery is safe to replay. Existing embedding
 backoff still applies.
 
-The retry counter and dispatch hint survive restarts. The dispatch repair
-scan can recover an interrupted or unavailable Cloud Tasks handoff. Without
-Cloud Tasks configured, deliver the pending stage to the private worker.
-Terminal operations require a new submission to try again.
+The retry counter and dispatch hint survive restarts. If storage loses the
+retry checkpoint reply, the RPC checks that the same upload attempt saved
+the requested counter or a newer one, then attempts dispatch. The dispatch
+repair scan can recover an interrupted or unavailable Cloud Tasks handoff.
+Without Cloud Tasks configured, deliver the pending stage to the private
+worker. Terminal operations require a new submission to try again.
 
 ### Hosted operation retention
 
