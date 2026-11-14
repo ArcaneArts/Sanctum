@@ -4677,7 +4677,8 @@ async fn hosted_change_stream_resumes_committed_events_across_instances() {
             .unwrap()
             .with_snapshot_cache_bytes(0)
     };
-    let writer = catalog();
+    let writer_storage = storage.inner.clone();
+    let writer = HostedCatalog::new(writer_storage.clone(), None, 1024).unwrap();
     let scope = sanctum_core::Scope {
         tenant: "default".parse().unwrap(),
         collection: "notes".parse().unwrap(),
@@ -4725,6 +4726,8 @@ async fn hosted_change_stream_resumes_committed_events_across_instances() {
     assert!(stream.message().await.unwrap().unwrap().changes.is_empty());
     let reads = storage.collection_reads.load(Ordering::Relaxed);
     let downloads = storage.collection_downloads.load(Ordering::Relaxed);
+    let catalog_reads = storage.catalog_reads.load(Ordering::Relaxed);
+    let catalog_downloads = storage.catalog_downloads.load(Ordering::Relaxed);
     tokio::time::timeout(std::time::Duration::from_secs(6), async {
         while storage.collection_reads.load(Ordering::Relaxed) < reads + 2 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -4736,6 +4739,29 @@ async fn hosted_change_stream_resumes_committed_events_across_instances() {
         storage.collection_downloads.load(Ordering::Relaxed),
         downloads
     );
+    assert!(storage.catalog_reads.load(Ordering::Relaxed) >= catalog_reads + 2);
+    assert_eq!(
+        storage.catalog_downloads.load(Ordering::Relaxed),
+        catalog_downloads
+    );
+
+    writer
+        .create_collection(
+            &sanctum_core::Scope {
+                tenant: scope.tenant.clone(),
+                collection: "sibling".parse().unwrap(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+        while storage.catalog_downloads.load(Ordering::Relaxed) == catalog_downloads {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("watch should verify membership against the new tenant catalog");
 
     let header = v1::UploadTextHeader {
         scope: Some(wire_scope.clone()),
@@ -4827,12 +4853,27 @@ async fn hosted_change_stream_resumes_committed_events_across_instances() {
             .changes
             .is_empty()
     );
-    writer.delete_collection(&scope, None).await.unwrap();
+    // Hold the collection lease so deletion commits the catalog tombstone
+    // while the collection manifest still advertises its previous generation.
+    let publication =
+        sanctum_db::Publication::new(writer_storage, std::time::Duration::from_secs(60)).unwrap();
+    let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
+    let lease = publication.acquire_existing(&unit).await.unwrap();
+    let deletion = uuid::Uuid::new_v4();
+    assert!(matches!(
+        writer.delete_collection(&scope, Some(deletion)).await,
+        Err(Error::Busy(_))
+    ));
     let removed = tokio::time::timeout(std::time::Duration::from_secs(8), resumed.message())
         .await
         .unwrap()
         .unwrap_err();
     assert_eq!(removed.code(), Code::NotFound);
+    lease.release().await.unwrap();
+    writer
+        .delete_collection(&scope, Some(deletion))
+        .await
+        .unwrap();
     drop(resumed);
     api.stop().await;
 }
@@ -6721,7 +6762,7 @@ impl Drop for InterruptedRead<'_> {
 }
 
 struct InterruptAcceptance {
-    inner: sanctum_storage_fs::FileStorage,
+    inner: Arc<sanctum_storage_fs::FileStorage>,
     interrupt: AtomicU8,
     catalog_reads: AtomicUsize,
     catalog_downloads: AtomicUsize,
@@ -6732,7 +6773,7 @@ struct InterruptAcceptance {
 impl InterruptAcceptance {
     fn new(path: &std::path::Path, interrupt: u8) -> Self {
         Self {
-            inner: sanctum_storage_fs::FileStorage::open(path).unwrap(),
+            inner: Arc::new(sanctum_storage_fs::FileStorage::open(path).unwrap()),
             interrupt: AtomicU8::new(interrupt),
             catalog_reads: AtomicUsize::new(0),
             catalog_downloads: AtomicUsize::new(0),

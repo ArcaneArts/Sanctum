@@ -8,9 +8,9 @@ use sanctum_proto::v1::{
     upload_text_frame::Frame,
 };
 use sanctum_service::{
-    ChunkRef, GitRepository, Hit, HostedCatalog, HostedJob, HostedJobState, HostedPreparation,
-    ImportEvent, ImportOptions, ImportState, Job, JobState, Replacement, ScanOptions, ScanStop,
-    Service, TextUpload, WatchedFolder,
+    ChunkRef, GitRepository, Hit, HostedCatalog, HostedChangePosition, HostedJob, HostedJobState,
+    HostedPreparation, ImportEvent, ImportOptions, ImportState, Job, JobState, Replacement,
+    ScanOptions, ScanStop, Service, TextUpload, WatchedFolder,
 };
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -372,7 +372,7 @@ impl Sanctum for Grpc {
         let scope = parse_scope(request.scope)?;
         let limit = request.limit.unwrap_or(100);
         let backend = self.0.clone();
-        let (first, generation) = changes_page(
+        let (first, position) = changes_page(
             backend.clone(),
             scope.clone(),
             request.after_cursor,
@@ -385,7 +385,7 @@ impl Sanctum for Grpc {
         tokio::spawn(async move {
             tokio::select! {
                 _ = shutdown.cancelled() => {}
-                _ = stream_changes(backend, scope, limit, first, generation, sender) => {}
+                _ = stream_changes(backend, scope, limit, first, position, sender) => {}
             }
         });
         Ok(Response::new(ReceiverStream::new(receiver)))
@@ -1899,7 +1899,7 @@ async fn stream_changes(
     scope: Scope,
     limit: u32,
     first: v1::ListChangesResponse,
-    mut generation: Option<uuid::Uuid>,
+    mut position: Option<HostedChangePosition>,
     sender: tokio::sync::mpsc::Sender<std::result::Result<v1::ListChangesResponse, Status>>,
 ) {
     let interval = match backend {
@@ -1922,14 +1922,13 @@ async fn stream_changes(
         let Ok(permit) = sender.reserve().await else {
             return;
         };
-        let caught_up_to = generation.filter(|_| at_head);
         let result = tokio::select! {
             _ = sender.closed() => return,
-            page = changes_page(backend.clone(), scope.clone(), cursor, limit, caught_up_to) => page,
+            page = changes_page(backend.clone(), scope.clone(), cursor, limit, position.as_ref()) => page,
         };
         match result {
-            Ok((page, observed_generation)) => {
-                generation = observed_generation;
+            Ok((page, observed_position)) => {
+                position = observed_position;
                 at_head = page.changes.len() < limit as usize;
                 if !page.changes.is_empty() || tokio::time::Instant::now() >= heartbeat {
                     cursor = page.next_cursor;
@@ -1950,19 +1949,19 @@ async fn changes_page(
     scope: Scope,
     after_cursor: u64,
     limit: u32,
-    caught_up_to: Option<uuid::Uuid>,
-) -> std::result::Result<(v1::ListChangesResponse, Option<uuid::Uuid>), Status> {
-    let (changes, generation) = match backend {
+    previous: Option<&HostedChangePosition>,
+) -> std::result::Result<(v1::ListChangesResponse, Option<HostedChangePosition>), Status> {
+    let (changes, position) = match backend {
         Backend::Local(service) => (
             work(move || service.changes(&scope, after_cursor, limit)).await?,
             None,
         ),
         Backend::Hosted(catalog) => {
-            let (changes, generation) = catalog
-                .poll_changes(&scope, after_cursor, limit, caught_up_to)
+            let (changes, position) = catalog
+                .poll_changes(&scope, after_cursor, limit, previous)
                 .await
                 .map_err(status)?;
-            (changes, Some(generation))
+            (changes, Some(position))
         }
     };
     let next_cursor = changes.last().map_or(after_cursor, |change| change.cursor);
@@ -1981,7 +1980,7 @@ async fn changes_page(
                 })
                 .collect(),
         },
-        generation,
+        position,
     ))
 }
 
