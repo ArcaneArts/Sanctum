@@ -1613,6 +1613,21 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   collections, and skipped the retired collection's job envelope.
 - Delivered in [PR #154](https://github.com/ArcaneArts/Sanctum/pull/154).
 
+### Operation-only listings for tenant-wide activity
+
+- New tenant-wide activity scans use the catalog's active collection IDs and
+  spend their eight-page budget on operation prefixes. A continuation can
+  resume within a collection or at the next unvisited collection. Tokens
+  issued by earlier servers can finish their original scans.
+- The hosted gRPC regression places 160 unrelated objects before the first
+  job and verifies both jobs arrive on the first wide page. It also resumes
+  after restart and after a collection is retired between pages.
+- A generated Python client and managed server on live MinIO verified the
+  first page with 240 unrelated source objects present, both continuation
+  formats across restart, and scope rejection. A separate tenant with nine
+  collections returned an empty first page with a continuation, then found
+  the ninth collection's job. [Activity contract](STORAGE.md#hosted-ingestion-activity).
+
 ## Local upload request replay
 
 - Local uploads and MCP deposits accept a scoped request UUID. The queue

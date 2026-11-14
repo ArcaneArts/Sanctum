@@ -73,7 +73,8 @@ Save the configuration and select **Restart server to apply**. The sidecar
 runs the standalone object worker and serves gRPC and MCP on the same port.
 The **Connect** page shows that active address. In **Activity**, use
 **Upload file** to stream a selected text or RTF file and track indexing and
-embedding. Object-backed activity follows storage order. An empty page
+embedding. Object-backed activity groups jobs by collection ID and lists their
+operations in storage-key order. An empty page
 can still have a **Next page** if the scan has more objects to check.
 Storage refresh measures the selected collection or the configured
 object store. The filesystem backend retains directory imports and queue pause

@@ -240,6 +240,18 @@ pub fn list_collection_details(
     .unwrap_or_default())
 }
 
+pub fn catalog_collection_ids_from(path: &Path, first: &str, limit: u32) -> Result<Vec<String>> {
+    Ok(read_initialized_catalog(path, |catalog, _| {
+        query_all(
+            catalog,
+            "SELECT id FROM collections WHERE id >= ?1 ORDER BY id LIMIT ?2",
+            params![first, limit],
+            |row| row.get(0),
+        )
+    })?
+    .unwrap_or_default())
+}
+
 pub fn update_collection_details(
     tx: &Transaction<'_>,
     collection: &str,

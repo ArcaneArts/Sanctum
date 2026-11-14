@@ -681,14 +681,17 @@ local reader.
 ### Hosted ingestion activity
 
 `ListIngestionJobs` and `sanctum-cli jobs [COLLECTION]` list retained
-operations in a tenant or one of its collections. Hosted activity follows
-object-key order and reads current job records. Pass `next_page_token` back
-as `page_token` with the same scope. Continue when a short or empty page
-still has a token. The server bounds object listing per request, and skips
-expired operations and deleted collections. Each tenant-wide request uses one
-published catalog generation to determine which collections are visible. Job
-records are read from live storage, so concurrent submissions or cleanup can
-change later pages.
+operations in a tenant or one of its collections. A tenant-wide scan reads
+one published catalog and walks active collection IDs in order. Within a
+collection, the scan reads operation objects in key order. Source and snapshot
+objects are outside these listings. Pass `next_page_token` back as `page_token`
+with the same scope. Continue when a short or empty page still has a token.
+Each request lists at most eight storage pages. The server skips expired
+operations and deleted collections, including a collection deleted after a new
+tenant-wide token was issued. Tokens from older servers can finish their
+original object scan. New tenant-wide tokens require the updated API. Records
+come from live storage, so concurrent submissions or cleanup can change later
+pages.
 
 ### Hosted upload cancellation
 
