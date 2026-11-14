@@ -27,6 +27,7 @@ mod embedding;
 mod git_import;
 mod hit_metadata;
 mod hosted_catalog;
+mod hosted_collection_creation;
 mod hosted_database;
 mod hosted_dispatch;
 mod hosted_embedding;
