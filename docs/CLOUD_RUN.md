@@ -276,6 +276,33 @@ measurements. Correlate them with snapshot events and Cloud Run instance
 IDs before interpreting them as cold and warm timings.
 [Cloud Run request and system logs](https://docs.cloud.google.com/run/docs/logging).
 
+### Verify document and query embeddings
+
+For a Vertex AI deployment, enable `aiplatform.googleapis.com` in the
+embedding project and give both runtime service accounts prediction access
+there. The worker embeds documents and the API embeds queries. Include the
+same [Google embedding configuration](LOCAL_API.md#google-cloud-embeddings)
+in both services' `SANCTUM_CONFIG_JSON`. Grant prediction access to the
+runtime service accounts separately from the test caller's Cloud Run
+invocation access. [Google Cloud IAM permissions](https://docs.cloud.google.com/gemini-enterprise-agent-platform/machine-learning/general/access-control).
+
+Run the check on a new small fixture with the configured dimensions.
+
+```sh
+PYTHONPATH="$generated" python scripts/check-hosted-deployment.py \
+  --api-url "$API_URL" --expect-private --embedding-dimensions 768 \
+  --wait-seconds 600
+```
+
+The check waits for complete document-vector coverage for the uploaded
+revision, then runs strict semantic search through gRPC and MCP. It checks
+the active profile, dimensions, scores, scope, revision, and exact excerpt
+bytes. The report includes the profile ID, embedded chunk count, and client
+timings. For Vertex AI evidence, pair it with successful document and query
+`embedding_request` events from the configured worker and API revisions.
+The check also runs against a local MinIO deployment with another configured
+provider.
+
 ### Recovery after scaling to zero
 
 Run this exercise on a dedicated deployment with its own queue, scheduler

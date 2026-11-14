@@ -1671,6 +1671,15 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   The local MCP check also passed with default logging and with logs
   disabled after switching it to the server's managed startup output.
   [Runbook](CLOUD_RUN.md#repeatable-ingestion-and-range-check).
+- The same deployment check can verify document embeddings and strict semantic
+  search with `--embedding-dimensions`. On live MinIO and Ollama, split submit
+  and verify calls checked complete coverage at 768 dimensions, the same
+  uploaded revision, and exact 59-byte gRPC and MCP excerpts. Server logs
+  recorded successful document and query embedding requests. The check rejected
+  a 384-dimension expectation and a deployment with embeddings disabled. The
+  lexical-only replay passed. Live Vertex prediction through Cloud Run remains
+  open.
+  [Embedding verification](CLOUD_RUN.md#verify-document-and-query-embeddings).
 
 ## Capacity across 10,000 mostly idle tenants
 

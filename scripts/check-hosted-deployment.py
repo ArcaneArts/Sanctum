@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import runpy
@@ -145,32 +146,45 @@ def range_bytes(start, end, data):
     return bytes(expected)
 
 
+def expected_excerpt(reference, start, end, excerpt, scope, job, data):
+    if (reference.scope, reference.source_id, reference.revision_id) != (scope, job.source_id, job.revision_id):
+        raise RuntimeError("search returned a different source revision")
+    _, tail, padding, _ = data
+    if not (0 <= start < end <= padding + len(tail)):
+        raise RuntimeError("search returned a range outside the fixture")
+    expected = range_bytes(start, end, data)
+    if excerpt.encode() != expected:
+        raise RuntimeError("search returned incorrect source bytes")
+    return expected
+
+
+def mcp_client(api_url, token):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    client = MCP["Rpc"](MCP["Http"](api_url + "/mcp", headers))
+    client.initialize()
+    return client
+
+
 def verify_retrieval(client, api_url, token, scope, job, data):
-    marker, tail, padding, _ = data
+    marker = data[0]
     request = pb.SearchTextRequest(scope=scope, mode=pb.SEARCH_MODE_LEXICAL, query=marker, limit=1)
     search, first_ms = time_call(lambda: client.SearchText(request, timeout=RPC_TIMEOUT))
     if len(search.hits) != 1:
         raise RuntimeError("gRPC search did not find the fixture")
     hit = search.hits[0]
     reference = hit.chunk
-    if (reference.source_id, reference.revision_id) != (job.source_id, job.revision_id):
-        raise RuntimeError("gRPC search returned a different revision")
+    expected = expected_excerpt(reference, hit.start_byte, hit.end_byte, hit.excerpt, scope, job, data)
     if hit.external.id != job.operation_id or not hit.database_generation:
         raise RuntimeError("gRPC search omitted fixture provenance")
     repeat, repeat_ms = time_call(lambda: client.SearchText(request, timeout=RPC_TIMEOUT))
     if len(repeat.hits) != 1 or repeat.hits[0].chunk != reference:
         raise RuntimeError("repeated search returned a different reference")
     fetched = client.FetchChunk(pb.FetchChunkRequest(chunk=reference), timeout=RPC_TIMEOUT)
-    start, end = fetched.start_byte, fetched.end_byte
-    if not (0 <= start < end <= padding + len(tail)):
-        raise RuntimeError("gRPC returned a range outside the fixture")
-    expected = range_bytes(start, end, data)
-    if fetched.excerpt.encode() != expected or hit.excerpt != fetched.excerpt:
+    start, end = hit.start_byte, hit.end_byte
+    if (fetched.start_byte, fetched.end_byte, fetched.excerpt.encode()) != (start, end, expected):
         raise RuntimeError("gRPC returned incorrect source bytes")
 
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    mcp = MCP["Rpc"](MCP["Http"](api_url + "/mcp", headers))
-    mcp.initialize()
+    mcp = mcp_client(api_url, token)
     target = {"tenant": scope.tenant, "collection": scope.collection}
     result = mcp.tool("search", **target, query=marker, mode="lexical", limit=1)
     matches = result["hits"]
@@ -192,6 +206,76 @@ def verify_retrieval(client, api_url, token, scope, job, data):
     }
 
 
+def wait_for_vectors(client, scope, job, timeout):
+    request = pb.EmbeddingStatusRequest(scope=scope, source_id=job.source_id, revision_id=job.revision_id)
+    deadline = time.monotonic() + timeout
+    while True:
+        status = client.GetEmbeddingStatus(request, timeout=RPC_TIMEOUT)
+        coverage = status.coverage
+        if not coverage.profile_id:
+            raise RuntimeError("embedding is disabled for this API")
+        if 0 < coverage.total_chunks == coverage.embedded_chunks and coverage.failed_chunks == 0:
+            return coverage
+        if coverage.failed_chunks > status.retrying_chunks:
+            raise RuntimeError(f"document embedding failed: {status.sample_error}")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"document embeddings reached {coverage.embedded_chunks}/{coverage.total_chunks}; "
+                f"retrying {status.retrying_chunks}; last provider error: {status.sample_error}"
+            )
+        time.sleep(1)
+
+
+def verify_semantic(client, api_url, token, scope, job, data, dimensions, timeout):
+    coverage, wait_ms = time_call(lambda: wait_for_vectors(client, scope, job, timeout))
+    runtime = client.GetRuntimeInfo(pb.Empty(), timeout=RPC_TIMEOUT)
+    if runtime.embedding_profile_id != coverage.profile_id or runtime.embedding_dimensions != dimensions:
+        raise RuntimeError(
+            f"expected the stored profile with {dimensions} dimensions; "
+            f"API reports {runtime.embedding_dimensions} dimensions, profile {runtime.embedding_profile_id}"
+        )
+
+    # This query does not use the fixture's unique lexical marker.
+    query = "A validation document uploaded to a hosted knowledge service"
+    request = pb.SearchTextRequest(scope=scope, mode=pb.SEARCH_MODE_SEMANTIC, query=query, limit=1)
+    search, grpc_ms = time_call(lambda: client.SearchText(request, timeout=RPC_TIMEOUT))
+    if (search.mode != pb.SEARCH_MODE_SEMANTIC or search.degraded_reason
+            or search.embedding_coverage != coverage or len(search.hits) != 1):
+        raise RuntimeError("gRPC did not return a complete semantic result")
+    hit = search.hits[0]
+    if (not hit.HasField("score") or not math.isfinite(hit.score)
+            or hit.embedding_state != pb.CHUNK_EMBEDDING_STATE_READY or not hit.database_generation):
+        raise RuntimeError("gRPC semantic hit omitted vector or snapshot information")
+    expected = expected_excerpt(hit.chunk, hit.start_byte, hit.end_byte, hit.excerpt, scope, job, data)
+
+    mcp = mcp_client(api_url, token)
+    result, mcp_ms = time_call(lambda: mcp.tool(
+        "search", tenant=scope.tenant, collection=scope.collection, query=query, mode="semantic", limit=1,
+    ))
+    mcp_coverage = result["embedding_coverage"]
+    if (result["mode"] != "semantic" or result["degraded_reason"] or len(result["hits"]) != 1
+            or mcp_coverage != {
+                "profile_id": coverage.profile_id, "total_chunks": coverage.total_chunks,
+                "embedded_chunks": coverage.embedded_chunks, "failed_chunks": 0,
+            }):
+        raise RuntimeError("MCP did not return a complete semantic result")
+    match = result["hits"][0]
+    if (match["embedding_state"] != "ready" or not match.get("database_generation")
+            or match.get("score") is None or not math.isfinite(match["score"])):
+        raise RuntimeError("MCP semantic hit omitted vector or snapshot information")
+    reference = pb.ChunkRef(
+        scope=pb.Scope(tenant=match["tenant"], collection=match["collection"]),
+        source_id=match["source_id"], revision_id=match["revision_id"], ordinal=match["ordinal"],
+    )
+    mcp_excerpt = expected_excerpt(reference, match["start_byte"], match["end_byte"], match["excerpt"], scope, job, data)
+    return {
+        "profile_id": coverage.profile_id, "dimensions": dimensions,
+        "embedded_chunks": coverage.embedded_chunks, "wait_for_vectors_ms": wait_ms,
+        "grpc_search_ms": grpc_ms, "mcp_search_ms": mcp_ms,
+        "grpc_verified_range_bytes": len(expected), "mcp_verified_range_bytes": len(mcp_excerpt),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--api-url", required=True)
@@ -199,12 +283,15 @@ def main():
     parser.add_argument("--mib", type=int, default=0, help="generate an exact-size UTF-8 upload")
     parser.add_argument("--phase", choices=["all", "submit", "verify"], default="all")
     parser.add_argument("--wait-seconds", type=int, default=180)
+    parser.add_argument("--embedding-dimensions", type=int, help="also verify embeddings and strict semantic retrieval")
     parser.add_argument("--expect-private", action="store_true", help="verify unauthenticated IAM denial over HTTP and gRPC")
     args = parser.parse_args()
     if args.phase != "all" and args.operation is None:
         parser.error("--operation is required when splitting submit and verify")
     if args.mib < 0 or args.wait_seconds < 1:
         parser.error("size and wait duration must be valid")
+    if args.embedding_dimensions is not None and args.embedding_dimensions < 1:
+        parser.error("--embedding-dimensions must be positive")
     operation = args.operation or uuid4()
     endpoint = urlsplit(args.api_url)
     if endpoint.path not in ("", "/") or endpoint.query or endpoint.fragment or endpoint.username:
@@ -233,6 +320,10 @@ def main():
             job, states = result
             report.update(wait_to_text_ready_ms=elapsed, observed_states=states)
             report.update(verify_retrieval(client, api_url, token, scope, job, data))
+            if args.embedding_dimensions is not None:
+                report["semantic"] = verify_semantic(
+                    client, api_url, token, scope, job, data, args.embedding_dimensions, args.wait_seconds,
+                )
     report["finished_at"] = utc_now()
     print(json.dumps(report, sort_keys=True))
 
