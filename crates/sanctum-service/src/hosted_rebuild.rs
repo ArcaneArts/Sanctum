@@ -43,10 +43,29 @@ struct Discovery {
 #[derive(Serialize, Deserialize)]
 struct Rebuild {
     run: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_operation: Option<Uuid>,
     operation: Uuid,
     step: Option<u32>,
     not_before: Option<u64>,
     dispatched_window: Option<u64>,
+}
+
+impl Rebuild {
+    fn new(scope: &Scope, run: Uuid, previous_operation: Option<Uuid>) -> Self {
+        Self {
+            run,
+            previous_operation,
+            operation: scoped_id(previous_operation.unwrap_or(run), scope, 0),
+            step: Some(0),
+            not_before: None,
+            dispatched_window: None,
+        }
+    }
+
+    fn step_id(&self, scope: &Scope, step: u64) -> Uuid {
+        scoped_id(self.previous_operation.unwrap_or(self.run), scope, step)
+    }
 }
 
 pub struct RebuildPage {
@@ -171,7 +190,9 @@ impl HostedCatalog {
             .map(|(path, scope)| {
                 let budget = &budget;
                 async move {
-                    let result = budget.attempt(self.ensure_rebuild(&scope, run)).await;
+                    let result = budget
+                        .attempt(self.ensure_rebuild(&scope, run, false))
+                        .await;
                     (path, scope, result)
                 }
             })
@@ -264,20 +285,33 @@ impl HostedCatalog {
         if discovery.profile.as_deref() != Some(profile) {
             return Ok(());
         }
-        self.ensure_rebuild(scope, discovery.run).await?;
+        let result = self.ensure_rebuild(scope, discovery.run, true).await;
         if let Some(wake) = &self.standalone_wake {
             wake.notify_one();
         }
-        Ok(())
+        result
     }
 
-    async fn ensure_rebuild(&self, scope: &Scope, run: Uuid) -> Result<()> {
+    async fn ensure_rebuild(&self, scope: &Scope, run: Uuid, on_access: bool) -> Result<()> {
         let key = self.rebuild_key(scope)?;
         let existing = self.read_rebuild_record::<Rebuild>(&key).await?;
-        let condition = match existing {
-            Some((record, _)) if record.run == run => return Ok(()),
-            Some((_, version)) => Condition::Match(version),
-            None => Condition::Create,
+        let (previous_operation, condition) = match existing {
+            Some((record, version)) if record.run == run => {
+                if !on_access || record.step.is_some() {
+                    return Ok(());
+                }
+                // Read after the terminal checkpoint so a stale search cannot
+                // restart work already processed by that operation.
+                let status = self.embedding_status(scope, None).await?;
+                if status.coverage.total - status.coverage.embedded <= status.coverage.failed
+                    && status.next_retry.is_none()
+                {
+                    return Ok(());
+                }
+                (Some(record.operation), Condition::Match(version))
+            }
+            Some((_, version)) => (None, Condition::Match(version)),
+            None => (None, Condition::Create),
         };
         let current = self
             .read_rebuild_record::<Discovery>(&self.discovery_key()?)
@@ -287,15 +321,8 @@ impl HostedCatalog {
                 "embedding profile changed during discovery".into(),
             ));
         }
-        let operation = scoped_id(run, scope, 0);
-        let record = Rebuild {
-            run,
-            operation,
-            step: Some(0),
-            not_before: None,
-            dispatched_window: None,
-        };
-        self.record_rebuild_hint(scope, operation).await?;
+        let record = Rebuild::new(scope, run, previous_operation);
+        self.record_rebuild_hint(scope, record.operation).await?;
         match self.write_rebuild_record(&key, &record, condition).await {
             Ok(_) => Ok(()),
             Err(Error::Conflict(_)) => {
@@ -429,7 +456,7 @@ impl HostedCatalog {
             return Err(Error::Busy("profile rebuild is scheduled for later".into()));
         }
         let count = match self
-            .embed_collection_with_id(scope, scoped_id(record.run, scope, u64::from(step) + 1))
+            .embed_collection_with_id(scope, record.step_id(scope, u64::from(step) + 1))
             .await
         {
             Ok(count) => Some(count),
@@ -498,23 +525,33 @@ impl HostedCatalog {
                 "profile rebuild belongs to another worker configuration".into(),
             ));
         }
-        if scoped_id(discovery.run, scope, 0) != operation {
-            return Ok(None);
-        }
         let key = self.rebuild_key(scope)?;
-        let (record, version) = self
-            .read_rebuild_record::<Rebuild>(&key)
-            .await?
-            .ok_or_else(|| Error::Busy("profile rebuild discovery is incomplete".into()))?;
-        if record.run != discovery.run {
-            return Err(Error::Busy(
+        match self.read_rebuild_record::<Rebuild>(&key).await? {
+            Some((record, version)) if record.run == discovery.run => {
+                if record.operation != record.step_id(scope, 0) {
+                    return Err(Error::Internal("profile rebuild identity mismatch".into()));
+                }
+                if record.operation == operation {
+                    return Ok(Some((key, record, version)));
+                }
+                if record.step.is_none() {
+                    let next = Rebuild::new(scope, record.run, Some(record.operation));
+                    if next.operation == operation {
+                        // Repair can observe a follow-up hint before its checkpoint.
+                        // Finish the same conditional handoff if the API stopped.
+                        let version = self
+                            .write_rebuild_record(&key, &next, Condition::Match(version))
+                            .await?;
+                        return Ok(Some((key, next, version)));
+                    }
+                }
+                Ok(None)
+            }
+            _ if scoped_id(discovery.run, scope, 0) == operation => Err(Error::Busy(
                 "profile rebuild discovery is incomplete".into(),
-            ));
+            )),
+            _ => Ok(None),
         }
-        if record.operation != operation {
-            return Err(Error::Internal("profile rebuild identity mismatch".into()));
-        }
-        Ok(Some((key, record, version)))
     }
 
     fn discovery_key(&self) -> Result<Key> {

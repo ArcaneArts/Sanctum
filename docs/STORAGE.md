@@ -498,22 +498,23 @@ batch alone. Dispatch repair can enqueue the pending upload batch under
 the new profile in the same dispatch window. An old upload task without
 a profile ID is handed back to dispatch on a Cloud Tasks worker. The
 manual worker endpoint can omit the profile when Cloud Tasks is absent.
-The scheduled embedding
-profile endpoint scans one page of object keys after a profile change
-and queues collections from their manifests. A persisted cursor resumes
-discovery on the next invocation. Once a worker starts discovery for the
-configured profile, a search can enqueue a collection with incomplete
-coverage if it has no rebuild record for the current run. This also covers
-collections added after the scan finishes. Search persists the same
-repair hint and rebuild record as scheduled discovery and reuses a record
-from the current run. Each collection's enqueue attempt has a one-second
-budget, and search can return its normal result if that attempt fails.
-Strict semantic search still requires compatible vectors. Workers rebuild
-each collection in bounded steps and ignore old run IDs. If storage loses
-the reply to a step's checkpoint write, the worker can acknowledge the
-delivery after reading a later or completed checkpoint for that same run
-and operation. If the checkpoint did not advance, redelivery can use the
-existing SQLite receipt without recomputing the batch. See the
+After a profile change, scheduled discovery queues collections from
+their manifests and saves its listing cursor for the next invocation.
+Once discovery starts, a search can queue a collection with incomplete
+coverage even after the scan finishes. Searches reuse an active rebuild.
+If a rebuild has completed, the API checks the latest coverage and
+queues a follow-up when there are unprocessed inputs or retryable failures.
+The follow-up has its own task and batch IDs. Repair can recover it from
+the durable hint if the API stops before publishing the rebuild record.
+Each collection's enqueue attempt has a one-second budget. Strict
+semantic search still requires compatible vectors.
+
+Workers rebuild each collection in bounded steps and ignore superseded
+operations. If storage loses the reply to a step's checkpoint write,
+the worker can acknowledge delivery after reading a later or completed
+checkpoint for that operation. If the checkpoint did not advance,
+redelivery can use the existing SQLite receipt without recomputing the
+batch. See the
 [Cloud Run schedule](CLOUD_RUN.md#schedule-dispatch-repair).
 
 ### Hosted source deletion and reclamation

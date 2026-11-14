@@ -1707,6 +1707,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   after discovery. It opens a fresh API and worker, then verifies lexical
   fallback, the persisted rebuild, and strict semantic retrieval through
   the new profile.
+- A search also queues a follow-up when an older worker publishes text
+  after the current profile's rebuild has completed. The gRPC regression
+  rejected the new checkpoint after saving its repair hint. A fresh
+  worker recovered one follow-up, ignored a delivery for the completed
+  operation, and restored semantic coverage from one of two chunks to
+  both chunks. On live MinIO and Ollama, the worker's HTTP handler
+  acknowledged old and duplicate deliveries and made one new document
+  embedding request. Strict semantic search returned the late excerpt.
+  Cloud Run rollouts must update the worker before deploying APIs that
+  schedule follow-ups. [Deployment order](CLOUD_RUN.md#verify-a-deployment).
 
 ## Profile-bound hosted task delivery
 

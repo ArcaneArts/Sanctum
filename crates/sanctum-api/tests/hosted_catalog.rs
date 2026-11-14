@@ -4939,6 +4939,162 @@ async fn hosted_search_queues_an_unvisited_collection_after_profile_discovery_fi
 }
 
 #[tokio::test]
+async fn hosted_search_restarts_a_completed_rebuild_for_late_text() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
+    let dispatch = Arc::new(TestDispatch {
+        fail: AtomicU8::new(0),
+        delivered: std::sync::Mutex::new(Vec::new()),
+    });
+    let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let current = || {
+        catalog()
+            .with_dispatch(dispatch.clone())
+            .with_embedding(Some(Arc::new(HostedEmbeddingFixture {
+                profile: "fixture-v2",
+                fail: AtomicU8::new(0),
+                queries: AtomicUsize::new(0),
+            })))
+    };
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let old = catalog();
+    old.create_collection(&scope, None).await.unwrap();
+    let mut old_api = start(old.clone()).await;
+    let header = v1::UploadTextHeader {
+        scope: Some(v1::Scope {
+            tenant: "default".into(),
+            collection: "notes".into(),
+        }),
+        name: "notes.txt".into(),
+        ..Default::default()
+    };
+    let accepted = old_api
+        .client
+        .submit_text(upload_frames(&header, [b"carnelian".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let initial_upload = accepted.operation_id.parse().unwrap();
+    old.register_upload(&scope, initial_upload).await.unwrap();
+    old.index_upload(&scope, initial_upload).await.unwrap();
+
+    let worker = current();
+    assert!(worker.discover_profile_rebuild().await.unwrap().complete);
+    for shard in 0..sanctum_service::DISPATCH_SHARDS {
+        worker.reconcile_shard(shard).await.unwrap();
+    }
+    let initial = dispatch.delivered.lock().unwrap()[0].0;
+    worker
+        .run_profile_rebuild(&scope, initial, 0)
+        .await
+        .unwrap();
+    worker
+        .run_profile_rebuild(&scope, initial, 1)
+        .await
+        .unwrap();
+    worker.try_dispatch_rebuild(&scope, initial).await;
+    assert_eq!(
+        worker
+            .embedding_status(&scope, None)
+            .await
+            .unwrap()
+            .coverage
+            .embedded,
+        1,
+    );
+    dispatch.delivered.lock().unwrap().clear();
+
+    let accepted = old_api
+        .client
+        .submit_text(upload_frames(&header, [b"amethyst".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let late_upload = accepted.operation_id.parse().unwrap();
+    old.register_upload(&scope, late_upload).await.unwrap();
+    old.index_upload(&scope, late_upload).await.unwrap();
+    old_api.stop().await;
+
+    let mut api = start(current()).await;
+    let mut search = v1::SearchCollectionsRequest {
+        tenant: "default".into(),
+        collections: vec!["notes".into()],
+        query: "amethyst".into(),
+        mode: v1::SearchMode::Lexical.into(),
+        ..Default::default()
+    };
+    // The search still succeeds if its rebuild record fails to publish after
+    // its dispatch hint is saved.
+    storage
+        .interrupt
+        .store(REJECT_REBUILD_CHECKPOINT, Ordering::Relaxed);
+    let result = api
+        .client
+        .search_collections(search.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(result.hits[0].excerpt, "amethyst");
+    let coverage = result.embedding_coverage.unwrap();
+    assert_eq!((coverage.embedded_chunks, coverage.total_chunks), (1, 2));
+    assert_eq!(storage.interrupt.load(Ordering::Relaxed), 0);
+
+    let worker = current();
+    for shard in 0..sanctum_service::DISPATCH_SHARDS {
+        worker.reconcile_shard(shard).await.unwrap();
+    }
+    let deliveries = dispatch.delivered.lock().unwrap().clone();
+    let [(follow_up, TaskStage::Rebuild { step: 0 }, Some(profile))] = deliveries.as_slice() else {
+        panic!("expected one follow-up rebuild, got {deliveries:?}");
+    };
+    assert_ne!(*follow_up, initial);
+    api.client.search_collections(search.clone()).await.unwrap();
+    for shard in 0..sanctum_service::DISPATCH_SHARDS {
+        worker.reconcile_shard(shard).await.unwrap();
+    }
+    assert_eq!(*dispatch.delivered.lock().unwrap(), deliveries);
+    worker
+        .run_profile_rebuild(&scope, initial, 0)
+        .await
+        .unwrap();
+    worker.try_dispatch_rebuild(&scope, initial).await;
+    assert_eq!(
+        worker
+            .embedding_status(&scope, None)
+            .await
+            .unwrap()
+            .coverage
+            .embedded,
+        1,
+    );
+    worker
+        .deliver_profile_rebuild(&scope, *follow_up, 0, Some(profile))
+        .await
+        .unwrap();
+    worker
+        .deliver_profile_rebuild(&scope, *follow_up, 1, Some(profile))
+        .await
+        .unwrap();
+    worker.try_dispatch_rebuild(&scope, *follow_up).await;
+
+    search.mode = v1::SearchMode::Semantic.into();
+    let result = api
+        .client
+        .search_collections(search)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(result.mode(), v1::SearchMode::Semantic);
+    assert!(result.hits.iter().any(|hit| hit.excerpt == "amethyst"));
+    let coverage = result.embedding_coverage.unwrap();
+    assert_eq!((coverage.embedded_chunks, coverage.total_chunks), (2, 2));
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn profile_discovery_keeps_failed_collections_pending_without_blocking_later_pages() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));

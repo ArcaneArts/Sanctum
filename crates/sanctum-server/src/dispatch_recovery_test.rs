@@ -428,7 +428,7 @@ async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
     let (mut api, _rebuild_api) = serve_api(rebuild).await;
     let result = api
         .search_text(v1::SearchTextRequest {
-            scope: Some(scope),
+            scope: Some(scope.clone()),
             query: "Rhodonite observation".into(),
             mode: v1::SearchMode::Semantic.into(),
             ..Default::default()
@@ -443,6 +443,79 @@ async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
     );
     assert_eq!(coverage.embedded_chunks, 1);
     assert_eq!(result.hits[0].excerpt, TEXT);
+
+    // Simulate an indexing worker that did not schedule embeddings during the
+    // rollout, after the new worker completed this collection's rebuild.
+    let late_text = "A violet amethyst specimen from the new excavation.\n";
+    let older = HostedCatalog::new(storage.clone(), Some(prefix.clone()), 1024).unwrap();
+    let (mut old_api, _old_server) = serve_api(older.clone()).await;
+    let late_operation = Uuid::new_v4();
+    submit_source(
+        &mut old_api,
+        &scope,
+        late_operation,
+        "amethyst.txt",
+        late_text.as_bytes(),
+    )
+    .await;
+    older
+        .register_upload(&internal_scope, late_operation)
+        .await
+        .unwrap();
+    older
+        .index_upload(&internal_scope, late_operation)
+        .await
+        .unwrap();
+    let search = v1::SearchTextRequest {
+        scope: Some(scope.clone()),
+        query: "amethyst".into(),
+        mode: v1::SearchMode::Lexical.into(),
+        ..Default::default()
+    };
+    let result = api.search_text(search.clone()).await.unwrap().into_inner();
+    assert_eq!(result.hits[0].excerpt, late_text);
+    assert_eq!(result.embedding_coverage.unwrap().embedded_chunks, 1);
+    let (next, _) = read_control(storage.as_ref(), &rebuild_key).await;
+    assert_eq!(next["run"], completed["run"]);
+    assert_ne!(next["operation"], completed["operation"]);
+    assert_eq!(next["step"], 0);
+    assert_eq!(
+        deliver_rebuild(0).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(new_profile.documents.load(Ordering::Relaxed), 1);
+
+    let restarted = rebuild_catalog(storage.clone());
+    let (worker, _worker_server) =
+        serve_http(crate::hosted_worker::router(restarted.clone())).await;
+    let delivery = json!({
+        "tenant": &scope.tenant,
+        "collection": &scope.collection,
+        "operation_id": next["operation"],
+        "profile": new_profile.profile_id(),
+        "step": 0,
+    });
+    let deliver = || {
+        http.post(format!("{worker}/internal/tasks/rebuild-collection"))
+            .json(&delivery)
+            .send()
+    };
+    for _ in 0..2 {
+        assert_eq!(deliver().await.unwrap().status(), StatusCode::NO_CONTENT);
+    }
+    assert_eq!(new_profile.documents.load(Ordering::Relaxed), 2);
+    let (mut api, _restarted_api) = serve_api(restarted).await;
+    let result = api
+        .search_text(v1::SearchTextRequest {
+            mode: v1::SearchMode::Semantic.into(),
+            ..search
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let coverage = result.embedding_coverage.unwrap();
+    assert_eq!((coverage.embedded_chunks, coverage.total_chunks), (2, 2));
+    assert!(result.hits.iter().any(|hit| hit.excerpt == late_text));
     clear_prefix(storage.as_ref(), &prefix).await;
 }
 
