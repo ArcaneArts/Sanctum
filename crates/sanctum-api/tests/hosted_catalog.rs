@@ -4480,6 +4480,78 @@ async fn hosted_metadata_is_atomic_and_filters_published_revisions() {
 }
 
 #[tokio::test]
+async fn hosted_source_sweep_resumes_a_partly_processed_page_after_a_lost_checkpoint_response() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        interrupt: AtomicU8::new(0),
+    });
+    let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let service = catalog();
+    for index in 0..10 {
+        let scope = sanctum_core::Scope {
+            tenant: "default".parse().unwrap(),
+            collection: format!("notes-{index}").parse().unwrap(),
+        };
+        service.create_collection(&scope, None).await.unwrap();
+    }
+    let key = Key::parse("_maintenance/source-sweep.json").unwrap();
+    storage
+        .put_control(
+            &key,
+            b"{\"next\":null}".as_slice().into(),
+            Condition::Create,
+        )
+        .await
+        .unwrap();
+    storage
+        .interrupt
+        .store(LOSE_SOURCE_SWEEP_CHECKPOINT_RESPONSE, Ordering::Relaxed);
+    assert!(matches!(
+        service.sweep_hosted_sources().await,
+        Err(Error::Busy(_))
+    ));
+    drop(service);
+
+    let mut cursor = String::new();
+    storage
+        .get(&key)
+        .await
+        .unwrap()
+        .reader
+        .read_to_string(&mut cursor)
+        .await
+        .unwrap();
+    let cursor: serde_json::Value = serde_json::from_str(&cursor).unwrap();
+    assert_eq!(
+        cursor["pending"],
+        serde_json::json!([
+            "default/collections/notes-8/HEAD.json",
+            "default/collections/notes-9/HEAD.json"
+        ])
+    );
+    let restarted = catalog();
+    storage
+        .interrupt
+        .store(REJECT_SOURCE_SWEEP_RELIST, Ordering::Relaxed);
+    let report = restarted.sweep_hosted_sources().await.unwrap();
+    assert_eq!(report.collections, 2);
+    assert_eq!(report.failed, 0);
+    assert!(!report.more);
+    let mut saved = String::new();
+    storage
+        .get(&key)
+        .await
+        .unwrap()
+        .reader
+        .read_to_string(&mut saved)
+        .await
+        .unwrap();
+    let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(saved, serde_json::json!({"next":null, "pending":[]}));
+}
+
+#[tokio::test]
 async fn hosted_source_sweep_retries_failed_objects_without_holding_up_later_batches() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance {
@@ -5918,6 +5990,8 @@ const CORRUPT_RANGE: u8 = 11;
 const LOSE_PREPARED_EMBEDDING_RESPONSE: u8 = 12;
 const LEAVE_COLLECTION_CREATION_INTENT: u8 = 13;
 const REJECT_RETIRED_SOURCE_DELETE: u8 = 14;
+const LOSE_SOURCE_SWEEP_CHECKPOINT_RESPONSE: u8 = 15;
+const REJECT_SOURCE_SWEEP_RELIST: u8 = 16;
 
 struct InterruptedRead<'a>(&'a AtomicU8);
 
@@ -5998,6 +6072,19 @@ impl Storage for InterruptAcceptance {
         if interrupt == 2 {
             return Err(Error::Busy("envelope write response lost".into()));
         }
+        if key.as_str() == "_maintenance/source-sweep.json"
+            && self
+                .interrupt
+                .compare_exchange(
+                    LOSE_SOURCE_SWEEP_CHECKPOINT_RESPONSE,
+                    0,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            return Err(Error::Busy("source sweep checkpoint response lost".into()));
+        }
         if key.as_str().contains("/prepared-embeddings/")
             && self
                 .interrupt
@@ -6020,6 +6107,10 @@ impl Storage for InterruptAcceptance {
         cursor: Option<&str>,
         limit: u32,
     ) -> StorageResult<ListPage> {
+        if prefix.is_none() && self.interrupt.load(Ordering::Relaxed) == REJECT_SOURCE_SWEEP_RELIST
+        {
+            return Err(Error::Busy("test blocked source sweep rediscovery".into()));
+        }
         self.inner.list(prefix, cursor, limit).await
     }
 

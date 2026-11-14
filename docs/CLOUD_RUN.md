@@ -179,8 +179,13 @@ compacts terminal records. It saves a scan cursor so subsequent calls
 continue the same pass. The snapshot sweep advances stored cursors for catalog and collection
 snapshots, resumes pending collection creations, and deletes noncurrent
 generations after reader grace.
-The source sweep advances a durable cursor and reclaims retired source
-bytes in bounded pages. The response and cleanup log report
+The source sweep saves both its listing cursor and the unprocessed
+collections from the current page. An invocation attempts up to eight
+collections, budgets 180 seconds for each, and stops starting work
+at its 210-second work deadline. It has up to 240 seconds total to return
+with the checkpoint saved. A collection interrupted by the work deadline
+remains first in the saved page. Individual failures are counted and
+revisited on the next full scan. The response and cleanup log report
 `deferred_objects` when a failed delete has been rescheduled. The worker
 continues with other due objects in that collection. The embedding profile
 job checks the worker's configured profile and

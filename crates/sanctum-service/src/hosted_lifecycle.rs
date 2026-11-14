@@ -1,11 +1,14 @@
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 
 use futures::{StreamExt, stream};
 use sanctum_core::{Error, Result, Scope};
 use sanctum_db::{Command, Unit, collection_prefix};
 use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
+use tokio::{
+    io::AsyncReadExt,
+    time::{Instant, timeout, timeout_at},
+};
 use uuid::Uuid;
 
 use crate::{HostedCatalog, db::hosted, hosted_rebuild::collection_manifest};
@@ -20,6 +23,8 @@ struct Deletion {
 #[derive(Default, Serialize, Deserialize)]
 struct SweepCursor {
     next: Option<String>,
+    #[serde(default)]
+    pending: VecDeque<String>,
 }
 
 pub struct SourceSweep {
@@ -38,6 +43,11 @@ struct ReclaimedObjects {
 
 const DELETE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONCURRENT_DELETES: usize = 4;
+const DISCOVERY_LIMIT: u32 = 32;
+const COLLECTION_LIMIT: usize = 8;
+const COLLECTION_TIMEOUT: Duration = Duration::from_secs(180);
+const SWEEP_WORK_TIMEOUT: Duration = Duration::from_secs(210);
+const SWEEP_TIMEOUT: Duration = Duration::from_secs(240);
 
 impl HostedCatalog {
     pub async fn delete_source(
@@ -85,15 +95,29 @@ impl HostedCatalog {
     }
 
     pub async fn sweep_hosted_sources(&self) -> Result<SourceSweep> {
+        timeout(
+            SWEEP_TIMEOUT,
+            self.sweep_source_page(Instant::now() + SWEEP_WORK_TIMEOUT, COLLECTION_TIMEOUT),
+        )
+        .await
+        .map_err(|_| Error::Busy("hosted source sweep checkpoint timed out".into()))?
+    }
+
+    async fn sweep_source_page(
+        &self,
+        work_deadline: Instant,
+        collection_timeout: Duration,
+    ) -> Result<SourceSweep> {
         let path = "_maintenance/source-sweep.json";
         let key = Key::parse(
             self.prefix
                 .as_ref()
                 .map_or_else(|| path.into(), |prefix| format!("{prefix}/{path}")),
         )?;
-        let (cursor, condition) = match self.storage.get(&key).await {
+        let (mut cursor, condition) = match self.storage.get(&key).await {
             Ok(download) => {
-                if download.object.length > MAX_CONTROL_BYTES as u64 {
+                let size = download.object.length;
+                if size > MAX_CONTROL_BYTES as u64 {
                     return Err(Error::Internal(
                         "source sweep cursor exceeds size limit".into(),
                     ));
@@ -101,9 +125,14 @@ impl HostedCatalog {
                 let mut body = Vec::new();
                 download
                     .reader
-                    .take(MAX_CONTROL_BYTES as u64 + 1)
+                    .take(size + 1)
                     .read_to_end(&mut body)
                     .await?;
+                if body.len() as u64 != size {
+                    return Err(Error::Internal(
+                        "source sweep cursor length mismatch".into(),
+                    ));
+                }
                 let cursor = serde_json::from_slice(&body)
                     .map_err(|error| Error::Internal(Box::new(error)))?;
                 (cursor, Condition::Match(download.object.version))
@@ -111,27 +140,56 @@ impl HostedCatalog {
             Err(Error::NotFound(_)) => (SweepCursor::default(), Condition::Create),
             Err(error) => return Err(error),
         };
-        let page = self
-            .storage
-            .list(self.prefix.as_ref(), cursor.next.as_deref(), 32)
-            .await?;
-        if page.next_cursor.is_some() && page.next_cursor == cursor.next {
-            return Err(Error::Internal(
-                "source sweep cursor did not advance".into(),
-            ));
+        if cursor.pending.is_empty() {
+            let page = self
+                .storage
+                .list(
+                    self.prefix.as_ref(),
+                    cursor.next.as_deref(),
+                    DISCOVERY_LIMIT,
+                )
+                .await?;
+            if page.next_cursor.is_some() && page.next_cursor == cursor.next {
+                return Err(Error::Internal(
+                    "source sweep cursor did not advance".into(),
+                ));
+            }
+            cursor.pending = page
+                .objects
+                .into_iter()
+                .filter(|object| collection_manifest(self.prefix.as_ref(), &object.key).is_some())
+                .map(|object| object.key.to_string())
+                .collect();
+            cursor.next = page.next_cursor;
         }
         let mut report = SourceSweep {
             deleted: 0,
             deferred_objects: 0,
             collections: 0,
             failed: 0,
-            more: page.next_cursor.is_some(),
+            more: false,
         };
-        for object in page.objects {
-            let Some(scope) = collection_manifest(self.prefix.as_ref(), &object.key) else {
-                continue;
+        for _ in 0..COLLECTION_LIMIT.min(cursor.pending.len()) {
+            if Instant::now() >= work_deadline {
+                break;
+            }
+            let manifest = cursor
+                .pending
+                .front()
+                .expect("work is bounded by the queue");
+            let scope = collection_manifest(self.prefix.as_ref(), &Key::parse(manifest)?)
+                .ok_or_else(|| {
+                    Error::Internal("invalid collection manifest in source sweep cursor".into())
+                })?;
+            let attempt = timeout(collection_timeout, self.reclaim_source_batch(&scope));
+            let Ok(result) = timeout_at(work_deadline, attempt).await else {
+                // Give the unfinished collection a full attempt in the next invocation.
+                break;
             };
-            match self.reclaim_source_batch(&scope).await {
+            cursor.pending.pop_front();
+            match result
+                .unwrap_or_else(|_| Err(Error::Busy("source cleanup attempt timed out".into())))
+            {
                 Ok((deleted, deferred)) => {
                     report.collections += 1;
                     report.deleted += deleted;
@@ -145,10 +203,8 @@ impl HostedCatalog {
                 }
             }
         }
-        let body = serde_json::to_vec(&SweepCursor {
-            next: page.next_cursor,
-        })
-        .map_err(|error| Error::Internal(Box::new(error)))?;
+        report.more = !cursor.pending.is_empty() || cursor.next.is_some();
+        let body = serde_json::to_vec(&cursor).map_err(|error| Error::Internal(Box::new(error)))?;
         self.storage
             .put_control(&key, body.into(), condition)
             .await?;
@@ -244,5 +300,38 @@ impl HostedCatalog {
         tokio::time::timeout(DELETE_TIMEOUT, self.storage.delete(&key))
             .await
             .map_err(|_| Error::Busy("retired source object deletion timed out".into()))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn source_sweep_checkpoints_discovery_when_its_work_budget_is_spent() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+        let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+        let service = catalog();
+        let scope = Scope {
+            tenant: "default".parse().unwrap(),
+            collection: "notes".parse().unwrap(),
+        };
+        service.create_collection(&scope, None).await.unwrap();
+        let paused = service
+            .sweep_source_page(Instant::now(), COLLECTION_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(paused.collections, 0);
+        assert_eq!(paused.failed, 0);
+        assert!(paused.more);
+        drop(service);
+
+        let resumed = catalog().sweep_hosted_sources().await.unwrap();
+        assert_eq!(resumed.collections, 1);
+        assert_eq!(resumed.failed, 0);
+        assert!(!resumed.more);
     }
 }
