@@ -2413,6 +2413,13 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   oversized listing and object responses without waiting for EOF and
   rejected a response containing more items than requested.
   [GCS storage adapter](STORAGE.md#google-cloud-storage-adapter).
+- A response that ends partway through its JSON now returns a retryable
+  error even when the HTTP body ends normally. The loopback fixture verified
+  that a listing retries the same page, a resumable upload confirms the
+  committed generation with a status probe, and a conditional control write
+  sends one request and returns a retryable error for its caller to reconcile.
+  Invalid JSON syntax and oversized responses still fail immediately.
+  [GCS storage adapter](STORAGE.md#google-cloud-storage-adapter).
 
 ## GCS resumable transfer recovery
 

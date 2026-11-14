@@ -75,6 +75,7 @@ async fn upload(
     match generation.as_str() {
         "0" => Json(metadata(key, 7, 11)).into_response(),
         "11" => Json(metadata(key, 7, 12)).into_response(),
+        "12" => ([(header::CONTENT_TYPE, "application/json")], "{\"name\":").into_response(),
         _ => StatusCode::PRECONDITION_FAILED.into_response(),
     }
 }
@@ -190,7 +191,12 @@ async fn list(
             "items": [metadata("default/notes", 4, 9)]
         }))
         .into_response(),
-        Some("invalid") => "{\"items\":[".into_response(),
+        Some("invalid") => "{\"items\":[!".into_response(),
+        Some("incomplete") if attempt == 1 => "{\"items\":[".into_response(),
+        Some("incomplete") => Json(json!({
+            "items": [metadata("default/notes/b", 13, 10)]
+        }))
+        .into_response(),
         Some("stalled") if attempt == 1 => std::future::pending().await,
         Some("stalled") => Json(json!({})).into_response(),
         _ => StatusCode::BAD_REQUEST.into_response(),
@@ -532,6 +538,26 @@ async fn native_generation_conditions_and_resumable_offsets() {
 }
 
 #[tokio::test]
+async fn incomplete_control_write_receipt_is_retryable_without_replaying_the_write() {
+    let (storage, fixture, server) = start().await;
+    let key = Key::parse("default/notes/HEAD.json").unwrap();
+    let expected = Version {
+        etag: None,
+        generation: Some("12".into()),
+    };
+    let result = storage
+        .put_control(
+            &key,
+            Bytes::from_static(b"control"),
+            Condition::Match(expected),
+        )
+        .await;
+    assert!(matches!(result, Err(Error::Busy(_))), "{result:?}");
+    assert_eq!(*fixture.writes.lock().unwrap(), ["12"]);
+    server.abort();
+}
+
+#[tokio::test]
 async fn native_downloads_are_generation_fenced_and_ranges_are_exact() {
     let (storage, _, server) = start().await;
     let key = Key::parse("default/notes/text").unwrap();
@@ -581,6 +607,23 @@ async fn usage_retries_the_same_gcs_page_without_counting_it_twice() {
             Some("opaque/+ token=".into()),
             Some("opaque/+ token=".into())
         ]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn list_retries_the_same_page_after_an_incomplete_json_response() {
+    let (storage, fixture, server) = start().await;
+    let prefix = Key::parse("default/notes").unwrap();
+    let page = storage
+        .list(Some(&prefix), Some("incomplete"), 1)
+        .await
+        .unwrap();
+    assert_eq!(page.objects.len(), 1);
+    assert_eq!(page.objects[0].key.as_str(), "default/notes/b");
+    assert_eq!(
+        *fixture.lists.lock().unwrap(),
+        [Some("incomplete".into()), Some("incomplete".into())]
     );
     server.abort();
 }
@@ -971,6 +1014,7 @@ struct RecoveryFixture {
 #[derive(PartialEq)]
 enum RecoveryScenario {
     Interrupted,
+    IncompleteCompletion,
     InvalidOffset,
     UnavailableSession { status: StatusCode, on_probe: bool },
     NoProgress,
@@ -1092,6 +1136,9 @@ async fn interrupted_part(
         3 if fixture.scenario == RecoveryScenario::InvalidOffset => incomplete(PART_BYTES + 1),
         3 => incomplete(FIRST_ACK),
         4 => incomplete(FIRST_ACK + PART_BYTES),
+        5 if fixture.scenario == RecoveryScenario::IncompleteCompletion => {
+            ([(header::CONTENT_TYPE, "application/json")], "{\"name\":").into_response()
+        }
         5 => {
             // The object is now committed, but the metadata response is lost.
             let lost = futures::stream::iter([Err::<Bytes, _>(std::io::Error::new(
@@ -1120,7 +1167,16 @@ async fn cancel_session(
 
 #[tokio::test]
 async fn resumable_upload_recovers_partial_part_and_lost_completion() {
-    let (storage, fixture, server) = start_recovery(RecoveryScenario::Interrupted).await;
+    assert_resumable_upload_recovery(RecoveryScenario::Interrupted).await;
+}
+
+#[tokio::test]
+async fn resumable_upload_recovers_an_incomplete_completion_receipt() {
+    assert_resumable_upload_recovery(RecoveryScenario::IncompleteCompletion).await;
+}
+
+async fn assert_resumable_upload_recovery(scenario: RecoveryScenario) {
+    let (storage, fixture, server) = start_recovery(scenario).await;
     let key = Key::parse("default/notes/bulk").unwrap();
     let version = storage
         .put_stream(

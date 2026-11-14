@@ -463,8 +463,13 @@ async fn read_metadata<T: serde::de::DeserializeOwned>(
         }
         bytes.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|_| invalid_response("GCS returned invalid object metadata"))
+    serde_json::from_slice(&bytes).map_err(|error| {
+        if error.is_eof() {
+            Error::Busy("GCS metadata response ended before the JSON was complete".into())
+        } else {
+            invalid_response("GCS returned invalid object metadata")
+        }
+    })
 }
 
 async fn upload_version(response: Response, key: &Key, length: u64) -> Result<Version> {
