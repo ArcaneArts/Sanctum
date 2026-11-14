@@ -1821,4 +1821,8 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   Tauri IPC fixture exercised local and hosted navigation, empty hosted
   pages, an expired cursor, a scoped cancel action, collection changes,
   and managed server restart.
+- The native macOS app launched with `pnpm devtop` and live MinIO.
+  A generated gRPC client confirmed an empty first page with a
+  continuation. In desktop activity, **Next page** showed the completed
+  upload and **Previous page** restored the empty page.
   [Desktop activity](DESKTOP.md#first-use).
