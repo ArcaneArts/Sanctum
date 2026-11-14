@@ -125,33 +125,52 @@ impl Service {
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
         let mut database = self.database(scope)?;
         let profile = self.embedding_profile();
-        if !database.has_retirement_work(profile)? {
+        if database.has_retirement_work(profile)? {
+            let writer = database.write()?;
+            writer.release_retirements(profile)?;
+            for candidate in writer.retirement_candidates(profile)? {
+                if !self.queue.retains_input(scope, candidate)? {
+                    writer.retire(candidate)?;
+                }
+            }
+            writer.expire_deletion_receipts()?;
+            writer.prune_unreferenced_embeddings()?;
+            writer.commit()?;
+        }
+
+        let garbage = database.due_revision_garbage()?;
+        if garbage.is_empty() {
             return Ok(());
         }
-        let writer = database.write()?;
-        writer.release_retirements(profile)?;
-        for candidate in writer.retirement_candidates(profile)? {
-            if !self.queue.retains_input(scope, candidate)? {
-                writer.retire(candidate)?;
-            }
-        }
-        writer.expire_deletion_receipts()?;
-        writer.prune_unreferenced_embeddings()?;
-        writer.commit()?;
-
-        let garbage = database.garbage()?;
-        let count = garbage.len();
+        let mut reclaimed = 0;
+        let mut deferred = 0;
         for garbage in garbage {
-            self.files
-                .discard_text(scope, garbage.source, garbage.revision)?;
-            database.acknowledge_garbage(garbage)?;
+            match self
+                .files
+                .discard_text(scope, garbage.source, garbage.revision)
+            {
+                Ok(()) => {
+                    database.acknowledge_garbage(garbage)?;
+                    reclaimed += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error, tenant = %scope.tenant, collection = %scope.collection,
+                        source = %garbage.source, revision = %garbage.revision,
+                        "retired local revision deletion will be retried"
+                    );
+                    database.defer_revision_cleanup(garbage)?;
+                    deferred += 1;
+                }
+            }
         }
         tracing::debug!(
             event = "cleanup_pass",
             kind = "local_source",
             tenant = %scope.tenant,
             collection = %scope.collection,
-            reclaimed_revisions = count,
+            reclaimed_revisions = reclaimed,
+            deferred_revisions = deferred,
             "completed local revision cleanup"
         );
         Ok(())
@@ -163,7 +182,9 @@ impl Service {
             let database = self.database(&scope)?;
             self.files.visit_revisions(&scope, |source, revision| {
                 let key = RevisionKey { source, revision };
-                if !database.contains_revision(key)? && !self.queue.retains_input(&scope, key)? {
+                if !database.tracks_revision_files(key)?
+                    && !self.queue.retains_input(&scope, key)?
+                {
                     self.files.discard_text(&scope, source, revision)?;
                 }
                 Ok(())

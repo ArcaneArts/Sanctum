@@ -349,7 +349,10 @@ and pending cleanup from the same snapshot as the current revision.
 every required embedding. A ready source can still have older data held
 for readers. `retained_revisions` counts superseded revisions still in
 SQLite. `pending_revision_cleanup` counts local revisions whose files
-remain queued for deletion. `pending_object_cleanup` counts hosted objects
+remain queued for deletion. When a local deletion fails, maintenance
+continues with other revisions and retries the failed deletion after
+at least one minute, even across server restarts.
+`pending_object_cleanup` counts hosted objects
 after their locators leave the index and before deletion is acknowledged.
 The last field is absent if an older snapshot or legacy garbage records
 prevent an exact per-source object count.
