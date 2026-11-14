@@ -295,8 +295,11 @@ cargo run --locked -p sanctum-cli -- search notes 'quartz formation' --mode hybr
   returns `UNAVAILABLE` if query embedding fails or the collection has no
   compatible vectors.
 - `hybrid` combines lexical and semantic ranks with reciprocal rank fusion
-  (constant 60). It falls back to lexical when the provider or compatible
-  vectors are unavailable. Semantic and hybrid modes collapse overlapping
+  (constant 60). Within each collection, its lexical leg first requires all
+  quoted terms in the same chunk. If neither lexical nor semantic ranking
+  returns an eligible hit, it searches for any of those terms. When the provider or compatible vectors
+  are unavailable, it reports lexical mode and a degradation reason.
+  Semantic and hybrid modes with vectors collapse overlapping
   byte ranges from the same source revision within the retrieved candidates.
 
 The response includes the mode used, optional scores, and coverage for the

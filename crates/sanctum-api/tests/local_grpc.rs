@@ -1676,6 +1676,20 @@ async fn embedding_search_reuses_vectors_and_isolates_profiles() {
         forecast.source_id
     );
 
+    let mut query = vector_search("quartz nonexistent", v1::SearchMode::Hybrid);
+    query.limit = Some(2);
+    let ranked = running
+        .client
+        .search_text(query)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ranked.mode(), v1::SearchMode::Hybrid);
+    assert_eq!(ranked.hits.len(), 2);
+    // A partial lexical match must not add a second rank contribution when
+    // semantic ranking found eligible chunks.
+    assert!(ranked.hits[0].score.unwrap() <= 1.0 / 61.0);
+
     provider.fail_queries.store(true, Ordering::SeqCst);
     let response = running
         .client
@@ -4238,5 +4252,59 @@ async fn storage_usage_counts_retained_and_staged_files_at_each_scope() {
         .await
         .unwrap_err();
     assert_eq!(missing.code(), Code::NotFound);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn hybrid_falls_back_to_partial_terms_without_embeddings() {
+    let directory = TempDir::new().unwrap();
+    let mut running = Running::with_embedding(&directory, None).await;
+    create(&mut running.client, "default").await;
+    let target = upload(&mut running.client, header("default"), b"quartz specimens").await;
+    let mut second = header("default");
+    if let Some(Frame::Header(header)) = &mut second.frame {
+        header.external = None;
+    }
+    upload(&mut running.client, second, b"quartz sediment").await;
+
+    let strict = vector_search("quartz nonexistent", v1::SearchMode::Lexical);
+    assert!(
+        running
+            .client
+            .search_text(strict.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .hits
+            .is_empty()
+    );
+    let mut hybrid = strict;
+    hybrid.mode = v1::SearchMode::Hybrid.into();
+    hybrid.limit = Some(10);
+    let partial = running
+        .client
+        .search_text(hybrid.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(partial.mode(), v1::SearchMode::Lexical);
+    assert_eq!(
+        partial.degraded_reason.as_deref(),
+        Some("embedding_disabled")
+    );
+    assert_eq!(partial.hits.len(), 2);
+
+    hybrid.query = "quartz specimens".into();
+    let exact = running
+        .client
+        .search_text(hybrid)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(exact.hits.len(), 1);
+    assert_eq!(
+        exact.hits[0].chunk.as_ref().unwrap().source_id,
+        target.source_id
+    );
     running.stop().await;
 }

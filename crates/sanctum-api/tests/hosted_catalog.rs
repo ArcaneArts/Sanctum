@@ -4622,3 +4622,73 @@ async fn hosted_database_export_replays_a_pinned_page_delta_on_another_instance(
     assert_eq!(rows, 2);
     second.stop().await;
 }
+
+#[tokio::test]
+async fn hosted_hybrid_falls_back_to_partial_terms_across_collections() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let catalog = HostedCatalog::new(storage, None, 1024).unwrap();
+    let mut server = start(catalog.clone()).await;
+    for (name, body) in [
+        ("notes", "quartz sediment"),
+        ("reference", "ridge minerals"),
+    ] {
+        let scope = sanctum_core::Scope {
+            tenant: "default".parse().unwrap(),
+            collection: name.parse().unwrap(),
+        };
+        catalog.create_collection(&scope, None).await.unwrap();
+        let header = v1::UploadTextHeader {
+            scope: Some(v1::Scope {
+                tenant: "default".into(),
+                collection: name.into(),
+            }),
+            name: "sample.txt".into(),
+            ..Default::default()
+        };
+        let job = server
+            .client
+            .submit_text(upload_frames(&header, [body.as_bytes()]))
+            .await
+            .unwrap()
+            .into_inner();
+        let id = job.operation_id.parse().unwrap();
+        catalog.register_upload(&scope, id).await.unwrap();
+        catalog.index_upload(&scope, id).await.unwrap();
+    }
+    let request = v1::SearchCollectionsRequest {
+        tenant: "default".into(),
+        collections: vec!["notes".into(), "reference".into()],
+        query: "quartz ridge".into(),
+        mode: v1::SearchMode::Lexical.into(),
+        ..Default::default()
+    };
+    assert!(
+        server
+            .client
+            .search_collections(request.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .hits
+            .is_empty()
+    );
+    let response = server
+        .client
+        .search_collections(v1::SearchCollectionsRequest {
+            mode: v1::SearchMode::Hybrid.into(),
+            ..request
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.mode(), v1::SearchMode::Lexical);
+    assert_eq!(
+        response.degraded_reason.as_deref(),
+        Some("embedding_disabled")
+    );
+    assert_eq!(response.hits.len(), 2);
+    assert_eq!(response.hits[0].excerpt, "quartz sediment");
+    assert_eq!(response.hits[1].excerpt, "ridge minerals");
+    server.stop().await;
+}

@@ -1166,3 +1166,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   The full-backup comparison took 30.00 s and uploaded 1,432,829,952
   bytes. Cold search increased from 2.68 s to 3.71 s in these runs.
   [Measurement](CAPACITY.md#publishing-the-deltas-on-minio).
+
+## Partial lexical matches for hybrid queries
+
+- The local and object-backed retrieval paths try the same all-term FTS5
+  query. Hybrid can use partial matches when both the all-term and
+  semantic searches have zero eligible chunks in a collection.
+- The gRPC tests exercised local strict and hybrid queries and hosted
+  multi-collection retrieval. The MCP smoke compared explicit lexical
+  search over HTTP with hybrid over stdio, then fetched the exact
+  matching UTF-8 range. [Search modes](LOCAL_API.md#ollama-and-search-modes).
+- The full ArguAna run with embeddings disabled reached 0.31437 Recall@10
+  and returned results for 662 of 1,406 queries. The strict lexical
+  baseline returned results for 63. [Method](CAPACITY.md#partial-lexical-matches-for-prose-queries).
+- Fusing partial matches with available vectors lowered Recall@10 on
+  ArguAna from 0.91038 to 0.88549. The fallback is limited to collections
+  with zero eligible semantic hits.

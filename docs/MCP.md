@@ -84,6 +84,11 @@ Collection, source, and chunk metadata tools work on both storage modes.
 Hosted results include the SQLite snapshot generation on each hit. A hosted upload reports `accepted`, then
 `registered`, then `text_ready` as worker stages publish its text.
 
+Hybrid search uses partial lexical matches in a collection when both
+its all-term lexical search and semantic ranking return zero eligible
+hits. This includes requests where embeddings are unavailable. Choose
+`mode: "lexical"` to require every term.
+
 Call `ingestion_status` with the returned operation ID until it reports
 `text_ready` before searching for the newly submitted text. Use the
 [gRPC CLI](LOCAL_API.md) for large files and directory imports. MCP HTTP

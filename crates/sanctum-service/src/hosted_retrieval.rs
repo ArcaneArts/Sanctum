@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::embedding::{
     CollectionSearchResult, Coverage, PreparedQuery, SearchResult,
     collections::{Candidates, collection_scopes, merge, rank_collection},
-    fuse, lexical_expression, limit_hits,
+    fuse, limit_hits,
 };
 use crate::{
     Chunk, ChunkEmbeddingState, ChunkRef, Hit, HostedCatalog, SearchMode, db,
@@ -64,16 +64,6 @@ impl HostedCatalog {
                 } else {
                     (limit * 4).max(32)
                 };
-                let lexical = if actual_mode == SearchMode::Semantic {
-                    Vec::new()
-                } else {
-                    database.search(
-                        &prepared.expression,
-                        candidate_limit,
-                        filter.as_ref(),
-                        &metadata,
-                    )?
-                };
                 let semantic = match (&prepared.vector, &prepared.profile) {
                     (Some(query), Some(profile)) if actual_mode != SearchMode::Lexical => database
                         .search_vector(
@@ -85,6 +75,14 @@ impl HostedCatalog {
                         )?,
                     _ => Vec::new(),
                 };
+                let lexical = prepared.lexical(
+                    database,
+                    mode,
+                    semantic.is_empty(),
+                    candidate_limit,
+                    filter.as_ref(),
+                    &metadata,
+                )?;
                 let ranked = match actual_mode {
                     SearchMode::Lexical => lexical.into_iter().map(|chunk| (chunk, None)).collect(),
                     SearchMode::Semantic => semantic
@@ -212,16 +210,11 @@ impl HostedCatalog {
         filter: Option<&Filter>,
         mode: SearchMode,
     ) -> Result<PreparedQuery> {
-        let expression = lexical_expression(&query, limit)?;
+        let mut prepared =
+            PreparedQuery::new(&query, limit, self.embedding_profile().map(str::to_owned))?;
         if let Some(filter) = filter {
             filter.validate()?;
         }
-        let mut prepared = PreparedQuery {
-            expression,
-            profile: self.embedding_profile().map(str::to_owned),
-            vector: None,
-            degraded: None,
-        };
         if mode != SearchMode::Lexical {
             if let Some(provider) = &self.embedding {
                 let profile = provider.profile_id().to_owned();
