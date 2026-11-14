@@ -507,8 +507,12 @@ Overlapping hits from the same revision are collapsed. Each reference
 carries the collection it came from.
 
 Hosted search uses one tenant catalog generation for collection membership
-and collection metadata throughout the request. Each collection still
-contributes results from its own published generation.
+and collection metadata throughout the request. A collection's embedding
+availability, coverage, ranking, and excerpt references come from the same
+published generation, even if a writer publishes during query embedding.
+Multi-collection search resolves one collection at a time and shares the query
+vector as soon as any collection has compatible vectors. Each hit reports the
+collection generation used for that result.
 
 ```sh
 cargo run --locked -p sanctum-cli -- search notes quartz --also reference --mode hybrid
