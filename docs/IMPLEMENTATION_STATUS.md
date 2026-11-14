@@ -434,6 +434,11 @@ Merged in [PR #19](https://github.com/ArcaneArts/Sanctum/pull/19).
   verified that only the latest queued revision published in the first
   tenant. A standalone server run also checked overlap during a streamed
   HTTP body and retrieved the exact replacement after retry.
+- A gRPC test stopped the server after an HTTP origin yielded part of its
+  response and stalled. The active import returned `UNAVAILABLE` and
+  shutdown left staging empty. A generated Python client exercised the
+  same case against the standalone server and observed the origin
+  connection close.
 
 ## Git imports
 
@@ -458,6 +463,11 @@ Merged in [PR #20](https://github.com/ArcaneArts/Sanctum/pull/20).
   regression covers multiple reconciliation pages, pending and published
   removals, excluded paths, and reuse of 129 pending jobs. The standalone
   private HTTPS check also passed with Basic and Bearer credentials.
+- Git and local directory imports use the same shutdown-aware gRPC stream.
+  The private HTTPS check stalled a real Git client and observed the remote
+  connection close after client disconnect and after managed server shutdown.
+  The server build passed the Windows x64 cross-check for the job object used
+  to stop Git's transport helpers. Runtime cancellation was exercised on macOS.
 
 ## Resumable changes and Python gRPC client
 

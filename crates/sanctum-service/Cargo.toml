@@ -20,6 +20,7 @@ futures.workspace = true
 globset.workspace = true
 memchr = "2.8"
 mime.workspace = true
+process-wrap = { version = "10.0.1", default-features = false, features = ["std", "process-group", "job-object"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
