@@ -2401,6 +2401,15 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   and verified that the open call ended at its deadline. The live MinIO
   worker scenario recovered a collection handle and queried and closed
   it through gRPC. [Hosted database inspection](STORAGE.md#hosted-database-inspection).
+- A shutdown regression stalled storage reads while opening a session,
+  querying it, or starting an export. Each request returned
+  `UNAVAILABLE` and released its pending read. On a fresh API, the
+  original handle returned the pinned SQL result and byte-exact SQLite
+  export after the current collection advanced. A generated Python
+  client also exercised an export stalled through an HTTP relay in front
+  of real MinIO. Closing the managed server's control pipe returned
+  `UNAVAILABLE` and the process exited cleanly in 2.1 ms on macOS.
+  A fresh process queried and exported the same 155,648-byte snapshot.
 
 ## Hosted collection creation with a lost intent reply
 
