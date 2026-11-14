@@ -46,18 +46,39 @@ impl VectorIndex for CollectionDb {
 fn search_candidates(
     connection: &Connection,
     similarity: &str,
+    arguments: Vec<Value>,
+    limit: u32,
+    filter: Option<&metadata_filter::Filter>,
+    collection_metadata: &[metadata::Entry],
+) -> Result<Vec<ScoredChunk>> {
+    const TABLES: &str =
+        "chunks c JOIN sources s ON s.id = c.source_id AND s.current_revision = c.revision_id
+         JOIN embedding_cache e ON e.profile = ?1 AND e.input_hash = c.content_hash";
+    search_with_join_order(
+        connection,
+        similarity,
+        TABLES,
+        arguments,
+        limit,
+        filter,
+        collection_metadata,
+    )
+}
+
+fn search_with_join_order(
+    connection: &Connection,
+    similarity: &str,
+    tables: &str,
     mut arguments: Vec<Value>,
     limit: u32,
     filter: Option<&metadata_filter::Filter>,
     collection_metadata: &[metadata::Entry],
 ) -> Result<Vec<ScoredChunk>> {
     let mut sql = format!(
-            "SELECT c.source_id, c.revision_id, c.ordinal, s.name, s.external_namespace,
-                    s.external_id, c.start_byte, c.end_byte, c.content_hash, {similarity}
-             FROM chunks c JOIN sources s ON s.id = c.source_id AND s.current_revision = c.revision_id
-             JOIN embedding_cache e ON e.profile = ?1 AND e.input_hash = c.content_hash
-             WHERE s.deleted = 0 AND e.vector IS NOT NULL",
-        );
+        "SELECT c.source_id, c.revision_id, c.ordinal, s.name, s.external_namespace,
+                s.external_id, c.start_byte, c.end_byte, c.content_hash, {similarity}
+         FROM {tables} WHERE s.deleted = 0 AND e.profile = ?1 AND e.vector IS NOT NULL",
+    );
     if let Some(filter) = filter {
         metadata_filter::append_condition(
             connection,

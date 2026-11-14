@@ -1296,3 +1296,17 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   A separate paginated listing matched both numbers. The run used a
   dedicated prefix and removed its objects after verification.
   [Method and results](CAPACITY.md#10000-mostly-idle-tenants).
+
+## SQLite vector scan order and read-only memory mapping
+
+- Three release runs used 262,144 vectors at both 768 and 1,536
+  dimensions. The two tested join orders returned identical ranked
+  references and scores across all 72 comparisons.
+- Without fixture planner statistics, automatic planning reached
+  498.92 ms and 837.13 ms median unfiltered at the two sizes. The
+  earlier multi-second result was from an analyzed fixture.
+- A read-only memory mapping experiment reduced those medians to
+  273.22 ms and 456.82 ms. The experiment leaves production on
+  automatic joins and ordinary SQLite reads pending hosted memory
+  and concurrency measurements.
+  [Method and results](CAPACITY.md#query-plan-and-read-only-memory-mapping).
