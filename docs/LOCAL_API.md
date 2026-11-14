@@ -50,6 +50,11 @@ new source with an existing external namespace and ID returns `ALREADY_EXISTS`.
 If its wait expires, the response includes the operation ID. The
 accepted work can continue after the client disconnects.
 
+Local upload acceptance records a BLAKE3 digest of the staged input.
+The worker checks it before publishing UTF-8 or RTF. A storage digest
+mismatch leaves the job retryable so it can resume after the original
+bytes are restored.
+
 `ListIngestionJobs` accepts a tenant, optional collection, and a page limit
 from 1 to 100 (default 25). Results sort by acceptance time, newest first,
 using the operation ID to break ties. Reuse `next_before_operation_id` as

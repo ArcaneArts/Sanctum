@@ -438,7 +438,7 @@ async fn local_pending_rtf_scan_uses_saved_utf8_while_the_index_writer_waits() {
 
 #[tokio::test]
 async fn local_rtf_checkpoint_is_reused_or_rebuilt_after_restart() {
-    for damage in [false, true] {
+    for (damage_canonical, retain_original) in [(false, false), (true, false), (false, true)] {
         let dir = TempDir::new().unwrap();
         let mut api = Running::start_with_workers(&dir, None, false).await;
         create(&mut api.client, "default").await;
@@ -446,7 +446,7 @@ async fn local_rtf_checkpoint_is_reused_or_rebuilt_after_restart() {
         let queued = api
             .client
             .submit_text(tokio_stream::iter([
-                rtf_header(false, "prepared-restart"),
+                rtf_header(retain_original, "prepared-restart"),
                 data(rtf),
                 end(),
             ]))
@@ -506,7 +506,11 @@ async fn local_rtf_checkpoint_is_reused_or_rebuilt_after_restart() {
         );
         drop(queue);
         let original = text.with_file_name("original");
-        if damage {
+        if retain_original {
+            let modified = br"{\rtf1\ansi Replaced caf\'e9}";
+            assert_eq!(modified.len(), rtf.len());
+            std::fs::write(&original, modified).unwrap();
+        } else if damage_canonical {
             // The same length still requires the BLAKE3 check.
             std::fs::write(&text, "Replaced café").unwrap();
         } else {
@@ -514,15 +518,22 @@ async fn local_rtf_checkpoint_is_reused_or_rebuilt_after_restart() {
             std::fs::remove_file(&original).unwrap();
         }
         let mut api = Running::start(&dir).await;
+        if retain_original {
+            let failed = await_failure(&mut api.client, id.clone()).await;
+            assert_eq!(failed.error_code.as_deref(), Some("retryable"));
+            assert!(failed.text_revision.is_none());
+            std::fs::write(&original, rtf).unwrap();
+            api.client.retry_ingestion_job(id.clone()).await.unwrap();
+        }
         let ready = await_ready(&mut api.client, id).await;
-        assert_eq!(ready.attempts, 2);
+        assert_eq!(ready.attempts, if retain_original { 3 } else { 2 });
         assert_eq!(std::fs::read_to_string(&text).unwrap(), canonical);
         assert_eq!(ready.text_revision.unwrap().source_encoding, "windows-1252");
         assert_eq!(
             search(&mut api.client, "default", "café").await[0].excerpt,
             canonical
         );
-        assert!(!original.exists());
+        assert_eq!(original.exists(), retain_original);
         api.stop().await;
     }
 }
@@ -3096,6 +3107,77 @@ async fn retry_preserves_the_operation_and_revision_after_a_storage_failure() {
         1
     );
     running.stop().await;
+}
+
+#[tokio::test]
+async fn local_upload_rejects_same_size_staged_changes_after_restart() {
+    let dir = TempDir::new().unwrap();
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    create(&mut api.client, "default").await;
+    let mut rich = rtf_header(true, "verified-upload");
+    if let Some(Frame::Header(header)) = &mut rich.frame {
+        header.request_id = Some(uuid::Uuid::new_v4().to_string());
+    }
+    let mut staged = Vec::new();
+    for (header, original, modified, name) in [
+        (
+            header("default"),
+            b"original cobalt".as_slice(),
+            b"modified cobalt".as_slice(),
+            "text.utf8",
+        ),
+        (
+            rich,
+            br"{\rtf1 original spinel}".as_slice(),
+            br"{\rtf1 modified spinel}".as_slice(),
+            "original",
+        ),
+    ] {
+        let frames = || tokio_stream::iter([header.clone(), data(original), end()]);
+        let job = api.client.submit_text(frames()).await.unwrap().into_inner();
+        assert_eq!(
+            api.client
+                .get_ingestion_job(job_request(job.operation_id.clone()))
+                .await
+                .unwrap()
+                .into_inner()
+                .state(),
+            v1::IngestionState::Accepted
+        );
+        let path = text_path(&dir, &job.source_id, &job.revision_id).with_file_name(name);
+        assert_eq!(original.len(), modified.len());
+        std::fs::write(&path, modified).unwrap();
+        staged.push((
+            job_request(job.operation_id),
+            job.revision_id,
+            path,
+            original,
+        ));
+    }
+    api.stop().await;
+
+    let mut api = Running::start(&dir).await;
+    for (request, revision, path, original) in staged {
+        let failed = await_failure(&mut api.client, request.clone()).await;
+        assert_eq!(failed.error_code.as_deref(), Some("retryable"));
+        assert!(failed.text_revision.is_none());
+        assert!(
+            search(&mut api.client, "default", "modified")
+                .await
+                .is_empty()
+        );
+        std::fs::write(path, original).unwrap();
+        api.client
+            .retry_ingestion_job(request.clone())
+            .await
+            .unwrap();
+        let ready = await_ready(&mut api.client, request).await;
+        assert_eq!((ready.revision_id, ready.attempts), (revision, 2));
+    }
+    let hits = search(&mut api.client, "default", "original").await;
+    assert_eq!(hits.len(), 2);
+    assert!(hits.iter().all(|hit| hit.excerpt.starts_with("original")));
+    api.stop().await;
 }
 
 #[tokio::test]
