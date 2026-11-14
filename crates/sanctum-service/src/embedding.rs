@@ -274,6 +274,17 @@ impl Service {
             .retrieval
             .read()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
+        self.local_writes.run(scope, || {
+            self.commit_embedding_batch(scope, profile, outcomes)
+        })
+    }
+
+    fn commit_embedding_batch(
+        &self,
+        scope: &Scope,
+        profile: &str,
+        outcomes: Vec<BatchOutcome>,
+    ) -> Result<()> {
         let mut database = self.database(scope)?;
         let writer = database.write()?;
         let mut published = false;

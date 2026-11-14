@@ -24,6 +24,14 @@ pub struct SourceIdentity {
 }
 
 impl CollectionDb {
+    pub fn find_source(
+        &self,
+        id: Option<Uuid>,
+        external: Option<&ExternalSource>,
+    ) -> Result<SourceIdentity> {
+        find_source(&self.0, id, external)
+    }
+
     pub fn garbage(&self) -> Result<Vec<RevisionKey>> {
         query_all(
             &self.0,

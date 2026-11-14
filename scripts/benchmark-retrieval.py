@@ -111,7 +111,7 @@ def count_provider(ollama, timeout):
             worker.join()
 
 
-def upload(client, scope, doc_id, body, previous=None):
+def upload(client, scope, doc_id, body, previous=None, *, record_busy=None):
     header = pb.UploadTextHeader(
         scope=scope, name=f"{doc_id}.txt",
         external=pb.ExternalSource(namespace="benchmark", id=doc_id), request_id=str(uuid4()),
@@ -124,7 +124,7 @@ def upload(client, scope, doc_id, body, previous=None):
         pb.UploadTextFrame(end=pb.UploadTextEnd()),
     )
     deadline = time.monotonic() + 90
-    job = retry_busy(lambda: client.SubmitText(iter(frames), timeout=30), deadline)
+    job = retry_busy(lambda: client.SubmitText(iter(frames), timeout=30), deadline, record_busy)
     request = pb.IngestionJobRequest(scope=scope, operation_id=job.operation_id)
     while True:
         if job.state == pb.INGESTION_STATE_TEXT_READY:
@@ -134,10 +134,10 @@ def upload(client, scope, doc_id, body, previous=None):
         if time.monotonic() >= deadline:
             raise TimeoutError(f"Waiting for {doc_id}: {job}")
         time.sleep(0.1)
-        job = retry_busy(lambda: client.GetIngestionJob(request, timeout=15), deadline)
+        job = retry_busy(lambda: client.GetIngestionJob(request, timeout=15), deadline, record_busy)
 
 
-def retry_busy(call, deadline):
+def retry_busy(call, deadline, record_busy):
     while True:
         try:
             return call()
@@ -145,6 +145,8 @@ def retry_busy(call, deadline):
             if (error.code() != grpc.StatusCode.UNAVAILABLE
                     or error.details() != "database is busy" or time.monotonic() >= deadline):
                 raise
+            if record_busy is not None:
+                record_busy()
             time.sleep(0.2)
 
 
@@ -170,11 +172,18 @@ def wait_for_embeddings(client, scope, chunks, timeout):
 
 def ingest(client, corpus, workers, timeout, embeddings):
     client.CreateCollection(pb.CreateCollectionRequest(scope=SCOPE), timeout=15)
+    busy_retries = 0
+    retry_lock = threading.Lock()
+
+    def record_busy():
+        nonlocal busy_retries
+        with retry_lock:
+            busy_retries += 1
 
     def document(item):
         doc_id, row = item
         text = (row["title"] + "\n" if row["title"] else "") + row["text"]
-        return upload(client, SCOPE, doc_id, text.encode()).chunks
+        return upload(client, SCOPE, doc_id, text.encode(), record_busy=record_busy).chunks
 
     started = time.monotonic()
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -186,7 +195,7 @@ def ingest(client, corpus, workers, timeout, embeddings):
     lexical_ready = time.monotonic()
     if embeddings:
         wait_for_embeddings(client, SCOPE, chunks, timeout)
-    return chunks, round(lexical_ready - started, 3), round(time.monotonic() - started, 3)
+    return chunks, round(lexical_ready - started, 3), round(time.monotonic() - started, 3), busy_retries
 
 
 def query_text(text):
@@ -295,7 +304,7 @@ def benchmark(args, root, corpus, queries, qrels, endpoint, counts):
         addresses = json.loads(server.stdout.readline())
         with grpc.insecure_channel(addresses["grpc"]) as channel:
             client = rpc.SanctumStub(channel)
-            chunks, lexical_seconds, embedding_seconds = ingest(
+            chunks, lexical_seconds, embedding_seconds, busy_retries = ingest(
                 client, corpus, args.workers, args.timeout, embeddings,
             )
             corpus_provider = counts()
@@ -316,6 +325,7 @@ def benchmark(args, root, corpus, queries, qrels, endpoint, counts):
         "queries_missing_judged_document": sum(qrels[qid] not in corpus for qid in queries),
         "truncated_queries": sum(len(row["text"].encode()) > 4096 for row in queries.values()),
         "chunks": chunks, "meta_db_bytes_after_shutdown": database.stat().st_size,
+        "ingestion_busy_retries": busy_retries,
         "lexical_index_seconds": lexical_seconds,
         "fully_embedded_seconds": embedding_seconds if embeddings else None,
         "corpus_provider_inputs": corpus_provider["document"],

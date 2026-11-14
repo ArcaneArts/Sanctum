@@ -6,7 +6,7 @@ use std::{
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use sanctum_core::{Error, ExternalSource, GitProvenance, Result, Scope, UrlProvenance, is_rtf};
-use sanctum_db_sqlite::{RevisionWriter, SourceIdentity};
+use sanctum_db_sqlite::{CollectionDb, SourceIdentity};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -317,12 +317,23 @@ impl StagedUpload {
             .retrieval
             .read()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
+        let scope = self.scope.clone();
+        service.local_writes.run(&scope, || {
+            self.enqueue_import_locked(bytes, hash, provenance)
+        })
+    }
+
+    fn enqueue_import_locked(
+        self,
+        bytes: u64,
+        hash: String,
+        provenance: Option<ImportProvenance>,
+    ) -> Result<ImportEvent> {
         let scope = &self.scope;
         let external = self.import_external();
         let id = external.id.clone();
-        let mut database = service.database(scope)?;
-        let writer = database.write()?;
-        let (current, pending) = self.import_heads(&writer)?;
+        let database = self.service.database(scope)?;
+        let (current, pending) = self.import_heads(&database)?;
         if let Some(event) = self.reuse_import(&current, &pending, |digest, _| {
             digest == Some(hash.as_str())
         })? {
@@ -348,8 +359,7 @@ impl StagedUpload {
             Some(ImportProvenance::Git(git)) => job.git = Some(git),
             None => {}
         }
-        let job = self.publish_job(job)?;
-        drop(writer);
+        let job = self.publish_job_locked(job, None)?;
         Ok(ImportEvent {
             source: Some(job.source),
             revision: Some(job.revision),
@@ -359,15 +369,21 @@ impl StagedUpload {
     }
 
     pub(crate) fn reuse_git_import(&self, git: &GitProvenance) -> Result<Option<ImportEvent>> {
-        let mut database = self.service.database(&self.scope)?;
-        let writer = database.write()?;
-        let (current, pending) = self.import_heads(&writer)?;
-        self.reuse_import(&current, &pending, |_, recorded| {
-            recorded.is_some_and(|recorded| {
-                recorded.repository == git.repository
-                    && recorded.reference == git.reference
-                    && recorded.path == git.path
-                    && recorded.blob == git.blob
+        let service = &self.service;
+        let _reader = service
+            .retrieval
+            .read()
+            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
+        service.local_writes.run(&self.scope, || {
+            let database = service.database(&self.scope)?;
+            let (current, pending) = self.import_heads(&database)?;
+            self.reuse_import(&current, &pending, |_, recorded| {
+                recorded.is_some_and(|recorded| {
+                    recorded.repository == git.repository
+                        && recorded.reference == git.reference
+                        && recorded.path == git.path
+                        && recorded.blob == git.blob
+                })
             })
         })
     }
@@ -381,10 +397,10 @@ impl StagedUpload {
 
     fn import_heads(
         &self,
-        writer: &RevisionWriter<'_>,
+        database: &CollectionDb,
     ) -> Result<(Option<SourceIdentity>, Option<crate::Job>)> {
         let external = self.import_external();
-        let current = match writer.find_source(None, Some(external)) {
+        let current = match database.find_source(None, Some(external)) {
             Ok(current) => Some(current),
             Err(Error::NotFound(_)) => None,
             Err(error) => return Err(error),
@@ -512,6 +528,18 @@ impl Service {
             .retrieval
             .read()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
+        self.local_writes.run(scope, || {
+            self.missing_import_locked(scope, namespace, id, prune)
+        })
+    }
+
+    fn missing_import_locked(
+        &self,
+        scope: &Scope,
+        namespace: &str,
+        id: &str,
+        prune: bool,
+    ) -> Result<Option<ImportEvent>> {
         let mut database = self.database(scope)?;
         let writer = database.write()?;
         let external = ExternalSource {

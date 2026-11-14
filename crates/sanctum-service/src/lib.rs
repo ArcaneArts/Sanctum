@@ -38,6 +38,7 @@ mod hosted_retrieval;
 mod hosted_snapshots;
 mod local_import;
 mod local_jobs;
+mod local_writes;
 mod maintenance;
 mod pending_scan;
 mod source_inspection;
@@ -81,6 +82,7 @@ pub struct Service {
     git_imports: git_import::ActiveImports,
     database_sessions: database_sessions::DatabaseSessions,
     retrieval: Arc<RwLock<()>>,
+    local_writes: Arc<local_writes::LocalWrites>,
     upload_requests: Arc<[Mutex<()>; 64]>,
     embedding: Option<Arc<dyn sanctum_embedding::Provider>>,
 }
@@ -207,7 +209,15 @@ impl Service {
         edits: Option<&[MetadataMutation]>,
     ) -> Result<Vec<MetadataEntry>> {
         match target {
-            Some(target) => self.database(scope)?.metadata(target, edits),
+            Some(target) if edits.is_some() => {
+                let _reader = self
+                    .retrieval
+                    .read()
+                    .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
+                self.local_writes
+                    .run(scope, || self.database(scope)?.metadata(target, edits))
+            }
+            Some(target) => self.database(scope)?.metadata(target, None),
             None => {
                 self.require_collection(scope)?;
                 db::metadata::catalog_metadata(
@@ -280,6 +290,7 @@ impl Service {
             git_imports: Default::default(),
             database_sessions,
             retrieval: Arc::new(RwLock::new(())),
+            local_writes: Arc::default(),
             upload_requests: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
             embedding,
         };

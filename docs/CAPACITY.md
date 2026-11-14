@@ -402,3 +402,13 @@ Recall@10 and 0.61493 nDCG@10. The same run's semantic mode reached
 0.91038 and 0.63994. The shipped rule uses partial terms only when
 semantic ranking has no eligible hits, keeping the original ranking
 path for collections with semantic results.
+
+## Local ingestion with 16 workers
+
+The release filesystem server ingested all 8,674 ArguAna sources with
+16 concurrent workers and real Ollama. The generated client counted
+zero SQLite-busy retries. Lexical publication finished in 270.94 s,
+and all 8,695 chunks had embeddings at 464.96 s. The earlier 16-worker
+trial hit SQLite contention during acceptance. The writer-lock run
+used three queries as a smoke check and did not rescore the test set.
+The provider processed 8,647 document inputs across 541 requests.
