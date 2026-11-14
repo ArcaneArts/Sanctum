@@ -3,23 +3,36 @@
 Sanctum is a Rust service for storing, indexing, and retrieving text for
 agents and other applications. Its Protobuf/gRPC API supports ingestion and
 retrieval with source references and namespaced integration metadata. Agents
-can connect to the local server through [MCP HTTP or stdio](docs/MCP.md).
+can connect to the local server through MCP HTTP or stdio.
 
-**Status:** early implementation. The local gRPC service and CLI support
-streamed UTF-8 and RTF uploads, directory imports, full-text search, optional
-Ollama-backed semantic and hybrid search, and exact byte-range retrieval.
-See the [local quick start](docs/LOCAL_API.md) and
-[implementation status](docs/IMPLEMENTATION_STATUS.md).
+The desktop tray and its managed MCP server have been exercised on macOS
+and Ubuntu with an X11 tray host.
+The object-backed server has been tested against MinIO. Live Google Cloud
+verification and Windows tray testing are still open.
+[Implementation status and acceptance evidence](docs/IMPLEMENTATION_STATUS.md).
 
-The desktop tray app runs a local MCP server and manages storage, imports,
-and Ollama settings. See the [desktop quick start](docs/DESKTOP.md).
+## Get started
 
-## What Sanctum will do
+Run the desktop tray app and its managed Rust server from the repository
+root after installing the native prerequisites.
+
+```sh
+pnpm install --frozen-lockfile
+pnpm devtop
+```
+
+Open **Connect** in the app for the active MCP URL and stdio configuration.
+Use **Activity** to create a collection and import files. The headless
+server and CLI expose the same underlying services.
+[Desktop setup and packaging](docs/DESKTOP.md), [MCP connection](docs/MCP.md),
+[gRPC and CLI quick start](docs/LOCAL_API.md).
+
+## Features
 
 - Ingest text, Markdown, RTF, source code, and text configuration files through
   a common text pipeline with overlapping chunks.
-- Support uploads, local file and directory imports, watched folders, URL
-  retrieval, and Git repository ingestion across the initial release milestones.
+- Stream uploads and import from local files, directories, watched folders,
+  URLs, and Git repositories through the local service.
 - Store source text in a user-selected directory or object storage, with chunk
   byte ranges allowing retrieval of only the required content.
 - Keep metadata and search indexes in SQLite, grouped into independent
@@ -35,26 +48,25 @@ and Ollama settings. See the [desktop quick start](docs/DESKTOP.md).
 - Report processing progress and storage usage for a collection, tenant, or the
   whole managed storage root.
 
-“Collection” is a working name. The permanent name for a grouping of information
-has not been chosen.
-
 ## Local and hosted operation
 
 The desktop application uses **Tauri, React, and shadcn/ui**, with PNPM for
 frontend tooling and development commands. Rust handles configuration, the
-server lifecycle, and API calls. Run `pnpm devtop` to launch the desktop app
-and its managed server during development.
+server lifecycle, and API calls. The headless server reads its configuration
+from `SANCTUM_CONFIG_JSON`. The desktop app persists its own settings and
+passes them to the managed server.
 
 The hosted deployment targets **Google Cloud Run, Cloud Storage, and Cloud
-Tasks**, with Linux server builds. Filesystem storage and S3 storage through
-MinIO provide local development and integration-test paths. Hosted instances
-will download database snapshots on demand and reuse them while warm, with
-durable queued work and coordinated database publication. See the
-[Cloud Run deployment guide](docs/CLOUD_RUN.md) for the API and worker setup.
+Tasks**, with Linux builds for separate API and worker roles. Object-backed
+instances download database snapshots on demand and reuse them while warm.
+Queued work and committed snapshots survive process restarts. Filesystem
+storage and S3-compatible MinIO are also supported.
+[Storage behavior](docs/STORAGE.md), [Cloud Run deployment](docs/CLOUD_RUN.md),
+[capacity measurements](docs/CAPACITY.md).
 
 Sanctum is always multi-tenant internally. A local installation normally uses
-the tenant ID `default`. The hosted service is operated by trusted applications;
-end-user accounts, signups, and authorization belong to those applications.
+the tenant ID `default`. Trusted hosted callers select the tenant ID and
+manage authorization for their own end users.
 
 ## Scope
 

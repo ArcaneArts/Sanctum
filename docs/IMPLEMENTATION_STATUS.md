@@ -11,6 +11,46 @@ which parts have working implementations and where to find the evidence.
 | 4. Cloud Run and Cloud Tasks | Linux API and worker containers, durable staged uploads, dispatch and repair, scheduled maintenance, and hosted gRPC and MCP | Live IAM, Cloud Run ingress, and Tasks and Scheduler delivery |
 | 5. Capacity | [200 MiB ingestion, GiB-scale snapshots, 10,000 MinIO tenants, and real embedding benchmarks](CAPACITY.md) | Cold/warm Cloud Run performance and production rollout limits |
 
+## Acceptance and next verification
+
+- **Local desktop and integrations.** The [macOS desktop workflow](#desktop-tray-and-first-use-flow)
+  exercised configuration, imports, and tray lifecycle. The
+  [Codex CLI check](#codex-mcp-retrieval) used real Ollama vectors and retrieved
+  exact citations across a source edit and server restart. The Ubuntu ARM64
+  package passed the [X11 tray workflow](#native-desktop-package-verification).
+  The [Windows x64 installer](#windows-x64-installer-build) needs installation,
+  WebView2 startup, and tray lifecycle verification on a licensed Windows
+  machine or an authorized evaluation guest. Distribution signing and macOS
+  notarization also remain open.
+- **Embedding providers.** Ollama and the OpenAI-compatible adapter have
+  returned real embeddings. The latter used Ollama's compatibility endpoint.
+  Vertex AI's next check is a real document and query prediction with the
+  configured dimensions and subsequent semantic retrieval. It needs a
+  Sanctum Google Cloud project and a prediction-enabled identity.
+  [Provider evidence](#google-cloud-embeddings).
+- **Object storage and recovery.** Filesystem and MinIO exercised exact
+  ranges, writer takeover, interrupted publication, and recovery from a
+  lost response. The live GCS contract needs a Sanctum test bucket and an
+  authorized ADC identity. [Storage contract](STORAGE.md#google-cloud-storage-adapter),
+  [publication evidence](#fenced-object-backed-database-publication).
+- **Cloud Run.** The API and worker containers and task dispatch are in
+  the repository. Local role processes on MinIO exercised stage replay
+  and HTTP handlers. The hosted deployment still needs live Cloud Run IAM,
+  gRPC and MCP ingress, real Cloud Tasks and Scheduler delivery, observed
+  scale-to-zero recovery, and cold/warm timings and memory at the target
+  database sizes. This requires the authorized Sanctum project, deployment
+  region, bucket, and deployer and invocation identities.
+  [Hosted acceptance runbook](CLOUD_RUN.md#verify-a-deployment).
+- **Capacity.** The recorded workloads cover 200 MiB sources, a 2.34 GiB
+  collection, 10,000 mostly idle MinIO tenants, concurrent active
+  collections, and real embeddings. Two simultaneous cold 2 GiB snapshot
+  reads exceeded ten seconds in every MinIO sample. The Cloud Run run
+  must measure transfer, database opens, warm reuse, and memory before
+  setting production limits. [Benchmark results](CAPACITY.md).
+
+The sections below record individual delivery slices. Later measurements
+and recovery checks extend the initial evidence for each feature.
+
 ## Local text ingestion and retrieval
 
 Merged in [PR #2](https://github.com/ArcaneArts/Sanctum/pull/2).
@@ -823,7 +863,8 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   SQLite point query latency, and the cost of publishing a one-row
   update. [Method and measurements](CAPACITY.md).
 - Representative text and vector query workloads, concurrent
-  collections, and actual Cloud Run capacity remain open.
+  collections, and Cloud Run capacity were outside that run.
+  [Subsequent capacity measurements](CAPACITY.md).
 - Delivered in [PR #53](https://github.com/ArcaneArts/Sanctum/pull/53).
 
 ## Retrieval metadata
@@ -1054,8 +1095,9 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   top-k.
 - A release comparison with pinned sqlite-vec v0.1.9 at 262,144 vectors and
   both 768 and 1,536 dimensions matched all 240 returned top-ten neighbors.
-  The scalar extension did not improve median latency. Representative model
-  recall and concurrent collections remain open. [Method and results](CAPACITY.md#exact-vector-ranking-in-sqlite).
+  The scalar extension did not improve median latency.
+  [Method and results](CAPACITY.md#exact-vector-ranking-in-sqlite),
+  [subsequent retrieval measurements](CAPACITY.md#retrieval-relevance-and-embedding-reuse).
 
 ## Native desktop package verification
 
