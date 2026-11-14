@@ -17,6 +17,37 @@ const ACTIVE: &str = "capacity-v1";
 const DIMENSIONS: usize = 768;
 const TOP_K: u32 = 10;
 
+#[test]
+fn clearing_read_query_state_drops_vector_and_filter_functions() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    fixture(file.path(), 128, DIMENSIONS, false);
+    let db = CollectionDb::open_read_only(file.path()).unwrap();
+    let filter = Filter::Test(Predicate {
+        level: Level::Source,
+        namespace: "benchmark".into(),
+        key: "sample".into(),
+        path: vec![PathSegment::Property("groups".into())],
+        operator: Operator::Contains,
+        operand: Some(json!("selected")),
+    });
+    let first = vector(1, DIMENSIONS);
+    let hits = db
+        .search_vector(ACTIVE, first.clone(), TOP_K, Some(&filter), &[])
+        .unwrap();
+    assert!(!hits.is_empty());
+    assert_eq!(Arc::strong_count(&first), 2);
+    db.clear_read_query_state().unwrap();
+    assert_eq!(Arc::strong_count(&first), 1);
+    assert!(
+        db.0.prepare("SELECT sanctum_metadata_matches(0, 'null')")
+            .is_err()
+    );
+    let next = db
+        .search_vector(ACTIVE, vector(90, DIMENSIONS), TOP_K, None, &[])
+        .unwrap();
+    assert_ne!(hits[0].chunk.reference, next[0].chunk.reference);
+}
+
 fn vector(seed: u64, dimensions: usize) -> Arc<[f32]> {
     let mut rng = seed.wrapping_add(1);
     let mut values: Vec<f32> = (0..dimensions)

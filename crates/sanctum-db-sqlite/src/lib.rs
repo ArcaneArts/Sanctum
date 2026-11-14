@@ -332,6 +332,16 @@ impl CollectionDb {
         open_read_only(path).map(Self)
     }
 
+    /// Releases closures containing query vectors and metadata filter values.
+    pub fn clear_read_query_state(&self) -> Result<()> {
+        self.0
+            .remove_function(metadata_filter::MATCHES_FUNCTION, 2)
+            .map_err(database_error)?;
+        self.0
+            .remove_function(vector_index::COSINE_FUNCTION, 1)
+            .map_err(database_error)
+    }
+
     pub fn imported_sources(&self, namespace: &str, after: &str) -> Result<Vec<String>> {
         query_all(
             &self.0,

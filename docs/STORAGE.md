@@ -305,8 +305,12 @@ The API resolves the current HEAD for each catalog or collection read.
 It reuses a downloaded snapshot when the generation and digest match,
 with at most 16 retained files and a 2 GiB default byte budget. Set
 `hosted_snapshot_cache_bytes` to change the budget or set it to zero to
-disable reuse. Oversized snapshots and files still in use can add to
-active temporary storage. Hosted gRPC search and fetch hits report the
+disable reuse. Each materialized collection can retain one idle read-only
+SQLite connection for search, fetch, and other ordinary collection reads.
+Simultaneous reads can open additional connections and release them after
+use. The handle stays with its own verified snapshot when HEAD advances.
+Oversized snapshots and files still in use can add to active temporary
+storage. Hosted gRPC search and fetch hits report the
 database generation that supplied their chunk ranges.
 
 Receipt reads and writers can use the same verified snapshot cache. A

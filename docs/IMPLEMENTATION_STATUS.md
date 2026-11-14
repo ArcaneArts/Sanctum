@@ -1359,3 +1359,18 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   bytes of temporary files while three readers held their verified copies.
   The run removed its fixture objects. Cloud Run memory and latency remain
   open. [Method and results](CAPACITY.md#two-simultaneous-cold-snapshot-reads).
+
+## Hosted SQLite read handle reuse
+
+- Ordinary hosted collection reads can keep one idle SQLite connection
+  with each verified snapshot. Concurrent reads can open their own
+  connections. A failed read drops its connection, and successful reads
+  clear query-specific vector and metadata functions before reuse.
+- The focused tests verified idle handle reuse, independent overlapping
+  reads, error disposal, and release of query-specific state. `pnpm check`
+  and the release server and CLI builds passed.
+- The release MCP and gRPC smoke against live MinIO recorded eight
+  collection reads across three snapshot generations, including four
+  handle reuses. A metadata write published a new generation and the next
+  reader opened its own handle. The filesystem MCP HTTP and stdio smoke
+  also passed. [Snapshot cache behavior](STORAGE.md#hosted-snapshot-reuse).
