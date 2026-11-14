@@ -1507,6 +1507,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   UTF-8 chunks in one 3,240-byte range request. Six individual fetches
   returned identical excerpts and would total 5,795 bytes. The test
   removed its fixture prefix. [Range behavior](STORAGE.md#hosted-lexical-publication).
+- Independent excerpt groups now use up to four simultaneous range
+  requests per search. A gRPC regression holds four reads at a barrier,
+  forces out-of-order completion, and compares the entire response.
+- Against live MinIO with 30 ms of injected delay per range, warm median
+  search time dropped from 457.5 ms to 152.5 ms over seven samples per
+  build. The generated Python client verified the same ranked excerpts
+  and measured the same 336 transferred bytes per search.
+  [Capacity measurements](CAPACITY.md#hosted-excerpt-reads-with-injected-latency).
 
 ## Structured gRPC errors
 

@@ -2261,6 +2261,74 @@ async fn hosted_lexical_search_coalesces_overlapping_excerpts_in_rank_order() {
 }
 
 #[tokio::test]
+async fn hosted_search_reads_independent_ranges_concurrently_and_preserves_rank() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        interrupt: AtomicU8::new(0),
+    });
+    let catalog = HostedCatalog::new(storage.clone(), None, 32 * 1024).unwrap();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    catalog.create_collection(&scope, None).await.unwrap();
+    let mut server = start(catalog.clone()).await;
+    let wire = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    for index in 0..6 {
+        let header = v1::UploadTextHeader {
+            scope: Some(wire.clone()),
+            name: format!("note-{index}.txt"),
+            ..Default::default()
+        };
+        let text = format!("quartz café 🦀 {index}");
+        let job = server
+            .client
+            .submit_text(upload_frames(&header, [text.as_bytes()]))
+            .await
+            .unwrap()
+            .into_inner();
+        let operation = job.operation_id.parse().unwrap();
+        catalog.register_upload(&scope, operation).await.unwrap();
+        catalog.index_upload(&scope, operation).await.unwrap();
+    }
+    let query = v1::SearchTextRequest {
+        scope: Some(wire),
+        query: "quartz".into(),
+        limit: Some(6),
+        mode: v1::SearchMode::Lexical.into(),
+        ..Default::default()
+    };
+    let expected = server
+        .client
+        .search_text(query.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(expected.hits.len(), 6);
+    storage
+        .interrupt
+        .store(PARALLEL_RANGE_START, Ordering::Relaxed);
+    let actual = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        server.client.search_text(query),
+    )
+    .await
+    .expect("four independent reads should enter the fixture together")
+    .unwrap()
+    .into_inner();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        storage.interrupt.load(Ordering::Relaxed),
+        PARALLEL_RANGE_CONTINUED
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_indexing_publishes_searchable_text_and_fences_old_replacements() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance {
@@ -6003,6 +6071,9 @@ const LEAVE_COLLECTION_CREATION_INTENT: u8 = 13;
 const REJECT_RETIRED_SOURCE_DELETE: u8 = 14;
 const LOSE_SOURCE_SWEEP_CHECKPOINT_RESPONSE: u8 = 15;
 const REJECT_SOURCE_SWEEP_RELIST: u8 = 16;
+const PARALLEL_RANGE_START: u8 = 40;
+const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
+const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
 
 struct InterruptedRead<'a>(&'a AtomicU8);
 
@@ -6045,6 +6116,19 @@ impl Storage for InterruptAcceptance {
                 let mut data = self.inner.read_range(key, range).await?.to_vec();
                 data[0] ^= 1;
                 return Ok(data.into());
+            }
+            PARALLEL_RANGE_START..=PARALLEL_RANGE_READY => {
+                let read = self.interrupt.fetch_add(1, Ordering::Relaxed);
+                // Four reads must be polled together. The first one finishes
+                // after a later group starts, forcing a different completion order.
+                let target = if read == PARALLEL_RANGE_START {
+                    PARALLEL_RANGE_CONTINUED
+                } else {
+                    PARALLEL_RANGE_READY
+                };
+                while self.interrupt.load(Ordering::Relaxed) < target {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
             }
             _ => {}
         }
