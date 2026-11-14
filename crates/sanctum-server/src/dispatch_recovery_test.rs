@@ -27,6 +27,7 @@ use super::{CloudTasks, CloudTasksConfig, Dispatch, Result, STANDARD, Task, Valu
 use base64::Engine;
 
 const TEXT: &str = "Café observation recorded during rhodonite recovery.\n";
+const RTF: &[u8] = br"{\rtf1\ansi Caf\'e9 observation recorded during rhodonite recovery.\par}";
 const TASK_PATH: &str = "/v2/projects/project/locations/region/queues/repair/tasks";
 
 #[tokio::test]
@@ -75,13 +76,13 @@ impl Dispatch for FixtureDispatch {
     }
 }
 
-struct StalledRegistration {
+struct StalledCheckpoint {
     storage: Arc<dyn Storage>,
     checkpoint: Mutex<Option<oneshot::Sender<oneshot::Receiver<()>>>>,
 }
 
 #[async_trait::async_trait]
-impl Storage for StalledRegistration {
+impl Storage for StalledCheckpoint {
     async fn head(&self, key: &Key) -> Result<Object> {
         self.storage.head(key).await
     }
@@ -224,9 +225,9 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
     })
     .await
     .unwrap();
-    let accepted = submit_text(&mut api, &scope, operation).await;
+    let accepted = submit_source(&mut api, &scope, operation, "repair.rtf", RTF).await;
     assert_eq!(accepted.operation_id, operation.to_string());
-    assert_eq!(accepted.total_bytes, TEXT.len() as u64);
+    assert_eq!(accepted.total_bytes, RTF.len() as u64);
     assert_eq!(accepted.state(), v1::IngestionState::Accepted);
     assert_eq!(queue.refused.lock().unwrap().len(), 1);
     assert!(queue.accepted.lock().unwrap().is_empty());
@@ -275,7 +276,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
 
     let before_registration = collection_generation(storage.as_ref(), prefix.as_ref()).await;
     let (checkpoint, mut reached) = oneshot::channel();
-    let stalled = catalog_with_storage(Arc::new(StalledRegistration {
+    let stalled = catalog_with_storage(Arc::new(StalledCheckpoint {
         storage: storage.clone(),
         checkpoint: Mutex::new(Some(checkpoint)),
     }));
@@ -327,6 +328,43 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         assert_eq!(request["httpMethod"], "POST");
         let body = STANDARD.decode(request["body"].as_str().unwrap()).unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), payload);
+        if index == 1 {
+            let (checkpoint, mut reached) = oneshot::channel();
+            let stalled = catalog_with_storage(Arc::new(StalledCheckpoint {
+                storage: storage.clone(),
+                checkpoint: Mutex::new(Some(checkpoint)),
+            }));
+            let (slow_worker, _slow_server) = serve_http(
+                crate::hosted_worker::router_with_task_deadline(stalled, Duration::from_secs(2)),
+            )
+            .await;
+            let response = http
+                .post(format!("{slow_worker}{path}"))
+                .header("content-type", "application/json")
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let mut canceled = reached
+                .try_recv()
+                .expect("extraction reached its checkpoint write");
+            assert!(
+                matches!(
+                    canceled.try_recv(),
+                    Err(oneshot::error::TryRecvError::Closed)
+                ),
+                "worker dropped the stalled write",
+            );
+            let pending = api
+                .get_ingestion_job(job.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(pending.state(), v1::IngestionState::Registered);
+            assert!(pending.preparation.is_none());
+            assert_eq!(queue.accepted.lock().unwrap().len(), 2);
+        }
         let response = http
             .post(format!("{worker}{path}"))
             .header("content-type", "application/json")
@@ -347,6 +385,19 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
                 .unwrap()
                 .into_inner();
             assert_eq!(registered.state(), v1::IngestionState::Registered);
+        }
+        if index == 1 {
+            let prepared = api
+                .get_ingestion_job(job.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            let Some(v1::hosted_preparation::Outcome::Ready(preparation)) =
+                prepared.preparation.and_then(|stage| stage.outcome)
+            else {
+                panic!("retry did not save the RTF preparation");
+            };
+            assert_eq!(preparation.canonical_bytes, TEXT.len() as u64);
         }
     }
     assert_eq!(queue.accepted.lock().unwrap().len(), stages.len());
@@ -446,7 +497,9 @@ async fn verify_retirement(
         (&retired, second),
     ] {
         assert_eq!(
-            submit_text(&mut api, scope, operation).await.state(),
+            submit_source(&mut api, scope, operation, "repair.txt", TEXT.as_bytes())
+                .await
+                .state(),
             v1::IngestionState::Accepted,
         );
     }
@@ -613,19 +666,21 @@ async fn verify_retirement(
     assert_eq!(queue.accepted.lock().unwrap().len(), accepted_before + 1);
 }
 
-async fn submit_text(
+async fn submit_source(
     client: &mut SanctumClient<Channel>,
     scope: &v1::Scope,
     operation: Uuid,
+    name: &str,
+    bytes: &[u8],
 ) -> v1::IngestionJob {
     let frames = [
         Frame::Header(v1::UploadTextHeader {
             scope: Some(scope.clone()),
             request_id: Some(operation.to_string()),
-            name: "repair.txt".into(),
+            name: name.into(),
             ..Default::default()
         }),
-        Frame::Data(TEXT.as_bytes().to_vec()),
+        Frame::Data(bytes.to_vec()),
         Frame::End(v1::UploadTextEnd {}),
     ]
     .map(|frame| v1::UploadTextFrame { frame: Some(frame) });

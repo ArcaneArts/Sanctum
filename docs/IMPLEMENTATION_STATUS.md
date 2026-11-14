@@ -2076,8 +2076,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   withholding a lease renewal response. They verified that SQLite interrupted
   a long statement, the manifest and command receipt stayed unchanged, and
   a retry committed the operation once.
-- Hosted text and RTF preparation happens before SQLite publication. Its
-  blocking extraction pass still needs to observe the worker deadline.
+- Before SQLite publication, hosted UTF-8 scanning and RTF extraction
+  stop at the next buffered read when a worker deadline drops the request.
+  Interrupted preparation does not record an invalid source outcome.
+  A deterministic regression interrupts each scanner after its first
+  input buffer, including an RTF binary destination.
+- The filesystem and MinIO worker regression also stalls the RTF
+  preparation checkpoint after successful extraction. The deadline
+  returns 503 and the operation stays registered without a preparation
+  outcome. Redelivery saves the checkpoint, dispatches lexical indexing,
+  and returns the exact canonical UTF-8 bytes through gRPC.
 
 ## Concurrent reads on two 2 GiB FTS snapshots
 
