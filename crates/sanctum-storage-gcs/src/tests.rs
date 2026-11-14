@@ -183,6 +183,15 @@ async fn object(
             _ => panic!("unexpected range attempt {attempt} for {scenario}"),
         };
     }
+    if let Some(scenario) = key.strip_prefix("default/notes/open-") {
+        return opening_object(
+            &fixture,
+            &key,
+            scenario,
+            query.get("ifGenerationMatch").map(String::as_str),
+        )
+        .await;
+    }
     if key.ends_with("/replaced") || key.ends_with("/removed") || key.ends_with("/changing") {
         return changing_object(
             &fixture,
@@ -229,6 +238,37 @@ async fn object(
     }
     assert_eq!(query["ifGenerationMatch"], "11");
     "abcdef".into_response()
+}
+
+async fn opening_object(
+    fixture: &Fixture,
+    key: &str,
+    scenario: &str,
+    condition: Option<&str>,
+) -> axum::response::Response {
+    let attempt = {
+        let mut calls = fixture.reads.lock().unwrap();
+        calls.push(condition.unwrap_or("metadata").into());
+        calls.len()
+    };
+    match (scenario, attempt) {
+        ("retry", 1) => StatusCode::TOO_MANY_REQUESTS.into_response(),
+        ("retry", 2) => Json(metadata(key, 6, 11)).into_response(),
+        ("retry", 3) => {
+            assert_eq!(condition, Some("11"));
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        ("retry", 4) | ("stalled", 2) => Json(metadata(key, 6, 12)).into_response(),
+        ("retry", 5) | ("stalled", 3) => {
+            assert_eq!(condition, Some("12"));
+            "xyzabc".into_response()
+        }
+        ("stalled", 1) => std::future::pending().await,
+        ("unavailable", _) => StatusCode::REQUEST_TIMEOUT.into_response(),
+        ("forbidden", 1) => StatusCode::FORBIDDEN.into_response(),
+        ("wrong-key", 1) => Json(metadata("default/notes/unrelated", 6, 11)).into_response(),
+        _ => panic!("unexpected download attempt {attempt} for {scenario}"),
+    }
 }
 
 fn changing_object(
@@ -482,6 +522,58 @@ async fn download_returns_retryable_error_when_every_generation_is_replaced() {
             "metadata", "11", "metadata", "12", "metadata", "13", "metadata", "14"
         ],
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn download_retries_transient_metadata_and_media_errors_before_returning_a_reader() {
+    let (storage, fixture, server) = start().await;
+    let key = Key::parse("default/notes/open-retry").unwrap();
+    let mut download = storage.get(&key).await.unwrap();
+    assert_eq!(download.object.version.generation.as_deref(), Some("12"));
+    let mut body = String::new();
+    download.reader.read_to_string(&mut body).await.unwrap();
+    assert_eq!(body, "xyzabc");
+    assert_eq!(
+        *fixture.reads.lock().unwrap(),
+        ["metadata", "metadata", "11", "metadata", "12"]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn download_retries_a_stalled_metadata_request() {
+    let (storage, fixture, server) = start().await;
+    let key = Key::parse("default/notes/open-stalled").unwrap();
+    let download = storage
+        .open_download(&key, Duration::from_millis(250))
+        .await
+        .unwrap();
+    assert_eq!(download.object.version.generation.as_deref(), Some("12"));
+    assert_eq!(
+        *fixture.reads.lock().unwrap(),
+        ["metadata", "metadata", "12"]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn download_open_bounds_retries_and_preserves_permanent_errors() {
+    let (storage, fixture, server) = start().await;
+    let key = Key::parse("default/notes/open-unavailable").unwrap();
+    assert!(matches!(storage.get(&key).await, Err(Error::Busy(_))));
+    assert_eq!(*fixture.reads.lock().unwrap(), ["metadata"; 4]);
+
+    fixture.reads.lock().unwrap().clear();
+    let key = Key::parse("default/notes/open-forbidden").unwrap();
+    assert!(matches!(storage.get(&key).await, Err(Error::Invalid(_))));
+    assert_eq!(*fixture.reads.lock().unwrap(), ["metadata"]);
+
+    fixture.reads.lock().unwrap().clear();
+    let key = Key::parse("default/notes/open-wrong-key").unwrap();
+    assert!(matches!(storage.get(&key).await, Err(Error::Io(error))
+        if error.kind() == io::ErrorKind::InvalidData));
+    assert_eq!(*fixture.reads.lock().unwrap(), ["metadata"]);
     server.abort();
 }
 
