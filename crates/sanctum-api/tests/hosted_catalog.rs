@@ -7177,6 +7177,15 @@ async fn hosted_submissions_recover_from_interrupted_acceptance() {
 
 #[tokio::test]
 async fn hosted_acceptance_rejects_corrupt_input_after_a_lost_upload_response() {
+    verify_hosted_input_upload_failure(CORRUPT_ACCEPTANCE_INPUT).await;
+}
+
+#[tokio::test]
+async fn hosted_acceptance_does_not_acknowledge_a_source_sync_error() {
+    verify_hosted_input_upload_failure(FAIL_INPUT_SYNC).await;
+}
+
+async fn verify_hosted_input_upload_failure(fault: u8) {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let catalog = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
@@ -7205,15 +7214,15 @@ async fn hosted_acceptance_rejects_corrupt_input_after_a_lost_upload_response() 
         operation_id: operation.clone(),
     };
     let input = [b"durable UTF-8 source".as_slice()];
-    storage
-        .interrupt
-        .store(CORRUPT_ACCEPTANCE_INPUT, Ordering::Relaxed);
-    assert!(
+    storage.interrupt.store(fault, Ordering::Relaxed);
+    assert_eq!(
         server
             .client
             .submit_text(upload_frames(&header, input))
             .await
-            .is_err()
+            .unwrap_err()
+            .code(),
+        Code::Internal
     );
     assert_eq!(
         server
@@ -7275,6 +7284,7 @@ const CORRUPT_ACCEPTANCE_INPUT: u8 = 19;
 const REJECT_PREPARED_EMBEDDING_WRITE: u8 = 20;
 const REJECT_REBUILD_CHECKPOINT: u8 = 21;
 const LOSE_REBUILD_CHECKPOINT: u8 = 22;
+const FAIL_INPUT_SYNC: u8 = 23;
 const PARALLEL_RANGE_START: u8 = 40;
 const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
 const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
@@ -7371,6 +7381,16 @@ impl Storage for InterruptAcceptance {
     }
 
     async fn put_stream(&self, key: &Key, reader: Reader, length: u64) -> StorageResult<Version> {
+        if key.as_str().contains("/inputs/")
+            && self
+                .interrupt
+                .compare_exchange(FAIL_INPUT_SYNC, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            // Model a rename that is visible even though its directory sync failed.
+            self.inner.put_stream(key, reader, length).await?;
+            return Err(std::io::Error::other("source directory sync failed").into());
+        }
         if key.as_str().contains("/inputs/")
             && self
                 .interrupt

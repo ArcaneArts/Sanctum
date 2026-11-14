@@ -612,6 +612,8 @@ impl HostedCatalog {
     ) -> Result<()> {
         let error = match self.storage.put_stream(key, reader, bytes).await {
             Ok(_) => return Ok(()),
+            // A failed local sync can leave readable bytes without durability.
+            Err(error @ (Error::Invalid(_) | Error::Io(_))) => return Err(error),
             Err(error) => error,
         };
         match self.verify_source(key, bytes, digest).await {
