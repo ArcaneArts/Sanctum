@@ -352,8 +352,9 @@ format. [Optional SQLite page deltas](#optional-sqlite-page-deltas).
 ### Hosted embedding batches
 
 Set the same server-level `embedding` configuration on the API and
-worker. For a private worker, submit one bounded batch with the
-following request. Repeat until `processed` is zero.
+worker. For a private worker, use the following request to prepare
+and publish a group of up to 16 distinct chunk inputs. Repeat until
+`processed` is zero.
 
 ```sh
 curl --fail-with-body http://127.0.0.1:47552/internal/tasks/embed-collection \
@@ -370,8 +371,14 @@ unavailable.
 With Cloud Tasks configured, lexical publication schedules bounded
 embedding steps automatically. The worker checkpoints each step and
 schedules retryable provider work at its recorded retry time. The
-reconciler can recover a missing delivery. Embedding and rebuild task
-payloads include the target profile ID, which also participates in the
+worker respects each provider's request batch size and groups completed
+requests in one fenced SQLite publication. Its preparation budget is
+120 seconds per group, including chunk reads and provider calls. If the
+budget expires after some requests finish, the worker publishes those
+results and leaves the remaining inputs pending. A committed step's
+receipt prevents reissuing its provider calls after an envelope write
+fails. The reconciler can recover a missing delivery. Embedding and rebuild
+task payloads include the target profile ID, which also participates in the
 Cloud Tasks name. A delivery for a different profile leaves the current
 batch alone. Dispatch repair can enqueue the pending upload batch under
 the new profile in the same dispatch window. An old upload task without
