@@ -33,6 +33,8 @@ const MAX_DOWNLOAD_RESUMES: u32 = 4;
 const MAX_RANGE_ATTEMPTS: u32 = 3;
 const RANGE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const RANGE_DEADLINE: Duration = Duration::from_secs(15);
+const MAX_LIST_ATTEMPTS: u32 = 3;
+const LIST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[async_trait::async_trait]
 trait Credential: Send + Sync {
@@ -527,23 +529,7 @@ impl Storage for GcsStorage {
                 query.append_pair("pageToken", cursor);
             }
         }
-        let response = self
-            .request(Method::GET, url)
-            .await?
-            .send()
-            .await
-            .map_err(transfer_error)?;
-        check(response.status())?;
-        let page: Page = response.json().await.map_err(transfer_error)?;
-        let objects = page
-            .items
-            .into_iter()
-            .map(ObjectMetadata::object)
-            .collect::<Result<_>>()?;
-        Ok(ListPage {
-            objects,
-            next_cursor: page.next_page_token,
-        })
+        self.list_page(url, LIST_ATTEMPT_TIMEOUT).await
     }
 
     async fn delete(&self, key: &Key) -> Result<()> {
@@ -562,6 +548,46 @@ impl Storage for GcsStorage {
 }
 
 impl GcsStorage {
+    async fn list_page(&self, url: Url, attempt_timeout: Duration) -> Result<ListPage> {
+        let mut attempt = 1;
+        loop {
+            let result = tokio::time::timeout(attempt_timeout, async {
+                let response = self
+                    .request(Method::GET, url.clone())
+                    .await?
+                    .send()
+                    .await
+                    .map_err(transfer_error)?;
+                check(response.status())?;
+                let body = response
+                    .bytes()
+                    .await
+                    .map_err(|_| Error::Busy("GCS listing response was interrupted".into()))?;
+                let page: Page = serde_json::from_slice(&body)
+                    .map_err(|_| invalid_response("GCS returned invalid listing metadata"))?;
+                let objects = page
+                    .items
+                    .into_iter()
+                    .map(ObjectMetadata::object)
+                    .collect::<Result<_>>()?;
+                Ok(ListPage {
+                    objects,
+                    next_cursor: page.next_page_token,
+                })
+            })
+            .await
+            .unwrap_or_else(|_| Err(Error::Busy("GCS list page timed out".into())));
+            match result {
+                Err(Error::Busy(_)) if attempt < MAX_LIST_ATTEMPTS => {
+                    // Retry the same page until a complete response can be returned.
+                    tokio::time::sleep(Duration::from_millis(100 << (attempt - 1))).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
     async fn open_download(&self, key: &Key, attempt_timeout: Duration) -> Result<Download> {
         let mut attempt = 1;
         loop {

@@ -1972,6 +1972,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   returned cold results in 5.96–6.23 s with a 2.41 GiB cgroup peak.
   [Measured results](CAPACITY.md#concurrent-grpc-search-on-1-gib-fts-snapshots).
 
+## GCS listing retries
+
+- The GCS adapter retries transient listing failures against the same page
+  token. The local JSON API fixture interrupted a paginated usage scan with
+  HTTP 429 and a broken response body. The scan counted each object once
+  and finished with 17 bytes across two objects. Separate cases verified
+  recovery from a stalled response, bounded retries for HTTP 503, and
+  immediate errors for HTTP 403 and malformed JSON. Live bucket validation
+  remains open. [Storage behavior](STORAGE.md#google-cloud-storage-adapter).
+
 ## GCS resumable transfer recovery
 
 - The native adapter retains a bounded upload part and probes the same
