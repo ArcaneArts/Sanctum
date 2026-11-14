@@ -371,12 +371,12 @@ snapshot cache budget, and whether page deltas are enabled.
 Seed through the ingestion API and read the SQLite snapshot length from
 the database session API. The example streams 200 MiB sources into two
 collections under a dedicated tenant until each snapshot reaches 1 GiB.
-Repeat with a new run ID and `--target-mib 2048` for 2 GiB. Each collection
-has its own measured size, which can exceed the target by one upload's
-index growth. Publication can use considerably more storage than the final
-database size. Keep the fixture prefix isolated for subsequent cleanup.
-Increase `--max-sources` if the selected chunk settings and fixture reach
-the upload count limit before the requested database size.
+Repeat with a new run ID, `--target-mib 2048`, and `--max-sources 45`
+for 2 GiB. Adjust the maximum upload count if you change chunk settings
+or the source fixture. Each collection has its own measured size,
+which can exceed the target by one upload's index growth. Publication
+can use considerably more storage than the final database size. Keep
+the fixture prefix isolated for subsequent cleanup.
 
 ```sh
 run_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
@@ -406,6 +406,13 @@ generation, and the verified canonical range for every search. It checks
 the same excerpt with a separate fetch after the timed passes. Use
 `--samples 24 --interval-seconds 5` to keep issuing search passes across
 more than one Cloud Monitoring sample interval.
+
+Measure one collection and both collections on separate fresh instances.
+Allow room for page-delta reconstruction alongside the retained SQLite
+files when choosing instance memory. The cache budget controls retained
+snapshots, while in-flight downloads and patch files also take space.
+[Local 1 GiB measurements](CAPACITY.md#concurrent-grpc-search-on-1-gib-fts-snapshots),
+[local 2 GiB measurements](CAPACITY.md#concurrent-grpc-search-on-2-gib-fts-snapshots).
 
 Correlate the timestamps and generation with `snapshot_download`,
 `snapshot_cache`, `collection_sqlite_handle`, and `search` events and

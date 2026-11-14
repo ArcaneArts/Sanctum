@@ -1610,3 +1610,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   registration receipt without publishing another database generation.
   It then delivered preparation and indexing and verified exact UTF-8
   retrieval through gRPC. This run used a loopback Cloud Tasks fixture.
+
+## Concurrent reads on two 2 GiB FTS snapshots
+
+- The release server published 78 sources of 200 MiB to MinIO and
+  produced two snapshots of roughly 2.05 GiB each. Fresh Linux ARM64
+  APIs on tmpfs served simultaneous cold gRPC searches in 5.96–6.40 s
+  with a 4.55 GiB cgroup peak. A generated Python client checked exact
+  UTF-8 ranges, source provenance, and snapshot generation.
+- A 5 GiB cache reused both SQLite connections on every repeat. With the
+  default 2 GiB budget, both snapshots were downloaded for every search
+  and peak memory was 4.52 GiB. The Cloud Run benchmark still needs the
+  authorized deployment.
+  [Timings and memory](CAPACITY.md#concurrent-grpc-search-on-2-gib-fts-snapshots).

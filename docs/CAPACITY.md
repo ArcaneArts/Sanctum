@@ -207,6 +207,42 @@ during page replay. The timings come from local Docker and MinIO. Live
 Cloud Run measurements at 1 GiB and 2 GiB still need the authorized
 deployment.
 
+### Concurrent gRPC search on 2 GiB FTS snapshots
+
+The same benchmark published 39 sources of 200 MiB per collection, with
+page deltas enabled and embeddings disabled. The resulting SQLite
+snapshots were 2,201,829,376 and 2,200,682,496 bytes. Each cold read
+transferred 2,384,690,304 and 2,383,227,352 bytes respectively, including
+the page deltas. The seed finished before any timed search began.
+
+Each run started a fresh Linux ARM64 API container from the repository
+image with two CPUs, an 8 GiB cgroup limit, a 6 GiB `/tmp` tmpfs, and
+a 5 GiB snapshot cache. MinIO ran on the local Docker bridge.
+There was one cold run against a single collection and two against both
+collections. Each cold pass was followed by three repeat passes. The
+generated Python client verified the snapshot generation, source
+provenance, and exact UTF-8 bytes over gRPC search and fetch.
+
+| Measurement | One active collection | Two active collections |
+| --- | ---: | ---: |
+| Cold search per collection | 4.53 s | 5.96–6.40 s |
+| Download and verify per collection | 4.52 s | 5.95–6.35 s |
+| Open read-only SQLite connection | 0.076 ms | 0.059–0.097 ms |
+| Repeat search | 7.64–9.13 ms | 5.11–49.46 ms |
+| Peak cgroup memory | 2.29 GiB | 4.55 GiB |
+
+Every repeat reused its SQLite connection. The largest sampled
+memory-backed file footprint was 2.18 GiB for one collection and
+4.44 GiB for two, measured using the cgroup's `shmem` counter.
+
+With the default 2 GiB cache, neither snapshot fit. Both repeat passes
+downloaded and reconstructed both snapshots again. Those searches took
+6.21–6.26 s and cgroup peak memory was 4.52 GiB for that run. The smaller
+cache saved retention between requests, while simultaneous downloads
+still needed nearly the same peak memory. These measurements cover the
+local API container after publication. Cloud Run still needs its own
+network, memory, and publication measurements.
+
 ## Exact vector ranking in SQLite
 
 The release comparison uses one SQLite database for chunk identity, metadata,
