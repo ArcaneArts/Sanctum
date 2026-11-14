@@ -91,6 +91,11 @@ Poll `GetIngestionJob` in the same tenant and collection to see processed
 bytes, attempts, failure details, or the committed lexical revision. The
 local queue persists through process restarts.
 
+New uploads can enter the durable queue while the collection database is
+indexing another source. The local server serializes collection mutations
+and replacement registration for each collection. Uploading bytes and
+computing embeddings run outside that writer lock.
+
 ```sh
 cargo run --locked -p sanctum-cli -- upload notes /path/to/notes.md --background
 cargo run --locked -p sanctum-cli -- job notes OPERATION_ID

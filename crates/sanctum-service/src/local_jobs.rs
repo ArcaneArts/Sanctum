@@ -87,6 +87,17 @@ impl Service {
             return Err(Error::Conflict("indexing canceled".into()));
         }
         let extracted = job.extract_rtf.then(|| self.extract_rtf(job)).transpose()?;
+        self.local_writes.run(&job.scope, || {
+            self.publish_index(job, extracted, &mut database)
+        })
+    }
+
+    fn publish_index(
+        &self,
+        job: &Job,
+        extracted: Option<(String, &'static str)>,
+        database: &mut crate::db::CollectionDb,
+    ) -> Result<Revision> {
         let input = self.files.open_text(&job.scope, job.source, job.revision)?;
         let writer = database.write()?;
         if job.replacement {
@@ -257,11 +268,22 @@ impl StagedUpload {
                 return Ok(job);
             }
         }
-        let mut database = self.service.database(&self.scope)?;
-        let writer = database.write()?;
+        if self.upload.replacement.is_none() {
+            return self.accept_upload(bytes, receipt);
+        }
+        let scope = self.scope.clone();
+        service
+            .local_writes
+            .run(&scope, || self.accept_upload(bytes, receipt))
+    }
+
+    fn accept_upload(self, bytes: u64, receipt: Option<(Uuid, &str)>) -> Result<Job> {
         let replacement = self.upload.replacement.as_ref();
         let (source, external) = if let Some(replacement) = replacement {
-            let current = writer.find_source(replacement.source, self.upload.external.as_ref())?;
+            let current = self
+                .service
+                .database(&self.scope)?
+                .find_source(replacement.source, self.upload.external.as_ref())?;
             if replacement
                 .expected_revision
                 .is_some_and(|expected| expected != current.revision)
@@ -305,16 +327,11 @@ impl StagedUpload {
         Ok(hash.finalize().to_hex().to_string())
     }
 
-    pub(crate) fn publish_job(self, job: Job) -> Result<Job> {
-        let service = self.service.clone();
-        let _reader = service
-            .retrieval
-            .read()
-            .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
-        self.publish_job_locked(job, None)
-    }
-
-    fn publish_job_locked(self, mut job: Job, request: Option<(Uuid, &str)>) -> Result<Job> {
+    pub(crate) fn publish_job_locked(
+        self,
+        mut job: Job,
+        request: Option<(Uuid, &str)>,
+    ) -> Result<Job> {
         self.service.require_collection(&job.scope)?;
         job.retain_original = self.upload.retain_original;
         job.chunking = self.service.chunking;

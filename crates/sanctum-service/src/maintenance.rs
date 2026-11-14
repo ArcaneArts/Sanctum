@@ -52,11 +52,13 @@ impl Service {
             .retrieval
             .read()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
-        let mut database = self.database(scope)?;
-        let writer = database.write()?;
-        let deleted = writer.delete_source(source, expected)?;
-        writer.commit()?;
-        Ok(deleted.revision)
+        self.local_writes.run(scope, || {
+            let mut database = self.database(scope)?;
+            let writer = database.write()?;
+            let deleted = writer.delete_source(source, expected)?;
+            writer.commit()?;
+            Ok(deleted.revision)
+        })
     }
 
     pub fn reclaim_retired(&self, scope: &Scope) -> Result<()> {

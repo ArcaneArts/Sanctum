@@ -1182,3 +1182,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - Fusing partial matches with available vectors lowered Recall@10 on
   ArguAna from 0.91038 to 0.88549. The fallback is limited to collections
   with zero eligible semantic hits.
+
+## Local collection write contention
+
+- New uploads stage bytes and write their durable queue record without a
+  collection write transaction. Replacement registration, import identity
+  checks, indexing, embedding commits, and revision metadata writes
+  coordinate through the same collection-specific writer lock.
+- A gRPC regression test held a SQLite writer open while submitting a new
+  source. The server accepted the operation and indexed it after the test
+  released the SQLite lock. `pnpm check` and the local MCP smoke passed.
+- The release ArguAna run completed all 8,674 uploads with 16 workers
+  and zero SQLite-busy retries. It reached full Ollama coverage for
+  8,695 chunks in 464.96 s. [Method](CAPACITY.md#local-ingestion-with-16-workers).

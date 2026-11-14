@@ -4308,3 +4308,45 @@ async fn hybrid_falls_back_to_partial_terms_without_embeddings() {
     );
     running.stop().await;
 }
+
+#[tokio::test]
+async fn new_upload_is_accepted_while_its_collection_database_has_a_writer() {
+    let directory = TempDir::new().unwrap();
+    let mut running = Running::start_with_workers(&directory, None, false).await;
+    create(&mut running.client, "default").await;
+    let path = directory.path().join("default/notes/meta.db");
+    let lock = rusqlite::Connection::open(path).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        running.client.submit_text(tokio_stream::iter([
+            header("default"),
+            v1::UploadTextFrame {
+                frame: Some(Frame::Data(b"independent upload".to_vec())),
+            },
+            v1::UploadTextFrame {
+                frame: Some(Frame::End(v1::UploadTextEnd {})),
+            },
+        ])),
+    )
+    .await
+    .expect("new upload acceptance must not wait for the collection writer")
+    .unwrap()
+    .into_inner();
+    assert_eq!(response.state(), v1::IngestionState::Accepted);
+    lock.execute_batch("ROLLBACK").unwrap();
+    let service = running.service.clone();
+    assert!(
+        tokio::task::spawn_blocking(move || service.process_next())
+            .await
+            .unwrap()
+            .unwrap()
+    );
+    assert_eq!(
+        search(&mut running.client, "default", "independent")
+            .await
+            .len(),
+        1
+    );
+    running.stop().await;
+}
