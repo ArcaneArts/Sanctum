@@ -2327,6 +2327,21 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   the next page, and recovered the timed-out hint on the next pass.
   [Scheduler setup](CLOUD_RUN.md#schedule-dispatch-repair).
 
+## Recovery of damaged hosted embedding batches
+
+- Workers rebuild invalid staged embeddings from verified current source
+  ranges and conditionally replace the damaged object by version. A valid
+  prepared batch or existing SQLite receipt is reused on redelivery.
+- The filesystem-backed regression corrupts a staged batch while a writer
+  holds the lease, loses the response to the repair write, then restarts
+  the worker. It verifies that repair did not publish a snapshot under
+  contention and replay did not repeat the provider calls.
+- The worker HTTP and gRPC integration on live MinIO and Ollama recovered
+  a damaged batch after releasing a competing SQLite writer, replayed
+  the committed delivery without another model call, and returned the
+  exact source excerpt through semantic search and fetch.
+  [Hosted embedding recovery](STORAGE.md#hosted-embedding-batches).
+
 ## Batching hosted embedding publications
 
 - Up to 16 distinct chunk inputs share one fenced SQLite publication.

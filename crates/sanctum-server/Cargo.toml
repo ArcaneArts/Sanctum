@@ -37,6 +37,7 @@ tracing = { workspace = true }
 uuid.workspace = true
 
 [dev-dependencies]
+sanctum-db = { path = "../sanctum-db" }
 sanctum-storage-fs = { path = "../sanctum-storage-fs" }
 tempfile.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }

@@ -19,6 +19,7 @@ const PUBLICATION_INPUT_LIMIT: u32 = 16;
 const PROVIDER_WINDOW: Duration = Duration::from_secs(120);
 
 mod prepared;
+use prepared::PreparedBatch;
 
 impl HostedCatalog {
     pub async fn embedding_status(
@@ -77,13 +78,13 @@ impl HostedCatalog {
                     .read_prepared_embeddings(key, provider.as_ref())
                     .await?
                 {
-                    Some(outcomes) => outcomes,
-                    None => {
+                    PreparedBatch::Ready(outcomes) => outcomes,
+                    PreparedBatch::Write(condition) => {
                         let outcomes = self.select_and_embed(scope, provider.as_ref()).await?;
                         if outcomes.is_empty() {
                             return Ok(0);
                         }
-                        self.stage_prepared_embeddings(key, provider.as_ref(), outcomes)
+                        self.stage_prepared_embeddings(key, provider.as_ref(), outcomes, condition)
                             .await?
                     }
                 }

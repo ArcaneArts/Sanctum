@@ -21,6 +21,11 @@ struct PreparedEmbedding {
     outcomes: Vec<PreparedOutcome>,
 }
 
+#[derive(Deserialize)]
+struct BatchFormat {
+    format: u64,
+}
+
 #[derive(Deserialize, Serialize)]
 struct PreparedOutcome {
     inputs: Vec<BatchInput>,
@@ -38,6 +43,11 @@ enum PreparedResult {
     Input(String),
 }
 
+pub(super) enum PreparedBatch {
+    Ready(Vec<BatchOutcome>),
+    Write(Condition),
+}
+
 impl HostedCatalog {
     pub(super) fn prepared_embedding_key(&self, scope: &Scope, id: Uuid) -> Result<Key> {
         let collection = collection_prefix(self.prefix.as_ref(), scope)?;
@@ -48,70 +58,48 @@ impl HostedCatalog {
         &self,
         key: &Key,
         provider: &dyn Provider,
-    ) -> Result<Option<Vec<BatchOutcome>>> {
-        let download = match self.storage.get(key).await {
+    ) -> Result<PreparedBatch> {
+        let mut download = match self.storage.get(key).await {
             Ok(download) => download,
-            Err(Error::NotFound(_)) => return Ok(None),
+            Err(Error::NotFound(_)) => return Ok(PreparedBatch::Write(Condition::Create)),
             Err(error) => return Err(error),
         };
-        if download.object.length > MAX_CONTROL_BYTES as u64 {
-            return Err(invalid_batch());
-        }
-        let mut body = Vec::new();
-        download
-            .reader
-            .take(MAX_CONTROL_BYTES as u64 + 1)
-            .read_to_end(&mut body)
-            .await?;
-        if body.len() as u64 != download.object.length {
-            return Err(invalid_batch());
-        }
-        let batch: PreparedEmbedding =
-            serde_json::from_slice(&body).map_err(|_| invalid_batch())?;
-        if batch.format != 1 || batch.key != key.as_str() || batch.profile != provider.profile_id()
-        {
-            return Err(invalid_batch());
-        }
-        let mut seen = HashSet::new();
-        for group in &batch.outcomes {
-            if group.inputs.is_empty()
-                || group.inputs.iter().any(|input| {
-                    input.hash.len() != 64
-                        || !input.hash.bytes().all(|b| b.is_ascii_hexdigit())
-                        || !seen.insert(input.hash.as_str())
-                })
+        let size = download.object.length;
+        if size <= MAX_CONTROL_BYTES as u64 {
+            let mut body = Vec::new();
+            (&mut download.reader)
+                .take(size + 1)
+                .read_to_end(&mut body)
+                .await?;
+            if body.len() as u64 != size {
+                return Err(Error::Busy(
+                    "prepared embedding batch read was incomplete".into(),
+                ));
+            }
+            if let Ok(batch) = serde_json::from_slice::<PreparedEmbedding>(&body)
+                && batch.format == 1
+                && batch.key == key.as_str()
+                && batch.profile == provider.profile_id()
+                && let Ok(outcomes) = decode_outcomes(batch.outcomes, provider.dimensions())
             {
-                return Err(invalid_batch());
+                return Ok(PreparedBatch::Ready(outcomes));
+            }
+            // Older workers must leave checkpoints from a newer format alone,
+            // even when they cannot deserialize its payload.
+            if serde_json::from_slice::<BatchFormat>(&body).is_ok_and(|header| header.format != 1) {
+                return Err(Error::Internal(
+                    "unsupported prepared embedding batch format".into(),
+                ));
             }
         }
-        if !(1..=PUBLICATION_INPUT_LIMIT as usize).contains(&seen.len()) {
-            return Err(invalid_batch());
+        let version = download.object.version;
+        if version.etag.is_none() && version.generation.is_none() {
+            return Err(Error::Internal(
+                "invalid prepared embedding batch has no version for conditional replacement"
+                    .into(),
+            ));
         }
-        batch
-            .outcomes
-            .into_iter()
-            .map(|outcome| {
-                let result = match outcome.result {
-                    PreparedResult::Vectors(vectors) => {
-                        if vectors.len() != outcome.inputs.len() {
-                            return Err(invalid_batch());
-                        }
-                        Ok(vectors
-                            .into_iter()
-                            .map(|vector| decode_vector(&vector, provider.dimensions()))
-                            .collect::<Result<_>>()?)
-                    }
-                    PreparedResult::Transient(message) => Err(EmbedError::Transient(message)),
-                    PreparedResult::Permanent(message) => Err(EmbedError::Permanent(message)),
-                    PreparedResult::Input(message) => Err(EmbedError::Input(message)),
-                };
-                Ok(BatchOutcome {
-                    inputs: outcome.inputs,
-                    result,
-                })
-            })
-            .collect::<Result<_>>()
-            .map(Some)
+        Ok(PreparedBatch::Write(Condition::Match(version)))
     }
 
     pub(super) async fn stage_prepared_embeddings(
@@ -119,6 +107,7 @@ impl HostedCatalog {
         key: &Key,
         provider: &dyn Provider,
         mut outcomes: Vec<BatchOutcome>,
+        condition: Condition,
     ) -> Result<Vec<BatchOutcome>> {
         for outcome in &mut outcomes {
             if let Err(error) = &mut outcome.result {
@@ -137,22 +126,18 @@ impl HostedCatalog {
             outcomes: outcomes.iter().map(PreparedOutcome::from).collect(),
         };
         let body = serde_json::to_vec(&batch).map_err(|error| Error::Internal(Box::new(error)))?;
-        match self
-            .storage
-            .put_control(key, body.into(), Condition::Create)
-            .await
-        {
+        match self.storage.put_control(key, body.into(), condition).await {
             Ok(_) => Ok(outcomes),
             // A failed filesystem sync can leave readable, nondurable bytes.
             Err(error @ (Error::Invalid(_) | Error::Io(_))) => Err(error),
             Err(error) => match self.read_prepared_embeddings(key, provider).await? {
                 // A competing delivery can win the create with a different
                 // set of inputs. Publish the batch that is actually durable.
-                Some(saved) => Ok(saved),
-                None if matches!(error, Error::Conflict(_)) => Err(Error::Busy(
+                PreparedBatch::Ready(saved) => Ok(saved),
+                PreparedBatch::Write(_) if matches!(error, Error::Conflict(_)) => Err(Error::Busy(
                     "prepared embedding batch changed during publication".into(),
                 )),
-                None => Err(error),
+                PreparedBatch::Write(_) => Err(error),
             },
         }
     }
@@ -190,6 +175,47 @@ impl From<&BatchOutcome> for PreparedOutcome {
             result,
         }
     }
+}
+
+fn decode_outcomes(outcomes: Vec<PreparedOutcome>, dimensions: usize) -> Result<Vec<BatchOutcome>> {
+    let mut seen = HashSet::new();
+    for group in &outcomes {
+        if group.inputs.is_empty()
+            || group.inputs.iter().any(|input| {
+                input.hash.len() != 64
+                    || !input.hash.bytes().all(|b| b.is_ascii_hexdigit())
+                    || !seen.insert(input.hash.as_str())
+            })
+        {
+            return Err(invalid_batch());
+        }
+    }
+    if !(1..=PUBLICATION_INPUT_LIMIT as usize).contains(&seen.len()) {
+        return Err(invalid_batch());
+    }
+    outcomes
+        .into_iter()
+        .map(|outcome| {
+            let result = match outcome.result {
+                PreparedResult::Vectors(vectors) => {
+                    if vectors.len() != outcome.inputs.len() {
+                        return Err(invalid_batch());
+                    }
+                    Ok(vectors
+                        .into_iter()
+                        .map(|vector| decode_vector(&vector, dimensions))
+                        .collect::<Result<_>>()?)
+                }
+                PreparedResult::Transient(message) => Err(EmbedError::Transient(message)),
+                PreparedResult::Permanent(message) => Err(EmbedError::Permanent(message)),
+                PreparedResult::Input(message) => Err(EmbedError::Input(message)),
+            };
+            Ok(BatchOutcome {
+                inputs: outcome.inputs,
+                result,
+            })
+        })
+        .collect::<Result<_>>()
 }
 
 fn decode_vector(encoded: &str, dimensions: usize) -> Result<Vec<f32>> {

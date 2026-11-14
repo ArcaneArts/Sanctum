@@ -485,7 +485,12 @@ deliveries of the same step and profile. After an ambiguous staging
 response or a create conflict, the worker reads and validates the saved
 batch before attempting publication in the same delivery. If storage
 never saved a batch, the write stays retryable. A retry on another
-instance uses any staged results while there is no committed receipt.
+instance uses a valid staged result while there is no committed receipt.
+When a saved batch fails validation, a retry reads and verifies the current
+source chunks, then replaces the invalid object using its observed storage
+version. If another worker already repaired it, the retry uses that saved
+result. Unsupported checkpoint formats and objects without a conditional
+write token surface an error. An interrupted download remains retryable.
 Two requests can still make provider calls before either stages results.
 A committed step's SQLite receipt takes precedence if an envelope write
 fails. The worker removes staged results after publication. The scheduled
