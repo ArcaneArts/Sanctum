@@ -450,7 +450,7 @@ impl<R: Read, S: Fn() -> bool> Read for IngestionReader<'_, R, S> {
     }
 }
 
-fn revision_for(job: &Job, content: RevisionContent) -> Revision {
+pub(crate) fn revision_for(job: &Job, content: RevisionContent) -> Revision {
     Revision {
         source: job.source,
         revision: job.revision,
