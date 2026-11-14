@@ -2192,6 +2192,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   immediate errors for HTTP 403 and malformed JSON. Live bucket validation
   remains open. [Storage behavior](STORAGE.md#google-cloud-storage-adapter).
 
+## GCS direct metadata retries
+
+- Snapshot and abandoned-upload cleanup use direct metadata reads. The
+  native adapter now retries those reads on the same object after throttling,
+  a disrupted response body, or a timeout. Full downloads keep their
+  existing open-attempt budget.
+- The loopback JSON API fixture reproduced a direct read failing on HTTP
+  429. It now verifies recovery through a subsequent interrupted body,
+  recovery from a stalled response, and a three-attempt limit. Missing
+  objects, authorization failures, and mismatched keys stop on the first
+  response. Live bucket validation still needs an authorized GCS bucket
+  and ADC. [Storage behavior](STORAGE.md#google-cloud-storage-adapter).
+
 ## Bounded GCS metadata responses
 
 - The native adapter requests only the GCS metadata fields needed for

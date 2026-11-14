@@ -34,6 +34,8 @@ const MAX_DOWNLOAD_RESUMES: u32 = 4;
 const MAX_RANGE_ATTEMPTS: u32 = 3;
 const RANGE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const RANGE_DEADLINE: Duration = Duration::from_secs(15);
+const MAX_METADATA_ATTEMPTS: u32 = 3;
+const METADATA_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LIST_ATTEMPTS: u32 = 3;
 const LIST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const OBJECT_FIELDS: &str = "name,size,etag,generation,updated";
@@ -469,22 +471,8 @@ async fn upload_version(response: Response, key: &Key, length: u64) -> Result<Ve
 #[async_trait::async_trait]
 impl Storage for GcsStorage {
     async fn head(&self, key: &Key) -> Result<Object> {
-        let mut url = self.objects_url(false, Some(key));
-        url.query_pairs_mut().append_pair("fields", OBJECT_FIELDS);
-        let response = self
-            .request(Method::GET, url)
-            .await?
-            .send()
+        self.read_object_metadata(key, METADATA_ATTEMPT_TIMEOUT)
             .await
-            .map_err(transfer_error)?;
-        check(response.status())?;
-        let object = read_metadata::<ObjectMetadata>(response, MAX_CONTROL_BYTES)
-            .await?
-            .object()?;
-        if &object.key != key {
-            return Err(invalid_response("GCS metadata returned a different object"));
-        }
-        Ok(object)
     }
 
     async fn get(&self, key: &Key) -> Result<Download> {
@@ -597,6 +585,41 @@ impl Storage for GcsStorage {
 }
 
 impl GcsStorage {
+    async fn read_object_metadata(&self, key: &Key, attempt_timeout: Duration) -> Result<Object> {
+        let mut attempt = 1;
+        loop {
+            let result = tokio::time::timeout(attempt_timeout, self.fetch_object_metadata(key))
+                .await
+                .unwrap_or_else(|_| Err(Error::Busy("GCS object metadata read timed out".into())));
+            match result {
+                Err(Error::Busy(_)) if attempt < MAX_METADATA_ATTEMPTS => {
+                    tokio::time::sleep(Duration::from_millis(100 << (attempt - 1))).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn fetch_object_metadata(&self, key: &Key) -> Result<Object> {
+        let mut url = self.objects_url(false, Some(key));
+        url.query_pairs_mut().append_pair("fields", OBJECT_FIELDS);
+        let response = self
+            .request(Method::GET, url)
+            .await?
+            .send()
+            .await
+            .map_err(transfer_error)?;
+        check(response.status())?;
+        let object = read_metadata::<ObjectMetadata>(response, MAX_CONTROL_BYTES)
+            .await?
+            .object()?;
+        if &object.key != key {
+            return Err(invalid_response("GCS metadata returned a different object"));
+        }
+        Ok(object)
+    }
+
     async fn list_page(
         &self,
         url: Url,
@@ -649,7 +672,7 @@ impl GcsStorage {
             // A retry starts with fresh metadata. Once media headers have been
             // accepted, body retries stay pinned to the chosen generation.
             let opened = tokio::time::timeout(attempt_timeout, async {
-                let object = self.head(key).await?;
+                let object = self.fetch_object_metadata(key).await?;
                 let response = match self
                     .media(key, None, object.version.generation.as_deref())
                     .await
