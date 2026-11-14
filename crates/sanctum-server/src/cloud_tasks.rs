@@ -128,6 +128,10 @@ impl CloudTasks {
             step.unwrap_or(0),
             task.window,
         );
+        if let Some(profile) = task.profile {
+            use std::fmt::Write;
+            write!(identity, "\nprofile={profile}").expect("writing to a string cannot fail");
+        }
         if task.retry != 0 {
             use std::fmt::Write;
             write!(identity, "\n{}", task.retry).expect("writing to a string cannot fail");
@@ -140,6 +144,9 @@ impl CloudTasks {
         });
         if let Some(step) = step {
             body["step"] = json!(step);
+        }
+        if let Some(profile) = task.profile {
+            body["profile"] = json!(profile);
         }
         let body = serde_json::to_vec(&body).map_err(|error| Error::Internal(Box::new(error)))?;
         let mut payload = json!({
@@ -248,6 +255,7 @@ mod tests {
             scope: &scope,
             operation,
             stage,
+            profile: None,
             window,
             retry: 0,
             not_before: None,
@@ -272,6 +280,7 @@ mod tests {
         let scheduled = dispatcher
             .payload(Task {
                 not_before: Some(1_800_000_000),
+                profile: Some("profile-a"),
                 ..task(TaskStage::Embed { step: 2 }, 2)
             })
             .unwrap();
@@ -284,7 +293,15 @@ mod tests {
         let body = STANDARD.decode(http["body"].as_str().unwrap()).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["step"], 2);
+        assert_eq!(body["profile"], "profile-a");
         assert_eq!(body["operation_id"], operation.to_string());
+        let different_profile = dispatcher
+            .payload(Task {
+                profile: Some("profile-b"),
+                ..task(TaskStage::Embed { step: 2 }, 2)
+            })
+            .unwrap();
+        assert_ne!(scheduled["task"]["name"], different_profile["task"]["name"]);
 
         let retry = dispatcher
             .payload(Task {

@@ -1252,3 +1252,18 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   persisted hint and rebuild record, restarted the server, and ran the
   worker's HTTP task handler to restore semantic retrieval. Live Cloud
   Tasks delivery was not exercised. `pnpm check` passed.
+
+## Profile-bound hosted task delivery
+
+- Cloud Tasks embedding and rebuild payloads carry the target profile
+  ID. The task name also includes that ID, and the upload envelope
+  records the profile of its last dispatch. The new profile can
+  redispatch a pending batch within the same window.
+- The dispatch fixture verified distinct names and profile fields.
+  A hosted service test delivered stale and legacy payloads, checked
+  that they left the pending batch intact, and redispatched it under
+  the new profile. The matching worker then published the vector.
+- A standalone worker HTTP smoke on MinIO and real Ollama exercised
+  stale, legacy, and current profile deliveries across restart. It
+  verified that only the matching payload advanced embedding progress
+  and enabled semantic retrieval. Live Cloud Tasks delivery remains open.

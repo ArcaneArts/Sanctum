@@ -28,6 +28,7 @@ pub struct Task<'a> {
     pub scope: &'a Scope,
     pub operation: Uuid,
     pub stage: TaskStage,
+    pub profile: Option<&'a str>,
     pub window: u64,
     pub retry: u32,
     pub not_before: Option<u64>,

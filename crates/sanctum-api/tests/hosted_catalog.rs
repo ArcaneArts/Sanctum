@@ -2659,7 +2659,7 @@ async fn dispatch_reconciliation_recovers_a_failed_handoff_and_advances_its_curs
     assert!(second.next_cursor.is_none());
     assert_eq!(
         &*dispatch.delivered.lock().unwrap(),
-        &[(operation, TaskStage::Register)]
+        &[(operation, TaskStage::Register, None)]
     );
     restarted.try_dispatch(&scope, operation).await;
     assert_eq!(dispatch.delivered.lock().unwrap().len(), 1);
@@ -2669,8 +2669,8 @@ async fn dispatch_reconciliation_recovers_a_failed_handoff_and_advances_its_curs
     assert_eq!(
         &*dispatch.delivered.lock().unwrap(),
         &[
-            (operation, TaskStage::Register),
-            (operation, TaskStage::Index)
+            (operation, TaskStage::Register, None),
+            (operation, TaskStage::Index, None)
         ]
     );
     restarted.index_upload(&scope, operation).await.unwrap();
@@ -2880,7 +2880,11 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
     service.try_dispatch(&scope, operation).await;
     assert_eq!(
         dispatch.delivered.lock().unwrap().last(),
-        Some(&(operation, TaskStage::Embed { step: 0 }))
+        Some(&(
+            operation,
+            TaskStage::Embed { step: 0 },
+            Some("fixture-v1".into())
+        ))
     );
     assert!(matches!(
         service.embed_upload(&scope, operation, 1).await,
@@ -2925,7 +2929,11 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
     restarted.reconcile_shard(0).await.unwrap();
     assert_eq!(
         dispatch.delivered.lock().unwrap().last(),
-        Some(&(operation, TaskStage::Embed { step: 1 }))
+        Some(&(
+            operation,
+            TaskStage::Embed { step: 1 },
+            Some("fixture-v1".into())
+        ))
     );
     restarted.embed_upload(&scope, operation, 0).await.unwrap();
     restarted.embed_upload(&scope, operation, 1).await.unwrap();
@@ -2939,6 +2947,125 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
         .unwrap()
         .into_inner();
     assert!(finished.embedding_work.is_none());
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn profile_change_requeues_an_embedding_batch_without_running_old_deliveries() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let dispatch = Arc::new(TestDispatch {
+        fail: AtomicU8::new(0),
+        delivered: std::sync::Mutex::new(Vec::new()),
+    });
+    let catalog = |profile: Option<&'static str>| {
+        let service = HostedCatalog::new(storage.clone(), None, 1024)
+            .unwrap()
+            .with_dispatch(dispatch.clone());
+        service.with_embedding(profile.map(|profile| {
+            Arc::new(HostedEmbeddingFixture {
+                profile,
+                fail: AtomicU8::new(0),
+                queries: AtomicUsize::new(0),
+            }) as Arc<dyn sanctum_embedding::Provider>
+        }))
+    };
+    let old = catalog(Some("fixture-v1"));
+    let new = catalog(Some("fixture-v2"));
+    let disabled = catalog(None);
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    old.create_collection(&scope, None).await.unwrap();
+    let mut server = start(old.clone()).await;
+    let operation = uuid::Uuid::from_u128(101);
+    let header = v1::UploadTextHeader {
+        scope: Some(v1::Scope {
+            tenant: "default".into(),
+            collection: "notes".into(),
+        }),
+        name: "embed.txt".into(),
+        request_id: Some(operation.to_string()),
+        ..Default::default()
+    };
+    server
+        .client
+        .submit_text(upload_frames(&header, [b"embed me".as_slice()]))
+        .await
+        .unwrap();
+    old.register_upload(&scope, operation).await.unwrap();
+    old.index_upload(&scope, operation).await.unwrap();
+    old.try_dispatch(&scope, operation).await;
+
+    new.deliver_embedding_upload(&scope, operation, 0, Some("fixture-v1"))
+        .await
+        .unwrap();
+    new.deliver_embedding_upload(&scope, operation, 0, None)
+        .await
+        .unwrap();
+    disabled
+        .deliver_embedding_upload(&scope, operation, 0, Some("fixture-v1"))
+        .await
+        .unwrap();
+    disabled.try_dispatch(&scope, operation).await;
+    assert_eq!(
+        new.embedding_status(&scope, None)
+            .await
+            .unwrap()
+            .coverage
+            .embedded,
+        0
+    );
+    new.reconcile_shard(0).await.unwrap();
+    assert_eq!(
+        &dispatch.delivered.lock().unwrap()[1..],
+        &[
+            (
+                operation,
+                TaskStage::Embed { step: 0 },
+                Some("fixture-v1".into())
+            ),
+            (
+                operation,
+                TaskStage::Embed { step: 0 },
+                Some("fixture-v2".into())
+            ),
+        ]
+    );
+
+    old.deliver_embedding_upload(&scope, operation, 0, Some("fixture-v2"))
+        .await
+        .unwrap();
+    assert_eq!(
+        old.embedding_status(&scope, None)
+            .await
+            .unwrap()
+            .coverage
+            .embedded,
+        0
+    );
+    new.deliver_embedding_upload(&scope, operation, 0, Some("fixture-v2"))
+        .await
+        .unwrap();
+    assert_eq!(
+        new.embedding_status(&scope, None)
+            .await
+            .unwrap()
+            .coverage
+            .embedded,
+        1
+    );
+    let job = server
+        .client
+        .get_ingestion_job(v1::IngestionJobRequest {
+            scope: header.scope,
+            operation_id: operation.to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(job.embedding_work.unwrap().next_batch, 1);
     server.stop().await;
 }
 
@@ -3056,8 +3183,10 @@ async fn idle_collections_rebuild_after_a_profile_change() {
         .lock()
         .unwrap()
         .iter()
-        .find_map(|&(operation, stage)| {
-            matches!(stage, TaskStage::Rebuild { step: 0 }).then_some(operation)
+        .find_map(|&(operation, stage, ref profile)| {
+            (matches!(stage, TaskStage::Rebuild { step: 0 })
+                && profile.as_deref() == Some("fixture-v2"))
+            .then_some(operation)
         })
         .unwrap();
     assert!(worker.discover_profile_rebuild().await.unwrap().complete);
@@ -3087,13 +3216,11 @@ async fn idle_collections_rebuild_after_a_profile_change() {
     assert_eq!(semantic.mode(), v1::SearchMode::Semantic);
     server.stop().await;
     second.try_dispatch_rebuild(&scope, operation).await;
-    assert!(
-        dispatch
-            .delivered
-            .lock()
-            .unwrap()
-            .contains(&(operation, TaskStage::Rebuild { step: 1 }))
-    );
+    assert!(dispatch.delivered.lock().unwrap().contains(&(
+        operation,
+        TaskStage::Rebuild { step: 1 },
+        Some("fixture-v2".into())
+    )));
     second
         .run_profile_rebuild(&scope, operation, 0)
         .await
@@ -3121,7 +3248,7 @@ async fn idle_collections_rebuild_after_a_profile_change() {
 
 struct TestDispatch {
     fail: AtomicU8,
-    delivered: std::sync::Mutex<Vec<(uuid::Uuid, TaskStage)>>,
+    delivered: std::sync::Mutex<Vec<(uuid::Uuid, TaskStage, Option<String>)>>,
 }
 
 #[async_trait::async_trait]
@@ -3130,10 +3257,11 @@ impl sanctum_service::Dispatch for TestDispatch {
         if self.fail.swap(0, Ordering::Relaxed) != 0 {
             return Err(Error::Busy("dispatch interrupted".into()));
         }
-        self.delivered
-            .lock()
-            .unwrap()
-            .push((task.operation, task.stage));
+        self.delivered.lock().unwrap().push((
+            task.operation,
+            task.stage,
+            task.profile.map(str::to_owned),
+        ));
         Ok(())
     }
 }
