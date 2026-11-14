@@ -555,20 +555,22 @@ impl Storage for GcsStorage {
         limit: u32,
     ) -> Result<ListPage> {
         let limit = list_limit(limit)?;
+        let prefix = prefix.map(|prefix| format!("{prefix}/"));
         let mut url = self.objects_url(false, None);
         {
             let mut query = url.query_pairs_mut();
             query
                 .append_pair("maxResults", &limit.to_string())
                 .append_pair("fields", LIST_FIELDS);
-            if let Some(prefix) = prefix {
-                query.append_pair("prefix", &format!("{prefix}/"));
+            if let Some(prefix) = &prefix {
+                query.append_pair("prefix", prefix);
             }
             if let Some(cursor) = cursor {
                 query.append_pair("pageToken", cursor);
             }
         }
-        self.list_page(url, limit, LIST_ATTEMPT_TIMEOUT).await
+        self.list_page(url, prefix.as_deref(), limit, LIST_ATTEMPT_TIMEOUT)
+            .await
     }
 
     async fn delete(&self, key: &Key) -> Result<()> {
@@ -625,6 +627,7 @@ impl GcsStorage {
     async fn list_page(
         &self,
         url: Url,
+        prefix: Option<&str>,
         limit: usize,
         attempt_timeout: Duration,
     ) -> Result<ListPage> {
@@ -648,7 +651,14 @@ impl GcsStorage {
                 let objects = page
                     .items
                     .into_iter()
-                    .map(ObjectMetadata::object)
+                    .map(|item| {
+                        if prefix.is_some_and(|prefix| !item.name.starts_with(prefix)) {
+                            return Err(invalid_response(
+                                "GCS listing returned an object outside its prefix",
+                            ));
+                        }
+                        item.object()
+                    })
                     .collect::<Result<_>>()?;
                 Ok(ListPage {
                     objects,

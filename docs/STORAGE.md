@@ -21,7 +21,10 @@ version ID when present before releasing resumed bytes. The stream also
 enforces the declared length. Higher-level retrieval verifies the chunk
 digest against its database record. [S3 GetObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html).
 Listing returns sizes and a continuation cursor. Usage sums actual stored
-object lengths and includes its measurement window.
+object lengths and includes its measurement window. S3 and GCS reject a
+listing page if it exceeds the requested item count or contains an object
+outside the requested prefix. Usage and reclamation consume a page only
+after these checks pass.
 
 ## Local validation
 
