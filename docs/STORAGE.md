@@ -103,8 +103,14 @@ and replaces them using the returned generation. Full downloads fence
 the media request to the generation from the metadata response. When a
 writer replaces or removes that generation between the requests, the
 adapter reads fresh metadata before retrying the media request. It returns
-a retryable error if the generation keeps changing across four attempts. Range
-reads require a 206 response and verify the exact interval and length.
+a retryable error if the generation keeps changing across four attempts.
+Once a full download starts, the adapter can resume an interrupted body
+at the next undelivered byte using a range request pinned to the original
+generation. It checks the resumed interval and object length and attempts
+at most four resumes without forward progress. If the pinned generation
+is replaced midstream, the reader fails so the caller can restart from
+fresh metadata. Range reads require a 206 response and verify the exact
+interval and length. [GCS object downloads](https://docs.cloud.google.com/storage/docs/json_api/v1/objects/get).
 Bulk transfers use bounded 8 MiB parts in a GCS resumable upload
 session. After an interrupted request or retryable HTTP failure,
 the adapter asks GCS for its persisted offset and resumes from that byte.

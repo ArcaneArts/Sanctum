@@ -7,8 +7,9 @@ use axum::{
     response::IntoResponse,
     routing::{get, post, put},
 };
+use futures::StreamExt;
 use serde_json::json;
-use tokio::{io::repeat, net::TcpListener};
+use tokio::{io::repeat, net::TcpListener, sync::Notify};
 
 use super::*;
 
@@ -26,6 +27,7 @@ struct Fixture {
     writes: Mutex<Vec<String>>,
     parts: Mutex<Vec<String>>,
     reads: Mutex<Vec<String>>,
+    interrupt_download: Arc<Notify>,
 }
 
 async fn start() -> (GcsStorage, Arc<Fixture>, tokio::task::JoinHandle<()>) {
@@ -128,6 +130,9 @@ async fn object(
     headers: HeaderMap,
 ) -> axum::response::Response {
     assert_credentials(&headers);
+    if let Some(scenario) = key.strip_prefix("default/notes/resume-") {
+        return download_object(&fixture, &key, scenario, &query, &headers);
+    }
     if key.ends_with("/replaced") || key.ends_with("/removed") || key.ends_with("/changing") {
         return changing_object(
             &fixture,
@@ -213,6 +218,68 @@ fn metadata(name: &str, size: u64, generation: u64) -> serde_json::Value {
         "name": name, "size": size.to_string(), "generation": generation.to_string(),
         "etag": "same-etag", "updated": "2026-11-13T09:00:00.123Z",
     })
+}
+
+fn download_object(
+    fixture: &Fixture,
+    key: &str,
+    scenario: &str,
+    query: &std::collections::HashMap<String, String>,
+    headers: &HeaderMap,
+) -> axum::response::Response {
+    let mut calls = fixture.reads.lock().unwrap();
+    if !query.contains_key("alt") {
+        calls.push("metadata".into());
+        return Json(metadata(key, 10, 11)).into_response();
+    }
+    assert_eq!(query["alt"], "media");
+    assert_eq!(query["ifGenerationMatch"], "11");
+    let range = header_value(headers, header::RANGE);
+    calls.push(range.unwrap_or("full").into());
+    if range.is_none() {
+        let ready = fixture.interrupt_download.clone();
+        let body = futures::stream::iter([Ok(Bytes::from_static(b"abc"))]).chain(
+            futures::stream::once(async move {
+                ready.notified().await;
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "fixture interrupted the body",
+                ))
+            }),
+        );
+        return (StatusCode::OK, Body::from_stream(body)).into_response();
+    }
+    match (scenario, calls.len()) {
+        ("success", 3) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        ("success", 4) => (
+            StatusCode::PARTIAL_CONTENT,
+            [(header::CONTENT_RANGE, "bytes 3-9/10")],
+            Body::from_stream(futures::stream::iter([Ok::<_, io::Error>(
+                Bytes::from_static(b"def"),
+            )])),
+        )
+            .into_response(),
+        ("success", 5) => (
+            StatusCode::PARTIAL_CONTENT,
+            [(header::CONTENT_RANGE, "bytes 6-9/10")],
+            "ghij",
+        )
+            .into_response(),
+        ("replaced", 3) => StatusCode::PRECONDITION_FAILED.into_response(),
+        ("wrong-total", 3) => (
+            StatusCode::PARTIAL_CONTENT,
+            [(header::CONTENT_RANGE, "bytes 3-9/11")],
+            "defghij",
+        )
+            .into_response(),
+        ("stalled", _) => (
+            StatusCode::PARTIAL_CONTENT,
+            [(header::CONTENT_RANGE, "bytes 3-9/10")],
+            Body::from_stream(futures::stream::empty::<io::Result<Bytes>>()),
+        )
+            .into_response(),
+        _ => panic!("unexpected resumed download for {scenario}"),
+    }
 }
 
 #[tokio::test]
@@ -325,6 +392,79 @@ async fn download_returns_retryable_error_when_every_generation_is_replaced() {
         ],
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn full_download_resumes_the_same_generation_at_delivered_byte_offsets() {
+    let (storage, fixture, server) = start().await;
+    let key = Key::parse("default/notes/resume-success").unwrap();
+    let mut download = storage.get(&key).await.unwrap();
+    assert_eq!(download.object.version.generation.as_deref(), Some("11"));
+    let mut result = interrupt_body(&mut download, &fixture).await;
+    download.reader.read_to_end(&mut result).await.unwrap();
+    assert_eq!(result, b"abcdefghij");
+    assert_eq!(
+        *fixture.reads.lock().unwrap(),
+        ["metadata", "full", "bytes=3-9", "bytes=3-9", "bytes=6-9"],
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn full_download_rejects_a_replaced_generation_or_different_length() {
+    for name in ["replaced", "wrong-total"] {
+        let (storage, fixture, server) = start().await;
+        let key = Key::parse(format!("default/notes/resume-{name}")).unwrap();
+        let mut download = storage.get(&key).await.unwrap();
+        let mut result = interrupt_body(&mut download, &fixture).await;
+        assert!(download.reader.read_to_end(&mut result).await.is_err());
+        assert_eq!(result, b"abc");
+        assert_eq!(
+            *fixture.reads.lock().unwrap(),
+            ["metadata", "full", "bytes=3-9"]
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn full_download_stops_retrying_when_no_more_bytes_arrive() {
+    let (storage, fixture, server) = start().await;
+    let key = Key::parse("default/notes/resume-stalled").unwrap();
+    let mut download = storage.get(&key).await.unwrap();
+    let mut result = interrupt_body(&mut download, &fixture).await;
+    let error = download.reader.read_to_end(&mut result).await.unwrap_err();
+    assert!(matches!(
+        error.get_ref().and_then(|error| error.downcast_ref()),
+        Some(Error::Busy(_))
+    ));
+    assert_eq!(result, b"abc");
+    assert_eq!(
+        *fixture.reads.lock().unwrap(),
+        [
+            "metadata",
+            "full",
+            "bytes=3-9",
+            "bytes=3-9",
+            "bytes=3-9",
+            "bytes=3-9"
+        ],
+    );
+    server.abort();
+}
+
+async fn interrupt_body(download: &mut Download, fixture: &Fixture) -> Vec<u8> {
+    let mut first = vec![0; 3];
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        download.reader.read_exact(&mut first),
+    )
+    .await
+    .expect("fixture sent part of the response body")
+    .unwrap();
+    assert_eq!(first, b"abc");
+    fixture.interrupt_download.notify_one();
+    first
 }
 
 const RECOVERY_LENGTH: u64 = 2 * PART_BYTES + 7;
