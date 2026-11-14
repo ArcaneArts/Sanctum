@@ -192,16 +192,7 @@ impl Service {
         let original_hash = extracted
             .as_ref()
             .map_or(&indexed.hash, |input| &input.original_hash);
-        if job
-            .import_hash
-            .as_ref()
-            .is_some_and(|hash| hash != original_hash)
-        {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "queued import does not match its accepted digest",
-            )));
-        }
+        verify_original_digest(job, original_hash)?;
         let content = RevisionContent {
             original_hash: original_hash.clone(),
             hash: indexed.hash,
@@ -247,8 +238,12 @@ impl Service {
         if let Some(prepared) = &job.rtf_preparation {
             if prepared.extractor == RTF_EXTRACTOR && self.matches_saved_text(job, prepared)? {
                 if job.retain_original {
-                    self.files
-                        .open_original(&job.scope, job.source, job.revision)?;
+                    let original =
+                        self.files
+                            .open_original(&job.scope, job.source, job.revision)?;
+                    let mut hash = blake3::Hasher::new();
+                    hash.update_reader(original.take(job.bytes.saturating_add(1)))?;
+                    verify_original_digest(job, hash.finalize().to_hex().as_str())?;
                 }
                 if job.extracting && !self.queue.extracted(job.id, prepared)? {
                     return Err(Error::Conflict("extraction canceled".into()));
@@ -304,18 +299,7 @@ impl Service {
             )
             .into());
         }
-        let previously_verified = job
-            .rtf_preparation
-            .as_ref()
-            .map(|prepared| prepared.original_hash.as_str())
-            .or(job.import_hash.as_deref());
-        if previously_verified.is_some_and(|expected| expected != original_hash) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "staged RTF no longer matches its recorded digest",
-            )
-            .into());
-        }
+        verify_original_digest(job, &original_hash)?;
         let preparation = RtfPreparation {
             original_hash,
             canonical_hash: output.hash.finalize().to_hex().to_string(),
@@ -330,6 +314,25 @@ impl Service {
         }
         Ok(preparation)
     }
+}
+
+fn verify_original_digest(job: &Job, digest: &str) -> Result<()> {
+    let expected = job
+        .upload_hash
+        .as_deref()
+        .or(job.import_hash.as_deref())
+        .or(job
+            .rtf_preparation
+            .as_ref()
+            .map(|prepared| prepared.original_hash.as_str()));
+    if expected.is_some_and(|expected| expected != digest) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staged source no longer matches its accepted digest",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn revision_for(job: &Job, content: RevisionContent) -> Revision {
@@ -357,7 +360,7 @@ impl StagedUpload {
         if request.is_some_and(|id| id.is_nil()) {
             return Err(Error::Invalid("request ID must be a nonzero UUID".into()));
         }
-        let fingerprint = request.map(|_| self.upload_fingerprint()).transpose()?;
+        let (digest, fingerprint) = self.hash_upload(bytes, request.is_some())?;
         let receipt = request.zip(fingerprint.as_deref());
         let service = self.service.clone();
         let _guard = receipt
@@ -382,15 +385,20 @@ impl StagedUpload {
             }
         }
         if self.upload.replacement.is_none() {
-            return self.accept_upload(bytes, receipt);
+            return self.accept_upload(bytes, digest, receipt);
         }
         let scope = self.scope.clone();
         service
             .local_writes
-            .run(&scope, || self.accept_upload(bytes, receipt))
+            .run(&scope, || self.accept_upload(bytes, digest, receipt))
     }
 
-    fn accept_upload(self, bytes: u64, receipt: Option<(Uuid, &str)>) -> Result<Job> {
+    fn accept_upload(
+        self,
+        bytes: u64,
+        digest: String,
+        receipt: Option<(Uuid, &str)>,
+    ) -> Result<Job> {
         let replacement = self.upload.replacement.as_ref();
         let (source, external) = if let Some(replacement) = replacement {
             let current = self
@@ -419,7 +427,7 @@ impl StagedUpload {
         } else {
             (Uuid::new_v4(), self.upload.external.clone())
         };
-        let job = new_job(
+        let mut job = new_job(
             self.scope.clone(),
             self.upload.name.clone(),
             external,
@@ -427,17 +435,48 @@ impl StagedUpload {
             bytes,
             replacement.is_some(),
         );
+        job.upload_hash = Some(digest);
         self.publish_job_locked(job, receipt)
     }
 
-    fn upload_fingerprint(&self) -> Result<String> {
-        let header =
-            serde_json::to_vec(&self.upload).map_err(|error| Error::Internal(Box::new(error)))?;
-        let mut hash = blake3::Hasher::new();
-        hash.update(&(header.len() as u64).to_le_bytes());
-        hash.update(&header);
-        hash.update_reader(self.file.reopen()?)?;
-        Ok(hash.finalize().to_hex().to_string())
+    fn hash_upload(&self, bytes: u64, with_fingerprint: bool) -> Result<(String, Option<String>)> {
+        let mut fingerprint = if with_fingerprint {
+            // Preserve the request receipt format for uploads accepted by older servers.
+            let header = serde_json::to_vec(&self.upload)
+                .map_err(|error| Error::Internal(Box::new(error)))?;
+            let mut hash = blake3::Hasher::new();
+            hash.update(&(header.len() as u64).to_le_bytes());
+            hash.update(&header);
+            Some(hash)
+        } else {
+            None
+        };
+        let mut input = self.file.reopen()?.take(bytes.saturating_add(1));
+        let mut content = blake3::Hasher::new();
+        let mut buffer = [0; 64 * 1024];
+        let mut read_total = 0;
+        loop {
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            read_total += read as u64;
+            content.update(&buffer[..read]);
+            if let Some(hash) = &mut fingerprint {
+                hash.update(&buffer[..read]);
+            }
+        }
+        if read_total != bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "staged upload changed size before acceptance",
+            )
+            .into());
+        }
+        Ok((
+            content.finalize().to_hex().to_string(),
+            fingerprint.map(|hash| hash.finalize().to_hex().to_string()),
+        ))
     }
 
     pub(crate) fn publish_job_locked(
@@ -490,6 +529,7 @@ pub(crate) fn new_job(
         replacement,
         update_sequence: 0,
         import_hash: None,
+        upload_hash: None,
         extract_rtf,
         retain_original: false,
         extracting: false,

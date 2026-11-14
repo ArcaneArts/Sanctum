@@ -77,6 +77,18 @@ the client, MinIO, and files on disk. Original retention and embeddings
 were disabled. The totals include the storage observed immediately after
 publication and retrieval.
 
+### Local uploads with acceptance digests
+
+The release build with acceptance digests ran both 200 MiB filesystem
+benchmarks sequentially on Apple M4 Max with request IDs and embeddings
+disabled. MCP returned the same exact end-of-file ranges described above.
+Original retention was disabled for the RTF run.
+
+| Format | Upload to acceptance | Acceptance to text ready | Total | Sampled peak server RSS |
+| --- | ---: | ---: | ---: | ---: |
+| UTF-8 | 0.325 s | 4.662 s | 4.987 s | 30,261,248 bytes (25 samples) |
+| RTF | 0.336 s | 6.977 s | 7.313 s | 30,916,608 bytes (36 samples) |
+
 ## SQLite snapshot transfer and publication
 
 The MinIO benchmark publishes synthetic SQLite databases with about 1 GiB

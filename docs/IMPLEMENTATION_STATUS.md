@@ -88,6 +88,15 @@ Merged in [PR #3](https://github.com/ArcaneArts/Sanctum/pull/3).
 - The gRPC tests cover persisted pause and acceptance, tenant-scoped cancellation,
   recovery from a missing receipt, and retry after a storage read failure.
 - Caller-provided upload request IDs were added in a later cycle.
+- Local uploads now save the accepted input's BLAKE3 digest in `runtime.db`.
+  The worker verifies it before publishing text and also checks retained RTF
+  originals when resuming from an extraction checkpoint. A generated Python
+  gRPC client accepted UTF-8 and RTF inputs, replaced both staged files with
+  same-size test data, and killed the standalone release server. After restart,
+  both jobs failed without publishing. Restoring the original files and retrying
+  published the same revision IDs and replayed the RTF request receipt.
+  [200 MiB ingestion measurements](CAPACITY.md#local-uploads-with-acceptance-digests),
+  [PR #138](https://github.com/ArcaneArts/Sanctum/pull/138).
 - Startup settles recorded pre-publication cancellations before workers
   claim jobs. The local gRPC regression verified terminal status, removal of
   staged RTF and queued metadata, and replay of the canceled receipt while
