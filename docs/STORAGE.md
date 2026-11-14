@@ -143,11 +143,12 @@ generation. It checks the resumed interval and object length and attempts
 at most four resumes without forward progress. If the pinned generation
 is replaced midstream, the reader fails so the caller can restart from
 fresh metadata. Range reads require a 206 response and verify the exact
-interval and length. A transient HTTP error or broken connection can
-retry the same bounded range up to three total attempts within 15 seconds.
-Each attempt has five seconds and starts with an empty buffer. The GCS
-range log counts received body bytes across attempts. Missing objects
-and invalid range responses return immediately.
+interval and length. A transient HTTP error, broken connection, or body
+that ends before the advertised interval is complete can retry the same
+bounded range up to three total attempts within 15 seconds. Each attempt
+has five seconds and starts with an empty buffer. The GCS range log counts
+received body bytes across attempts. Missing objects, invalid response
+headers, and bodies that exceed the requested range return immediately.
 [GCS object downloads](https://docs.cloud.google.com/storage/docs/json_api/v1/objects/get),
 [retry behavior](https://docs.cloud.google.com/storage/docs/retry-strategy).
 

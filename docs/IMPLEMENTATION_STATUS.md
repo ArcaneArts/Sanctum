@@ -2378,6 +2378,12 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   exhausted retries, a missing object, and an incorrect range header.
   Each attempt has five seconds, with three attempts and a 15-second
   overall budget. [PR #136](https://github.com/ArcaneArts/Sanctum/pull/136).
+- The GCS adapter also retries when a correctly framed range response
+  closes cleanly with a short body. The loopback fixture returned two
+  bytes for a four-byte range with a valid `Content-Range`. A retry
+  returned the exact four bytes. Repeated short bodies exhausted the
+  three-attempt limit and returned a retryable storage error.
+  [Range validation and retry](STORAGE.md#google-cloud-storage-adapter).
 
 ### GCS retries before opening a download
 
