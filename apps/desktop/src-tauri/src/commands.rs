@@ -182,13 +182,26 @@ pub(crate) async fn overview(host: State<'_, Host>, collection: Option<String>) 
         .into_iter()
         .map(|job| {
             let state = job.state();
+            let preparation = job.preparation.and_then(|preparation| preparation.outcome);
+            let error = match &preparation {
+                Some(v1::hosted_preparation::Outcome::InvalidSource(message)) => {
+                    Some(message.clone())
+                }
+                _ => job.error_message,
+            };
             Job {
                 collection: job.scope.map_or_else(String::new, |scope| scope.collection),
                 id: job.operation_id,
                 name: job.name,
                 state: match state {
                     v1::IngestionState::Accepted => "Queued",
-                    v1::IngestionState::Registered => "Registered",
+                    v1::IngestionState::Registered => match preparation {
+                        Some(v1::hosted_preparation::Outcome::Ready(_)) => "Awaiting indexing",
+                        Some(v1::hosted_preparation::Outcome::InvalidSource(_)) => {
+                            "Source validation failed"
+                        }
+                        None => "Registered",
+                    },
                     v1::IngestionState::Extracting => "Extracting",
                     v1::IngestionState::Indexing => "Indexing",
                     v1::IngestionState::Publishing => "Publishing",
@@ -201,7 +214,7 @@ pub(crate) async fn overview(host: State<'_, Host>, collection: Option<String>) 
                 total_bytes: job.total_bytes,
                 processed_bytes: job.processed_bytes,
                 attempts: job.attempts,
-                error: job.error_message,
+                error,
                 retryable: job.error_code.as_deref() == Some("retryable")
                     || (!filesystem
                         && (matches!(

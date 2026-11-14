@@ -2000,6 +2000,19 @@ async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf()
     ));
     catalog.register_upload(&scope, id).await.unwrap();
     catalog.try_dispatch(&scope, id).await;
+    let request = v1::IngestionJobRequest {
+        scope: Some(wire.clone()),
+        operation_id: id.to_string(),
+    };
+    let registered = server
+        .client
+        .get_ingestion_job(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(registered.state(), v1::IngestionState::Registered);
+    assert_eq!(registered.processed_bytes, 0);
+    assert!(registered.preparation.is_none());
     storage.interrupt.store(2, Ordering::Relaxed);
     assert!(matches!(
         catalog.prepare_upload(&scope, id).await,
@@ -2020,6 +2033,36 @@ async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf()
         ]
     );
     let mut server = start(restarted.clone()).await;
+    let prepared = server
+        .client
+        .get_ingestion_job(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(prepared.state(), v1::IngestionState::Registered);
+    assert_eq!(prepared.processed_bytes, rtf.len() as u64);
+    assert!(prepared.text_revision.is_none());
+    assert_eq!(
+        prepared.preparation,
+        Some(v1::HostedPreparation {
+            outcome: Some(v1::hosted_preparation::Outcome::Ready(v1::PreparedText {
+                canonical_bytes: "durably prepared café".len() as u64,
+                chunks: 1,
+            })),
+        })
+    );
+    let activity = server
+        .client
+        .list_ingestion_jobs(v1::ListIngestionJobsRequest {
+            tenant: "default".into(),
+            collection: Some("notes".into()),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(activity.jobs, [prepared]);
     let query = || v1::SearchTextRequest {
         scope: Some(wire.clone()),
         query: "durably".into(),
@@ -2047,6 +2090,14 @@ async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf()
         sanctum_service::HostedJobState::TextReady
     ));
     restarted.index_upload(&scope, id).await.unwrap();
+    let published = server
+        .client
+        .get_ingestion_job(request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(published.state(), v1::IngestionState::TextReady);
+    assert!(published.preparation.is_none());
     let hits = server
         .client
         .search_text(query())
@@ -2069,6 +2120,50 @@ async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf()
             .objects
             .is_empty()
     );
+    storage.interrupt.store(0, Ordering::Relaxed);
+    let invalid = uuid::Uuid::from_u128(201);
+    let invalid_header = v1::UploadTextHeader {
+        request_id: Some(invalid.to_string()),
+        name: "invalid.txt".into(),
+        ..header
+    };
+    server
+        .client
+        .submit_text(upload_frames(&invalid_header, [[0xff].as_slice()]))
+        .await
+        .unwrap();
+    restarted.register_upload(&scope, invalid).await.unwrap();
+    restarted.prepare_upload(&scope, invalid).await.unwrap();
+    let request = v1::IngestionJobRequest {
+        scope: Some(wire),
+        operation_id: invalid.to_string(),
+    };
+    let prepared = server
+        .client
+        .get_ingestion_job(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(prepared.state(), v1::IngestionState::Registered);
+    assert_eq!(prepared.processed_bytes, 0);
+    assert!(prepared.error_code.is_none());
+    let Some(v1::hosted_preparation::Outcome::InvalidSource(message)) = prepared
+        .preparation
+        .and_then(|preparation| preparation.outcome)
+    else {
+        panic!("expected a durable validation error");
+    };
+    restarted.index_upload(&scope, invalid).await.unwrap();
+    let failed = server
+        .client
+        .get_ingestion_job(request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(failed.state(), v1::IngestionState::Failed);
+    assert_eq!(failed.error_code.as_deref(), Some("invalid_source"));
+    assert_eq!(failed.error_message, Some(message));
+    assert!(failed.preparation.is_none());
     server.stop().await;
 }
 

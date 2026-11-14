@@ -916,6 +916,19 @@ fn print_job(job: v1::IngestionJob) {
         job.total_bytes,
         job.attempts,
     );
+    if let Some(preparation) = job.preparation.and_then(|preparation| preparation.outcome) {
+        match preparation {
+            v1::hosted_preparation::Outcome::Ready(text) => {
+                println!(
+                    "Awaiting indexing ({} canonical bytes, {} chunks)",
+                    text.canonical_bytes, text.chunks
+                );
+            }
+            v1::hosted_preparation::Outcome::InvalidSource(message) => {
+                println!("Source validation failed during preparation: {message}");
+            }
+        }
+    }
     if let Some(work) = job.embedding_work {
         println!("Next embedding batch: {}", work.next_batch);
         if let Some(when) = work.not_before_unix_seconds {

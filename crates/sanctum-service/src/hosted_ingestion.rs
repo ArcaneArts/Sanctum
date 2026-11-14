@@ -46,11 +46,13 @@ pub struct HostedJob {
     pub name: String,
     pub external: Option<ExternalSource>,
     pub bytes: u64,
+    pub processed_bytes: u64,
     pub created_at: u64,
     pub update_sequence: u64,
     pub state: HostedJobState,
     pub content: Option<RevisionContent>,
     pub embedding_work: Option<HostedEmbeddingWork>,
+    pub preparation: Option<HostedPreparation>,
 }
 
 impl HostedJob {
@@ -77,6 +79,11 @@ impl HostedJob {
 pub struct HostedEmbeddingWork {
     pub next_batch: u32,
     pub not_before: Option<u64>,
+}
+
+pub enum HostedPreparation {
+    Ready { canonical_bytes: u64, chunks: u64 },
+    InvalidSource(String),
 }
 
 pub enum HostedJobState {
@@ -866,6 +873,20 @@ impl Operation {
     }
 
     fn job(self) -> HostedJob {
+        let preparation = match &self.stage {
+            Stage::PendingIndexing {
+                preparation: Some(preparation),
+                ..
+            } => Some(preparation.status()),
+            _ => None,
+        };
+        let processed_bytes = if matches!(self.stage, Stage::TextReady { .. })
+            || matches!(preparation, Some(HostedPreparation::Ready { .. }))
+        {
+            self.bytes
+        } else {
+            0
+        };
         let embedding_work = match &self.stage {
             Stage::TextReady {
                 embedding: Some(step),
@@ -912,11 +933,13 @@ impl Operation {
             name: self.upload.name,
             external,
             bytes: self.bytes,
+            processed_bytes,
             created_at: self.created_at,
             update_sequence,
             state,
             content,
             embedding_work,
+            preparation,
         }
     }
 

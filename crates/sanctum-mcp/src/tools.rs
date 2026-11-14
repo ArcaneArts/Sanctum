@@ -10,9 +10,9 @@ use rmcp::{
 };
 use sanctum_core::{Error, ExternalSource, Result as SanctumResult, Scope, ScopeId};
 use sanctum_service::{
-    ChunkRef, Hit, HostedCatalog, HostedJob, HostedJobState, Job, JobState, MetadataEdit,
-    MetadataEntry, MetadataMutation, Replacement, RevisionTarget, ScanOptions, SearchMode, Service,
-    TextUpload,
+    ChunkRef, Hit, HostedCatalog, HostedJob, HostedJobState, HostedPreparation, Job, JobState,
+    MetadataEdit, MetadataEntry, MetadataMutation, Replacement, RevisionTarget, ScanOptions,
+    SearchMode, Service, TextUpload,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -751,10 +751,16 @@ fn hosted_job_value(scope: &Scope, job: HostedJob) -> Value {
         "revision_id": job.revision.to_string(),
         "state": state,
         "total_bytes": job.bytes,
-        "processed_bytes": if job.content.is_some() { job.bytes } else { 0 },
+        "processed_bytes": job.processed_bytes,
         "update_sequence": job.update_sequence,
         "created_at_unix_seconds": job.created_at,
         "failure": failure,
+        "preparation": job.preparation.map(|preparation| match preparation {
+            HostedPreparation::Ready { canonical_bytes, chunks } => json!({
+                "ready": { "canonical_bytes": canonical_bytes, "chunks": chunks },
+            }),
+            HostedPreparation::InvalidSource(message) => json!({"invalid_source": message}),
+        }),
         "embedding_work": job.embedding_work.map(|work| json!({
             "next_batch": work.next_batch,
             "not_before_unix_seconds": work.not_before,

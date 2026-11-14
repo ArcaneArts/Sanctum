@@ -37,6 +37,18 @@ pub(super) enum Preparation {
     Invalid(String),
 }
 
+impl Preparation {
+    pub(super) fn status(&self) -> super::HostedPreparation {
+        match self {
+            Self::Ready(canonical) => super::HostedPreparation::Ready {
+                canonical_bytes: canonical.content.bytes,
+                chunks: canonical.content.chunks,
+            },
+            Self::Invalid(message) => super::HostedPreparation::InvalidSource(message.clone()),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub(super) struct Canonical {
     content: RevisionContent,

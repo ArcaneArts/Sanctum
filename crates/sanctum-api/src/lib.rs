@@ -8,9 +8,9 @@ use sanctum_proto::v1::{
     upload_text_frame::Frame,
 };
 use sanctum_service::{
-    ChunkRef, GitRepository, Hit, HostedCatalog, HostedJob, HostedJobState, ImportEvent,
-    ImportOptions, ImportState, Job, JobState, Replacement, ScanOptions, ScanStop, Service,
-    TextUpload, WatchedFolder,
+    ChunkRef, GitRepository, Hit, HostedCatalog, HostedJob, HostedJobState, HostedPreparation,
+    ImportEvent, ImportOptions, ImportState, Job, JobState, Replacement, ScanOptions, ScanStop,
+    Service, TextUpload, WatchedFolder,
 };
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -1695,11 +1695,7 @@ fn wire_hosted_job(scope: &Scope, job: HostedJob) -> v1::IngestionJob {
         name: job.name,
         external,
         total_bytes: job.bytes,
-        processed_bytes: if state == v1::IngestionState::TextReady {
-            job.bytes
-        } else {
-            0
-        },
+        processed_bytes: job.processed_bytes,
         state: state.into(),
         error_code,
         error_message,
@@ -1709,6 +1705,22 @@ fn wire_hosted_job(scope: &Scope, job: HostedJob) -> v1::IngestionJob {
         embedding_work: job.embedding_work.map(|work| v1::HostedEmbeddingWork {
             next_batch: work.next_batch,
             not_before_unix_seconds: work.not_before,
+        }),
+        preparation: job.preparation.map(|preparation| {
+            use v1::hosted_preparation::Outcome;
+            let outcome = match preparation {
+                HostedPreparation::Ready {
+                    canonical_bytes,
+                    chunks,
+                } => Outcome::Ready(v1::PreparedText {
+                    canonical_bytes,
+                    chunks,
+                }),
+                HostedPreparation::InvalidSource(message) => Outcome::InvalidSource(message),
+            };
+            v1::HostedPreparation {
+                outcome: Some(outcome),
+            }
         }),
         ..Default::default()
     }
@@ -1746,6 +1758,7 @@ fn wire_job(job: Job) -> v1::IngestionJob {
         update_sequence: job.update_sequence,
         created_at_unix_seconds: job.created_at,
         embedding_work: None,
+        preparation: None,
         url: job.url.map(wire_url),
         git: job.git.map(wire_git),
     }
