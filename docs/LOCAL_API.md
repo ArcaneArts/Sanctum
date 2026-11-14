@@ -782,6 +782,9 @@ query reads the tenant catalog. Queries include only current, non-deleted
 source revisions and their chunks. Fields and filters can refer to an
 entity's own level or an ancestor. For example, group chunks by a
 source-level tag and filter them by a collection-level flag.
+Hosted source and chunk queries use a single tenant catalog generation to
+verify membership and read any collection metadata used by the query. They
+read the collection's published database separately.
 
 Use the same namespaced keys and literal path segments as search filters.
 `list.sort_by` returns the selected JSON value with each target. The

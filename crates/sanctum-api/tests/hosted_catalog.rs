@@ -5016,7 +5016,7 @@ async fn hosted_metadata_is_atomic_and_filters_published_revisions() {
     };
 
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let service = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
     let mut server = start(service.clone()).await;
     let scope = sanctum_core::Scope {
@@ -5134,7 +5134,12 @@ async fn hosted_metadata_is_atomic_and_filters_published_revisions() {
     }
 
     server.stop().await;
-    let mut server = start(HostedCatalog::new(storage, None, 1024).unwrap()).await;
+    let mut server = start(
+        HostedCatalog::new(storage.clone(), None, 1024)
+            .unwrap()
+            .with_snapshot_cache_bytes(0),
+    )
+    .await;
     for (target, index) in indexes {
         assert_eq!(
             server
@@ -5280,6 +5285,8 @@ async fn hosted_metadata_is_atomic_and_filters_published_revisions() {
         })),
         ..Default::default()
     };
+    let reads = storage.catalog_reads.load(Ordering::Relaxed);
+    let downloads = storage.catalog_downloads.load(Ordering::Relaxed);
     let groups = server
         .client
         .query_metadata(grouped)
@@ -5290,6 +5297,40 @@ async fn hosted_metadata_is_atomic_and_filters_published_revisions() {
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].count, 1);
     assert_eq!(groups[0].value_json.as_deref(), Some("null"));
+    assert_eq!(storage.catalog_reads.load(Ordering::Relaxed), reads + 1);
+    assert_eq!(
+        storage.catalog_downloads.load(Ordering::Relaxed),
+        downloads + 1
+    );
+
+    // A collection field may be used by the selected view even without a filter.
+    let page = server
+        .client
+        .query_metadata(v1::QueryMetadataRequest {
+            tenant: "default".into(),
+            collection: Some("notes".into()),
+            level: MetadataLevel::Source.into(),
+            view: Some(View::List(v1::MetadataList {
+                sort_by: Some(v1::MetadataField {
+                    level: MetadataLevel::Collection.into(),
+                    namespace: "integration".into(),
+                    key: "status".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(page.matches.len(), 1);
+    assert_eq!(page.matches[0].value_json.as_deref(), Some("true"));
+    assert_eq!(storage.catalog_reads.load(Ordering::Relaxed), reads + 2);
+    assert_eq!(
+        storage.catalog_downloads.load(Ordering::Relaxed),
+        downloads + 2
+    );
 
     for (tenant, expected) in [("default", 1), ("other", 0)] {
         let result = server

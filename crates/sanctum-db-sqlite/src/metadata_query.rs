@@ -43,6 +43,24 @@ pub struct Query {
     pub limit: u32,
 }
 
+impl Query {
+    fn field(&self) -> Option<&Field> {
+        match &self.view {
+            View::List { sort, .. } => sort.as_ref(),
+            View::Count { group_by } => group_by.as_ref(),
+        }
+    }
+
+    pub fn uses_collection_metadata(&self) -> bool {
+        self.field()
+            .is_some_and(|field| field.level == Level::Collection)
+            || self
+                .filter
+                .as_ref()
+                .is_some_and(Filter::uses_collection_metadata)
+    }
+}
+
 pub struct Match {
     pub collection: String,
     pub source: Option<String>,
@@ -139,10 +157,7 @@ impl CollectionDb {
 }
 
 fn validate(query: &Query) -> Result<Option<&Field>> {
-    let field = match &query.view {
-        View::List { sort, .. } => sort.as_ref(),
-        View::Count { group_by } => group_by.as_ref(),
-    };
+    let field = query.field();
     if !(1..=32).contains(&query.limit) {
         return Err(Error::Invalid(
             "metadata query limit must be 1 to 32".into(),
