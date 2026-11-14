@@ -196,6 +196,9 @@ The next invocation drains the saved page before listing again. The
 source sweep response and cleanup log report
 `deferred_objects` when a failed delete has been rescheduled. The worker
 continues with other due objects in that collection.
+The snapshot sweep reports `failed_deletions` for individual objects
+it will revisit on a later full scan. Its `failed` count covers whole
+unit attempts that could not complete.
 
 The embedding profile job checks the worker's configured profile and resumes
 its scan after a change. Each invocation attempts up to 16 collections with up

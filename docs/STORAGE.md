@@ -557,6 +557,10 @@ Deletion is eligible 15 minutes after that observation, including for uploaded
 snapshots that never committed.
 Busy units are revisited on the next pass. The sweep preserves the
 published HEAD generation and leaves already downloaded reader files usable.
+Each unit lists up to 64 objects per page. Individual deletes have a
+two-second deadline. The sweep records rejected or timed-out deletes
+in `failed_deletions` and continues through the page. A later full
+scan revisits those objects. A lost writer lease ends the unit's pass.
 The maintenance response includes `recovered_creations` for creation intents
 resolved with a successful catalog outcome.
 
@@ -625,8 +629,9 @@ the fence, retry the request or let the snapshot sweep finish it from
 the catalog tombstone. Deleted collection IDs remain reserved.
 Existing database inspection handles can read their pinned generation
 until expiry. The worker waits 15 minutes after the manifest is fenced,
-then removes the retired collection's snapshots, operation objects,
-and source bytes in bounded pages. It retains the small manifest fence.
+then clears the retired manifest's database locator and removes snapshots,
+operation objects, and source bytes in bounded pages. It retains the small
+manifest fence.
 An already materialized snapshot remains readable for the life of its
 local reader.
 

@@ -883,7 +883,7 @@ async fn hosted_collection_reclamation_keeps_open_snapshots_and_resumes() {
     use std::time::{Duration, SystemTime};
 
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(sanctum_storage_fs::FileStorage::open(dir.path()).unwrap());
+    let store = Arc::new(InterruptAcceptance::new(dir.path(), 0));
     let catalog = || HostedCatalog::new(store.clone(), None, 1024).unwrap();
     let service = catalog();
     let scope = sanctum_core::Scope {
@@ -960,16 +960,31 @@ async fn hosted_collection_reclamation_keeps_open_snapshots_and_resumes() {
         )
         .await
         .unwrap();
+    store
+        .interrupt
+        .store(REJECT_RETIRED_COLLECTION_DELETE, Ordering::Relaxed);
     let first = service.sweep_hosted_snapshots().await.unwrap();
     assert!(first.more && first.deleted > 0);
     let restarted = catalog();
+    let mut failed_deletions = first.failed_deletions;
     for _ in 0..8 {
         let report = restarted.sweep_hosted_snapshots().await.unwrap();
         assert_eq!(report.failed, 0);
+        failed_deletions += report.failed_deletions;
         if !report.more {
             break;
         }
     }
+    assert_eq!(failed_deletions, 1);
+    let remaining = store.list(Some(&prefix), None, 8).await.unwrap().objects;
+    assert_eq!(remaining.len(), 2);
+    assert_eq!(
+        remaining[1].key.as_str(),
+        format!("{prefix}/sources/late-000")
+    );
+    store.interrupt.store(0, Ordering::Relaxed);
+    let retry = catalog().sweep_hosted_snapshots().await.unwrap();
+    assert_eq!(retry.failed_deletions, 0);
     let remaining = store.list(Some(&prefix), None, 8).await.unwrap().objects;
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].key, head);
@@ -7782,6 +7797,7 @@ const SESSION_SNAPSHOT_DROPPED: u8 = 32;
 const BLOCK_UPLOAD_REPLY: u8 = 33;
 const UPLOAD_REPLY_BLOCKED: u8 = 34;
 const UPLOAD_REPLY_DROPPED: u8 = 35;
+const REJECT_RETIRED_COLLECTION_DELETE: u8 = 36;
 const PARALLEL_RANGE_START: u8 = 40;
 const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
 const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
@@ -8105,6 +8121,13 @@ impl Storage for InterruptAcceptance {
     }
 
     async fn delete(&self, key: &Key) -> StorageResult<()> {
+        if key.as_str().ends_with("/sources/late-000")
+            && self.interrupt.load(Ordering::Relaxed) == REJECT_RETIRED_COLLECTION_DELETE
+        {
+            return Err(Error::Busy(
+                "test rejected a retired collection object delete".into(),
+            ));
+        }
         if key.as_str().contains("/inputs/")
             && self.interrupt.load(Ordering::Relaxed) == REJECT_UPLOAD_INPUT_DELETE
         {
