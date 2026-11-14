@@ -442,7 +442,8 @@ impl HostedCatalog {
         let key = self.extracted_key(scope, record, registration, attempt)?;
         let reader = tokio::fs::File::from_std(file.reopen()?);
         self.upload_verified_source(&key, Box::pin(reader), content.bytes, &content.hash)
-            .await?;
+            .await
+            .map_err(retryable_source_storage_error)?;
         Ok((attempt, key))
     }
 
@@ -657,7 +658,11 @@ impl HostedCatalog {
         key: &Key,
         bytes: u64,
     ) -> Result<tokio::io::Take<sanctum_storage::Reader>> {
-        let input = self.storage.get(key).await?;
+        let input = self
+            .storage
+            .get(key)
+            .await
+            .map_err(retryable_source_storage_error)?;
         if input.object.length != bytes {
             return Err(invalid_input());
         }
@@ -775,6 +780,17 @@ fn prepare_text(
             git: None,
         },
     ))
+}
+
+fn retryable_source_storage_error(error: Error) -> Error {
+    match error {
+        // This error describes access to the object, such as a GCS HTTP 403.
+        // Only validation of the accepted bytes can mark the source invalid.
+        Error::Invalid(message) => Error::Busy(format!(
+            "hosted source storage rejected the request: {message}"
+        )),
+        error => error,
+    }
 }
 
 fn invalid_input() -> Error {

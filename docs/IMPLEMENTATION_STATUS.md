@@ -1951,6 +1951,18 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 
 ## Durable hosted source preparation
 
+- Hosted preparation and indexing preserve an accepted upload when storage
+  rejects an input read or the write of an extracted RTF object. The gRPC
+  regression covers rejection during plain-text preparation, indexing from
+  a saved preparation, RTF extraction writes, and verification of a retained
+  original. After access returns, a fresh worker publishes the original
+  revision and clients retrieve the exact UTF-8 excerpt.
+  A loopback proxy injected HTTP 403 responses into a live MinIO run.
+  The standalone worker returned HTTP 503, kept the jobs registered,
+  and published the same revisions after restart. A generated Python
+  gRPC client verified the excerpts.
+  [Hosted lexical publication](STORAGE.md#hosted-lexical-publication).
+
 - Cloud Tasks dispatches preparation and lexical publication as separate
   steps. The preparation checkpoint stores the canonical source digest,
   size, chunk count, and RTF object reference. A retry of lexical

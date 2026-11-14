@@ -2702,6 +2702,132 @@ async fn hosted_text_uploads_retry_when_stored_bytes_differ_from_acceptance() {
 }
 
 #[tokio::test]
+async fn hosted_source_storage_rejection_keeps_verified_uploads_retryable() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
+    let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let wire = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    let worker = catalog();
+    worker.create_collection(&scope, None).await.unwrap();
+    let mut server = start(catalog()).await;
+    for (name, tag, body, prepared, rejection) in [
+        (
+            "prepare.txt",
+            "azurite",
+            "azurite café",
+            false,
+            DENY_SOURCE_READ,
+        ),
+        (
+            "index.txt",
+            "carnelian",
+            "carnelian café",
+            true,
+            DENY_SOURCE_READ,
+        ),
+        (
+            "extract.rtf",
+            "garnet",
+            r"{\rtf1\ansi garnet caf\'e9}",
+            false,
+            DENY_EXTRACTION_WRITE,
+        ),
+        (
+            "retain.rtf",
+            "jasper",
+            r"{\rtf1\ansi jasper caf\'e9}",
+            true,
+            DENY_SOURCE_READ,
+        ),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        let header = v1::UploadTextHeader {
+            scope: Some(wire.clone()),
+            name: name.into(),
+            request_id: Some(id.to_string()),
+            retain_original: name == "retain.rtf",
+            ..Default::default()
+        };
+        let submitted = server
+            .client
+            .submit_text(upload_frames(&header, [body.as_bytes()]))
+            .await
+            .unwrap()
+            .into_inner();
+        worker.register_upload(&scope, id).await.unwrap();
+        if prepared {
+            worker.prepare_upload(&scope, id).await.unwrap();
+        }
+        storage.interrupt.store(rejection, Ordering::Relaxed);
+        let result = if prepared {
+            worker.index_upload(&scope, id).await
+        } else {
+            worker.prepare_upload(&scope, id).await
+        };
+        let Err(error) = result else {
+            panic!("{name}: storage rejection advanced the operation");
+        };
+        assert!(matches!(error, Error::Busy(_)), "{name}: {error}");
+        let request = v1::IngestionJobRequest {
+            scope: Some(wire.clone()),
+            operation_id: id.to_string(),
+        };
+        let waiting = server
+            .client
+            .get_ingestion_job(request.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(waiting.state(), v1::IngestionState::Registered);
+        assert!(waiting.text_revision.is_none() && waiting.error_code.is_none());
+        assert_eq!(waiting.preparation.is_some(), prepared);
+
+        storage.interrupt.store(0, Ordering::Relaxed);
+        let restarted = catalog();
+        restarted.prepare_upload(&scope, id).await.unwrap();
+        restarted.index_upload(&scope, id).await.unwrap();
+        let published = server
+            .client
+            .get_ingestion_job(request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(published.state(), v1::IngestionState::TextReady);
+        assert_eq!(published.source_id, submitted.source_id);
+        assert_eq!(published.revision_id, submitted.revision_id);
+        let hits = server
+            .client
+            .search_text(v1::SearchTextRequest {
+                scope: Some(wire.clone()),
+                query: tag.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .hits;
+        assert_eq!(hits.len(), 1);
+        let fetched = server
+            .client
+            .fetch_chunk(v1::FetchChunkRequest {
+                chunk: hits[0].chunk.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(fetched.excerpt, format!("{tag} café"));
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_index_rebuilds_missing_and_damaged_rtf_checkpoints() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
@@ -7988,6 +8114,8 @@ const BLOCK_UPLOAD_REPLY: u8 = 33;
 const UPLOAD_REPLY_BLOCKED: u8 = 34;
 const UPLOAD_REPLY_DROPPED: u8 = 35;
 const REJECT_RETIRED_COLLECTION_DELETE: u8 = 36;
+const DENY_SOURCE_READ: u8 = 37;
+const DENY_EXTRACTION_WRITE: u8 = 38;
 const PARALLEL_RANGE_START: u8 = 40;
 const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
 const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
@@ -8043,6 +8171,11 @@ impl Storage for InterruptAcceptance {
         {
             return Err(Error::Busy("test blocked original input reads".into()));
         }
+        if self.interrupt.load(Ordering::Relaxed) == DENY_SOURCE_READ
+            && key.as_str().contains("/inputs/")
+        {
+            return Err(Error::Invalid("test source read returned HTTP 403".into()));
+        }
         if key.as_str().ends_with("/meta.db")
             && self.interrupt.load(Ordering::Relaxed) == BLOCK_SESSION_SNAPSHOT
         {
@@ -8092,6 +8225,13 @@ impl Storage for InterruptAcceptance {
     }
 
     async fn put_stream(&self, key: &Key, reader: Reader, length: u64) -> StorageResult<Version> {
+        if self.interrupt.load(Ordering::Relaxed) == DENY_EXTRACTION_WRITE
+            && key.as_str().ends_with("/text.utf8")
+        {
+            return Err(Error::Invalid(
+                "test extraction write returned HTTP 403".into(),
+            ));
+        }
         if key.as_str().contains("/inputs/")
             && self
                 .interrupt
