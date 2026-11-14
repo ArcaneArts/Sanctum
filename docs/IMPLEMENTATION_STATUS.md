@@ -921,6 +921,22 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   context tool returns the same cited hit and exact source text.
 - Delivered in [PR #51](https://github.com/ArcaneArts/Sanctum/pull/51).
 
+## Nonoverlapping lexical citations
+
+- Local and hosted single-collection lexical search now apply the same
+  overlap rule as semantic, hybrid, and multi-collection search. The
+  higher-ranked citation retains its original byte range and chunk
+  identity. The candidate budget allows lower-ranked, nonoverlapping
+  chunks to fill the requested limit.
+- The local and hosted gRPC fixtures requested three hits from seven
+  overlapping chunks and got ordinals 0, 2, and 4 in lexical and degraded
+  hybrid mode. The hosted fixture verified that the three touching winning
+  ranges share one storage request and checked each excerpt against the
+  stored bytes and its individual fetch.
+- A generated Python client verified the same ranks and exact UTF-8 bytes
+  against live MinIO.
+  [PR #132](https://github.com/ArcaneArts/Sanctum/pull/132).
+
 ## Direct source range retrieval
 
 - gRPC, MCP, and the CLI read up to 64 KiB from a published source revision

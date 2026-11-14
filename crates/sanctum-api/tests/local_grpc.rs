@@ -220,6 +220,60 @@ async fn local_upload_request_ids_replay_across_concurrency_restart_and_expiry()
 }
 
 #[tokio::test]
+async fn local_lexical_search_fills_limit_with_nonoverlapping_citations() {
+    let directory = TempDir::new().unwrap();
+    let service = Service::open(directory.path(), 32_768)
+        .unwrap()
+        .with_chunking(sanctum_core::ChunkSettings {
+            window_bytes: 1024,
+            overlap_bytes: 512,
+            max_tokens: None,
+        })
+        .unwrap();
+    let mut api = Running::with_service(service, true).await;
+    create(&mut api.client, "default").await;
+    let text = "unique 🦀 café              \n".repeat(128);
+    let revision = upload(&mut api.client, header("default"), text.as_bytes()).await;
+    assert_eq!(revision.chunks, 7);
+    let request = v1::SearchTextRequest {
+        scope: scope("default"),
+        query: "unique".into(),
+        limit: Some(3),
+        mode: v1::SearchMode::Lexical.into(),
+        ..Default::default()
+    };
+    let result = api
+        .client
+        .search_text(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let fallback = api
+        .client
+        .search_text(v1::SearchTextRequest {
+            query: "unique absentword".into(),
+            mode: v1::SearchMode::Hybrid.into(),
+            ..request
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fallback.mode(), v1::SearchMode::Lexical);
+    assert_eq!(fallback.hits, result.hits);
+    assert_eq!(result.hits.len(), 3);
+    for (ordinal, hit) in [0, 2, 4].into_iter().zip(result.hits) {
+        let reference = hit.chunk.as_ref().unwrap();
+        assert_eq!(reference.ordinal, ordinal);
+        assert_eq!(reference.revision_id, revision.revision_id);
+        assert_eq!(
+            hit.excerpt,
+            text[hit.start_byte as usize..hit.end_byte as usize]
+        );
+    }
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn local_pending_literal_scan_does_not_require_lexical_publication() {
     use v1::pending_text_scan_event::Event;
     let dir = TempDir::new().unwrap();

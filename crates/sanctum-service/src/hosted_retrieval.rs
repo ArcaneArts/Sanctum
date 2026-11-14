@@ -8,7 +8,7 @@ use sanctum_storage::Key;
 use uuid::Uuid;
 
 use crate::embedding::{
-    CollectionSearchResult, Coverage, PreparedQuery, SearchResult,
+    CollectionSearchResult, Coverage, PreparedQuery, SearchResult, candidate_budget,
     collections::{Candidates, collection_scopes, merge, rank_collection},
     fuse, limit_hits, query_scope,
 };
@@ -63,11 +63,7 @@ impl HostedCatalog {
                     Ok(strategy) => strategy,
                     Err(error) => return Ok((coverage, Err(error))),
                 };
-                let candidate_limit = if actual_mode == SearchMode::Lexical {
-                    limit
-                } else {
-                    (limit * 4).max(32)
-                };
+                let candidate_limit = candidate_budget(limit);
                 let semantic = match (&prepared.vector, &prepared.profile) {
                     (Some(query), Some(profile)) if actual_mode != SearchMode::Lexical => database
                         .search_vector(
@@ -95,7 +91,7 @@ impl HostedCatalog {
                         .collect(),
                     SearchMode::Hybrid => fuse(lexical, semantic),
                 };
-                let chunks = limit_hits(ranked, actual_mode, limit)
+                let chunks = limit_hits(ranked, limit)
                     .map(|(chunk, score)| {
                         let fields = metadata_for_hit(
                             database,
@@ -167,7 +163,7 @@ impl HostedCatalog {
         let prepared = self
             .prepare_hosted_query(&scopes, query, limit, filter.as_ref(), requested)
             .await?;
-        let candidate_limit = (limit * 4).max(32);
+        let candidate_limit = candidate_budget(limit);
         let filter = filter.map(Arc::new);
         let mut all = Vec::with_capacity(scopes.len());
         let mut coverage = Coverage::default();

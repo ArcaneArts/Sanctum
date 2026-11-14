@@ -382,8 +382,13 @@ cargo run --locked -p sanctum-cli -- search notes 'quartz formation' --mode hybr
   quoted terms in the same chunk. If neither lexical nor semantic ranking
   returns an eligible hit, it searches for any of those terms. When the provider or compatible vectors
   are unavailable, it reports lexical mode and a degradation reason.
-  Semantic and hybrid modes with vectors collapse overlapping
-  byte ranges from the same source revision within the retrieved candidates.
+
+All search modes keep the higher-ranked chunk when byte ranges from the
+same source revision overlap. Touching ranges are eligible independently.
+Search considers up to four times the requested limit per ranked list,
+with a minimum of 32 candidates, to make room for lower-ranked,
+nonoverlapping hits. A result can contain fewer hits than requested when
+the candidate window is exhausted.
 
 The response includes the mode used, optional scores, and coverage for the
 active profile across current chunks in the collection, before any metadata
