@@ -142,6 +142,14 @@ Merged in [PR #6](https://github.com/ArcaneArts/Sanctum/pull/6).
   destinations and binary payloads, and malformed input. gRPC tests cover
   restart, retention, exact excerpts, and directory re-import.
 - Full size and memory measurements remain part of the capacity milestone.
+- Local workers save a queue receipt for completed RTF extraction after the
+  canonical file is durable. On retry they verify the saved digest and size,
+  reuse intact UTF-8, or regenerate it from the original. The restart
+  regression covers both reuse with the original absent and repair of
+  same-length corruption. A standalone server test used `SIGKILL` after
+  extraction, scanned the same bytes through MCP while paused, and fetched
+  the resulting published range through a generated Python gRPC client.
+  [PR #135](https://github.com/ArcaneArts/Sanctum/pull/135).
 
 ## Revision-aware metadata and change polling
 

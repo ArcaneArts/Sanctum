@@ -43,6 +43,15 @@ pub struct JobFailure {
     pub message: String,
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct RtfPreparation {
+    pub original_hash: String,
+    pub canonical_hash: String,
+    pub canonical_bytes: u64,
+    pub encoding: String,
+    pub extractor: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Job {
     pub id: Uuid,
@@ -74,6 +83,7 @@ pub struct Job {
     pub chunking: ChunkSettings,
     pub initial_metadata: Vec<crate::metadata::Mutation>,
     pub initial_chunk_metadata: Vec<crate::metadata::ChunkMetadata>,
+    pub rtf_preparation: Option<RtfPreparation>,
 }
 
 #[derive(Clone, Debug)]
@@ -83,7 +93,7 @@ const COLUMNS: &str = "operation_id, tenant, collection, source_id, revision_id,
     name, external_namespace, external_id, total_bytes, processed_bytes,
     attempts, status, error_code, error_message, content_hash, chunks,
     replacement, update_sequence, import_hash, extract_rtf, retain_original, extracting,
-    canonical_bytes, original_hash, source_encoding, extractor, created_at, url_provenance, git_provenance, chunk_window_bytes, chunk_overlap_bytes, initial_metadata, initial_chunk_metadata, chunk_max_tokens";
+    canonical_bytes, original_hash, source_encoding, extractor, created_at, url_provenance, git_provenance, chunk_window_bytes, chunk_overlap_bytes, initial_metadata, initial_chunk_metadata, chunk_max_tokens, rtf_preparation";
 
 impl LocalQueue {
     /// The caller holds the storage owner's exclusive lock for this queue.
@@ -106,6 +116,7 @@ impl LocalQueue {
                 include_str!("runtime_v12.sql"),
                 include_str!("runtime_v13.sql"),
                 include_str!("runtime_v14.sql"),
+                include_str!("runtime_v15.sql"),
             ],
         )?;
         // The previous worker may have stopped after recording a cancellation.
@@ -113,7 +124,8 @@ impl LocalQueue {
         connection
             .execute(
                 "UPDATE ingestion_jobs SET status = 'canceled', extracting = 0,
-                 finished_at = unixepoch(), initial_metadata = NULL, initial_chunk_metadata = NULL
+                 finished_at = unixepoch(), initial_metadata = NULL, initial_chunk_metadata = NULL,
+                 rtf_preparation = NULL
              WHERE status IN ('accepted', 'indexing')
                AND cancel_requested = 1 AND publication_started = 0",
                 [],
@@ -121,7 +133,9 @@ impl LocalQueue {
             .map_err(database_error)?;
         connection
             .execute(
-                "UPDATE ingestion_jobs SET status = 'accepted', processed_bytes = 0, extracting = 0
+                "UPDATE ingestion_jobs SET status = 'accepted',
+                 processed_bytes = CASE WHEN rtf_preparation IS NULL OR extracting = 1
+                                        THEN 0 ELSE total_bytes END
              WHERE status IN ('indexing', 'publishing')",
                 [],
             )
@@ -481,7 +495,10 @@ impl LocalQueue {
     pub fn claim(&self) -> Result<Option<Job>> {
         self.connect()?.query_row(
             &format!("UPDATE ingestion_jobs
-                SET status = 'indexing', attempts = attempts + 1, processed_bytes = 0, extracting = extract_rtf
+                SET status = 'indexing', attempts = attempts + 1,
+                    processed_bytes = CASE WHEN rtf_preparation IS NULL OR extracting = 1
+                                           THEN 0 ELSE total_bytes END,
+                    extracting = extract_rtf AND (rtf_preparation IS NULL OR extracting = 1)
                 WHERE operation_id = (
                     SELECT operation_id FROM ingestion_jobs
                     WHERE status = 'accepted' AND (SELECT paused = 0 FROM executor_settings WHERE id = 1)
@@ -504,16 +521,29 @@ impl LocalQueue {
         Ok(changed == 1)
     }
 
-    pub fn extracted(&self, id: Uuid) -> Result<bool> {
-        let updated = self
+    pub fn extract_again(&self, id: Uuid) -> Result<bool> {
+        let changed = self
             .connect()?
             .execute(
-                "UPDATE ingestion_jobs SET extracting = 0, processed_bytes = total_bytes
+                "UPDATE ingestion_jobs SET processed_bytes = 0, extracting = 1
              WHERE operation_id = ?1 AND status = 'indexing' AND cancel_requested = 0",
                 [id.to_string()],
             )
             .map_err(database_error)?;
-        Ok(updated == 1)
+        Ok(changed == 1)
+    }
+
+    pub fn extracted(&self, id: Uuid, preparation: &RtfPreparation) -> Result<bool> {
+        let changed = self
+            .connect()?
+            .execute(
+                "UPDATE ingestion_jobs SET extracting = 0, processed_bytes = total_bytes,
+                 rtf_preparation = ?2
+             WHERE operation_id = ?1 AND status = 'indexing' AND cancel_requested = 0",
+                params![id.to_string(), write_json(Some(preparation))?],
+            )
+            .map_err(database_error)?;
+        Ok(changed == 1)
     }
 
     /// This transition is the point after which cancellation cannot win.
@@ -537,7 +567,8 @@ impl LocalQueue {
              SET status = 'text_ready', content_hash = ?2, chunks = ?3, extracting = 0,
                  canonical_bytes = ?4, original_hash = ?5, source_encoding = ?6, extractor = ?7,
                  processed_bytes = total_bytes, error_code = NULL, error_message = NULL,
-                 finished_at = unixepoch(), initial_metadata = NULL, initial_chunk_metadata = NULL
+                 finished_at = unixepoch(), initial_metadata = NULL, initial_chunk_metadata = NULL,
+                 rtf_preparation = NULL
              WHERE operation_id = ?1 AND status IN ('indexing', 'publishing')",
                 params![
                     id.to_string(),
@@ -558,13 +589,16 @@ impl LocalQueue {
             .execute(
                 "UPDATE ingestion_jobs SET
                  status = CASE WHEN cancel_requested = 1 THEN 'canceled' ELSE 'failed' END,
-                 extracting = 0,
+                 extracting = CASE WHEN cancel_requested = 0 AND ?2 = 'retryable'
+                                   THEN extracting ELSE 0 END,
                  error_code = CASE WHEN cancel_requested = 0 THEN ?2 END,
                  error_message = CASE WHEN cancel_requested = 0 THEN ?3 END,
                  initial_metadata = CASE WHEN cancel_requested = 0 AND ?2 = 'retryable'
                                          THEN initial_metadata END,
                  initial_chunk_metadata = CASE WHEN cancel_requested = 0 AND ?2 = 'retryable'
                                                THEN initial_chunk_metadata END,
+                 rtf_preparation = CASE WHEN cancel_requested = 0 AND ?2 = 'retryable'
+                                        THEN rtf_preparation END,
                  finished_at = unixepoch()
              WHERE operation_id = ?1 AND status IN ('indexing', 'publishing')",
                 params![id.to_string(), code, message],
@@ -581,7 +615,8 @@ impl LocalQueue {
                  status = CASE WHEN status = 'accepted' THEN 'canceled' ELSE status END,
                  finished_at = CASE WHEN status = 'accepted' THEN unixepoch() END,
                  initial_metadata = CASE WHEN status = 'indexing' THEN initial_metadata END,
-                 initial_chunk_metadata = CASE WHEN status = 'indexing' THEN initial_chunk_metadata END",
+                 initial_chunk_metadata = CASE WHEN status = 'indexing' THEN initial_chunk_metadata END,
+                 rtf_preparation = CASE WHEN status = 'indexing' THEN rtf_preparation END",
             "status IN ('accepted', 'indexing') AND publication_started = 0",
             "only queued or indexing operations can be canceled",
         )
@@ -592,7 +627,9 @@ impl LocalQueue {
             scope,
             id,
             "SET status = 'accepted', error_code = NULL, error_message = NULL,
-                 processed_bytes = 0, finished_at = NULL",
+                 processed_bytes = CASE WHEN rtf_preparation IS NULL OR extracting = 1
+                                        THEN 0 ELSE total_bytes END,
+                 finished_at = NULL",
             "status = 'failed' AND error_code = 'retryable'",
             "only retryable failures can be retried",
         )
@@ -715,6 +752,7 @@ fn map_job(row: &Row<'_>) -> rusqlite::Result<Job> {
         },
         initial_metadata: read_json(row, 31)?.unwrap_or_default(),
         initial_chunk_metadata: read_json(row, 32)?.unwrap_or_default(),
+        rtf_preparation: read_json(row, 34)?,
     })
 }
 

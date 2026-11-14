@@ -124,6 +124,13 @@ bytes and search results follow the independent revision lifecycle.
 `sanctum-cli jobs [COLLECTION]` lists local activity newest first. Pass
 `--before OPERATION_ID` with the cursor shown for the next page.
 
+The local RTF worker saves the canonical UTF-8 file and its digest before
+indexing. After a restart or retry, the worker verifies the saved file and
+can resume indexing without rerunning extraction. If the saved text is
+missing or fails verification, it extracts the original again. An intact
+extraction checkpoint also lets a pending literal scan work while the
+restarted queue is paused.
+
 `SearchText` defaults to lexical search. It matches the supplied words in a
 single chunk using SQLite FTS5 tokenization. Results include byte offsets as
 `[start_byte, end_byte)` into
