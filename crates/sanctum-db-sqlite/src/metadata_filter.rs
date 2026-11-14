@@ -10,6 +10,8 @@ use super::{
     metadata_indexes::{self, Index},
 };
 
+pub(super) const MATCHES_FUNCTION: &str = "sanctum_metadata_matches";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
     Collection,
@@ -289,7 +291,7 @@ pub(super) fn append_for(
     if !predicates.is_empty() {
         connection
             .create_scalar_function(
-                "sanctum_metadata_matches",
+                MATCHES_FUNCTION,
                 2,
                 FunctionFlags::SQLITE_UTF8
                     | FunctionFlags::SQLITE_DETERMINISTIC
@@ -390,7 +392,7 @@ fn compile(
                     operator,
                     ..test.clone()
                 });
-                write!(sql, " AND sanctum_metadata_matches({index}, m.value)")
+                write!(sql, " AND {MATCHES_FUNCTION}({index}, m.value)")
                     .expect("writing to a String");
             }
             sql.push(')');

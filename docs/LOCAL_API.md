@@ -705,6 +705,7 @@ timings and counts for an existing log pipeline:
 | `hosted_input_transfer` | Direction, staged source bytes, and duration |
 | `snapshot_publish`, `snapshot_download` | Snapshot size, actual transferred database bytes, and duration |
 | `snapshot_cache` | Generation and whether it was already materialized at lookup |
+| `collection_sqlite_handle` | Generation and whether the read reused an idle SQLite handle |
 | `cleanup_pass` | Reclaimed entries, failures and further work when available |
 
 Use `sanctum_service=trace` to include `source_range_read` events for

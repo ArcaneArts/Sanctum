@@ -5,6 +5,8 @@ use sanctum_core::Result;
 
 use super::{Chunk, CollectionDb, database_error, metadata, metadata_filter, query_all, row_chunk};
 
+pub(super) const COSINE_FUNCTION: &str = "sanctum_cosine";
+
 pub struct ScoredChunk {
     pub chunk: Chunk,
     pub score: f64,
@@ -34,7 +36,7 @@ impl VectorIndex for CollectionDb {
         register_dot_product(&self.0, query)?;
         search_candidates(
             &self.0,
-            "sanctum_cosine(e.vector)",
+            &format!("{COSINE_FUNCTION}(e.vector)"),
             vec![profile.to_owned().into()],
             limit,
             filter,
@@ -101,7 +103,7 @@ fn search_with_join_order(
 fn register_dot_product(connection: &Connection, query: Arc<[f32]>) -> Result<()> {
     connection
         .create_scalar_function(
-            "sanctum_cosine",
+            COSINE_FUNCTION,
             1,
             FunctionFlags::SQLITE_UTF8
                 | FunctionFlags::SQLITE_DETERMINISTIC

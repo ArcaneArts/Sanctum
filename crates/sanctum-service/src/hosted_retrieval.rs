@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Instant};
 
 use sanctum_core::{Error, Result, Scope, ScopeId};
-use sanctum_db::{Unit, collection_prefix};
+use sanctum_db::{Materialized, Unit, collection_prefix};
 use sanctum_db_sqlite::vector_index::VectorIndex;
 use sanctum_embedding::Purpose;
 use sanctum_storage::Key;
@@ -302,7 +302,12 @@ impl HostedCatalog {
         scope: &Scope,
         read: impl FnOnce(&db::CollectionDb) -> Result<T> + Send + 'static,
     ) -> Result<(T, Uuid)> {
-        self.with_owned_collection(scope, move |db| read(&db)).await
+        let database = self.collection_snapshot(scope).await?;
+        tokio::task::spawn_blocking(move || {
+            Ok((database.read_collection(read)?, database.generation.id))
+        })
+        .await
+        .map_err(|error| Error::Internal(Box::new(error)))?
     }
 
     pub(crate) async fn with_owned_collection<T: Send + 'static>(
@@ -310,19 +315,22 @@ impl HostedCatalog {
         scope: &Scope,
         read: impl FnOnce(db::CollectionDb) -> Result<T> + Send + 'static,
     ) -> Result<(T, Uuid)> {
-        self.require_collection(scope).await?;
-        let unit = Unit::collection(self.prefix.as_ref(), scope)?;
-        let database = self
-            .snapshots
-            .read(&self.publication, &unit)
-            .await?
-            .ok_or_else(|| Error::NotFound("collection database was not found".into()))?;
+        let database = self.collection_snapshot(scope).await?;
         tokio::task::spawn_blocking(move || {
             let value = read(db::CollectionDb::open_read_only(database.path())?)?;
             Ok((value, database.generation.id))
         })
         .await
         .map_err(|error| Error::Internal(Box::new(error)))?
+    }
+
+    async fn collection_snapshot(&self, scope: &Scope) -> Result<Arc<Materialized>> {
+        self.require_collection(scope).await?;
+        let unit = Unit::collection(self.prefix.as_ref(), scope)?;
+        self.snapshots
+            .read(&self.publication, &unit)
+            .await?
+            .ok_or_else(|| Error::NotFound("collection database was not found".into()))
     }
 
     async fn read_hit(

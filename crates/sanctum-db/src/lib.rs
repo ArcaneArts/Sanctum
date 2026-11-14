@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -126,16 +126,62 @@ pub struct Lease {
 
 pub struct Materialized {
     pub generation: Generation,
+    collection_reader: Mutex<Option<sanctum_db_sqlite::CollectionDb>>,
     file: NamedTempFile,
 }
 
 impl Materialized {
+    fn new(generation: Generation, file: NamedTempFile) -> Self {
+        Self {
+            generation,
+            collection_reader: Mutex::new(None),
+            file,
+        }
+    }
+
     pub fn path(&self) -> &Path {
         self.file.path()
     }
 
     pub fn reopen(&self) -> Result<std::fs::File> {
         Ok(self.file.reopen()?)
+    }
+
+    /// Borrows an exclusive read-only SQLite handle for this snapshot. At most
+    /// one idle handle stays with the file. Concurrent readers can open another
+    /// connection while the first is in use.
+    pub fn read_collection<T>(
+        &self,
+        read: impl FnOnce(&sanctum_db_sqlite::CollectionDb) -> Result<T>,
+    ) -> Result<T> {
+        let cached = self.idle_collection_reader().take();
+        let reused = cached.is_some();
+        let database = match cached {
+            Some(database) => database,
+            None => sanctum_db_sqlite::CollectionDb::open_read_only(self.path())?,
+        };
+        tracing::debug!(
+            event = "collection_sqlite_handle",
+            generation = %self.generation.id,
+            reused,
+            "opened or reused a read-only SQLite handle"
+        );
+        let result = read(&database);
+        if result.is_ok() && database.clear_read_query_state().is_ok() {
+            let mut idle = self.idle_collection_reader();
+            if idle.is_none() {
+                *idle = Some(database);
+            }
+        }
+        result
+    }
+
+    fn idle_collection_reader(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<sanctum_db_sqlite::CollectionDb>> {
+        self.collection_reader
+            .lock()
+            .expect("idle SQLite handle mutex was poisoned")
     }
 }
 
@@ -464,7 +510,7 @@ impl Publication {
             duration_ms = start.elapsed().as_secs_f64() * 1_000.0,
             "materialized a database snapshot"
         );
-        Ok(Materialized { generation, file })
+        Ok(Materialized::new(generation, file))
     }
 
     async fn download_checked(
@@ -672,13 +718,7 @@ impl Lease {
         self.write(head).await?;
         if let Some(snapshots) = &self.publication.snapshots {
             snapshots
-                .remember(
-                    &self.unit,
-                    Materialized {
-                        generation: generation.clone(),
-                        file: staged,
-                    },
-                )
+                .remember(&self.unit, Materialized::new(generation.clone(), staged))
                 .await;
         }
         tracing::debug!(
@@ -1075,4 +1115,45 @@ fn sql_error(error: rusqlite::Error) -> Error {
 
 fn corrupt(message: &'static str) -> Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn materialized_snapshot_retains_one_idle_handle_without_locking_out_other_readers() {
+        let file = NamedTempFile::new().unwrap();
+        let mut connection = Connection::open(file.path()).unwrap();
+        let transaction = connection.transaction().unwrap();
+        sanctum_db_sqlite::initialize_collection(&transaction).unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        let snapshot = Materialized::new(
+            Generation {
+                id: Uuid::new_v4(),
+                bytes: file.path().metadata().unwrap().len(),
+                blake3: hash_file(&mut file.reopen().unwrap()).unwrap(),
+                chain: None,
+            },
+            file,
+        );
+        assert!(snapshot.idle_collection_reader().is_none());
+        snapshot.read_collection(|db| db.change_cursor()).unwrap();
+        assert!(snapshot.idle_collection_reader().is_some());
+        snapshot
+            .read_collection(|outer| {
+                assert!(snapshot.idle_collection_reader().is_none());
+                snapshot.read_collection(|inner| {
+                    assert!(!std::ptr::eq(outer, inner));
+                    assert_eq!(outer.change_cursor()?, inner.change_cursor()?);
+                    Ok(())
+                })
+            })
+            .unwrap();
+        assert!(snapshot.idle_collection_reader().is_some());
+        let error = snapshot.read_collection::<()>(|_| Err(Error::Busy("read failed".into())));
+        assert!(matches!(error, Err(Error::Busy(_))));
+        assert!(snapshot.idle_collection_reader().is_none());
+    }
 }
