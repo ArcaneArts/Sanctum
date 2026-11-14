@@ -64,8 +64,10 @@ If a local upload fails after entering publication, maintenance checks
 the collection database before settling its queue record. An already
 committed revision recovers its `TEXT_READY` receipt. If the revision
 never committed and a newer intent superseded it, Sanctum reports a
-conflict and reclaims the staged files. A failed current upload remains
-available for retry. Inconclusive checks retry on a persisted deadline.
+conflict and reclaims the staged files. Maintenance also settles failed
+replacements for deleted sources, including while the ingestion queue is
+paused. A failed current upload remains available for retry. Inconclusive
+checks retry on a persisted deadline.
 
 Local upload acceptance records a BLAKE3 digest of the staged input.
 The worker checks it before publishing UTF-8 or RTF. A storage digest

@@ -206,24 +206,32 @@ impl Service {
                 "scheduled cleanup for superseded ingestion inputs"
             );
         }
-        for job in self.queue.interrupted_publications()? {
+        for job in self.queue.failed_reconciliation_candidates()? {
             let reconcile = || {
                 self.require_collection(&job.scope)?;
                 // The retrieval guard prevents retirement. If a manual retry
                 // starts during this read, the queue's attempt check wins.
                 let database =
                     db::CollectionDb::open_read_only(&self.files.database_path(&job.scope))?;
-                let committed = database
-                    .revision_summary(job.source, job.revision)?
-                    .map(|content| revision_for(&job, content));
-                self.queue.reconcile_publication(&job, committed.as_ref())
+                let (committed, deleted_source) = database.read_snapshot(|database| {
+                    let committed = database.revision_summary(job.source, job.revision)?;
+                    let deleted_source = committed.is_none()
+                        && job.replacement
+                        && !database.has_active_source(job.source)?;
+                    Ok((
+                        committed.map(|content| revision_for(&job, content)),
+                        deleted_source,
+                    ))
+                })?;
+                self.queue
+                    .reconcile_failed_input(&job, committed.as_ref(), deleted_source)
             };
             let settled = reconcile();
             if let Err(error) = settled {
-                self.queue.defer_publication_reconciliation(&job)?;
+                self.queue.defer_failed_reconciliation(&job)?;
                 tracing::warn!(
                     %error, tenant = %job.scope.tenant, collection = %job.scope.collection,
-                    operation = %job.id, "could not reconcile an interrupted local publication"
+                    operation = %job.id, "could not reconcile a failed local upload"
                 );
             }
         }

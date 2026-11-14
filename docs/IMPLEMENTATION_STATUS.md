@@ -191,6 +191,13 @@ Merged in [PR #4](https://github.com/ArcaneArts/Sanctum/pull/4).
   19 to 20 runtime migration, both recovery outcomes with ingestion
   paused, cleanup of the recovered RTF original, and exact UTF-8 retrieval.
   [Ingestion recovery](LOCAL_API.md#text-uploads).
+- The local gRPC deletion regression removes a source with an unpublished
+  retryable replacement and a committed replacement missing its queue
+  receipt. Startup restores the committed outcome, reclaims the abandoned
+  input with the queue still paused, and replays the terminal conflict
+  for the original upload request ID. A managed server and generated
+  Python gRPC client verified the version 20 to 21 queue migration,
+  abandoned input removal, and exact UTF-8 retrieval from a new source.
 
 ## Local file and directory imports
 
