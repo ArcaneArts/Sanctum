@@ -1347,3 +1347,15 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   download and one SQLite publication. Live Cloud Run and Cloud Tasks
   timing remains open.
   [Storage contract](STORAGE.md#hosted-lexical-publication).
+
+## Two simultaneous GiB-scale snapshot reads
+
+- The release snapshot benchmark ran against live MinIO with two 1 GiB
+  databases and again with two 2 GiB databases. Cold resolutions took
+  6.09–6.71 s and 12.85–20.04 s respectively. Warm reads resolved in
+  1.12–1.96 ms with a cache budget large enough for both databases.
+- Both collections returned their distinct SQLite markers through cold
+  reads, warm reuse, and eviction. The 2 GiB fixture reached 6,450,941,952
+  bytes of temporary files while three readers held their verified copies.
+  The run removed its fixture objects. Cloud Run memory and latency remain
+  open. [Method and results](CAPACITY.md#two-simultaneous-cold-snapshot-reads).
