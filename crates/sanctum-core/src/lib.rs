@@ -20,6 +20,20 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+pub enum ImportCredential {
+    Bearer(String),
+    Basic(BasicImportCredential),
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BasicImportCredential {
+    pub username: String,
+    pub password_env: String,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ScopeId(String);
 

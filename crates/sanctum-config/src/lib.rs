@@ -1,6 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
-use sanctum_core::{ChunkSettings, Error, Result};
+use sanctum_core::{ChunkSettings, Error, ImportCredential, Result};
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_ENV: &str = "SANCTUM_CONFIG_JSON";
@@ -31,7 +31,7 @@ pub struct Config {
     #[serde(default)]
     pub chunking: ChunkSettings,
     pub embedding: Option<EmbeddingConfig>,
-    pub url_import_origins: Option<HashMap<String, Option<String>>>,
+    pub url_import_origins: Option<HashMap<String, Option<ImportCredential>>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
