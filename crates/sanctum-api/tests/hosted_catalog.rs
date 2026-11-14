@@ -7080,15 +7080,10 @@ async fn hosted_submissions_recover_from_interrupted_acceptance() {
         };
         let input = [b"durable".as_slice()];
         storage.interrupt.store(mode, Ordering::Relaxed);
-        assert_eq!(
-            server
-                .client
-                .submit_text(upload_frames(&header, input))
-                .await
-                .unwrap_err()
-                .code(),
-            Code::Unavailable
-        );
+        let first = server
+            .client
+            .submit_text(upload_frames(&header, input))
+            .await;
         server.stop().await;
         server = start(catalog.clone()).await;
         let initial = server.client.get_ingestion_job(request.clone()).await;
@@ -7103,9 +7098,20 @@ async fn hosted_submissions_recover_from_interrupted_acceptance() {
             .unwrap()
             .into_inner();
         if mode == 1 {
+            assert_eq!(first.unwrap_err().code(), Code::Unavailable);
             assert_eq!(initial.unwrap_err().code(), Code::NotFound);
         } else {
+            assert_eq!(first.unwrap().into_inner(), accepted);
             assert_eq!(initial.unwrap().into_inner(), accepted);
+            assert_eq!(
+                server
+                    .client
+                    .submit_text(upload_frames(&header, [b"changed".as_slice()]))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::AlreadyExists,
+            );
         }
         assert_eq!(
             server

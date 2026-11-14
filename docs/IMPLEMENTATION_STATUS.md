@@ -2372,6 +2372,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   a successful retry with the same request ID after rejecting corrupt input.
   [Hosted uploads](STORAGE.md#hosted-uploads).
 
+## Hosted upload acceptance with a lost envelope response
+
+- The API confirms an ambiguous acceptance by reading the durable
+  operation and matching the uploaded bytes and options. It can return
+  the saved job and dispatch registration in the original RPC. An
+  uncommitted write remains retryable.
+- The filesystem gRPC test verified that a pre-commit failure leaves no
+  accepted job, a lost reply after commit returns the same job before
+  and after restart, and replay with different bytes is rejected.
+  The live MinIO worker scenario lost the original object and envelope
+  replies in one upload, acknowledged it over gRPC, then repaired a
+  refused task handoff after restart and fetched the exact extracted text.
+  [Hosted uploads](STORAGE.md#hosted-uploads).
+
 ## Hosted manifest writes with lost responses
 
 - The database executor verifies an ambiguous conditional write by reading

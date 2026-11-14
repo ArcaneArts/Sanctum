@@ -142,7 +142,7 @@ async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
         checkpoint: Mutex::new(None),
         after_dispatch: false,
         lose_source_reply: None,
-        lose_embedding_reply: AtomicBool::new(true),
+        lose_control_reply: Mutex::new(Some("/prepared-embeddings/")),
     });
     let (worker, worker_server) =
         serve_http(crate::hosted_worker::router(make_catalog(fault.clone()))).await;
@@ -164,7 +164,7 @@ async fn minio_embedding_delivery_recovers_a_lost_batch_write_reply() {
     };
     let response = deliver(worker).await.unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert!(!fault.lose_embedding_reply.load(Ordering::Relaxed));
+    assert!(fault.lose_control_reply.lock().unwrap().is_none());
     assert_eq!(provider.documents.load(Ordering::Relaxed), 1);
     let committed = collection_generation(storage.as_ref(), Some(&prefix)).await;
     assert_ne!(before, committed);
@@ -272,7 +272,7 @@ struct StalledCheckpoint {
     checkpoint: Mutex<Option<oneshot::Sender<oneshot::Receiver<()>>>>,
     after_dispatch: bool,
     lose_source_reply: Option<&'static str>,
-    lose_embedding_reply: AtomicBool,
+    lose_control_reply: Mutex<Option<&'static str>>,
 }
 
 #[async_trait::async_trait]
@@ -316,10 +316,10 @@ impl Storage for StalledCheckpoint {
             }
         }
         let version = self.storage.put_control(key, bytes, condition).await?;
-        if key.as_str().contains("/prepared-embeddings/")
-            && self.lose_embedding_reply.swap(false, Ordering::Relaxed)
-        {
-            return Err(Error::Busy("prepared embedding write response lost".into()));
+        let mut fault = self.lose_control_reply.lock().unwrap();
+        if fault.is_some_and(|part| key.as_str().contains(part)) {
+            fault.take();
+            return Err(Error::Busy("control write response lost".into()));
         }
         Ok(version)
     }
@@ -433,9 +433,9 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         checkpoint: Mutex::new(None),
         after_dispatch: false,
         lose_source_reply: Some("/inputs/"),
-        lose_embedding_reply: AtomicBool::new(false),
+        lose_control_reply: Mutex::new(Some("/operation.json")),
     });
-    let (mut api, api_server) = serve_api(catalog_with_storage(api_storage)).await;
+    let (mut api, api_server) = serve_api(catalog_with_storage(api_storage.clone())).await;
     api.create_collection(v1::CreateCollectionRequest {
         scope: Some(scope.clone()),
         ..Default::default()
@@ -443,9 +443,17 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
     .await
     .unwrap();
     let accepted = submit_source(&mut api, &scope, operation, "repair.rtf", RTF).await;
+    assert!(api_storage.lose_control_reply.lock().unwrap().is_none());
     assert_eq!(accepted.operation_id, operation.to_string());
     assert_eq!(accepted.total_bytes, RTF.len() as u64);
     assert_eq!(accepted.state(), v1::IngestionState::Accepted);
+    assert_eq!(
+        api.get_ingestion_job(job.clone())
+            .await
+            .unwrap()
+            .into_inner(),
+        accepted
+    );
     assert_eq!(queue.refused.lock().unwrap().len(), 1);
     assert!(queue.accepted.lock().unwrap().is_empty());
     drop(api);
@@ -498,7 +506,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         checkpoint: Mutex::new(Some(checkpoint)),
         after_dispatch: false,
         lose_source_reply: None,
-        lose_embedding_reply: AtomicBool::new(false),
+        lose_control_reply: Mutex::new(None),
     }));
     let (deadline_worker, deadline_server) =
         serve_http(crate::hosted_worker::router_with_task_budgets(
@@ -543,7 +551,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         checkpoint: Mutex::new(Some(checkpoint)),
         after_dispatch: true,
         lose_source_reply: None,
-        lose_embedding_reply: AtomicBool::new(false),
+        lose_control_reply: Mutex::new(None),
     }));
     let (handoff_worker, handoff_server) =
         serve_http(crate::hosted_worker::router_with_task_budgets(
@@ -614,7 +622,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
                 checkpoint: Mutex::new(Some(checkpoint)),
                 after_dispatch: false,
                 lose_source_reply: None,
-                lose_embedding_reply: AtomicBool::new(false),
+                lose_control_reply: Mutex::new(None),
             }));
             let (slow_worker, _slow_server) =
                 serve_http(crate::hosted_worker::router_with_task_budgets(
@@ -656,7 +664,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
                 checkpoint: Mutex::new(None),
                 after_dispatch: false,
                 lose_source_reply: Some("/objects/"),
-                lose_embedding_reply: AtomicBool::new(false),
+                lose_control_reply: Mutex::new(None),
             });
             let (worker, server) =
                 serve_http(crate::hosted_worker::router(catalog_with_storage(storage))).await;
