@@ -1756,3 +1756,23 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   hints from older releases. Deploy updated repair workers before APIs
   begin writing the new hint format.
   [Dispatch repair](STORAGE.md#cloud-tasks-dispatch).
+
+## Maintenance recovery for hosted collection creation
+
+- Hosted creation first records a tenant-scoped intent. Scheduled
+  snapshot maintenance can initialize a missing collection database,
+  activate an already-published initial database, or clean up an
+  intent left after catalog activation.
+- The filesystem-backed gRPC test interrupted creation before initial
+  publication, before catalog activation, and after activation. A fresh
+  maintenance service recovered all three with no client retries.
+  The original request IDs replayed their outcomes without publishing
+  another catalog generation.
+- With live MinIO, a generated Python client received `UNAVAILABLE`
+  while another writer held the catalog lease. A fresh process in the
+  Cloud Run worker role ran the HTTP snapshot sweep and reported one
+  recovered creation. The next API process listed the collection and
+  replayed its original request ID. The initial database generation and
+  recovered catalog generation were reused. Actual Cloud Run ingress
+  and Scheduler delivery remain open.
+  [Snapshot maintenance](STORAGE.md#scheduled-snapshot-reclamation).

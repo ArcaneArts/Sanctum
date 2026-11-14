@@ -4750,6 +4750,147 @@ async fn hosted_database_sessions_pin_a_scope_and_generation_across_instances() 
 }
 
 #[tokio::test]
+async fn maintenance_recovers_hosted_collection_creation_without_a_client_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        interrupt: AtomicU8::new(0),
+    });
+    let prefix = Key::parse("managed").unwrap();
+    let make_catalog = || HostedCatalog::new(storage.clone(), Some(prefix.clone()), 1024).unwrap();
+    let executor =
+        sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(30)).unwrap();
+    let tenant = "default".parse().unwrap();
+    let catalog = sanctum_db::Unit::catalog(Some(&prefix), &tenant).unwrap();
+    let scope = |name: &str| sanctum_core::Scope {
+        tenant: tenant.clone(),
+        collection: name.parse().unwrap(),
+    };
+    let request = |name: &str, id| v1::CreateCollectionRequest {
+        scope: Some(v1::Scope {
+            tenant: "default".into(),
+            collection: name.into(),
+        }),
+        request_id: Some(id),
+    };
+    let intent_prefix = Key::parse("managed/default/catalog/creations").unwrap();
+    let mut api = start(make_catalog()).await;
+
+    // Persist the request while the initial SQLite writer is held.
+    let before_initial = uuid::Uuid::new_v4().to_string();
+    let first_scope = scope("before-initial");
+    let before_unit = sanctum_db::Unit::collection(Some(&prefix), &first_scope).unwrap();
+    let initial_lease = executor.acquire(&before_unit).await.unwrap();
+    assert_eq!(
+        api.client
+            .create_collection(request("before-initial", before_initial.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable,
+    );
+    assert!(executor.generation(&before_unit).await.unwrap().is_none());
+    assert_eq!(
+        api.client
+            .create_collection(request("other-collection", before_initial.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists,
+    );
+    let other_unit =
+        sanctum_db::Unit::collection(Some(&prefix), &scope("other-collection")).unwrap();
+    assert!(executor.generation(&other_unit).await.unwrap().is_none());
+    initial_lease.release().await.unwrap();
+
+    // Keep the initial snapshot, but interrupt before catalog activation.
+    let after_initial = uuid::Uuid::new_v4().to_string();
+    let after_unit = sanctum_db::Unit::collection(Some(&prefix), &scope("after-initial")).unwrap();
+    let catalog_lease = executor.acquire(&catalog).await.unwrap();
+    assert_eq!(
+        api.client
+            .create_collection(request("after-initial", after_initial.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable,
+    );
+    let initial = executor.generation(&after_unit).await.unwrap().unwrap();
+    assert!(executor.generation(&catalog).await.unwrap().is_none());
+    catalog_lease.release().await.unwrap();
+
+    // Simulate the API stopping after catalog publication but before removing the intent.
+    let after_activation = uuid::Uuid::new_v4().to_string();
+    storage
+        .interrupt
+        .store(LEAVE_COLLECTION_CREATION_INTENT, Ordering::Relaxed);
+    api.client
+        .create_collection(request("after-activation", after_activation.clone()))
+        .await
+        .unwrap();
+    let listed = api
+        .client
+        .list_collections(v1::ListCollectionsRequest {
+            tenant: "default".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.collections.len(), 1);
+    assert_eq!(
+        storage
+            .list(Some(&intent_prefix), None, 8)
+            .await
+            .unwrap()
+            .objects
+            .len(),
+        3
+    );
+    api.stop().await;
+
+    let maintenance = make_catalog();
+    let sweep = maintenance.sweep_hosted_snapshots().await.unwrap();
+    assert_eq!(
+        (sweep.recovered_creations, sweep.failed, sweep.more),
+        (3, 0, false)
+    );
+    assert!(
+        storage
+            .list(Some(&intent_prefix), None, 8)
+            .await
+            .unwrap()
+            .objects
+            .is_empty()
+    );
+    assert_eq!(
+        executor.generation(&after_unit).await.unwrap(),
+        Some(initial)
+    );
+    assert_eq!(
+        maintenance
+            .list_collections(&tenant, None, 10)
+            .await
+            .unwrap(),
+        ["after-activation", "after-initial", "before-initial"],
+    );
+    let generation = executor.generation(&catalog).await.unwrap();
+    let mut api = start(make_catalog()).await;
+    for (name, id) in [
+        ("before-initial", before_initial),
+        ("after-initial", after_initial),
+        ("after-activation", after_activation),
+    ] {
+        api.client
+            .create_collection(request(name, id))
+            .await
+            .unwrap();
+    }
+    assert_eq!(executor.generation(&catalog).await.unwrap(), generation);
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn snapshot_sweep_resumes_units_and_protects_published_generations() {
     use std::time::{Duration, SystemTime};
 
@@ -5566,6 +5707,7 @@ const REJECT_SECOND_RANGE: u8 = 9;
 const FIRST_RANGE_READ: u8 = 10;
 const CORRUPT_RANGE: u8 = 11;
 const LOSE_PREPARED_EMBEDDING_RESPONSE: u8 = 12;
+const LEAVE_COLLECTION_CREATION_INTENT: u8 = 13;
 
 struct InterruptedRead<'a>(&'a AtomicU8);
 
@@ -5672,6 +5814,21 @@ impl Storage for InterruptAcceptance {
     }
 
     async fn delete(&self, key: &Key) -> StorageResult<()> {
+        if key.as_str().contains("/catalog/creations/")
+            && self
+                .interrupt
+                .compare_exchange(
+                    LEAVE_COLLECTION_CREATION_INTENT,
+                    0,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            return Err(Error::Busy(
+                "test interrupted collection creation cleanup".into(),
+            ));
+        }
         self.inner.delete(key).await
     }
 }

@@ -67,8 +67,15 @@ are retained for 45 days. The dispatch layer must reject expired
 operation envelopes when it invokes this executor.
 
 The executor has a shared publication contract for the filesystem,
-MinIO, and GCS. Hosted catalog operations use it to publish initial
-collection databases and activate them in the tenant catalog.
+MinIO, and GCS. Hosted creation stores a request under
+`<tenant>/catalog/creations/<request-id>.json` before initializing the
+collection database. Maintenance can resume from this intent even if
+the caller or initial API instance never retries. Activation is a
+separate fenced catalog commit with a request receipt. A committed
+receipt takes precedence on replay, and an interrupted activation
+reuses the published initial database. The intent is removed once
+the catalog outcome is committed. A pending request ID is reserved
+for the named collection within its tenant.
 
 ### Optional SQLite page deltas
 
@@ -434,13 +441,16 @@ shows the scheduler configuration.
 
 ### Scheduled snapshot reclamation
 
-The worker's snapshot sweep scans catalog and collection manifests. Each
-invocation processes up to eight units and stores the remaining work and
-pagination cursors. It acquires the unit's writer lease to mark snapshots
+The worker's snapshot sweep scans catalog and collection manifests and
+pending creation intents. Each invocation processes up to eight entries
+and stores the remaining work and pagination cursors. It acquires the
+unit's writer lease to mark snapshots
 that are no longer current. Deletion is eligible after 15 minutes from
 that observation, including for uploaded snapshots that never committed.
 Busy units are revisited on the next pass. The sweep preserves the
 published HEAD generation and leaves already downloaded reader files usable.
+The maintenance response includes `recovered_creations` for creation intents
+resolved with a successful catalog outcome.
 
 ### Hosted metadata
 

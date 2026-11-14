@@ -73,64 +73,6 @@ impl HostedCatalog {
         self
     }
 
-    pub async fn create_collection(&self, scope: &Scope, operation: Option<Uuid>) -> Result<()> {
-        if operation.is_some_and(|id| id.is_nil()) {
-            return Err(Error::Invalid("request ID must be a nonzero UUID".into()));
-        }
-        let catalog = Unit::catalog(self.prefix.as_ref(), &scope.tenant)?;
-        // A reused request ID must be checked before initializing another collection.
-        if let Some(operation) = operation
-            && let Some(outcome) = self.publication.receipt(&catalog, operation).await?
-        {
-            return collection_outcome(scope, &outcome);
-        }
-
-        if self.collection_retired(scope).await? {
-            return Err(Error::Conflict("collection ID was retired".into()));
-        }
-        let initialize = Unit::collection(self.prefix.as_ref(), scope)?;
-        // A previous attempt can have published the collection before catalog activation.
-        if self.publication.generation(&initialize).await?.is_none() {
-            let mut writer = self.publication.acquire(&initialize).await?;
-            let result = writer
-                .apply(
-                    vec![Command {
-                        operation: Uuid::nil(),
-                        payload: (),
-                    }],
-                    |tx, ()| {
-                        db::initialize_collection(tx)?;
-                        Ok("initialized".into())
-                    },
-                )
-                .await;
-            let release = writer.release().await;
-            result?;
-            release?;
-        }
-
-        let mut writer = self.publication.acquire(&catalog).await?;
-        let command = Command {
-            operation: operation.unwrap_or_else(Uuid::new_v4),
-            payload: scope.collection.to_string(),
-        };
-        let result = writer
-            .apply(vec![command], |tx, collection| {
-                db::initialize_catalog(tx)?;
-                let outcome = if db::activate_collection(tx, &collection)? {
-                    "created"
-                } else {
-                    "exists"
-                };
-                Ok(format!("{outcome}:{collection}"))
-            })
-            .await;
-        let release = writer.release().await;
-        let (_, receipts) = result?;
-        release?;
-        collection_outcome(scope, &receipts[0].outcome)
-    }
-
     pub async fn delete_collection(&self, scope: &Scope, request_id: Option<Uuid>) -> Result<()> {
         if request_id.is_some_and(|id| id.is_nil()) {
             return Err(Error::Invalid("request ID must be a nonzero UUID".into()));
@@ -242,21 +184,6 @@ impl HostedCatalog {
         tokio::task::spawn_blocking(move || read(database.path(), collection))
             .await
             .map_err(|error| Error::Internal(Box::new(error)))?
-    }
-}
-
-fn collection_outcome(scope: &Scope, outcome: &str) -> Result<()> {
-    if outcome == format!("created:{}", scope.collection) {
-        Ok(())
-    } else if outcome == format!("exists:{}", scope.collection) {
-        Err(Error::Conflict(format!(
-            "collection {} already exists",
-            scope.collection
-        )))
-    } else {
-        Err(Error::Conflict(
-            "request ID already applies to a different collection".into(),
-        ))
     }
 }
 

@@ -6,7 +6,10 @@ use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
-use crate::{HostedCatalog, hosted_rebuild::collection_manifest};
+use crate::{
+    HostedCatalog, hosted_collection_creation::creation_key_scope,
+    hosted_rebuild::collection_manifest,
+};
 
 const GRACE: Duration = Duration::from_secs(900);
 const UNIT_BUDGET: usize = 8;
@@ -19,19 +22,21 @@ struct Cursor {
 
 #[derive(Serialize, Deserialize)]
 struct UnitCursor {
-    manifest: String,
+    #[serde(rename = "manifest")]
+    key: String,
     next: Option<String>,
 }
 
 pub struct SnapshotSweep {
     pub deleted: usize,
     pub units: usize,
+    pub recovered_creations: usize,
     pub failed: usize,
     pub more: bool,
 }
 
 impl HostedCatalog {
-    /// Scans a bounded page of manifest keys and a bounded number of snapshot pages.
+    /// Scans a bounded page of manifests and pending creations.
     pub async fn sweep_hosted_snapshots(&self) -> Result<SnapshotSweep> {
         let path = "_maintenance/snapshot-sweep.json";
         let key = Key::parse(
@@ -76,9 +81,11 @@ impl HostedCatalog {
                 ));
             }
             for item in page.objects {
-                if unit_from_manifest(self.prefix.as_ref(), &item.key)?.is_some() {
+                if unit_from_manifest(self.prefix.as_ref(), &item.key)?.is_some()
+                    || creation_key_scope(self.prefix.as_ref(), &item.key).is_some()
+                {
                     cursor.pending.push_back(UnitCursor {
-                        manifest: item.key.to_string(),
+                        key: item.key.to_string(),
                         next: None,
                     });
                 }
@@ -89,6 +96,7 @@ impl HostedCatalog {
         let mut report = SnapshotSweep {
             deleted: 0,
             units: 0,
+            recovered_creations: 0,
             failed: 0,
             more: false,
         };
@@ -97,7 +105,20 @@ impl HostedCatalog {
                 .pending
                 .pop_front()
                 .expect("budget is bounded by the queue");
-            let manifest = Key::parse(&pending.manifest)?;
+            let manifest = Key::parse(&pending.key)?;
+            if let Some((tenant, operation)) = creation_key_scope(self.prefix.as_ref(), &manifest) {
+                match self
+                    .recover_collection_creation(tenant, operation, &manifest)
+                    .await
+                {
+                    Ok(recovered) => report.recovered_creations += usize::from(recovered),
+                    Err(error) => {
+                        report.failed += 1;
+                        tracing::warn!(%error, key = %manifest, "collection creation remains pending");
+                    }
+                }
+                continue;
+            }
             let Some(unit) = unit_from_manifest(self.prefix.as_ref(), &manifest)? else {
                 continue;
             };
@@ -135,6 +156,7 @@ impl HostedCatalog {
             kind = "hosted_snapshot",
             deleted_objects = report.deleted,
             units = report.units,
+            recovered_creations = report.recovered_creations,
             failed = report.failed,
             more = report.more,
             "completed a bounded cleanup pass"

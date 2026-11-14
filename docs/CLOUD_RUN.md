@@ -177,7 +177,8 @@ The upload sweep reclaims losing input attempts and old unpublished
 extractions, settles stale uploads after their processing window, and
 compacts terminal records. It saves a scan cursor so subsequent calls
 continue the same pass. The snapshot sweep advances stored cursors for catalog and collection
-snapshots and deletes noncurrent generations after reader grace.
+snapshots, resumes pending collection creations, and deletes noncurrent
+generations after reader grace.
 The source sweep advances a durable cursor and reclaims retired source
 bytes in bounded pages. The embedding profile job checks the worker's configured profile and
 resumes discovery after a change. It shares the existing dispatch
