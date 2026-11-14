@@ -356,9 +356,10 @@ impl Sanctum for Grpc {
             scope,
             request.after_cursor,
             request.limit.unwrap_or(100),
+            None,
         )
         .await
-        .map(Response::new)
+        .map(|(page, _)| Response::new(page))
     }
 
     type WatchChangesStream = ReceiverStream<std::result::Result<v1::ListChangesResponse, Status>>;
@@ -371,14 +372,20 @@ impl Sanctum for Grpc {
         let scope = parse_scope(request.scope)?;
         let limit = request.limit.unwrap_or(100);
         let backend = self.0.clone();
-        let first =
-            changes_page(backend.clone(), scope.clone(), request.after_cursor, limit).await?;
+        let (first, generation) = changes_page(
+            backend.clone(),
+            scope.clone(),
+            request.after_cursor,
+            limit,
+            None,
+        )
+        .await?;
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         let shutdown = self.1.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = shutdown.cancelled() => {}
-                _ = stream_changes(backend, scope, limit, first, sender) => {}
+                _ = stream_changes(backend, scope, limit, first, generation, sender) => {}
             }
         });
         Ok(Response::new(ReceiverStream::new(receiver)))
@@ -1892,6 +1899,7 @@ async fn stream_changes(
     scope: Scope,
     limit: u32,
     first: v1::ListChangesResponse,
+    mut generation: Option<uuid::Uuid>,
     sender: tokio::sync::mpsc::Sender<std::result::Result<v1::ListChangesResponse, Status>>,
 ) {
     let interval = match backend {
@@ -1914,8 +1922,14 @@ async fn stream_changes(
         let Ok(permit) = sender.reserve().await else {
             return;
         };
-        match changes_page(backend.clone(), scope.clone(), cursor, limit).await {
-            Ok(page) => {
+        let caught_up_to = generation.filter(|_| at_head);
+        let result = tokio::select! {
+            _ = sender.closed() => return,
+            page = changes_page(backend.clone(), scope.clone(), cursor, limit, caught_up_to) => page,
+        };
+        match result {
+            Ok((page, observed_generation)) => {
+                generation = observed_generation;
                 at_head = page.changes.len() < limit as usize;
                 if !page.changes.is_empty() || tokio::time::Instant::now() >= heartbeat {
                     cursor = page.next_cursor;
@@ -1936,31 +1950,39 @@ async fn changes_page(
     scope: Scope,
     after_cursor: u64,
     limit: u32,
-) -> std::result::Result<v1::ListChangesResponse, Status> {
-    let changes = match backend {
-        Backend::Local(service) => {
-            work(move || service.changes(&scope, after_cursor, limit)).await?
+    caught_up_to: Option<uuid::Uuid>,
+) -> std::result::Result<(v1::ListChangesResponse, Option<uuid::Uuid>), Status> {
+    let (changes, generation) = match backend {
+        Backend::Local(service) => (
+            work(move || service.changes(&scope, after_cursor, limit)).await?,
+            None,
+        ),
+        Backend::Hosted(catalog) => {
+            let (changes, generation) = catalog
+                .poll_changes(&scope, after_cursor, limit, caught_up_to)
+                .await
+                .map_err(status)?;
+            (changes, Some(generation))
         }
-        Backend::Hosted(catalog) => catalog
-            .changes(&scope, after_cursor, limit)
-            .await
-            .map_err(status)?,
     };
     let next_cursor = changes.last().map_or(after_cursor, |change| change.cursor);
-    Ok(v1::ListChangesResponse {
-        next_cursor,
-        changes: changes
-            .into_iter()
-            .map(|change| v1::SourceChange {
-                cursor: change.cursor,
-                kind: change.kind,
-                source_id: change.source,
-                revision_id: change.revision,
-                previous_revision_id: change.previous_revision,
-                chunk_ordinal: change.ordinal,
-            })
-            .collect(),
-    })
+    Ok((
+        v1::ListChangesResponse {
+            next_cursor,
+            changes: changes
+                .into_iter()
+                .map(|change| v1::SourceChange {
+                    cursor: change.cursor,
+                    kind: change.kind,
+                    source_id: change.source,
+                    revision_id: change.revision,
+                    previous_revision_id: change.previous_revision,
+                    chunk_ordinal: change.ordinal,
+                })
+                .collect(),
+        },
+        generation,
+    ))
 }
 
 async fn work<T: Send + 'static>(

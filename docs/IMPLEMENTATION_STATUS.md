@@ -912,6 +912,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   to observe publication and resume replacement and reset events.
 - Delivered in [PR #42](https://github.com/ArcaneArts/Sanctum/pull/42).
 
+### Idle hosted change polling
+
+- Once a watch catches up, it checks collection membership and the current
+  manifest on each poll. An unchanged generation requires no collection
+  snapshot download or SQLite query. Full pages continue to drain, and
+  deleted collections end the watch with `NOT_FOUND`.
+- The hosted gRPC integration test disables retention, counts collection
+  downloads during idle polls, and verifies ordered replay and deletion.
+- A generated Python gRPC client against live MinIO received an idle
+  heartbeat after nine collection manifest reads and one snapshot download.
+  It observed source publication, replayed replacement and `metadata_reset`
+  with one event per page after reconnecting, and observed `NOT_FOUND` after
+  a second process deleted the collection.
+
 ## Hosted database inspection
 
 - Scoped operator handles store the immutable publication identity

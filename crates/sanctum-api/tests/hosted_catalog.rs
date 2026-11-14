@@ -4634,8 +4634,12 @@ impl sanctum_service::Dispatch for TestDispatch {
 #[tokio::test]
 async fn hosted_change_stream_resumes_committed_events_across_instances() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
-    let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
+    let catalog = || {
+        HostedCatalog::new(storage.clone(), None, 1024)
+            .unwrap()
+            .with_snapshot_cache_bytes(0)
+    };
     let writer = catalog();
     let scope = sanctum_core::Scope {
         tenant: "default".parse().unwrap(),
@@ -4682,6 +4686,19 @@ async fn hosted_change_stream_resumes_committed_events_across_instances() {
         .unwrap()
         .into_inner();
     assert!(stream.message().await.unwrap().unwrap().changes.is_empty());
+    let reads = storage.collection_reads.load(Ordering::Relaxed);
+    let downloads = storage.collection_downloads.load(Ordering::Relaxed);
+    tokio::time::timeout(std::time::Duration::from_secs(6), async {
+        while storage.collection_reads.load(Ordering::Relaxed) < reads + 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("watch should continue polling the collection manifest");
+    assert_eq!(
+        storage.collection_downloads.load(Ordering::Relaxed),
+        downloads
+    );
 
     let header = v1::UploadTextHeader {
         scope: Some(wire_scope.clone()),
@@ -4773,6 +4790,12 @@ async fn hosted_change_stream_resumes_committed_events_across_instances() {
             .changes
             .is_empty()
     );
+    writer.delete_collection(&scope, None).await.unwrap();
+    let removed = tokio::time::timeout(std::time::Duration::from_secs(8), resumed.message())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(removed.code(), Code::NotFound);
     drop(resumed);
     api.stop().await;
 }

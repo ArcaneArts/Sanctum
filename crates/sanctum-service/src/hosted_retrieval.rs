@@ -384,7 +384,7 @@ impl HostedCatalog {
     }
 }
 
-async fn query_snapshot<T: Send + 'static>(
+pub(crate) async fn query_snapshot<T: Send + 'static>(
     snapshot: Arc<Materialized>,
     read: impl FnOnce(&db::CollectionDb) -> Result<T> + Send + 'static,
 ) -> Result<(T, Uuid)> {
