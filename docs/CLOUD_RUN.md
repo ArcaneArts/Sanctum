@@ -341,3 +341,69 @@ keep the real queue configuration.
    with the original operation and fixture size. Record text readiness,
    revision, and matching gRPC and MCP bytes. Restore the test deployment's
    normal queue and scheduler state if any exercise step fails.
+
+### Measure GiB-scale snapshot reads
+
+Use the [generated Python client](../examples/python/README.md) and a test
+deployment with a dedicated storage prefix. Disable embeddings on both
+roles for the lexical benchmark. Enable the diagnostics above on the API.
+Choose the service memory limit and `hosted_snapshot_cache_bytes` for the
+workload under test. The default cache holds at most 2 GiB of snapshots.
+Two 2 GiB snapshots plus their tenant catalog need a larger budget to stay
+cached together. Cloud Run counts the materialized files and SQLite working
+space against instance memory. Record instance memory, concurrency, the
+snapshot cache budget, and whether page deltas are enabled.
+[Cloud Run writable filesystem](https://docs.cloud.google.com/run/docs/container-contract#file_system_access).
+
+Seed through the ingestion API and read the SQLite snapshot length from
+the database session API. The example streams 200 MiB sources into two
+collections under a dedicated tenant until each snapshot reaches 1 GiB.
+Repeat with a new run ID and `--target-mib 2048` for 2 GiB. Each collection
+has its own measured size, which can exceed the target by one upload's
+index growth. Publication can use considerably more storage than the final
+database size. Keep the fixture prefix isolated for subsequent cleanup.
+Increase `--max-sources` if the selected chunk settings and fixture reach
+the upload count limit before the requested database size.
+
+```sh
+run_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+PYTHONPATH="$generated" python scripts/benchmark-deployed-snapshots.py \
+  --api-url "$API_URL" seed --run-id "$run_id" \
+  --collections 2 --target-mib 1024 > snapshot-manifest.json
+```
+
+The seed uses deterministic request IDs. Keep the run ID and seed arguments
+to replay an interrupted seed. Keep both collections unchanged while
+measuring, including the embedding profile. Wait for a fresh API instance
+or route requests to a fresh test API revision with the same storage and
+cache settings. The first search pass runs before any collection database
+session or fetch. Repeat the measure command against fresh instances for
+additional cold samples.
+
+```sh
+PYTHONPATH="$generated" python scripts/benchmark-deployed-snapshots.py \
+  --api-url "$API_URL" measure snapshot-manifest.json --samples 4 \
+  > snapshot-searches.json
+```
+
+Use `--collection collection-1` to measure a single active collection.
+Each pass dispatches one simultaneous gRPC request per selected collection.
+The report includes UTC timestamps, latency, snapshot byte length and
+generation, and the verified canonical range for every search. It checks
+the same excerpt with a separate fetch after the timed passes. Use
+`--samples 24 --interval-seconds 5` to keep issuing search passes across
+more than one Cloud Monitoring sample interval.
+
+Correlate the timestamps and generation with `snapshot_download`,
+`snapshot_cache`, `collection_sqlite_handle`, and `search` events and
+Cloud Run instance IDs. A cold collection read downloads the generation
+on that instance. A warm sample reuses the materialized generation, and
+the handle event identifies SQLite connection reuse. Report materialization
+time and transferred bytes separately from SQLite open time and client
+latency. Record the API and worker revision memory and tmpfs distributions
+from Cloud Monitoring during seeding and search, with the sample interval
+and concurrency. These platform metrics sample once a minute and can
+miss shorter peaks. Record out-of-memory exits or request failures if
+they occur.
+[Cloud Run instance logs](https://docs.cloud.google.com/run/docs/logging),
+[Cloud Run memory metrics](https://docs.cloud.google.com/monitoring/api/metrics_gcp_p_z#run).

@@ -156,14 +156,17 @@ impl Materialized {
     ) -> Result<T> {
         let cached = self.idle_collection_reader().take();
         let reused = cached.is_some();
+        let start = Instant::now();
         let database = match cached {
             Some(database) => database,
             None => sanctum_db_sqlite::CollectionDb::open_read_only(self.path())?,
         };
+        let duration_ms = start.elapsed().as_secs_f64() * 1_000.0;
         tracing::debug!(
             event = "collection_sqlite_handle",
             generation = %self.generation.id,
             reused,
+            duration_ms,
             "opened or reused a read-only SQLite handle"
         );
         let result = read(&database);

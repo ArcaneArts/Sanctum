@@ -1549,3 +1549,23 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   deployment and checks that an authenticated Scheduler invocation creates
   the missing task. It still needs an authorized Google Cloud project.
   [Dispatch repair exercise](CLOUD_RUN.md#repair-an-upload-that-never-reached-the-queue).
+
+## Search against deployed SQLite snapshots
+
+- The generated Python benchmark seeds synthetic text through gRPC until
+  the published databases reach the requested size. It records a manifest
+  of actual snapshot lengths and generations. A separate invocation runs
+  simultaneous lexical searches and verifies the exact UTF-8 excerpts and
+  subsequent fetches against the fixture.
+- SQLite read-handle logs include time to open a new connection or select
+  the cached connection. The runbook explains how to correlate these
+  events with object transfer times, generation and instance identity,
+  and Cloud Run memory and tmpfs metrics.
+  [Deployed capacity procedure](CLOUD_RUN.md#measure-gib-scale-snapshot-reads).
+- The release API on live MinIO verified separate seed and measure runs
+  across two collections, exact range retrieval, and idempotent replay
+  of a seed with multiple sources. `pnpm check` passed.
+- The target-size run published two databases of about 1.05 GiB and
+  searched both concurrently. The Linux ARM64 Docker API with tmpfs
+  returned cold results in 5.96–6.23 s with a 2.41 GiB cgroup peak.
+  [Measured results](CAPACITY.md#concurrent-grpc-search-on-1-gib-fts-snapshots).

@@ -177,6 +177,36 @@ cache budget cannot serve as a Cloud Run memory limit, where the retained
 copies and in-flight files also use instance memory. Live Cloud Run sizing
 and ingress timing remain open.
 
+### Concurrent gRPC search on 1 GiB FTS snapshots
+
+The [deployed snapshot benchmark](CLOUD_RUN.md#measure-gib-scale-snapshot-reads)
+published twenty 200 MiB text sources per collection through the release
+API and MinIO. The two SQLite databases were 1,131,315,200 and
+1,131,708,416 bytes. The seed ran on macOS with page deltas enabled and
+embeddings disabled. Each read run used a fresh API with a 5 GiB snapshot
+cache, one concurrent query per collection, and three repeated passes.
+The two cold searches ran against real FTS indexes. Every timed result and
+the subsequent fetch matched the expected UTF-8 bytes and published
+generation.
+
+| Measure | macOS API to loopback MinIO | Linux ARM64 API to MinIO over Docker bridge |
+| --- | ---: | ---: |
+| First gRPC search, per collection | 9.27–10.19 s | 5.96–6.23 s |
+| Download and verify collection snapshot | 9.23–10.17 s | 5.93–6.21 s |
+| Open read-only SQLite connection | 0.127–0.141 ms | 0.074–0.295 ms |
+| Repeated gRPC searches | 4.36–10.91 ms | 9.26–50.93 ms |
+
+Each cold API downloaded 1,257,944,248 and 1,258,443,024 bytes for
+the two collections, including their retained page deltas. The Linux run
+reused both SQLite handles on each repeat. The macOS column contains two
+API runs. The Linux column contains one run with two CPUs, an 8 GiB
+cgroup limit, and `/tmp` mounted as tmpfs. The Linux cgroup peak was
+2,590,826,496 bytes. The largest observed `shmem` sample was
+2,498,883,584 bytes across 46 samples, including memory-backed files
+during page replay. The timings come from local Docker and MinIO. Live
+Cloud Run measurements at 1 GiB and 2 GiB still need the authorized
+deployment.
+
 ## Exact vector ranking in SQLite
 
 The release comparison uses one SQLite database for chunk identity, metadata,
