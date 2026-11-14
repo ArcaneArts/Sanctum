@@ -180,7 +180,10 @@ continue the same pass. The snapshot sweep advances stored cursors for catalog a
 snapshots, resumes pending collection creations, and deletes noncurrent
 generations after reader grace.
 The source sweep advances a durable cursor and reclaims retired source
-bytes in bounded pages. The embedding profile job checks the worker's configured profile and
+bytes in bounded pages. The response and cleanup log report
+`deferred_objects` when a failed delete has been rescheduled. The worker
+continues with other due objects in that collection. The embedding profile
+job checks the worker's configured profile and
 resumes discovery after a change. It shares the existing dispatch
 shards. Point scheduled requests and task deliveries at the active
 worker revision when updating the embedding configuration.

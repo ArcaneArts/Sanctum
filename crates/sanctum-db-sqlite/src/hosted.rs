@@ -229,6 +229,7 @@ pub fn delete_source(tx: &Transaction<'_>, source: Uuid, expected: Option<Uuid>)
 }
 
 const HOSTED_READER_GRACE_SECONDS: i64 = 900;
+const HOSTED_DELETE_RETRY_SECONDS: i64 = 300;
 
 pub fn retire_revisions(tx: &Transaction<'_>, profile: Option<&str>) -> Result<()> {
     initialize_collection(tx)?;
@@ -261,12 +262,27 @@ pub fn retire_revisions(tx: &Transaction<'_>, profile: Option<&str>) -> Result<(
     writer.prune_unreferenced_embeddings()
 }
 
-pub fn acknowledge_objects(tx: &Transaction<'_>, objects: &[String]) -> Result<()> {
+pub fn settle_object_deletions(
+    tx: &Transaction<'_>,
+    objects: &[String],
+    failures: &[String],
+) -> Result<()> {
     let mut delete = tx
         .prepare("DELETE FROM hosted_object_garbage WHERE object_key = ?1")
         .map_err(database_error)?;
     for key in objects {
         delete.execute([key]).map_err(database_error)?;
+    }
+    let mut defer = tx
+        .prepare(
+            "UPDATE hosted_object_garbage SET delete_after = unixepoch() + ?2
+             WHERE object_key = ?1 AND delete_after <= unixepoch()",
+        )
+        .map_err(database_error)?;
+    for key in failures {
+        defer
+            .execute(params![key, HOSTED_DELETE_RETRY_SECONDS])
+            .map_err(database_error)?;
     }
     Ok(())
 }

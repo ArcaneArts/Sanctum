@@ -687,6 +687,21 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   bytes during the grace period.
 - Delivered in [PR #38](https://github.com/ArcaneArts/Sanctum/pull/38).
 
+### Independent retries for retired source objects
+
+- A source sweep continues past failed deletions, acknowledges successes,
+  and commits a five-minute retry delay for failed objects. The worker HTTP
+  response and cleanup event report the number deferred.
+- The filesystem-backed regression seeded 65 due objects and blocked the
+  first. It verified 63 successful deletions in the first 64-object batch,
+  progress on the next batch after restart, and acknowledgement of an
+  already absent object.
+- The worker HTTP route ran against live MinIO through a proxy that
+  returned an S3 access error for one delete. It removed the other two
+  objects, observed the retry delay after restart, and cleared the
+  deferred object when its retry became due.
+  [Hosted reclamation](STORAGE.md#hosted-source-deletion-and-reclamation).
+
 ## Scheduled hosted snapshot reclamation
 
 - The private worker snapshot sweep persists discovery and per-unit

@@ -4480,6 +4480,120 @@ async fn hosted_metadata_is_atomic_and_filters_published_revisions() {
 }
 
 #[tokio::test]
+async fn hosted_source_sweep_retries_failed_objects_without_holding_up_later_batches() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        interrupt: AtomicU8::new(0),
+    });
+    let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let service = catalog();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    service.create_collection(&scope, None).await.unwrap();
+    let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
+    let executor =
+        sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(15)).unwrap();
+    let keys: Vec<_> = (0..65)
+        .map(|index| format!("default/collections/notes/sources/retired-{index:02}.utf8"))
+        .collect();
+    for key in &keys {
+        storage
+            .put_stream(&Key::parse(key).unwrap(), Box::pin(&b"old bytes"[..]), 9)
+            .await
+            .unwrap();
+    }
+    let mut writer = executor.acquire(&unit).await.unwrap();
+    writer
+        .apply(
+            vec![sanctum_db::Command {
+                operation: uuid::Uuid::new_v4(),
+                payload: keys.clone(),
+            }],
+            |tx, keys| {
+                for key in keys {
+                    tx.execute(
+                    "INSERT INTO hosted_object_garbage (object_key, delete_after) VALUES (?1, 0)",
+                    [key],
+                ).map_err(|error| Error::Internal(Box::new(error)))?;
+                }
+                Ok("seeded".into())
+            },
+        )
+        .await
+        .unwrap();
+    writer.release().await.unwrap();
+
+    storage
+        .interrupt
+        .store(REJECT_RETIRED_SOURCE_DELETE, Ordering::Relaxed);
+    let good = Key::parse(&keys[1]).unwrap();
+    let last = Key::parse(&keys[64]).unwrap();
+    let blocked = Key::parse(&keys[0]).unwrap();
+    let first = service.sweep_hosted_sources().await.unwrap();
+    assert!(matches!(storage.head(&good).await, Err(Error::NotFound(_))));
+    assert_eq!(first.deleted, 63);
+    assert_eq!(first.deferred_objects, 1);
+    assert_eq!(first.failed, 1);
+    assert!(storage.head(&blocked).await.is_ok());
+    assert!(storage.head(&last).await.is_ok());
+    drop(service);
+
+    let restarted = catalog();
+    assert_eq!(restarted.reclaim_hosted_sources(&scope).await.unwrap(), 1);
+    assert!(matches!(storage.head(&last).await, Err(Error::NotFound(_))));
+    assert!(storage.head(&blocked).await.is_ok());
+    let scratch = tempfile::tempdir().unwrap();
+    let snapshot = executor.read(&unit, scratch.path()).await.unwrap().unwrap();
+    let db = rusqlite::Connection::open(snapshot.path()).unwrap();
+    let remaining: (String, bool) = db
+        .query_row(
+            "SELECT object_key, delete_after > unixepoch() FROM hosted_object_garbage",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(remaining, (blocked.to_string(), true));
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM hosted_object_garbage", [], |row| row
+            .get::<_, u32>(
+            0
+        ))
+        .unwrap(),
+        1
+    );
+    drop(db);
+
+    let mut writer = executor.acquire(&unit).await.unwrap();
+    writer
+        .apply(
+            vec![sanctum_db::Command {
+                operation: uuid::Uuid::new_v4(),
+                payload: (),
+            }],
+            |tx, ()| {
+                tx.execute("UPDATE hosted_object_garbage SET delete_after = 0", [])
+                    .map_err(|error| Error::Internal(Box::new(error)))?;
+                Ok("retry due".into())
+            },
+        )
+        .await
+        .unwrap();
+    writer.release().await.unwrap();
+    storage.interrupt.store(0, Ordering::Relaxed);
+    // The provider may have deleted the object before returning a lost response.
+    storage.delete(&blocked).await.unwrap();
+    assert_eq!(restarted.reclaim_hosted_sources(&scope).await.unwrap(), 1);
+    assert!(matches!(
+        storage.head(&blocked).await,
+        Err(Error::NotFound(_))
+    ));
+    assert_eq!(restarted.reclaim_hosted_sources(&scope).await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn hosted_deletion_replays_and_defers_object_reclamation() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
@@ -5803,6 +5917,7 @@ const FIRST_RANGE_READ: u8 = 10;
 const CORRUPT_RANGE: u8 = 11;
 const LOSE_PREPARED_EMBEDDING_RESPONSE: u8 = 12;
 const LEAVE_COLLECTION_CREATION_INTENT: u8 = 13;
+const REJECT_RETIRED_SOURCE_DELETE: u8 = 14;
 
 struct InterruptedRead<'a>(&'a AtomicU8);
 
@@ -5909,6 +6024,11 @@ impl Storage for InterruptAcceptance {
     }
 
     async fn delete(&self, key: &Key) -> StorageResult<()> {
+        if key.as_str().ends_with("/retired-00.utf8")
+            && self.interrupt.load(Ordering::Relaxed) == REJECT_RETIRED_SOURCE_DELETE
+        {
+            return Err(Error::Busy("test blocked one retired source".into()));
+        }
         if key.as_str().contains("/catalog/creations/")
             && self
                 .interrupt

@@ -1,3 +1,6 @@
+use std::time::Duration;
+
+use futures::{StreamExt, stream};
 use sanctum_core::{Error, Result, Scope};
 use sanctum_db::{Command, Unit, collection_prefix};
 use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES};
@@ -21,10 +24,20 @@ struct SweepCursor {
 
 pub struct SourceSweep {
     pub deleted: usize,
+    pub deferred_objects: usize,
     pub collections: usize,
     pub failed: usize,
     pub more: bool,
 }
+
+#[derive(Default)]
+struct ReclaimedObjects {
+    deleted: Vec<String>,
+    deferred: Vec<String>,
+}
+
+const DELETE_TIMEOUT: Duration = Duration::from_secs(10);
+const CONCURRENT_DELETES: usize = 4;
 
 impl HostedCatalog {
     pub async fn delete_source(
@@ -109,6 +122,7 @@ impl HostedCatalog {
         }
         let mut report = SourceSweep {
             deleted: 0,
+            deferred_objects: 0,
             collections: 0,
             failed: 0,
             more: page.next_cursor.is_some(),
@@ -117,10 +131,12 @@ impl HostedCatalog {
             let Some(scope) = collection_manifest(self.prefix.as_ref(), &object.key) else {
                 continue;
             };
-            match self.reclaim_hosted_sources(&scope).await {
-                Ok(deleted) => {
+            match self.reclaim_source_batch(&scope).await {
+                Ok((deleted, deferred)) => {
                     report.collections += 1;
                     report.deleted += deleted;
+                    report.deferred_objects += deferred;
+                    report.failed += usize::from(deferred > 0);
                 }
                 Err(Error::NotFound(_)) => {}
                 Err(error) => {
@@ -140,6 +156,7 @@ impl HostedCatalog {
             event = "cleanup_pass",
             kind = "hosted_source",
             deleted_objects = report.deleted,
+            deferred_objects = report.deferred_objects,
             collections = report.collections,
             failed = report.failed,
             more = report.more,
@@ -150,6 +167,12 @@ impl HostedCatalog {
 
     /// Reclaims a bounded set of objects after their locators and reader grace expire.
     pub async fn reclaim_hosted_sources(&self, scope: &Scope) -> Result<usize> {
+        self.reclaim_source_batch(scope)
+            .await
+            .map(|(deleted, _)| deleted)
+    }
+
+    async fn reclaim_source_batch(&self, scope: &Scope) -> Result<(usize, usize)> {
         let profile = self
             .embedding
             .as_ref()
@@ -164,20 +187,28 @@ impl HostedCatalog {
             })
             .await?;
         let prefix = format!("{}/", collection_prefix(self.prefix.as_ref(), scope)?);
-        for object in &objects {
-            if !object.starts_with(&prefix) {
-                return Err(Error::Internal(
-                    "retired object key escapes its collection".into(),
-                ));
-            }
-            let key = Key::parse(object)?;
-            match self.storage.delete(&key).await {
-                Ok(()) | Err(Error::NotFound(_)) => {}
-                Err(error) => return Err(error),
+        let mut deletions = stream::iter(objects)
+            .map(|object| {
+                let prefix = &prefix;
+                async move {
+                    let result = self.delete_retired_object(prefix, &object).await;
+                    (object, result)
+                }
+            })
+            .buffer_unordered(CONCURRENT_DELETES);
+        let mut settled = ReclaimedObjects::default();
+        while let Some((object, result)) = deletions.next().await {
+            match result {
+                Ok(()) | Err(Error::NotFound(_)) => settled.deleted.push(object),
+                Err(error) => {
+                    tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
+                        "retired source object deletion will be retried");
+                    settled.deferred.push(object);
+                }
             }
         }
-        let deleted = objects.len();
-        if retire || deleted > 0 {
+        let counts = (settled.deleted.len(), settled.deferred.len());
+        if retire || counts != (0, 0) {
             let unit = Unit::collection(self.prefix.as_ref(), scope)?;
             let mut writer = self.publication.acquire(&unit).await?;
             let result = writer
@@ -185,15 +216,13 @@ impl HostedCatalog {
                     "retire-sources",
                     vec![Command {
                         operation: Uuid::new_v4(),
-                        payload: objects,
+                        payload: settled,
                     }],
-                    move |tx, objects| {
+                    move |tx, settled| {
                         if retire {
                             hosted::retire_revisions(tx, profile.as_deref())?;
                         }
-                        if !objects.is_empty() {
-                            hosted::acknowledge_objects(tx, &objects)?;
-                        }
+                        hosted::settle_object_deletions(tx, &settled.deleted, &settled.deferred)?;
                         Ok("reclaimed".into())
                     },
                 )
@@ -202,6 +231,18 @@ impl HostedCatalog {
             result?;
             released?;
         }
-        Ok(deleted)
+        Ok(counts)
+    }
+
+    async fn delete_retired_object(&self, prefix: &str, object: &str) -> Result<()> {
+        if !object.starts_with(prefix) {
+            return Err(Error::Internal(
+                "retired object key escapes its collection".into(),
+            ));
+        }
+        let key = Key::parse(object)?;
+        tokio::time::timeout(DELETE_TIMEOUT, self.storage.delete(&key))
+            .await
+            .map_err(|_| Error::Busy("retired source object deletion timed out".into()))?
     }
 }

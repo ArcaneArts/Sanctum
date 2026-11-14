@@ -16,6 +16,7 @@ sanctum-embedding = { path = "../sanctum-embedding" }
 async-trait.workspace = true
 base64 = "0.22"
 blake3 = { workspace = true }
+futures.workspace = true
 globset.workspace = true
 memchr = "2.8"
 mime.workspace = true

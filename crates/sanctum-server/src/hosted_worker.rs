@@ -288,6 +288,7 @@ async fn sweep_sources(State(service): State<HostedCatalog>) -> Response {
     match service.sweep_hosted_sources().await {
         Ok(report) => Json(serde_json::json!({
             "deleted": report.deleted,
+            "deferred_objects": report.deferred_objects,
             "collections": report.collections,
             "failed": report.failed,
             "more": report.more,
