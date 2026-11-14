@@ -83,6 +83,14 @@ message RuntimeInfo {
   uint32 chunk_overlap_bytes = 15;
   bool standalone_object_worker = 16;
   optional uint32 chunk_max_tokens = 17;
+  MetadataLimits metadata_limits = 18;
+}
+
+message MetadataLimits {
+  // Compact JSON bytes per submitted value or patch, and per resulting value.
+  uint32 max_value_bytes = 1;
+  // Sum of compact JSON values or patches in one upload or mutation request.
+  uint32 max_request_bytes = 2;
 }
 
 message DatabaseTarget {

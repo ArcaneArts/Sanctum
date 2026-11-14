@@ -3,7 +3,9 @@ use std::{ops::Deref, path::Path, time::Duration};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
 };
-use sanctum_core::{ByteRange, Error, ExternalSource, GitProvenance, Result, UrlProvenance};
+use sanctum_core::{
+    ByteRange, Error, ExternalSource, GitProvenance, MetadataLimits, Result, UrlProvenance,
+};
 use uuid::Uuid;
 
 pub mod embedding;
@@ -564,14 +566,18 @@ impl<T: Deref<Target = Connection>> RevisionWrite<T> {
             ordinal: None,
         };
         if !source.is_empty() {
-            metadata::revision_entries(&self.0, target, Some(source))?;
+            metadata::revision_entries(&self.0, target, Some((source, MetadataLimits::default())))?;
         }
         for chunk in chunks {
             let target = metadata::RevisionTarget {
                 ordinal: Some(chunk.ordinal),
                 ..target
             };
-            metadata::revision_entries(&self.0, target, Some(&chunk.entries))?;
+            metadata::revision_entries(
+                &self.0,
+                target,
+                Some((&chunk.entries, MetadataLimits::default())),
+            )?;
         }
         Ok(())
     }

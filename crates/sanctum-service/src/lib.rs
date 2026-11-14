@@ -12,7 +12,8 @@ pub use db::metadata::{
 pub use db::{metadata_filter, metadata_indexes, metadata_query, snapshot as database_snapshot};
 pub use hit_metadata::{HitMetadata, HitMetadataEntry};
 use sanctum_core::{
-    ChunkSettings, Error, ExternalSource, Result, Scope, ScopeId, UsageMeasurement, UsageScope,
+    ChunkSettings, Error, ExternalSource, MetadataLimits, Result, Scope, ScopeId, UsageMeasurement,
+    UsageScope,
 };
 use sanctum_db_sqlite::{self as db, CollectionDb};
 pub use sanctum_db_sqlite::{Chunk, ChunkRef, CollectionDetails, Revision, RevisionContent};
@@ -88,6 +89,7 @@ pub struct Service {
     queue: LocalQueue,
     max_source_bytes: u64,
     chunking: ChunkSettings,
+    metadata_limits: MetadataLimits,
     url_importer: url_import::UrlImporter,
     imports: local_import::ActiveImports,
     database_sessions: database_sessions::DatabaseSessions,
@@ -116,6 +118,18 @@ pub struct Replacement {
 }
 
 impl TextUpload {
+    fn check_metadata_limits(&self, limits: MetadataLimits) -> Result<()> {
+        if limits == MetadataLimits::default() {
+            return Ok(());
+        }
+        let edits = self.initial_metadata.iter().chain(
+            self.initial_chunk_metadata
+                .iter()
+                .flat_map(|chunk| &chunk.entries),
+        );
+        db::metadata::validate_input_limits(limits, edits)
+    }
+
     fn validate(&mut self) -> Result<()> {
         db::metadata::validate_initial_metadata(
             &self.initial_metadata,
@@ -226,6 +240,12 @@ impl Service {
         target: Option<RevisionTarget>,
         edits: Option<&[MetadataMutation]>,
     ) -> Result<Vec<MetadataEntry>> {
+        let edits = edits
+            .map(|edits| {
+                db::metadata::validate_input_limits(self.metadata_limits, edits.iter())?;
+                Ok::<_, Error>((edits, self.metadata_limits))
+            })
+            .transpose()?;
         match target {
             Some(target) if edits.is_some() => {
                 let _reader = self
@@ -304,6 +324,7 @@ impl Service {
             queue,
             max_source_bytes,
             chunking: ChunkSettings::default(),
+            metadata_limits: MetadataLimits::default(),
             url_importer: url_import::UrlImporter::new()?,
             imports: Default::default(),
             database_sessions,
@@ -331,6 +352,16 @@ impl Service {
         settings.validate()?;
         self.chunking = settings;
         Ok(self)
+    }
+
+    pub fn with_metadata_limits(mut self, limits: MetadataLimits) -> Result<Self> {
+        limits.validate()?;
+        self.metadata_limits = limits;
+        Ok(self)
+    }
+
+    pub fn metadata_limits(&self) -> MetadataLimits {
+        self.metadata_limits
     }
 
     pub fn max_source_bytes(&self) -> u64 {

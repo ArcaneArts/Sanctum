@@ -487,6 +487,12 @@ async fn main() -> anyhow::Result<()> {
             if let Some(tokens) = info.chunk_max_tokens {
                 println!("Chunk token budget: {tokens} estimated tokens");
             }
+            if let Some(limits) = info.metadata_limits {
+                println!(
+                    "Metadata limits: {} bytes per value, {} bytes per request",
+                    limits.max_value_bytes, limits.max_request_bytes
+                );
+            }
             if let Some(concurrency) = info.local_worker_concurrency {
                 println!("Local workers: {concurrency}");
             }

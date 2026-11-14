@@ -4,7 +4,7 @@ use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
     types::Value as SqlValue,
 };
-use sanctum_core::{Error, Result};
+use sanctum_core::{Error, MetadataLimits, Result};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -13,7 +13,6 @@ use super::{
     unsigned_column,
 };
 
-const VALUE_LIMIT: usize = 64 * 1024;
 const CHANGE_RETENTION: i64 = 10_000;
 
 #[derive(Clone, Copy)]
@@ -84,6 +83,24 @@ pub fn validate_initial_metadata(source: &[Mutation], chunks: &[ChunkMetadata]) 
     Ok(())
 }
 
+pub fn validate_input_limits<'a>(
+    limits: MetadataLimits,
+    edits: impl Iterator<Item = &'a Mutation>,
+) -> Result<()> {
+    let mut bytes = 0;
+    for edit in edits {
+        let value = match &edit.edit {
+            Edit::Set(value) | Edit::Patch(value) => value,
+            Edit::Remove => continue,
+        };
+        let length = serde_json::to_vec(value).map_err(json_error)?.len();
+        limits.check_value(length)?;
+        bytes += length;
+        limits.check_request(bytes)?;
+    }
+    Ok(())
+}
+
 pub fn validate_metadata_ordinals(chunks: &[ChunkMetadata], chunk_count: u64) -> Result<()> {
     if let Some(chunk) = chunks.iter().find(|chunk| chunk.ordinal >= chunk_count) {
         return Err(Error::Invalid(format!(
@@ -117,7 +134,7 @@ fn initial_metadata_bytes(edits: &[Mutation]) -> Result<usize> {
             return Err(Error::Invalid("initial metadata requires set edits".into()));
         };
         let length = serde_json::to_vec(value).map_err(json_error)?.len();
-        if length > VALUE_LIMIT {
+        if length > MetadataLimits::MAX_VALUE_BYTES as usize {
             return Err(Error::Invalid("metadata value exceeds 64 KiB".into()));
         }
         bytes += length;
@@ -128,7 +145,7 @@ fn initial_metadata_bytes(edits: &[Mutation]) -> Result<usize> {
 pub fn catalog_metadata(
     path: &Path,
     collection: &str,
-    edits: Option<&[Mutation]>,
+    edits: Option<(&[Mutation], MetadataLimits)>,
 ) -> Result<Vec<Entry>> {
     let mut connection = open(path, false)?;
     migrate(&mut connection, CATALOG_MIGRATIONS)?;
@@ -176,14 +193,15 @@ pub fn mutate_catalog_metadata(
     transaction: &Transaction<'_>,
     collection: &str,
     edits: &[Mutation],
+    limits: MetadataLimits,
 ) -> Result<Vec<Entry>> {
-    catalog_entries(transaction, collection, Some(edits))
+    catalog_entries(transaction, collection, Some((edits, limits)))
 }
 
 fn catalog_entries(
     connection: &Connection,
     collection: &str,
-    edits: Option<&[Mutation]>,
+    edits: Option<(&[Mutation], MetadataLimits)>,
 ) -> Result<Vec<Entry>> {
     super::confirm_collection(connection, collection)?;
     apply(
@@ -200,7 +218,7 @@ impl CollectionDb {
     pub fn metadata(
         &mut self,
         target: RevisionTarget,
-        edits: Option<&[Mutation]>,
+        edits: Option<(&[Mutation], MetadataLimits)>,
     ) -> Result<Vec<Entry>> {
         let transaction = self
             .0
@@ -298,14 +316,15 @@ pub fn mutate_revision_metadata(
     transaction: &Transaction<'_>,
     target: RevisionTarget,
     edits: &[Mutation],
+    limits: MetadataLimits,
 ) -> Result<Vec<Entry>> {
-    revision_entries(transaction, target, Some(edits))
+    revision_entries(transaction, target, Some((edits, limits)))
 }
 
 pub(crate) fn revision_entries(
     connection: &Connection,
     target: RevisionTarget,
-    edits: Option<&[Mutation]>,
+    edits: Option<(&[Mutation], MetadataLimits)>,
 ) -> Result<Vec<Entry>> {
     let source = target.source.to_string();
     let revision = target.revision.to_string();
@@ -394,9 +413,9 @@ fn apply(
     predicate: &str,
     columns: &str,
     target: Vec<SqlValue>,
-    edits: Option<&[Mutation]>,
+    edits: Option<(&[Mutation], MetadataLimits)>,
 ) -> Result<Vec<Entry>> {
-    if let Some(edits) = edits {
+    if let Some((edits, limits)) = edits {
         if !(1..=32).contains(&edits.len()) {
             return Err(Error::Invalid(
                 "metadata batch must contain 1 to 32 mutations".into(),
@@ -443,9 +462,7 @@ fn apply(
                 }
             };
             let json = serde_json::to_string(&value).map_err(json_error)?;
-            if json.len() > VALUE_LIMIT {
-                return Err(Error::Invalid("metadata value exceeds 64 KiB".into()));
-            }
+            limits.check_value(json.len())?;
             args.push(json.into());
             connection
                 .execute(&upsert, params_from_iter(&args))

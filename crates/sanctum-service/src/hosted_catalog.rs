@@ -1,6 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
-use sanctum_core::{ChunkSettings, Error, Result, Scope, ScopeId, UsageMeasurement, UsageScope};
+use sanctum_core::{
+    ChunkSettings, Error, MetadataLimits, Result, Scope, ScopeId, UsageMeasurement, UsageScope,
+};
 use sanctum_db::{
     Command, Materialized, Publication, SnapshotCache, Unit, collection_prefix, tenant_prefix,
 };
@@ -18,6 +20,7 @@ pub struct HostedCatalog {
     pub(crate) prefix: Option<Key>,
     pub(crate) max_source_bytes: u64,
     pub(crate) chunking: ChunkSettings,
+    pub(crate) metadata_limits: MetadataLimits,
     pub(crate) publication: Publication,
     pub(crate) snapshots: Arc<SnapshotCache>,
     pub(crate) dispatcher: Option<Arc<dyn Dispatch>>,
@@ -42,6 +45,7 @@ impl HostedCatalog {
             prefix,
             max_source_bytes,
             chunking: ChunkSettings::default(),
+            metadata_limits: MetadataLimits::default(),
             publication,
             snapshots,
             dispatcher: None,
@@ -54,6 +58,16 @@ impl HostedCatalog {
         settings.validate()?;
         self.chunking = settings;
         Ok(self)
+    }
+
+    pub fn with_metadata_limits(mut self, limits: MetadataLimits) -> Result<Self> {
+        limits.validate()?;
+        self.metadata_limits = limits;
+        Ok(self)
+    }
+
+    pub fn metadata_limits(&self) -> MetadataLimits {
+        self.metadata_limits
     }
 
     pub fn with_embedding(

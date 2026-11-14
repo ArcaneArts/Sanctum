@@ -188,6 +188,64 @@ impl ChunkSettings {
     }
 }
 
+/// Admission limits for metadata values and merge patches on one request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetadataLimits {
+    pub max_value_bytes: u32,
+    pub max_request_bytes: u32,
+}
+
+impl Default for MetadataLimits {
+    fn default() -> Self {
+        Self {
+            max_value_bytes: Self::MAX_VALUE_BYTES,
+            max_request_bytes: Self::MAX_REQUEST_BYTES,
+        }
+    }
+}
+
+impl MetadataLimits {
+    pub const MAX_VALUE_BYTES: u32 = 64 * 1024;
+    pub const MAX_REQUEST_BYTES: u32 = 2 * 1024 * 1024;
+
+    pub fn validate(self) -> Result<()> {
+        if !(1..=Self::MAX_VALUE_BYTES).contains(&self.max_value_bytes) {
+            return Err(Error::Invalid(format!(
+                "metadata_limits.max_value_bytes must be 1 to {}",
+                Self::MAX_VALUE_BYTES
+            )));
+        }
+        if !(1..=Self::MAX_REQUEST_BYTES).contains(&self.max_request_bytes) {
+            return Err(Error::Invalid(format!(
+                "metadata_limits.max_request_bytes must be 1 to {}",
+                Self::MAX_REQUEST_BYTES
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn check_value(self, bytes: usize) -> Result<()> {
+        if bytes > self.max_value_bytes as usize {
+            return Err(Error::Invalid(format!(
+                "metadata value exceeds the {} byte limit",
+                self.max_value_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn check_request(self, bytes: usize) -> Result<()> {
+        if bytes > self.max_request_bytes as usize {
+            return Err(Error::Invalid(format!(
+                "metadata request values exceed the {} byte limit",
+                self.max_request_bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
 pub const UPLOAD_FRAME_BYTES: usize = 256 * 1024;
 
 pub fn is_rtf(name: &str) -> bool {
