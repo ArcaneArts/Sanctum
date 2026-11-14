@@ -1,5 +1,5 @@
 use std::{
-    io::{self, BufReader, BufWriter, Write},
+    io::{self, BufReader, BufWriter, Read, Write},
     time::Instant,
 };
 
@@ -15,6 +15,7 @@ use sanctum_storage::Key;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{EmbeddingStep, HostedCatalog, HostedJob, Operation, Stage, unix_seconds};
@@ -396,10 +397,10 @@ impl HostedCatalog {
         let is_rtf = is_rtf(&record.upload.name);
         let expected = record.blake3.clone();
         let chunking = record.chunking;
-        let (file, mut content) =
-            tokio::task::spawn_blocking(move || prepare_text(staged, is_rtf, expected, chunking))
-                .await
-                .map_err(|error| Error::Internal(Box::new(error)))??;
+        let (file, mut content) = run_preparation(move |cancellation| {
+            prepare_text(staged, is_rtf, expected, chunking, cancellation)
+        })
+        .await?;
         crate::db::metadata::validate_metadata_ordinals(
             &record.upload.initial_chunk_metadata,
             content.chunks,
@@ -638,22 +639,74 @@ async fn copy_verified(
     Ok(())
 }
 
+// Dropping a timed-out request also signals the blocking work it started.
+async fn run_preparation<T: Send + 'static>(
+    prepare: impl FnOnce(&CancellationToken) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let cancellation = CancellationToken::new();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    tokio::task::spawn_blocking(move || {
+        check_preparation(&cancellation)?;
+        let result = prepare(&cancellation);
+        check_preparation(&cancellation)?;
+        result
+    })
+    .await
+    .map_err(|error| Error::Internal(Box::new(error)))?
+}
+
+fn check_preparation(cancellation: &CancellationToken) -> Result<()> {
+    if cancellation.is_cancelled() {
+        return Err(Error::Busy("hosted source preparation canceled".into()));
+    }
+    Ok(())
+}
+
+fn preparation_reader(inner: impl Read, cancellation: &CancellationToken) -> BufReader<impl Read> {
+    struct PreparationInput<'a, R> {
+        inner: R,
+        cancellation: &'a CancellationToken,
+    }
+
+    impl<R: Read> Read for PreparationInput<'_, R> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.cancellation.is_cancelled() {
+                return Err(io::Error::from(io::ErrorKind::ConnectionAborted));
+            }
+            self.inner.read(buffer)
+        }
+    }
+
+    BufReader::new(PreparationInput {
+        inner,
+        cancellation,
+    })
+}
+
 fn prepare_text(
     input: NamedTempFile,
     is_rtf: bool,
     original_hash: String,
     chunking: ChunkSettings,
+    cancellation: &CancellationToken,
 ) -> Result<(NamedTempFile, RevisionContent)> {
     let (file, encoding) = if is_rtf {
         let canonical = NamedTempFile::new()?;
         let mut writer = BufWriter::new(canonical.reopen()?);
-        let encoding = rtf_to_utf8(BufReader::new(input.reopen()?), &mut writer)?;
+        let encoding = rtf_to_utf8(
+            preparation_reader(input.reopen()?, cancellation),
+            &mut writer,
+        )?;
         writer.flush()?;
         (canonical, encoding)
     } else {
         (input, "UTF-8")
     };
-    let index = index_utf8_with_settings(BufReader::new(file.reopen()?), chunking, |_, _| Ok(()))?;
+    let index = index_utf8_with_settings(
+        preparation_reader(file.reopen()?, cancellation),
+        chunking,
+        |_, _| Ok(()),
+    )?;
     if !is_rtf && index.hash != original_hash {
         return Err(invalid_input());
     }
@@ -684,4 +737,77 @@ fn invalid_input() -> Error {
 
 pub(super) fn decode(receipt: &str) -> Result<Outcome> {
     serde_json::from_str(receipt).map_err(|error| Error::Internal(Box::new(error)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{io::Cursor, sync::mpsc, time::Duration};
+    use tokio::sync::oneshot;
+
+    struct PausedInput {
+        bytes: Cursor<Vec<u8>>,
+        pause: Option<(oneshot::Sender<()>, mpsc::Receiver<()>)>,
+    }
+
+    impl Read for PausedInput {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if let Some((started, resume)) = self.pause.take() {
+                started.send(()).unwrap();
+                resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                return Read::read(&mut self.bytes, buffer);
+            }
+            panic!("preparation continued reading after cancellation");
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_preparation_interrupts_utf8_scan_and_rtf_extraction() {
+        for is_rtf in [false, true] {
+            let (started, started_rx) = oneshot::channel();
+            let (resume, resume_rx) = mpsc::channel();
+            let (settled, settled_rx) = oneshot::channel();
+            let mut bytes = if is_rtf {
+                br"{\rtf1{\pict\bin32768 ".to_vec()
+            } else {
+                Vec::new()
+            };
+            bytes.extend_from_slice(&[b'x'; 32768]);
+            if is_rtf {
+                bytes.extend_from_slice(b"}}");
+            }
+            let mut work = Box::pin(run_preparation(move |cancellation| {
+                let input = preparation_reader(
+                    PausedInput {
+                        bytes: Cursor::new(bytes),
+                        pause: Some((started, resume_rx)),
+                    },
+                    cancellation,
+                );
+                let result = if is_rtf {
+                    rtf_to_utf8(input, io::sink()).map(|_| ())
+                } else {
+                    index_utf8_with_settings(input, ChunkSettings::default(), |_, _| Ok(()))
+                        .map(|_| ())
+                };
+                let interrupted = matches!(&result, Err(Error::Io(error))
+                    if error.kind() == io::ErrorKind::ConnectionAborted);
+                settled.send(interrupted).unwrap();
+                result
+            }));
+            tokio::select! {
+                result = &mut work => panic!("preparation completed before cancellation: {result:?}"),
+                started = started_rx => started.unwrap(),
+            }
+            drop(work);
+            resume.send(()).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), settled_rx)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                "interrupted input must be a retryable failure (RTF: {is_rtf})",
+            );
+        }
+    }
 }
