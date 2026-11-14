@@ -8,6 +8,7 @@ rust-version.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
+http = "1"
 object_store.workspace = true
 sanctum-core = { path = "../sanctum-core" }
 sanctum-storage = { path = "../sanctum-storage" }
@@ -16,5 +17,6 @@ tokio-util = { workspace = true, features = ["io"] }
 tracing.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 sanctum-storage = { path = "../sanctum-storage", features = ["test-support"] }
 uuid.workspace = true

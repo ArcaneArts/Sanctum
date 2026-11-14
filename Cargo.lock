@@ -2681,8 +2681,10 @@ name = "sanctum-storage-s3"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "bytes",
  "futures",
+ "http",
  "object_store",
  "sanctum-core",
  "sanctum-storage",
