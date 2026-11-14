@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use sanctum_config::{CloudRunRole, Config, ObjectStorageConfig};
 use sanctum_service::HostedCatalog;
@@ -6,6 +6,8 @@ use sanctum_storage::{Key, Storage};
 use sanctum_storage_gcs::GcsStorage;
 use sanctum_storage_s3::{S3Config, S3Storage};
 use tokio_util::sync::CancellationToken;
+
+const CLOUD_RUN_DRAIN: Duration = Duration::from_secs(7);
 
 pub(crate) async fn serve(
     config: Config,
@@ -160,20 +162,47 @@ pub(crate) async fn serve(
         Ok::<(), anyhow::Error>(())
     };
     tokio::pin!(grpc, worker);
-    tokio::select! {
+    let result = tokio::select! {
         result = &mut grpc => {
-            cancellation.cancel();
-            result.and(worker.await)
+            return drain(&cancellation, config.cloud_run_role, async {
+                result.and(worker.await)
+            }).await;
         }
         result = &mut worker => {
-            cancellation.cancel();
-            result.and(grpc.await)
+            return drain(&cancellation, config.cloud_run_role, async {
+                result.and(grpc.await)
+            }).await;
         }
-        signal = crate::shutdown_signal() => {
-            cancellation.cancel();
-            let (grpc, worker) = tokio::join!(grpc, worker);
-            signal.map_err(anyhow::Error::from).and(grpc).and(worker)
+        signal = crate::shutdown_signal() => signal,
+    };
+    drain(&cancellation, config.cloud_run_role, async {
+        let (grpc, worker) = tokio::join!(grpc, worker);
+        result.map_err(anyhow::Error::from).and(grpc).and(worker)
+    })
+    .await
+}
+
+async fn drain(
+    cancellation: &CancellationToken,
+    role: Option<CloudRunRole>,
+    work: impl Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    cancellation.cancel();
+    if let Some(role) = role {
+        match tokio::time::timeout(CLOUD_RUN_DRAIN, work).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    event = "cloud_run_drain_timeout",
+                    ?role,
+                    elapsed_seconds = CLOUD_RUN_DRAIN.as_secs(),
+                    "stopped waiting for requests during Cloud Run shutdown"
+                );
+                Ok(())
+            }
         }
+    } else {
+        work.await
     }
 }
 
@@ -186,4 +215,26 @@ async fn bind(address: Option<SocketAddr>) -> std::io::Result<Option<tokio::net:
 
 async fn health() -> axum::http::StatusCode {
     axum::http::StatusCode::NO_CONTENT
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future::pending, time::Instant};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn cloud_run_drain_returns_when_work_is_still_pending() {
+        let cancellation = CancellationToken::new();
+        let started = Instant::now();
+        tokio::time::timeout(
+            CLOUD_RUN_DRAIN + Duration::from_secs(2),
+            drain(&cancellation, Some(CloudRunRole::Worker), pending()),
+        )
+        .await
+        .expect("Cloud Run drain must be bounded")
+        .unwrap();
+        assert!(cancellation.is_cancelled());
+        assert!(started.elapsed() >= CLOUD_RUN_DRAIN);
+    }
 }
