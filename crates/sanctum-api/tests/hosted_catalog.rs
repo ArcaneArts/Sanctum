@@ -2294,7 +2294,12 @@ async fn hosted_index_rebuilds_missing_and_damaged_rtf_checkpoints() {
     catalog.create_collection(&scope, None).await.unwrap();
     let mut server = start(catalog.clone()).await;
     let mut pending = Vec::new();
-    for (tag, retain) in [("missing", false), ("damaged", true)] {
+    for (tag, retain) in [
+        ("missing", false),
+        ("damaged", true),
+        ("alteredoriginal", true),
+        ("missingoriginal", true),
+    ] {
         let rtf = format!(r"{{\rtf1\ansi {tag} caf\'e9}}");
         let header = v1::UploadTextHeader {
             scope: Some(wire.clone()),
@@ -2318,12 +2323,12 @@ async fn hosted_index_rebuilds_missing_and_damaged_rtf_checkpoints() {
         .unwrap();
         let extraction = storage.list(Some(&prefix), None, 10).await.unwrap().objects;
         assert_eq!(extraction.len(), 1);
-        if retain {
+        if tag == "damaged" {
             let path = directory.path().join(extraction[0].key.as_str());
             let mut bytes = std::fs::read(&path).unwrap();
             bytes[0] = b'X';
             std::fs::write(path, bytes).unwrap();
-        } else {
+        } else if !retain {
             storage.delete(&extraction[0].key).await.unwrap();
         }
         let inputs = Key::parse(format!(
@@ -2333,7 +2338,9 @@ async fn hosted_index_rebuilds_missing_and_damaged_rtf_checkpoints() {
         let input = storage.list(Some(&inputs), None, 10).await.unwrap().objects;
         assert_eq!(input.len(), 1);
         let original = directory.path().join(input[0].key.as_str());
-        if retain {
+        if tag == "missingoriginal" {
+            storage.delete(&input[0].key).await.unwrap();
+        } else if retain {
             let mut wrong = rtf.as_bytes().to_vec();
             let position = rtf.find(tag).unwrap();
             wrong[position] = b'X';
@@ -2352,8 +2359,15 @@ async fn hosted_index_rebuilds_missing_and_damaged_rtf_checkpoints() {
             operation_id: accepted.operation_id,
         };
         if retain {
-            assert!(matches!(catalog.index_upload(&scope, operation).await,
-                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData));
+            let Err(error) = catalog.index_upload(&scope, operation).await else {
+                panic!("published a revision with an unverified retained original");
+            };
+            if tag == "missingoriginal" {
+                assert!(matches!(error, Error::Busy(_)));
+            } else {
+                assert!(matches!(error,
+                    Error::Io(error) if error.kind() == std::io::ErrorKind::InvalidData));
+            }
             let job = server
                 .client
                 .get_ingestion_job(request.clone())
