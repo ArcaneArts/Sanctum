@@ -11,6 +11,7 @@ pub mod hosted;
 mod lifecycle;
 pub mod metadata;
 pub mod metadata_filter;
+pub mod metadata_indexes;
 pub mod metadata_query;
 pub mod queue;
 pub mod snapshot;
@@ -26,6 +27,7 @@ const CATALOG_MIGRATIONS: &[&str] = &[
     include_str!("catalog_v3.sql"),
     include_str!("catalog_v4.sql"),
     include_str!("catalog_v5.sql"),
+    include_str!("metadata_indexes.sql"),
 ];
 const COLLECTION_SCHEMA: &str = include_str!("collection.sql");
 const COLLECTION_MIGRATIONS: &[&str] = &[
@@ -39,6 +41,7 @@ const COLLECTION_MIGRATIONS: &[&str] = &[
     include_str!("collection_v8.sql"),
     include_str!("collection_v9.sql"),
     include_str!("collection_v10.sql"),
+    include_str!("metadata_indexes.sql"),
 ];
 
 #[derive(Debug)]

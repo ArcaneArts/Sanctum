@@ -122,7 +122,7 @@ impl HostedCatalog {
         self.storage.delete(&key).await
     }
 
-    fn database_unit(&self, target: &DatabaseTarget) -> Result<Unit> {
+    pub(crate) fn database_unit(&self, target: &DatabaseTarget) -> Result<Unit> {
         match &target.collection {
             Some(collection) => Unit::collection(
                 self.prefix.as_ref(),

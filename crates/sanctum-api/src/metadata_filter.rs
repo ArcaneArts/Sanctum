@@ -110,7 +110,7 @@ fn parse_field(field: v1::MetadataField) -> Result<Field> {
     })
 }
 
-fn parse_level(level: v1::MetadataLevel) -> Result<Level> {
+pub(super) fn parse_level(level: v1::MetadataLevel) -> Result<Level> {
     match level {
         v1::MetadataLevel::Collection => Ok(Level::Collection),
         v1::MetadataLevel::Source => Ok(Level::Source),

@@ -645,6 +645,41 @@ same request to get the next page. Each page reads current committed data.
 An integration that needs repeatable pages across concurrent edits can
 query an exported database snapshot.
 
+### Named metadata indexes
+
+Use `CreateMetadataIndex`, `ListMetadataIndexes`, and `DropMetadataIndex`
+to manage optional SQLite indexes. Each request selects a database with
+`DatabaseTarget`. Omit `collection` for a tenant catalog index at
+`COLLECTION` level, or set it for a `SOURCE` or `CHUNK` index in that
+collection. For example, send this request to `CreateMetadataIndex`:
+
+```json
+{
+  "target": { "tenant": "default", "collection": "notes" },
+  "index": {
+    "name": "review-status",
+    "level": "METADATA_LEVEL_SOURCE",
+    "namespace": "review",
+    "key": "status"
+  }
+}
+```
+
+An index lets `QueryMetadata` and source or chunk search filters look up
+top-level `EXISTS` and `EQUAL` matches by key. It narrows the metadata
+rows considered and keeps the same JSON comparison rules. An index on a
+sparse, frequently queried field is a good candidate. Nested paths and
+other operators retain their existing query behavior. Every metadata key
+can be stored and queried without creating an index.
+
+Each database supports up to 32 named indexes. Names follow the tenant
+and collection ID rules. Each level, namespace, and key combination can
+have one index. Repeating the same create succeeds. A conflicting name
+or field returns `ALREADY_EXISTS`, and dropping an unknown index returns
+`NOT_FOUND`. Creation and removal commit through the database's normal
+write path. Hosted changes publish a new generation, and an already
+opened database session keeps its pinned snapshot.
+
 ## Read-only SQL sessions and snapshots
 
 `OpenDatabaseSession` accepts a tenant and optional collection. With only

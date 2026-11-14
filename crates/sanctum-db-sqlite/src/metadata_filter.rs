@@ -7,6 +7,7 @@ use serde_json::{Number, Value};
 use super::{
     database_error,
     metadata::{Entry, valid_name},
+    metadata_indexes::{self, Index},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -270,9 +271,21 @@ pub(super) fn append_for(
     collection: CollectionValues<'_>,
 ) -> Result<()> {
     filter.validate()?;
+    let indexes = if has_indexable_test(filter, collection) {
+        metadata_indexes::list(connection)?
+    } else {
+        Vec::new()
+    };
     let mut predicates = Vec::new();
     sql.push_str(" AND ");
-    compile(sql, arguments, &mut predicates, filter, collection)?;
+    compile(
+        sql,
+        arguments,
+        &mut predicates,
+        filter,
+        collection,
+        &indexes,
+    )?;
     if !predicates.is_empty() {
         connection
             .create_scalar_function(
@@ -295,12 +308,31 @@ pub(super) fn append_for(
     Ok(())
 }
 
+fn has_indexable_test(filter: &Filter, collection: CollectionValues<'_>) -> bool {
+    match filter {
+        Filter::Test(test) => {
+            indexable(test)
+                && !(test.level == Level::Collection
+                    && matches!(collection, CollectionValues::Entries(_)))
+        }
+        Filter::All(children) | Filter::Any(children) => children
+            .iter()
+            .any(|child| has_indexable_test(child, collection)),
+        Filter::Not(_) => false,
+    }
+}
+
+fn indexable(test: &Predicate) -> bool {
+    test.path.is_empty() && matches!(test.operator, Operator::Exists | Operator::Equal)
+}
+
 fn compile(
     sql: &mut String,
     arguments: &mut Vec<SqlValue>,
     predicates: &mut Vec<Predicate>,
     filter: &Filter,
     collection: CollectionValues<'_>,
+    indexes: &[Index],
 ) -> Result<()> {
     match filter {
         Filter::Test(test) => {
@@ -320,28 +352,48 @@ fn compile(
                 });
                 return Ok(());
             }
-            let index = predicates.len();
-            let mut predicate = test.clone();
-            if matches!(predicate.operator, Operator::Missing) {
-                predicate.operator = Operator::Exists;
-                sql.push_str("NOT ");
-            }
-            predicates.push(predicate);
-            match test.level {
-                Level::Collection => write!(sql,
-                    "EXISTS (SELECT 1 FROM collection_metadata AS m WHERE m.collection = c.collection
-                        AND m.namespace = ? AND m.key = ? AND sanctum_metadata_matches({index}, m.value))"),
-                level => {
-                    let ordinal = if level == Level::Chunk { "c.ordinal" } else { "-1" };
-                    write!(sql,
-                        "EXISTS (SELECT 1 FROM revision_metadata AS m
-                            WHERE m.source = c.source_id AND m.revision = c.revision_id
-                              AND m.ordinal = {ordinal} AND m.namespace = ? AND m.key = ?
-                              AND sanctum_metadata_matches({index}, m.value))")
-                }
-            }.expect("writing to a String");
             arguments.push(test.namespace.clone().into());
             arguments.push(test.key.clone().into());
+            let indexed = indexable(test)
+                && indexes.iter().any(|index| {
+                    index.level == test.level
+                        && index.namespace == test.namespace
+                        && index.key == test.key
+                });
+            let mut operator = test.operator;
+            if matches!(operator, Operator::Missing) {
+                operator = Operator::Exists;
+                sql.push_str("NOT ");
+            }
+            sql.push_str(match (indexed, test.level) {
+                (true, Level::Collection) =>
+                    "c.collection IN (SELECT m.collection FROM collection_metadata m
+                        WHERE m.namespace = ? AND m.key = ?",
+                (true, Level::Source) =>
+                    "(c.source_id, c.revision_id) IN (SELECT m.source, m.revision FROM revision_metadata m
+                        WHERE m.namespace = ? AND m.key = ? AND m.ordinal = -1",
+                (true, Level::Chunk) =>
+                    "(c.source_id, c.revision_id, c.ordinal) IN (SELECT m.source, m.revision, m.ordinal
+                        FROM revision_metadata m WHERE m.namespace = ? AND m.key = ? AND m.ordinal >= 0",
+                (false, Level::Collection) => "EXISTS (SELECT 1 FROM collection_metadata m
+                    WHERE m.collection = c.collection AND m.namespace = ? AND m.key = ?",
+                (false, Level::Source) => "EXISTS (SELECT 1 FROM revision_metadata m
+                    WHERE m.source = c.source_id AND m.revision = c.revision_id
+                      AND m.ordinal = -1 AND m.namespace = ? AND m.key = ?",
+                (false, Level::Chunk) => "EXISTS (SELECT 1 FROM revision_metadata m
+                    WHERE m.source = c.source_id AND m.revision = c.revision_id
+                      AND m.ordinal = c.ordinal AND m.namespace = ? AND m.key = ?",
+            });
+            if !test.path.is_empty() || !matches!(operator, Operator::Exists) {
+                let index = predicates.len();
+                predicates.push(Predicate {
+                    operator,
+                    ..test.clone()
+                });
+                write!(sql, " AND sanctum_metadata_matches({index}, m.value)")
+                    .expect("writing to a String");
+            }
+            sql.push(')');
         }
         Filter::All(children) | Filter::Any(children) => {
             let separator = if matches!(filter, Filter::All(_)) {
@@ -354,15 +406,130 @@ fn compile(
                 if index != 0 {
                     sql.push_str(separator);
                 }
-                compile(sql, arguments, predicates, child, collection)?;
+                compile(sql, arguments, predicates, child, collection, indexes)?;
             }
             sql.push(')');
         }
         Filter::Not(child) => {
             sql.push_str("NOT (");
-            compile(sql, arguments, predicates, child, collection)?;
+            compile(sql, arguments, predicates, child, collection, &[])?;
             sql.push(')');
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::{TransactionBehavior, params, params_from_iter};
+    use serde_json::json;
+
+    use super::*;
+    use crate::{initialize_catalog, initialize_collection, metadata_indexes::Edit, query_all};
+
+    #[test]
+    fn named_partial_indexes_preserve_matches_and_narrow_key_lookups() {
+        for (level, select, insert) in [
+            (
+                Level::Collection,
+                "SELECT c.collection FROM (SELECT id AS collection FROM collections) c WHERE 1",
+                "INSERT INTO collection_metadata VALUES ('with-key', ?1, ?2, '1.0')",
+            ),
+            (
+                Level::Source,
+                "SELECT c.source_id FROM (SELECT id AS source_id, current_revision AS revision_id FROM sources) c WHERE 1",
+                "INSERT INTO revision_metadata VALUES ('with-key', 'r', -1, ?1, ?2, '1.0')",
+            ),
+            (
+                Level::Chunk,
+                "SELECT c.source_id FROM chunks c WHERE 1",
+                "INSERT INTO revision_metadata VALUES ('with-key', 'r', 0, ?1, ?2, '1.0')",
+            ),
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            match level {
+                Level::Collection => {
+                    initialize_catalog(&tx).unwrap();
+                    tx.execute_batch(
+                        "INSERT INTO collections (id) VALUES ('with-key'), ('absent');",
+                    )
+                    .unwrap();
+                }
+                Level::Source | Level::Chunk => {
+                    initialize_collection(&tx).unwrap();
+                    tx.execute_batch(
+                        "INSERT INTO sources (id, name, current_revision) VALUES ('with-key', 'with key', 'r'), ('absent', 'absent', 'r');
+                         INSERT INTO revisions (source_id, id, content_hash, bytes, chunk_count, chunker)
+                            VALUES ('with-key', 'r', 'hash', 1, 1, 'test'), ('absent', 'r', 'hash', 1, 1, 'test');
+                         INSERT INTO chunks (source_id, revision_id, ordinal, start_byte, end_byte, content_hash)
+                            VALUES ('with-key', 'r', 0, 0, 1, 'hash'), ('absent', 'r', 0, 0, 1, 'hash');",
+                    ).unwrap();
+                }
+            }
+            let namespace = "integration's";
+            let key = "clé 'test'";
+            tx.execute(insert, params![namespace, key]).unwrap();
+            let values = if level == Level::Collection {
+                CollectionValues::Catalog
+            } else {
+                CollectionValues::Entries(&[])
+            };
+            let check = |connection: &Connection, indexed: bool| {
+                for (operator, operand, expected) in [
+                    (Operator::Exists, None, "with-key"),
+                    (Operator::Equal, Some(json!(1)), "with-key"),
+                    (Operator::Missing, None, "absent"),
+                ] {
+                    let filter = Filter::Test(Predicate {
+                        level,
+                        namespace: namespace.into(),
+                        key: key.into(),
+                        path: Vec::new(),
+                        operator,
+                        operand,
+                    });
+                    let mut sql = select.to_owned();
+                    let mut arguments = Vec::new();
+                    append_for(connection, &mut sql, &mut arguments, &filter, values).unwrap();
+                    let plan = query_all(
+                        connection,
+                        &format!("EXPLAIN QUERY PLAN {sql}"),
+                        params_from_iter(&arguments),
+                        |row| row.get::<_, String>(3),
+                    )
+                    .unwrap();
+                    let used_index = plan
+                        .iter()
+                        .any(|step| step.contains("sanctum_meta_frequent"));
+                    if !indexed || !matches!(operator, Operator::Missing) {
+                        assert_eq!(used_index, indexed, "{plan:?}");
+                    }
+                    let matches =
+                        query_all(connection, &sql, params_from_iter(&arguments), |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .unwrap();
+                    assert_eq!(matches, [expected]);
+                }
+            };
+            check(&tx, false);
+            let name: sanctum_core::ScopeId = "frequent".parse().unwrap();
+            metadata_indexes::apply(
+                &tx,
+                Edit::Create(Index {
+                    name: name.clone(),
+                    level,
+                    namespace: namespace.into(),
+                    key: key.into(),
+                }),
+            )
+            .unwrap();
+            check(&tx, true);
+            metadata_indexes::apply(&tx, Edit::Drop(name)).unwrap();
+            check(&tx, false);
+        }
+    }
 }

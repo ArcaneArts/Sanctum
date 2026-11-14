@@ -34,6 +34,9 @@ service Sanctum {
   rpc GetMetadata(MetadataTarget) returns (MetadataResponse);
   rpc MutateMetadata(MutateMetadataRequest) returns (MetadataResponse);
   rpc QueryMetadata(QueryMetadataRequest) returns (QueryMetadataResponse);
+  rpc ListMetadataIndexes(DatabaseTarget) returns (ListMetadataIndexesResponse);
+  rpc CreateMetadataIndex(CreateMetadataIndexRequest) returns (Empty);
+  rpc DropMetadataIndex(DropMetadataIndexRequest) returns (Empty);
   rpc ListChanges(ListChangesRequest) returns (ListChangesResponse);
   rpc WatchChanges(ListChangesRequest) returns (stream ListChangesResponse);
   rpc GetChangeCursor(ChangeCursorRequest) returns (ChangeCursor);
@@ -184,6 +187,28 @@ message MetadataField {
   string namespace = 2;
   string key = 3;
   repeated MetadataPathSegment path = 4;
+}
+
+// A named partial index for top-level key existence and equality filters.
+message MetadataIndex {
+  string name = 1;
+  MetadataLevel level = 2;
+  string namespace = 3;
+  string key = 4;
+}
+
+message ListMetadataIndexesResponse {
+  repeated MetadataIndex indexes = 1;
+}
+
+message CreateMetadataIndexRequest {
+  DatabaseTarget target = 1;
+  MetadataIndex index = 2;
+}
+
+message DropMetadataIndexRequest {
+  DatabaseTarget target = 1;
+  string name = 2;
 }
 
 message MetadataList {
