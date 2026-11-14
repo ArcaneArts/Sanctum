@@ -4432,6 +4432,126 @@ async fn dispatch_reconciliation_recovers_a_failed_handoff_and_advances_its_curs
 }
 
 #[tokio::test]
+async fn hosted_acceptance_replays_while_dispatch_hint_writes_are_unavailable() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
+    let dispatch = Arc::new(TestDispatch {
+        fail: AtomicU8::new(1),
+        delivered: std::sync::Mutex::new(Vec::new()),
+    });
+    let catalog = || {
+        HostedCatalog::new(storage.clone(), None, 1024)
+            .unwrap()
+            .with_dispatch(dispatch.clone())
+    };
+    let scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    let mut server = start(catalog()).await;
+    server
+        .client
+        .create_collection(v1::CreateCollectionRequest {
+            scope: Some(scope.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let operation = uuid::Uuid::from_u128(100);
+    let header = v1::UploadTextHeader {
+        scope: Some(scope.clone()),
+        name: "recover.txt".into(),
+        request_id: Some(operation.to_string()),
+        ..Default::default()
+    };
+    let content = "Durable café quartz";
+    let accepted = server
+        .client
+        .submit_text(upload_frames(&header, [content.as_bytes()]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(accepted.state(), v1::IngestionState::Accepted);
+    assert!(dispatch.delivered.lock().unwrap().is_empty());
+    assert!(has_upload_hint(storage.as_ref(), operation).await);
+    server.stop().await;
+
+    storage
+        .interrupt
+        .store(REJECT_DISPATCH_HINT_WRITES, Ordering::Relaxed);
+    dispatch.fail.store(1, Ordering::Relaxed);
+    let worker = catalog();
+    let mut server = start(worker.clone()).await;
+    let replay = server
+        .client
+        .submit_text(upload_frames(&header, [content.as_bytes()]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(replay, accepted);
+    assert!(dispatch.delivered.lock().unwrap().is_empty());
+    let mut new_upload = header.clone();
+    let new_operation = uuid::Uuid::from_u128(101);
+    new_upload.request_id = Some(new_operation.to_string());
+    assert_eq!(
+        server
+            .client
+            .submit_text(upload_frames(&new_upload, [content.as_bytes()]))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable
+    );
+    assert_eq!(
+        server
+            .client
+            .get_ingestion_job(v1::IngestionJobRequest {
+                scope: Some(scope.clone()),
+                operation_id: new_operation.to_string(),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        Code::NotFound
+    );
+
+    let report = worker.reconcile_shard(0).await.unwrap();
+    assert_eq!((report.dispatched, report.failed), (1, 0));
+    assert_eq!(
+        &*dispatch.delivered.lock().unwrap(),
+        &[(operation, TaskStage::Register, None)]
+    );
+    let collection = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    worker
+        .register_upload(&collection, operation)
+        .await
+        .unwrap();
+    worker.index_upload(&collection, operation).await.unwrap();
+    let hits = server
+        .client
+        .search_text(v1::SearchTextRequest {
+            scope: Some(scope),
+            query: "quartz".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .hits;
+    let [hit] = hits.as_slice() else {
+        panic!("expected one result for the accepted upload");
+    };
+    assert_eq!(hit.excerpt, content);
+    let chunk = hit.chunk.as_ref().unwrap();
+    assert_eq!(chunk.source_id, accepted.source_id);
+    assert_eq!(chunk.revision_id, accepted.revision_id);
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn standalone_worker_resumes_hosted_hints_without_an_external_dispatcher() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
@@ -8116,6 +8236,7 @@ const UPLOAD_REPLY_DROPPED: u8 = 35;
 const REJECT_RETIRED_COLLECTION_DELETE: u8 = 36;
 const DENY_SOURCE_READ: u8 = 37;
 const DENY_EXTRACTION_WRITE: u8 = 38;
+const REJECT_DISPATCH_HINT_WRITES: u8 = 39;
 const PARALLEL_RANGE_START: u8 = 40;
 const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
 const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
@@ -8271,6 +8392,12 @@ impl Storage for InterruptAcceptance {
         bytes: axum::body::Bytes,
         condition: Condition,
     ) -> StorageResult<Version> {
+        if self.interrupt.load(Ordering::Relaxed) == REJECT_DISPATCH_HINT_WRITES
+            && key.as_str().starts_with("_dispatch/")
+            && key.as_str().contains("/pending/")
+        {
+            return Err(Error::Busy("test blocked dispatch hint writes".into()));
+        }
         if key.as_str().contains("/snapshots/sessions/") {
             match self.interrupt.load(Ordering::Relaxed) {
                 CHANGE_SESSION_REPLY => {

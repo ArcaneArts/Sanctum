@@ -838,9 +838,8 @@ impl HostedUpload {
                     )
                 {
                     self.service
-                        .record_dispatch_hint(&self.scope, self.operation, attempt)
-                        .await?;
-                    self.service.try_dispatch(&self.scope, self.operation).await;
+                        .restore_replay_dispatch(&self.scope, self.operation, attempt)
+                        .await;
                 }
                 return Ok(job);
             }
