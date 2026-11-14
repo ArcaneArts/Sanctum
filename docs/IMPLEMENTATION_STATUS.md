@@ -2570,6 +2570,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   hints from older releases. Deploy updated repair workers before APIs
   begin writing the new hint format.
   [Dispatch repair](STORAGE.md#cloud-tasks-dispatch).
+- A matching upload retry returns the durable receipt even if the server
+  cannot refresh its dispatch hint. The filesystem gRPC regression also
+  rejects a new upload during that failure and shows that dispatch repair
+  can recover the original hint. A generated Python client and standalone
+  server exercised the same sequence against live MinIO through a proxy
+  that denied hint writes. Restarting the server recovered the accepted
+  revision, and gRPC fetched its exact UTF-8 bytes. The test prefix was
+  removed. [Hosted upload acceptance](STORAGE.md#hosted-uploads).
 
 ## Local collection creation recovery
 
