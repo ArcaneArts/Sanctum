@@ -389,6 +389,53 @@ replacement, avoiding ten input embeddings. Each took one batched
 request. Time from upload start to complete embeddings was 1.69 s
 initially and 1.18 s after the edit, including the polling interval.
 
+### Concurrent hosted retrieval with real embeddings
+
+The hosted benchmark runs one release API and standalone object worker
+with MinIO. It publishes two collections with the same text window and
+Ollama profile as the local ArguAna run. Each collection takes a
+different slice of the corpus, ensures its selected queries have their
+judged documents present, and then fills the remaining document slots
+in archive order. The subsets can share documents.
+
+Use the generated Python client and an isolated MinIO prefix as above:
+
+```sh
+PYTHONPATH="$generated" python scripts/benchmark-hosted-vectors.py /path/to/arguana \
+  --revision eaff2253e2ba --documents 512 --queries 40
+```
+
+After both collections reach full coverage, a fresh API process serves
+the first concurrent semantic pass. The same API then runs semantic
+searches serially and concurrently, followed by concurrent hybrid
+search. The timed interval includes the provider query, SQLite ranking,
+and source-range fetches. Each returned excerpt is verified against the
+source bytes. Each pass measures recall on the same fixed query subset.
+
+The loopback MinIO run used 512 documents and 40 queries per collection.
+The collections shared 40 documents. They had 514 and 512 chunks at full
+coverage and published databases of 4,304,896 and 4,284,416 bytes. The first
+API requests took 230.62 and 185.06 ms. Downloading and replaying each
+collection's snapshot chain took 56.47 and 59.63 ms and transferred
+4,501,952 and 4,510,448 bytes respectively. Both requests also used the
+tenant catalog. Ollama was already warm when the API restarted.
+
+| Pass | Queries | p50 (ms) | p95 (ms) | Recall@10 |
+| --- | ---: | ---: | ---: | ---: |
+| Concurrent semantic, starting with a fresh API | 80 | 105.03 | 229.48 | 0.98750 |
+| Warm semantic, one query at a time | 80 | 104.13 | 138.14 | 0.98750 |
+| Warm semantic, two active collections | 80 | 127.96 | 187.43 | 0.98750 |
+| Warm hybrid, two active collections | 80 | 130.69 | 197.08 | 0.98750 |
+
+Only the first query per collection starts with a cold collection snapshot.
+All four passes retrieved the judged document for 79 of 80 queries after
+removing exact query-ID matches. The query ID list, joined with newline
+separators, had SHA-256
+`af57e5456f8f7bb9d0283cad2252e04c586e679d4d4b3a440eaac61a9e344bbf`.
+The subset limits the number of competing documents. Use the full ArguAna
+run for retrieval quality across the complete dataset. Cloud Run memory and
+latency for simultaneous GiB-scale collections remain unmeasured.
+
 ## SQLite page changes during a source replacement
 
 Use the [delta measurement script](../scripts/measure-snapshot-delta.py)
