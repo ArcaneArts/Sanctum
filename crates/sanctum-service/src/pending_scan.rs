@@ -1,7 +1,7 @@
 use std::{future::Future, io, sync::Arc};
 
 use memchr::memmem;
-use sanctum_core::{ByteRange, Error, ExternalSource, Result, Scope, is_rtf};
+use sanctum_core::{ByteRange, Error, ExternalSource, Result, Scope};
 use sanctum_storage::{Key, Storage};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
@@ -97,23 +97,25 @@ impl Service {
                 "literal scan requires pending text ingestion".into(),
             ));
         }
-        let input = if is_rtf(&job.name) {
-            ScanSource::RtfOriginal
-        } else {
-            let file = self.files.open_text(scope, job.source, job.revision)?;
-            if file.metadata()?.len() != job.bytes {
-                return Err(Error::Internal(
-                    "staged upload size differs from its receipt".into(),
-                ));
-            }
-            ScanSource::Local(tokio::fs::File::from_std(file))
-        };
+        let (input, total_bytes) =
+            if job.extract_rtf && (job.extracting || job.state == JobState::Accepted) {
+                (ScanSource::RtfOriginal, job.bytes)
+            } else {
+                let file = self.files.open_text(scope, job.source, job.revision)?;
+                let length = file.metadata()?.len();
+                if !job.extract_rtf && length != job.bytes {
+                    return Err(Error::Internal(
+                        "staged upload size differs from its receipt".into(),
+                    ));
+                }
+                (ScanSource::Local(tokio::fs::File::from_std(file)), length)
+            };
         Ok(PendingText {
             source: Some(job.source),
             revision: job.revision,
             name: job.name,
             external: job.external,
-            total_bytes: job.bytes,
+            total_bytes,
             input,
         })
     }

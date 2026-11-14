@@ -214,11 +214,12 @@ be 1 to 1024 UTF-8 bytes. The default hit limit is 10 and the maximum is 100.
 The final event reports `COMPLETE`, `BYTE_LIMIT`, `HIT_LIMIT`,
 `INVALID_TEXT`, or `EXTRACTION_PENDING` with zero bytes read when a pending
 RTF upload has no scan-ready text. The first event reports the original
-upload length in that case. Hosted RTF becomes scan-ready as soon as
-preparation saves the canonical UTF-8 object, even while lexical indexing
-is pending. The reported length and ranges then refer to those UTF-8
-bytes. A match is provisional until its source is published. Closing the
-gRPC stream stops the scan. Published text uses the ordinary search path.
+upload length in that case. RTF becomes scan-ready after the local worker
+saves canonical UTF-8 to disk or the hosted preparation task saves it to
+object storage, even while lexical indexing is pending. The reported
+length and ranges then refer to those UTF-8 bytes. A match is provisional
+until its source is published. Closing the gRPC stream stops the scan.
+Published text uses the ordinary search path.
 
 ```sh
 cargo run --locked -p sanctum-cli -- scan-pending notes OPERATION_ID '=value' --byte-limit 65536

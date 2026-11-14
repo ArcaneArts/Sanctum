@@ -266,6 +266,109 @@ async fn local_pending_literal_scan_does_not_require_lexical_publication() {
 }
 
 #[tokio::test]
+async fn local_pending_rtf_scan_uses_saved_utf8_while_the_index_writer_waits() {
+    use v1::{PendingTextScanStop as Stop, pending_text_scan_event::Event};
+
+    let dir = TempDir::new().unwrap();
+    let mut api = Running::start_with_workers(&dir, None, false).await;
+    create(&mut api.client, "default").await;
+    let header = v1::UploadTextFrame {
+        frame: Some(Frame::Header(v1::UploadTextHeader {
+            scope: scope("default"),
+            name: "notes.rtf".into(),
+            ..Default::default()
+        })),
+    };
+    let rtf = br"{\rtf1\ansi Local caf\'e9}";
+    let queued = api
+        .client
+        .submit_text(tokio_stream::iter([header, data(rtf), end()]))
+        .await
+        .unwrap()
+        .into_inner();
+    let job = job_request(queued.operation_id);
+    let scan = v1::ScanPendingTextRequest {
+        job: Some(job.clone()),
+        literal: "café".into(),
+        ..Default::default()
+    };
+    let mut events = api
+        .client
+        .scan_pending_text(scan.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(
+        events.message().await.unwrap().unwrap().event,
+        Some(Event::Source(source)) if source.total_bytes == rtf.len() as u64
+    ));
+    assert!(matches!(
+        events.message().await.unwrap().unwrap().event,
+        Some(Event::Progress(progress))
+            if progress.stop() == Stop::ExtractionPending && progress.read_bytes == 0
+    ));
+    assert!(events.message().await.unwrap().is_none());
+
+    let lock = rusqlite::Connection::open(dir.path().join("default/notes/meta.db")).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let service = api.service.clone();
+    let worker = tokio::task::spawn_blocking(move || service.process_next());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let progress = api
+                .client
+                .get_ingestion_job(job.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            if progress.state() == v1::IngestionState::Indexing {
+                break;
+            }
+            assert!(!worker.is_finished(), "{progress:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(search(&mut api.client, "default", "café").await.is_empty());
+    let canonical = "Local café";
+    let mut events = api
+        .client
+        .scan_pending_text(scan.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(
+        events.message().await.unwrap().unwrap().event,
+        Some(Event::Source(source))
+            if source.revision_id == queued.revision_id && source.total_bytes == canonical.len() as u64
+    ));
+    let Some(Event::Progress(progress)) = events.message().await.unwrap().unwrap().event else {
+        panic!("missing scan progress");
+    };
+    assert_eq!(progress.stop(), Stop::Complete);
+    assert_eq!(progress.read_bytes, canonical.len() as u64);
+    let [hit] = progress.matches.as_slice() else {
+        panic!("expected one match");
+    };
+    assert_eq!(
+        &canonical[hit.start_byte as usize..hit.end_byte as usize],
+        "café"
+    );
+    assert!(events.message().await.unwrap().is_none());
+
+    lock.execute_batch("ROLLBACK").unwrap();
+    assert!(worker.await.unwrap().unwrap());
+    let hits = search(&mut api.client, "default", "café").await;
+    assert_eq!(hits[0].excerpt, canonical);
+    assert_eq!(
+        api.client.scan_pending_text(scan).await.unwrap_err().code(),
+        Code::AlreadyExists
+    );
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn local_upload_keeps_accepted_chunk_settings_across_restart() {
     let dir = TempDir::new().unwrap();
     let configured = Service::open(dir.path(), 32_768)
