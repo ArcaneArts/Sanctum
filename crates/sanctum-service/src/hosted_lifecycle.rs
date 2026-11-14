@@ -136,6 +136,15 @@ impl HostedCatalog {
         self.storage
             .put_control(&key, body.into(), condition)
             .await?;
+        tracing::debug!(
+            event = "cleanup_pass",
+            kind = "hosted_source",
+            deleted_objects = report.deleted,
+            collections = report.collections,
+            failed = report.failed,
+            more = report.more,
+            "completed a bounded cleanup pass"
+        );
         Ok(report)
     }
 

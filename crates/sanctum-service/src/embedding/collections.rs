@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use sanctum_core::{ByteRange, Error, Result, Scope, ScopeId};
 use sanctum_db_sqlite::vector_index::VectorIndex;
@@ -6,7 +9,7 @@ use sanctum_db_sqlite::vector_index::VectorIndex;
 use super::{Coverage, PreparedQuery, SearchMode, blocking, fuse};
 use crate::{
     Chunk, ChunkEmbeddingState, Hit, HitMetadata, Service, db, hit_metadata::metadata_for_hit,
-    metadata_filter::Filter,
+    metadata_filter::Filter, telemetry,
 };
 
 const MAX_COLLECTIONS: usize = 8;
@@ -36,13 +39,26 @@ impl Service {
         filter: Option<Filter>,
         mode: SearchMode,
     ) -> Result<CollectionSearchResult> {
-        let scopes = collection_scopes(tenant, collections)?;
+        let start = Instant::now();
+        let scopes = collection_scopes(tenant.clone(), collections)?;
         let prepared = self
             .prepare_query(scopes.clone(), query, limit, filter.as_ref(), mode)
             .await?;
         let service = self.clone();
-        blocking(move || service.rank_collections(scopes, prepared, limit, filter.as_ref(), mode))
-            .await
+        let result = blocking(move || {
+            service.rank_collections(scopes, prepared, limit, filter.as_ref(), mode)
+        })
+        .await?;
+        telemetry::search(
+            &tenant,
+            None,
+            start.elapsed(),
+            result.mode,
+            result.coverage,
+            result.hits.len(),
+            result.degraded,
+        );
+        Ok(result)
     }
 
     fn rank_collections(

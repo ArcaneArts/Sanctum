@@ -1,15 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sanctum_core::{ByteRange, Error, Result, Scope};
 use sanctum_db_sqlite::vector_index::{ScoredChunk, VectorIndex};
-use sanctum_embedding::{EmbedError, Provider, Purpose, embed};
+use sanctum_embedding::{EmbedError, Provider, Purpose};
 use tokio::sync::watch;
 
-use crate::{Chunk, ChunkRef, Hit, Service, metadata_filter::Filter};
+use crate::{Chunk, ChunkRef, Hit, Service, metadata_filter::Filter, telemetry};
 pub use sanctum_db_sqlite::embedding::Coverage;
 
 pub(crate) mod collections;
@@ -119,6 +119,7 @@ impl Service {
         filter: Option<Filter>,
         mode: SearchMode,
     ) -> Result<SearchResult> {
+        let start = Instant::now();
         let prepared = self
             .prepare_query(vec![scope.clone()], query, limit, filter.as_ref(), mode)
             .await?;
@@ -189,6 +190,15 @@ impl Service {
                     .collect::<Result<Vec<_>>>()?;
                 Ok((hits, actual_mode, coverage, degraded))
             })?;
+            telemetry::search(
+                &scope.tenant,
+                Some(&scope.collection),
+                start.elapsed(),
+                actual_mode,
+                coverage,
+                hits.len(),
+                degraded,
+            );
             Ok(SearchResult {
                 hits,
                 mode: actual_mode,
@@ -220,6 +230,7 @@ impl Service {
             prepared.degraded = Some("embedding_disabled");
             return Ok(prepared);
         };
+        let (tenant, collection) = query_scope(&scopes);
         let service = self.clone();
         let profile = provider.profile_id().to_owned();
         let available = blocking(move || {
@@ -237,7 +248,15 @@ impl Service {
             prepared.degraded = Some("embeddings_unavailable");
             return Ok(prepared);
         }
-        match embed(provider.as_ref(), Purpose::Query, &[query]).await {
+        match telemetry::embed(
+            &tenant,
+            collection.as_ref(),
+            provider.as_ref(),
+            Purpose::Query,
+            &[query],
+        )
+        .await
+        {
             Ok(mut vectors) => prepared.vector = vectors.pop().map(Arc::from),
             Err(error) => {
                 tracing::warn!(%error, "query embedding unavailable");
@@ -343,7 +362,7 @@ pub async fn run_embedding_worker(service: Service, mut stop: watch::Receiver<bo
                     match batch {
                         Ok(batch) if !batch.texts.is_empty() => {
                             let outcomes = tokio::select! {
-                                outcomes = embed_batch(provider.as_ref(), batch) => outcomes,
+                                outcomes = embed_batch(&scope, provider.as_ref(), batch) => outcomes,
                                 _ = stop.changed() => return,
                             };
                             let current = service.clone();
@@ -376,11 +395,22 @@ pub async fn run_embedding_worker(service: Service, mut stop: watch::Receiver<bo
     }
 }
 
-pub(crate) async fn embed_batch(provider: &dyn Provider, batch: Batch) -> Vec<BatchOutcome> {
+pub(crate) async fn embed_batch(
+    scope: &Scope,
+    provider: &dyn Provider,
+    batch: Batch,
+) -> Vec<BatchOutcome> {
     let mut pending: Vec<_> = std::iter::once(0..batch.texts.len()).collect();
     let mut outcomes = Vec::new();
     while let Some(range) = pending.pop() {
-        let result = embed(provider, Purpose::Document, &batch.texts[range.clone()]).await;
+        let result = telemetry::embed(
+            &scope.tenant,
+            Some(&scope.collection),
+            provider,
+            Purpose::Document,
+            &batch.texts[range.clone()],
+        )
+        .await;
         if matches!(result, Err(EmbedError::Input(_))) && range.len() > 1 {
             let mid = range.start + range.len() / 2;
             pending.push(mid..range.end);
@@ -393,6 +423,17 @@ pub(crate) async fn embed_batch(provider: &dyn Provider, batch: Batch) -> Vec<Ba
         }
     }
     outcomes
+}
+
+// Both callers validate that the scopes are non-empty and share a tenant.
+pub(crate) fn query_scope(
+    scopes: &[Scope],
+) -> (sanctum_core::ScopeId, Option<sanctum_core::ScopeId>) {
+    let first = &scopes[0];
+    (
+        first.tenant.clone(),
+        (scopes.len() == 1).then(|| first.collection.clone()),
+    )
 }
 
 #[derive(Clone)]

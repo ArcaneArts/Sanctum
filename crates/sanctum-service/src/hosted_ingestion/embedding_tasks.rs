@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use sanctum_core::{Error, Result, Scope};
 use uuid::Uuid;
 
@@ -27,6 +29,7 @@ impl HostedCatalog {
             }
             _ => return Ok(()),
         };
+        let start = Instant::now();
         let now = unix_seconds()?;
         if current.not_before.is_some_and(|earliest| now < earliest) {
             return Err(Error::Busy("embedding task is scheduled for later".into()));
@@ -59,9 +62,10 @@ impl HostedCatalog {
             *embedding = next;
         }
         record.dispatched_at = None;
-        self.checkpoint(&prefix, record, version, |stage| {
+        let job = self.checkpoint(&prefix, record, version, |stage| {
             matches!(stage, Stage::TextReady { embedding: Some(current), .. } if current.step == step)
         }).await?;
+        job.log_stage(scope, "embedding_batch", start);
         Ok(())
     }
 }

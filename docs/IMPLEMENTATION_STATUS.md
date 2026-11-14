@@ -1209,3 +1209,17 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   generated Python client created catalog and source indexes against
   live MinIO, queried them after a server restart, and dropped them.
   [Index API](LOCAL_API.md#named-metadata-indexes).
+
+## Structured operation diagnostics
+
+- Local and hosted service events report queue and operation age, stage
+  outcomes, provider request latency, search coverage, committed vector
+  reuse, snapshot transfer and cache behavior, and bounded cleanup work.
+  Cloud Run roles emit JSON to stderr. Local servers can select JSON and
+  enable scoped diagnostic events with `RUST_LOG`.
+- `pnpm check` passed. A generated Python gRPC client exercised the
+  filesystem server and live MinIO with Ollama. It checked the emitted
+  JSON fields, exact range bytes, cold downloads and warm reuse after
+  restart, and one reused vector on each replacement. The fixture's
+  source text, filename, and query were absent from the logs.
+  [Event reference](LOCAL_API.md#server-diagnostics).

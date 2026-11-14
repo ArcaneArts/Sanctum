@@ -133,6 +133,15 @@ impl HostedCatalog {
                 condition,
             )
             .await?;
+        tracing::debug!(
+            event = "cleanup_pass",
+            kind = "hosted_upload",
+            deleted_objects = report.deleted,
+            expired = report.expired,
+            failed = report.failed,
+            more = report.more,
+            "completed a bounded cleanup pass"
+        );
         Ok(report)
     }
 

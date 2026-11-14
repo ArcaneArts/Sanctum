@@ -82,7 +82,7 @@ impl HostedCatalog {
             batch.hashes.push(chunk.hash);
         }
         let count = batch.hashes.len();
-        let outcomes = embed_batch(provider.as_ref(), batch).await;
+        let outcomes = embed_batch(scope, provider.as_ref(), batch).await;
         let mut writer = self.publication.acquire(&unit).await?;
         let saved = writer
             .apply_stage(

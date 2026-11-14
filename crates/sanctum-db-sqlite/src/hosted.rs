@@ -177,8 +177,8 @@ pub fn release_canceled_intent(
     Ok(())
 }
 
-pub fn publish_revision(
-    tx: &Transaction<'_>,
+pub fn publish_revision<'tx>(
+    tx: &'tx Transaction<'_>,
     revision: &crate::Revision,
     objects: &RevisionObjects,
     replacement: bool,
@@ -188,7 +188,7 @@ pub fn publish_revision(
         &[crate::metadata::ChunkMetadata],
     ),
     add_chunks: impl FnOnce(&crate::RevisionWrite<&rusqlite::Connection>) -> Result<()>,
-) -> Result<()> {
+) -> Result<crate::RevisionWrite<&'tx rusqlite::Connection>> {
     let writer = crate::RevisionWrite(&**tx);
     add_chunks(&writer)?;
     writer.register(revision, replacement, profile)?;
@@ -205,7 +205,7 @@ pub fn publish_revision(
     )
     .map_err(database_error)?;
     release_intent(tx, revision.source)?;
-    Ok(())
+    Ok(writer)
 }
 
 pub fn delete_source(tx: &Transaction<'_>, source: Uuid, expected: Option<Uuid>) -> Result<Uuid> {

@@ -1,6 +1,6 @@
 use std::{
     io,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use sanctum_core::{ChunkSettings, Error, ExternalSource, Result, Scope};
@@ -12,7 +12,7 @@ use tempfile::NamedTempFile;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
-use crate::{HostedCatalog, RevisionContent, TaskStage, TextUpload};
+use crate::{HostedCatalog, RevisionContent, TaskStage, TextUpload, telemetry};
 
 mod activity;
 mod cancellation;
@@ -47,6 +47,27 @@ pub struct HostedJob {
     pub state: HostedJobState,
     pub content: Option<RevisionContent>,
     pub embedding_work: Option<HostedEmbeddingWork>,
+}
+
+impl HostedJob {
+    fn log_stage(&self, scope: &Scope, stage: &'static str, start: Instant) {
+        let outcome = match self.state {
+            HostedJobState::Accepted => "accepted",
+            HostedJobState::Registered => "registered",
+            HostedJobState::TextReady => "text_ready",
+            HostedJobState::Canceled => "canceled",
+            HostedJobState::Failed { .. } => "failed",
+        };
+        telemetry::ingestion_stage(
+            scope,
+            self.operation,
+            stage,
+            self.created_at,
+            self.bytes,
+            start.elapsed(),
+            outcome,
+        );
+    }
 }
 
 pub struct HostedEmbeddingWork {
@@ -220,6 +241,7 @@ impl HostedCatalog {
         if !matches!(record.stage, Stage::PendingRegistration) {
             return Ok(record.job());
         }
+        let start = Instant::now();
         let unit = Unit::collection(self.prefix.as_ref(), scope)?;
         let intent = record.revision_intent()?;
         let expires_at = record
@@ -259,9 +281,11 @@ impl HostedCatalog {
                 Stage::PendingIndexing { registration }
             }
             RegistrationOutcome::Canceled => {
-                return self
+                let job = self
                     .checkpoint_canceled(scope, &prefix, record, version, None)
-                    .await;
+                    .await?;
+                job.log_stage(scope, "register", start);
+                return Ok(job);
             }
             RegistrationOutcome::Failed { code, message } => Stage::Failed {
                 code,
@@ -269,10 +293,13 @@ impl HostedCatalog {
                 registration: None,
             },
         };
-        self.checkpoint(&prefix, record, version, |stage| {
-            matches!(stage, Stage::PendingRegistration)
-        })
-        .await
+        let job = self
+            .checkpoint(&prefix, record, version, |stage| {
+                matches!(stage, Stage::PendingRegistration)
+            })
+            .await?;
+        job.log_stage(scope, "register", start);
+        Ok(job)
     }
 
     async fn checkpoint(
@@ -607,7 +634,18 @@ impl HostedUpload {
             serde_json::to_vec(&candidate).map_err(|error| Error::Internal(Box::new(error)))?;
         let store = self.service.storage.as_ref();
         let reader = tokio::fs::File::from_std(self.file.reopen()?);
+        let upload_started = Instant::now();
         store.put_stream(&input, Box::pin(reader), bytes).await?;
+        tracing::debug!(
+            event = "hosted_input_transfer",
+            tenant = %self.scope.tenant,
+            collection = %self.scope.collection,
+            operation = %self.operation,
+            direction = "upload",
+            bytes,
+            duration_ms = upload_started.elapsed().as_secs_f64() * 1_000.0,
+            "uploaded a staged source"
+        );
         if let Err(error) = self.service.require_collection(&self.scope).await {
             if matches!(error, Error::NotFound(_))
                 && let Err(cleanup) = store.delete(&input).await

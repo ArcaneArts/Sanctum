@@ -64,6 +64,8 @@ impl SnapshotCache {
             })
             .await?;
         tracing::debug!(
+            event = "snapshot_cache",
+            unit = %unit.prefix,
             generation = %file.generation.id,
             snapshot_bytes = file.generation.bytes,
             cached = ready,

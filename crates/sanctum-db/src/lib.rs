@@ -401,10 +401,13 @@ impl Publication {
         generation: Generation,
         directory: &Path,
     ) -> Result<Materialized> {
+        let start = Instant::now();
+        let mut downloaded_bytes = generation.bytes;
         let file = if let Some(chain) = &generation.chain {
             // Database sessions carry their own generation descriptor.
             chain.validate(&generation)?;
             let base = &chain.base;
+            downloaded_bytes = base.bytes;
             let database = self
                 .download_checked(
                     &unit.snapshot(base.id)?,
@@ -422,6 +425,7 @@ impl Publication {
                         directory,
                     )
                     .await?;
+                downloaded_bytes = downloaded_bytes.saturating_add(delta.bytes);
                 let mut writer = database.reopen()?;
                 let bytes = delta.result_bytes;
                 tokio::task::spawn_blocking(move || {
@@ -450,6 +454,15 @@ impl Publication {
             )
             .await?
         };
+        tracing::debug!(
+            event = "snapshot_download",
+            unit = %unit.prefix,
+            generation = %generation.id,
+            snapshot_bytes = generation.bytes,
+            downloaded_bytes,
+            duration_ms = start.elapsed().as_secs_f64() * 1_000.0,
+            "materialized a database snapshot"
+        );
         Ok(Materialized { generation, file })
     }
 
@@ -550,6 +563,7 @@ impl Lease {
                 "database command batch must contain 1 to 64 commands".into(),
             ));
         }
+        let start = Instant::now();
         self.renew().await?;
         let directory = tempfile::tempdir()?;
         let (source, shared) = match (self.head.generation.clone(), &self.publication.snapshots) {
@@ -637,7 +651,12 @@ impl Lease {
                 .await;
         }
         tracing::debug!(
+            event = "snapshot_publish",
+            unit = %self.unit.prefix,
+            generation = %generation.id,
+            stage,
             epoch = self.head.epoch,
+            duration_ms = start.elapsed().as_secs_f64() * 1_000.0,
             snapshot_bytes = generation.bytes,
             uploaded_bytes,
             commands = receipts.len(),
