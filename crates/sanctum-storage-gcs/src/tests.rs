@@ -133,6 +133,56 @@ async fn object(
     if let Some(scenario) = key.strip_prefix("default/notes/resume-") {
         return download_object(&fixture, &key, scenario, &query, &headers);
     }
+    if let Some(scenario) = key.strip_prefix("default/notes/range-") {
+        assert_eq!(query["alt"], "media");
+        assert_eq!(headers[header::RANGE], "bytes=1-4");
+        let attempt = {
+            let mut calls = fixture.reads.lock().unwrap();
+            calls.push("range:1-4".into());
+            calls.len()
+        };
+        return match (scenario, attempt) {
+            ("recover", 1) => StatusCode::REQUEST_TIMEOUT.into_response(),
+            ("recover", 2) => {
+                let body =
+                    stream::iter([Ok(Bytes::from_static(b"bc"))]).chain(stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Err(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "interrupted range",
+                        ))
+                    }));
+                (
+                    StatusCode::PARTIAL_CONTENT,
+                    [(header::CONTENT_RANGE, "bytes 1-4/6")],
+                    Body::from_stream(body),
+                )
+                    .into_response()
+            }
+            ("recover", 3) => (
+                StatusCode::PARTIAL_CONTENT,
+                [(header::CONTENT_RANGE, "bytes 1-4/6")],
+                "bcde",
+            )
+                .into_response(),
+            ("stall", 1) => std::future::pending().await,
+            ("stall", 2) => (
+                StatusCode::PARTIAL_CONTENT,
+                [(header::CONTENT_RANGE, "bytes 1-4/6")],
+                "bcde",
+            )
+                .into_response(),
+            ("unavailable", _) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            ("missing", _) => StatusCode::NOT_FOUND.into_response(),
+            ("wrong", _) => (
+                StatusCode::PARTIAL_CONTENT,
+                [(header::CONTENT_RANGE, "bytes 0-3/6")],
+                "abcd",
+            )
+                .into_response(),
+            _ => panic!("unexpected range attempt {attempt} for {scenario}"),
+        };
+    }
     if key.ends_with("/replaced") || key.ends_with("/removed") || key.ends_with("/changing") {
         return changing_object(
             &fixture,
@@ -348,6 +398,47 @@ async fn native_downloads_are_generation_fenced_and_ranges_are_exact() {
             .next_cursor
             .is_none()
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn range_read_recovers_after_timeout_and_an_interrupted_partial_body() {
+    let (storage, fixture, server) = start().await;
+    let key = Key::parse("default/notes/range-recover").unwrap();
+    let range = ByteRange { start: 1, end: 5 };
+    assert_eq!(storage.read_range(&key, range).await.unwrap(), "bcde");
+    assert_eq!(*fixture.reads.lock().unwrap(), ["range:1-4"; 3]);
+    server.abort();
+}
+
+#[tokio::test]
+async fn range_read_bounds_retries_and_preserves_permanent_errors() {
+    let range = ByteRange { start: 1, end: 5 };
+    for (scenario, expected_attempts) in [("unavailable", 3), ("missing", 1), ("wrong", 1)] {
+        let (storage, fixture, server) = start().await;
+        let key = Key::parse(format!("default/notes/range-{scenario}")).unwrap();
+        let error = storage.read_range(&key, range).await.unwrap_err();
+        match scenario {
+            "unavailable" => assert!(matches!(error, Error::Busy(_))),
+            "missing" => assert!(matches!(error, Error::NotFound(_))),
+            "wrong" => assert!(matches!(error, Error::Io(_))),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            *fixture.reads.lock().unwrap(),
+            vec!["range:1-4"; expected_attempts]
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn range_read_can_retry_a_stalled_request() {
+    let (storage, fixture, server) = start().await;
+    let key = Key::parse("default/notes/range-stall").unwrap();
+    let range = ByteRange { start: 1, end: 5 };
+    assert_eq!(storage.read_range(&key, range).await.unwrap(), "bcde");
+    assert_eq!(*fixture.reads.lock().unwrap(), ["range:1-4"; 2]);
     server.abort();
 }
 

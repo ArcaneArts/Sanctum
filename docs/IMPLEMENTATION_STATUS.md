@@ -1798,6 +1798,13 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   cases checked replacement, a different total length, and stalled
   transfers. The live GCS bucket contract still needs authorized ADC.
   [GCS adapter](STORAGE.md#google-cloud-storage-adapter).
+- For bounded range reads, the loopback JSON API returned HTTP 408,
+  then broke a partial response body, then returned the exact bytes.
+  The adapter discarded the partial response and requested the original
+  interval each time. Separate tests exercised a stalled request,
+  exhausted retries, a missing object, and an incorrect range header.
+  Each attempt has five seconds, with three attempts and a 15-second
+  overall budget. [PR #136](https://github.com/ArcaneArts/Sanctum/pull/136).
 
 ## Dispatch repair after collection deletion
 
