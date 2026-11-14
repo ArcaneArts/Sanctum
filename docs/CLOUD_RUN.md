@@ -247,6 +247,8 @@ updating Sanctum from a build that predates profile-bound tasks, update
 the worker before the API so the worker accepts the new payload field.
 When upgrading to attempt-scoped upload hints, bring the repair worker
 onto the new build before deploying API revisions that write those hints.
+Use the same rollout order for follow-up embedding rebuilds. The worker
+needs to recognize their operation IDs to recover them from dispatch hints.
 [Cloud Run HTTP/2](https://docs.cloud.google.com/run/docs/configuring/http2),
 [MCP client setup](MCP.md#hosted-connection).
 The [storage guide](STORAGE.md) documents the worker stages, retry behavior,
