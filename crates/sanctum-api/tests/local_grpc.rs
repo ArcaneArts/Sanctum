@@ -5379,6 +5379,67 @@ async fn await_watch_hit(client: &mut SanctumClient<Channel>, query: &str) -> v1
 }
 
 #[tokio::test]
+async fn explicit_file_import_validates_text_regardless_of_extension() {
+    let dir = TempDir::new().unwrap();
+    let input = TempDir::new().unwrap();
+    let note = input.path().join("settings.custom");
+    let binary = input.path().join("invalid.custom");
+    let content = "# settings\r\ncolor = 'vermilion café 🦀'\r\n";
+    std::fs::write(&note, content).unwrap();
+    std::fs::write(&binary, [0xff, 0xfe, 0xfd]).unwrap();
+
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    let request = |path: &std::path::Path| v1::ImportLocalRequest {
+        scope: scope("default"),
+        path: path.to_str().unwrap().into(),
+        ..Default::default()
+    };
+    let explicit = request(&note);
+    for filtered in [
+        request(input.path()),
+        v1::ImportLocalRequest {
+            include: vec!["*.md".into()],
+            ..explicit.clone()
+        },
+        v1::ImportLocalRequest {
+            exclude: vec!["*.custom".into()],
+            ..explicit.clone()
+        },
+    ] {
+        assert!(import(&mut running.client, filtered).await.is_empty());
+    }
+
+    let events = import(&mut running.client, explicit.clone()).await;
+    let [event] = events.as_slice() else {
+        panic!("expected one explicit import event, got {events:?}");
+    };
+    assert_eq!(event.path, "settings.custom");
+    assert_eq!(event.state(), v1::ImportState::Queued);
+    await_ready(
+        &mut running.client,
+        job_request(event.operation_id.clone().unwrap()),
+    )
+    .await;
+    let unchanged = import(&mut running.client, explicit).await;
+    assert_eq!(unchanged[0].state(), v1::ImportState::Unchanged);
+    assert_eq!(unchanged[0].source_id, event.source_id);
+    let hits = search(&mut running.client, "default", "vermilion").await;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].excerpt, content);
+
+    let invalid = import(&mut running.client, request(&binary)).await;
+    assert_eq!(invalid[0].state(), v1::ImportState::Queued);
+    let failed = await_failure(
+        &mut running.client,
+        job_request(invalid[0].operation_id.clone().unwrap()),
+    )
+    .await;
+    assert_eq!(failed.error_code.as_deref(), Some("invalid_source"));
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn directory_import_tracks_edits_duplicates_and_removed_paths() {
     let dir = TempDir::new().unwrap();
     let input = TempDir::new().unwrap();
