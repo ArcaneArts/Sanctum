@@ -79,9 +79,11 @@ deleted sources. A failed current upload remains available for retry.
 Inconclusive checks retry on a persisted deadline.
 
 Local upload acceptance records a BLAKE3 digest of the staged input.
-The worker checks it before publishing UTF-8 or RTF. A storage digest
-mismatch leaves the job retryable so it can resume after the original
-bytes are restored.
+The worker verifies the stored bytes before publishing UTF-8 or RTF and
+when decoding or extraction rejects the text. A size or digest mismatch
+leaves the job retryable so it can resume under the same operation and
+revision IDs after the original bytes are restored. Malformed content
+that matches the accepted upload still fails with `invalid_source`.
 
 `ListIngestionJobs` accepts a tenant, optional collection, and a page limit
 from 1 to 100 (default 25). Results sort by acceptance time, newest first,
