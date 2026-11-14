@@ -5,6 +5,8 @@ use sanctum_db_sqlite::watched_folders::{Counts, Folder};
 use tokio::sync::watch;
 use uuid::Uuid;
 
+mod notifications;
+
 use crate::{ImportOptions, ImportState, Service};
 
 pub struct WatchedFolder {
@@ -110,13 +112,22 @@ impl Service {
         self.queue.remove_folder(scope, id)
     }
 
-    fn scan_next_folder(&self, stop: &watch::Receiver<bool>) -> Result<bool> {
+    fn scan_next_folder(
+        &self,
+        stop: &watch::Receiver<bool>,
+        notifications: Option<&mut notifications::Notifications>,
+    ) -> Result<bool> {
         if *stop.borrow() {
             return Ok(false);
         }
         let Some(folder) = self.queue.next_folder()? else {
             return Ok(false);
         };
+        if let Some(notifications) = notifications
+            && let Err(error) = notifications.cover_folder(&self.queue, folder.id)
+        {
+            tracing::warn!(%error, "could not refresh watched folder subscriptions");
+        }
         let folder = WatchedFolder::try_from(folder)?;
         let mut counts = Counts::default();
         let mut error = None;
@@ -158,14 +169,33 @@ impl Service {
 }
 
 pub async fn run_watched_folders(service: Service, mut stop: watch::Receiver<bool>) {
+    let mut notifications = notifications::Notifications::open(service.files.root().to_owned());
     while !*stop.borrow_and_update() {
         let watcher = service.clone();
         let stopped = stop.clone();
-        match tokio::task::spawn_blocking(move || watcher.scan_next_folder(&stopped)).await {
-            Ok(Ok(true)) => continue,
-            Ok(Ok(false)) => {}
-            Ok(Err(error)) => tracing::warn!(%error, "watched folder scan failed"),
-            Err(error) => tracing::warn!(%error, "watched folder worker failed"),
+        let pass = tokio::task::spawn_blocking(move || {
+            if let Some(notifications) = &mut notifications
+                && let Err(error) = notifications.schedule(&watcher.queue)
+            {
+                tracing::warn!(%error, "could not schedule notified folder scans");
+            }
+            let result = watcher.scan_next_folder(&stopped, notifications.as_mut());
+            (notifications, result)
+        })
+        .await;
+        match pass {
+            Ok((current, result)) => {
+                notifications = current;
+                match result {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(%error, "watched folder scan failed"),
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "watched folder worker failed");
+                notifications = notifications::Notifications::open(service.files.root().to_owned());
+            }
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}

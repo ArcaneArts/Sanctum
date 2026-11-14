@@ -3027,6 +3027,38 @@ async fn folder_watch_reconciles_offline_edits_and_prunes_explicitly() {
             .await
             .is_empty()
     );
+    // The hour-long reconciliation interval cannot discover this run of edits.
+    let nested = files.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let edited = nested.join("edited.md");
+    std::fs::write(&edited, "tourmaline").unwrap();
+    let created = await_watch_hit(&mut running.client, "tourmaline").await;
+    let temporary = nested.join("edited.tmp");
+    for text in ["kyanite", "rutile", "diopside"] {
+        std::fs::write(&temporary, text).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_file(&edited).unwrap();
+        std::fs::rename(&temporary, &edited).unwrap();
+    }
+    let edited = await_watch_hit(&mut running.client, "diopside").await;
+    assert_eq!(created.source_id, edited.source_id);
+    assert_ne!(created.revision_id, edited.revision_id);
+    let jobs = running
+        .client
+        .list_ingestion_jobs(v1::ListIngestionJobsRequest {
+            tenant: "default".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        jobs.jobs
+            .iter()
+            .filter(|job| job.source_id == edited.source_id)
+            .count(),
+        2,
+    );
     let request = v1::UnwatchFolderRequest {
         scope: scope("other"),
         id: watch.id,

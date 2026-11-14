@@ -96,6 +96,34 @@ impl LocalQueue {
             .map_err(database_error)
     }
 
+    pub fn folder_paths(&self) -> Result<Vec<(Uuid, String)>> {
+        query_all(
+            &self.connect()?,
+            "SELECT id, path FROM watched_folders",
+            [],
+            |row| Ok((crate::queue::uuid(row, 0)?, row.get(1)?)),
+        )
+    }
+
+    pub fn request_folder_scans(&self, ids: &[Uuid]) -> Result<()> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction().map_err(database_error)?;
+        {
+            let mut statement = transaction
+                .prepare(
+                    "UPDATE watched_folders SET next_scan_at = min(next_scan_at, unixepoch())
+                    WHERE id = ?1",
+                )
+                .map_err(database_error)?;
+            for id in ids {
+                statement
+                    .execute([id.to_string()])
+                    .map_err(database_error)?;
+            }
+        }
+        transaction.commit().map_err(database_error)
+    }
+
     pub fn scanned_folder(&self, id: Uuid, counts: Counts, error: Option<&str>) -> Result<()> {
         self.connect()?
             .execute(
