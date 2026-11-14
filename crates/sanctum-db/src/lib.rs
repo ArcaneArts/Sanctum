@@ -299,17 +299,19 @@ impl Publication {
             expires_at_ms: now + self.ttl.as_millis() as u64,
         });
         let deadline = Instant::now() + self.ttl;
-        let version = self
-            .storage
-            .put_control(&key, encode(&head)?, condition)
+        let write = self.storage.put_control(&key, encode(&head)?, condition);
+        let version = tokio::time::timeout_at(deadline.into(), write)
             .await
-            .map_err(|error| {
-                if matches!(error, Error::Conflict(_)) {
+            .map_err(|_| Error::Busy("database writer acquisition timed out".into()))?
+            .map_err(|error| match error {
+                Error::Conflict(_) => {
                     Error::Busy("another writer acquired the database unit".into())
-                } else {
-                    error
                 }
+                error => error,
             })?;
+        if Instant::now() >= deadline {
+            return Err(Error::Busy("database writer acquisition timed out".into()));
+        }
         Ok(Lease {
             publication: self.clone(),
             unit: unit.clone(),
@@ -577,12 +579,7 @@ impl Lease {
             .expect("live lease has an owner")
             .expires_at_ms = unix_ms()? + self.publication.ttl.as_millis() as u64;
         let deadline = Instant::now() + self.publication.ttl;
-        let previous_deadline = self.deadline;
-        tokio::time::timeout_at(previous_deadline.into(), self.write(head))
-            .await
-            .map_err(|_| {
-                Error::StaleRevision("database writer renewal exceeded its lease".into())
-            })??;
+        self.write(head).await?;
         self.deadline = deadline;
         self.ensure_live()
     }
@@ -606,7 +603,6 @@ impl Lease {
     }
 
     pub async fn release(mut self) -> Result<()> {
-        self.ensure_live()?;
         let mut head = self.head.clone();
         head.owner = None;
         self.write(head).await
@@ -897,29 +893,29 @@ impl Lease {
         head.update = Uuid::new_v4();
         let key = self.unit.head()?;
         let bytes = encode(&head)?;
+        self.ensure_live()?;
         // Dropping a pending CAS can hide a successful HEAD update.
         self.lost = true;
-        let result = self
-            .publication
-            .storage
-            .put_control(&key, bytes, Condition::Match(self.version.clone()))
-            .await;
+        let write = self.publication.storage.put_control(
+            &key,
+            bytes,
+            Condition::Match(self.version.clone()),
+        );
+        let result = tokio::time::timeout_at(self.deadline.into(), write).await;
         match result {
-            Ok(version) => {
+            Ok(Ok(version)) if Instant::now() < self.deadline => {
                 self.version = version;
                 self.head = head;
                 self.lost = false;
                 Ok(())
             }
-            Err(error) => {
-                if matches!(error, Error::Conflict(_) | Error::NotFound(_)) {
-                    Err(Error::StaleRevision(
-                        "database writer lost ownership".into(),
-                    ))
-                } else {
-                    Err(error)
-                }
-            }
+            Ok(Err(Error::Conflict(_) | Error::NotFound(_))) => Err(Error::StaleRevision(
+                "database writer lost ownership".into(),
+            )),
+            Ok(Err(error)) => Err(error),
+            Ok(Ok(_)) | Err(_) => Err(Error::StaleRevision(
+                "database manifest write exceeded its lease".into(),
+            )),
         }
     }
 }

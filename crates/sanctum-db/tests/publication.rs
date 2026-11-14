@@ -293,6 +293,91 @@ async fn late_renewal_response_requires_reacquiring_the_lease() {
 }
 
 #[tokio::test]
+async fn filesystem_late_publication_response_recovers_the_committed_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(dir.path()).unwrap());
+    verify_late_publication(storage, "late-publication").await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live MinIO bucket and S3 credentials"]
+async fn minio_late_publication_response_recovers_the_committed_receipt() {
+    let prefix = format!("late-publication-{}", Uuid::new_v4());
+    verify_late_publication(minio_storage(), &prefix).await;
+}
+
+async fn verify_late_publication(storage: Arc<dyn Storage>, prefix: &str) {
+    let prefix = Key::parse(prefix).unwrap();
+    let unit = Unit::catalog(Some(&prefix), &"default".parse().unwrap()).unwrap();
+    let store = Arc::new(PublicationStorage::new(storage.clone()));
+    let ttl = Duration::from_millis(900);
+    let publication = Publication::new(store.clone(), ttl).unwrap();
+    let mut writer = publication.acquire(&unit).await.unwrap();
+    let (finish, late_reply) = oneshot::channel();
+    *store.publication_reply_hold.lock().unwrap() = Some(late_reply);
+    let operation = Uuid::new_v4();
+    let result = tokio::time::timeout(
+        ttl * 3,
+        writer.apply(vec![command(operation, 7)], apply_value),
+    )
+    .await
+    .expect("publication must return even when storage withholds its reply");
+    assert!(matches!(result, Err(Error::StaleRevision(_))));
+    assert!(finish.send(()).is_err());
+    assert!(matches!(writer.renew().await, Err(Error::StaleRevision(_))));
+
+    let next = Publication::new(storage.clone(), Duration::from_secs(15)).unwrap();
+    let generation = next.generation(&unit).await.unwrap().unwrap();
+    assert_eq!(
+        next.receipt(&unit, operation).await.unwrap().as_deref(),
+        Some("7")
+    );
+    let mut retry = next.acquire(&unit).await.unwrap();
+    let (replayed, receipts) = retry
+        .apply(vec![command(operation, 999)], |_, _| {
+            panic!("the committed command must not run again")
+        })
+        .await
+        .unwrap();
+    assert_eq!(replayed, generation);
+    assert_eq!(receipts[0].outcome, "7");
+    retry.release().await.unwrap();
+    delete_prefix(storage.as_ref(), &prefix).await;
+}
+
+#[tokio::test]
+async fn a_timed_out_acquisition_and_release_are_reconciled_by_the_next_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(PublicationStorage::new(Arc::new(
+        sanctum_storage_fs::FileStorage::open(dir.path()).unwrap(),
+    )));
+    let unit = Unit::catalog(None, &"default".parse().unwrap()).unwrap();
+    let ttl = Duration::from_millis(300);
+    let publication = Publication::new(store.clone(), ttl).unwrap();
+
+    let (finish, acquisition_reply) = oneshot::channel();
+    *store.control_reply_hold.lock().unwrap() = Some(acquisition_reply);
+    let result = tokio::time::timeout(ttl * 3, publication.acquire(&unit))
+        .await
+        .expect("acquisition must stop at its deadline");
+    assert!(matches!(result, Err(Error::Busy(_))));
+    assert!(finish.send(()).is_err());
+    let writer = publication.acquire(&unit).await.unwrap();
+    assert_eq!(writer.epoch(), 2);
+
+    let (finish, release_reply) = oneshot::channel();
+    *store.control_reply_hold.lock().unwrap() = Some(release_reply);
+    let result = tokio::time::timeout(ttl * 3, writer.release())
+        .await
+        .expect("release must stop at its deadline");
+    assert!(matches!(result, Err(Error::StaleRevision(_))));
+    assert!(finish.send(()).is_err());
+    let writer = publication.acquire(&unit).await.unwrap();
+    assert_eq!(writer.epoch(), 3);
+    writer.release().await.unwrap();
+}
+
+#[tokio::test]
 async fn filesystem_snapshot_delta_contract() {
     let directory = tempfile::tempdir().unwrap();
     let storage = sanctum_storage_fs::FileStorage::open(directory.path()).unwrap();
@@ -719,6 +804,7 @@ struct PublicationStorage {
     transfer_delay_ms: std::sync::atomic::AtomicUsize,
     upload_hold: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     control_reply_hold: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    publication_reply_hold: Mutex<Option<oneshot::Receiver<()>>>,
     lose: std::sync::atomic::AtomicBool,
     snapshot_gets: std::sync::atomic::AtomicUsize,
     fail_delta: std::sync::atomic::AtomicBool,
@@ -734,6 +820,7 @@ impl PublicationStorage {
             transfer_delay_ms: Default::default(),
             upload_hold: Default::default(),
             control_reply_hold: Default::default(),
+            publication_reply_hold: Default::default(),
             lose: Default::default(),
             snapshot_gets: Default::default(),
             fail_delta: Default::default(),
@@ -847,6 +934,12 @@ impl Storage for PublicationStorage {
         let hold = self.control_reply_hold.lock().unwrap().take();
         if let Some(hold) = hold {
             hold.await.unwrap();
+        }
+        if published {
+            let hold = self.publication_reply_hold.lock().unwrap().take();
+            if let Some(hold) = hold {
+                hold.await.unwrap();
+            }
         }
         if published && self.lose.swap(false, std::sync::atomic::Ordering::Relaxed) {
             return Err(Error::Busy("publication response lost".into()));
