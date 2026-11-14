@@ -2290,7 +2290,7 @@ async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf()
 }
 
 #[tokio::test]
-async fn hosted_lexical_search_coalesces_overlapping_excerpts_in_rank_order() {
+async fn hosted_lexical_search_keeps_rank_and_coalesces_touching_excerpts() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance {
         inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
@@ -2319,7 +2319,8 @@ async fn hosted_lexical_search_coalesces_overlapping_excerpts_in_rank_order() {
         name: "overlap.txt".into(),
         ..Default::default()
     };
-    let text = "unique 🦀 café\n".repeat(180);
+    // Identical 32-byte lines give all seven windows the same lexical rank.
+    let text = "unique 🦀 café              \n".repeat(128);
     let job = server
         .client
         .submit_text(upload_frames(&header, text.as_bytes().chunks(97)))
@@ -2332,7 +2333,7 @@ async fn hosted_lexical_search_coalesces_overlapping_excerpts_in_rank_order() {
     let search = || v1::SearchTextRequest {
         scope: Some(wire.clone()),
         query: "unique".into(),
-        limit: Some(20),
+        limit: Some(3),
         mode: v1::SearchMode::Lexical.into(),
         ..Default::default()
     };
@@ -2346,15 +2347,34 @@ async fn hosted_lexical_search_coalesces_overlapping_excerpts_in_rank_order() {
         .unwrap()
         .into_inner();
     assert_eq!(storage.interrupt.load(Ordering::Relaxed), FIRST_RANGE_READ);
-    assert!(result.hits.len() > 2);
+    let hits = result.hits;
+    let ordinals: Vec<_> = hits
+        .iter()
+        .map(|hit| hit.chunk.as_ref().unwrap().ordinal)
+        .collect();
+    assert_eq!(ordinals, [0, 2, 4]);
     assert!(
-        result
-            .hits
-            .windows(2)
-            .any(|pair| pair[0].end_byte > pair[1].start_byte)
+        hits.windows(2)
+            .all(|pair| pair[0].end_byte == pair[1].start_byte)
     );
     storage.interrupt.store(0, Ordering::Relaxed);
-    for hit in &result.hits {
+    let fallback = server
+        .client
+        .search_text(v1::SearchTextRequest {
+            query: "unique absentword".into(),
+            mode: v1::SearchMode::Hybrid.into(),
+            ..search()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fallback.mode(), v1::SearchMode::Lexical);
+    assert_eq!(
+        fallback.degraded_reason.as_deref(),
+        Some("embedding_disabled")
+    );
+    assert_eq!(fallback.hits, hits);
+    for hit in &hits {
         assert_eq!(
             hit.excerpt,
             text[hit.start_byte as usize..hit.end_byte as usize]
@@ -2480,7 +2500,7 @@ async fn hosted_indexing_publishes_searchable_text_and_fences_old_replacements()
         name: "field-notes.txt".into(),
         ..Default::default()
     };
-    let body = "unicorn café 🦀\n".repeat(400);
+    let body = "unicorn café 🦀\n".repeat(800);
     let job = server
         .client
         .submit_text(upload_frames(&header, body.as_bytes().chunks(97)))

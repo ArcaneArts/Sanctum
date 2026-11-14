@@ -147,11 +147,7 @@ impl Service {
             let (hits, actual_mode, coverage, degraded) = db.read_snapshot(|db| {
                 let coverage = db.embedding_coverage(prepared.profile.as_deref())?;
                 let (actual_mode, degraded) = prepared.strategy(mode, coverage)?;
-                let candidate_limit = if actual_mode == SearchMode::Lexical {
-                    limit
-                } else {
-                    (limit * 4).max(32)
-                };
+                let candidate_limit = candidate_budget(limit);
                 let semantic = match (&prepared.vector, &prepared.profile) {
                     (Some(query), Some(profile)) if actual_mode != SearchMode::Lexical => db
                         .search_vector(
@@ -179,7 +175,7 @@ impl Service {
                         .collect(),
                     SearchMode::Hybrid => fuse(lexical, semantic),
                 };
-                let hits = limit_hits(ranked, actual_mode, limit)
+                let hits = limit_hits(ranked, limit)
                     .map(|(chunk, score)| {
                         let fields = crate::hit_metadata::metadata_for_hit(
                             db,
@@ -491,31 +487,35 @@ async fn blocking<T: Send + 'static>(
         .map_err(|error| Error::Internal(Box::new(error)))?
 }
 
+pub(crate) fn candidate_budget(limit: u32) -> u32 {
+    (limit * 4).max(32)
+}
+
 pub(crate) fn limit_hits(
     ranked: Vec<(Chunk, Option<f64>)>,
-    mode: SearchMode,
     limit: u32,
 ) -> impl Iterator<Item = (Chunk, Option<f64>)> {
     let mut ranges: HashMap<_, Vec<ByteRange>> = HashMap::new();
     ranked
         .into_iter()
         .filter(move |(chunk, _)| {
-            if mode == SearchMode::Lexical {
-                return true;
-            }
             let accepted = ranges
                 .entry((chunk.reference.source, chunk.reference.revision))
                 .or_default();
-            if accepted
-                .iter()
-                .any(|range| range.start < chunk.range.end && chunk.range.start < range.end)
-            {
-                return false;
-            }
-            accepted.push(chunk.range);
-            true
+            accept_range(accepted, chunk.range)
         })
         .take(limit as usize)
+}
+
+fn accept_range(accepted: &mut Vec<ByteRange>, candidate: ByteRange) -> bool {
+    if accepted
+        .iter()
+        .any(|range| range.start < candidate.end && candidate.start < range.end)
+    {
+        return false;
+    }
+    accepted.push(candidate);
+    true
 }
 
 pub(crate) fn fuse(lexical: Vec<Chunk>, semantic: Vec<ScoredChunk>) -> Vec<(Chunk, Option<f64>)> {

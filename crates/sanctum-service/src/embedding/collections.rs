@@ -6,7 +6,7 @@ use std::{
 use sanctum_core::{ByteRange, Error, Result, Scope, ScopeId};
 use sanctum_db_sqlite::vector_index::VectorIndex;
 
-use super::{Coverage, PreparedQuery, SearchMode, blocking, fuse};
+use super::{Coverage, PreparedQuery, SearchMode, accept_range, blocking, candidate_budget, fuse};
 use crate::{
     Chunk, ChunkEmbeddingState, Hit, HitMetadata, Service, db, hit_metadata::metadata_for_hit,
     metadata_filter::Filter, telemetry,
@@ -73,7 +73,7 @@ impl Service {
             .retrieval
             .read()
             .map_err(|_| Error::Busy("retrieval lock is unavailable".into()))?;
-        let candidate_limit = (limit * 4).max(32);
+        let candidate_limit = candidate_budget(limit);
         let mut coverage = Coverage::default();
         let mut all = Vec::with_capacity(scopes.len());
         for scope in scopes {
@@ -219,13 +219,9 @@ pub(crate) fn merge<T>(
                     chunk.reference.revision,
                 ))
                 .or_default();
-            if accepted
-                .iter()
-                .any(|range| range.start < chunk.range.end && chunk.range.start < range.end)
-            {
+            if !accept_range(accepted, chunk.range) {
                 return None;
             }
-            accepted.push(chunk.range);
             let score = 1.0 / (RANK_CONSTANT + rank + 1) as f64;
             Some((scope, chunk, extra, score))
         })
