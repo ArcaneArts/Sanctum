@@ -154,7 +154,8 @@ impl HostedCatalog {
         record.stage = match outcome {
             Outcome::Ready(content) => {
                 if schedule_embedding {
-                    self.record_dispatch_hint(scope, operation).await?;
+                    self.record_dispatch_hint(scope, operation, record.attempt)
+                        .await?;
                 }
                 Stage::TextReady {
                     registration,

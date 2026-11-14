@@ -1737,3 +1737,22 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   UTF-8 from lexical search. Both old dispatch hints were removed. The
   live Cloud Tasks and Scheduler checks remain open.
   [Hosted operation retention](STORAGE.md#hosted-operation-retention).
+
+## Dispatch hints for individual upload attempts
+
+- A durable upload hint names its staging attempt. Repair keeps recent
+  hints while admission is in flight. Once an unaccepted hint passes
+  the 15-minute grace period, repair uses the conditional acceptance
+  fence before removing that attempt's hint. It can remove a losing
+  hint immediately after another attempt commits.
+- The filesystem regression paused admission before the envelope write.
+  A fresh repair service retained the recent hint, fenced and removed it
+  after aging, and rejected the paused admission. A retry with the same
+  operation ID got its own hint. After an injected dispatch failure,
+  repair advanced the retry to indexing and retrieval returned the original text.
+- The live MinIO dispatch test exercised the worker against a loopback
+  Cloud Tasks fixture. It removed a losing attempt hint, preserved the
+  winning attempt through a restart, and still handled operation-only
+  hints from older releases. Deploy updated repair workers before APIs
+  begin writing the new hint format.
+  [Dispatch repair](STORAGE.md#cloud-tasks-dispatch).

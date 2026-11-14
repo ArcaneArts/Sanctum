@@ -3195,8 +3195,7 @@ async fn dispatch_reconciliation_recovers_a_failed_handoff_and_advances_its_curs
     );
     restarted.index_upload(&scope, operation).await.unwrap();
     restarted.try_dispatch(&scope, operation).await;
-    let key = Key::parse(format!("_dispatch/00/pending/default/notes/{operation}")).unwrap();
-    assert!(matches!(storage.head(&key).await, Err(Error::NotFound(_))));
+    assert!(!has_upload_hint(storage.as_ref(), operation).await);
 }
 
 #[tokio::test]
@@ -3264,8 +3263,7 @@ async fn standalone_worker_resumes_hosted_hints_without_an_external_dispatcher()
         .await
         .unwrap();
     assert_eq!((idle.dispatched, idle.failed), (0, 0));
-    let key = Key::parse(format!("_dispatch/00/pending/default/notes/{id}")).unwrap();
-    assert!(matches!(storage.head(&key).await, Err(Error::NotFound(_))));
+    assert!(!has_upload_hint(storage.as_ref(), id).await);
 }
 
 #[tokio::test]
@@ -3549,8 +3547,7 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
     restarted.embed_upload(&scope, operation, 0).await.unwrap();
     restarted.embed_upload(&scope, operation, 1).await.unwrap();
     restarted.try_dispatch(&scope, operation).await;
-    let key = Key::parse(format!("_dispatch/00/pending/default/notes/{operation}")).unwrap();
-    assert!(matches!(storage.head(&key).await, Err(Error::NotFound(_))));
+    assert!(!has_upload_hint(storage.as_ref(), operation).await);
     let finished = server
         .client
         .get_ingestion_job(request)
@@ -5305,15 +5302,7 @@ async fn hosted_expiration_settles_pending_stages_and_preserves_committed_text()
     let pending = storage.list(Some(&hints), None, 100).await.unwrap().objects;
     let ids: Vec<_> = pending
         .iter()
-        .filter_map(|object| {
-            object
-                .key
-                .as_str()
-                .rsplit('/')
-                .next()?
-                .parse::<uuid::Uuid>()
-                .ok()
-        })
+        .filter_map(|object| hint_operation(&object.key))
         .collect();
     assert_eq!(ids, vec![recent.operation]);
 
@@ -5369,13 +5358,19 @@ async fn upload_sweep_fences_an_in_flight_acceptance_before_reclaiming() {
         inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
         interrupt: AtomicU8::new(3),
     });
-    let catalog = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let dispatch = Arc::new(TestDispatch {
+        fail: AtomicU8::new(0),
+        delivered: std::sync::Mutex::new(Vec::new()),
+    });
+    let catalog = HostedCatalog::new(storage.clone(), None, 1024)
+        .unwrap()
+        .with_dispatch(dispatch.clone());
     let scope = sanctum_core::Scope {
         tenant: "default".parse().unwrap(),
         collection: "notes".parse().unwrap(),
     };
     catalog.create_collection(&scope, None).await.unwrap();
-    let operation = uuid::Uuid::new_v4();
+    let operation = uuid::Uuid::from_u128(694);
     let input = || sanctum_service::TextUpload {
         name: "notes.txt".into(),
         external: None,
@@ -5408,12 +5403,34 @@ async fn upload_sweep_fences_an_in_flight_acceptance_before_reclaiming() {
         .objects
         .remove(0)
         .key;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(directory.path().join(abandoned.as_str()))
+    let hints = Key::parse("_dispatch/00/pending/default/notes").unwrap();
+    let old_hint = storage
+        .list(Some(&hints), None, 10)
+        .await
         .unwrap()
-        .set_modified(SystemTime::now() - Duration::from_secs(901))
-        .unwrap();
+        .objects
+        .remove(0)
+        .key;
+    assert!(old_hint.as_str().contains(&format!("{operation}.")));
+    let restarted = HostedCatalog::new(storage.clone(), None, 1024)
+        .unwrap()
+        .with_dispatch(dispatch.clone());
+    assert_eq!(restarted.reconcile_shard(0).await.unwrap().dispatched, 0);
+    storage.head(&old_hint).await.unwrap();
+    for key in [&abandoned, &old_hint] {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.path().join(key.as_str()))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(901))
+            .unwrap();
+    }
+    let page = restarted.reconcile_shard(0).await.unwrap();
+    assert_eq!((page.dispatched, page.failed), (0, 0));
+    assert!(matches!(
+        storage.head(&old_hint).await,
+        Err(Error::NotFound(_))
+    ));
 
     let sweep = catalog.sweep_abandoned_uploads().await.unwrap();
     assert_eq!(sweep.deleted, 1);
@@ -5428,16 +5445,24 @@ async fn upload_sweep_fences_an_in_flight_acceptance_before_reclaiming() {
         Err(Error::NotFound(_))
     ));
 
-    let retry = catalog
+    let retry = restarted
         .stage_upload(scope.clone(), input(), Some(operation))
         .await
         .unwrap();
     std::io::Write::write_all(&mut retry.reopen().unwrap(), b"quartz").unwrap();
+    dispatch.fail.store(1, Ordering::Relaxed);
     let accepted = retry.enqueue().await.unwrap();
     assert_eq!(accepted.operation, operation);
-    catalog.register_upload(&scope, operation).await.unwrap();
-    catalog.index_upload(&scope, operation).await.unwrap();
-    let hits = catalog
+    let surviving = storage.list(Some(&hints), None, 10).await.unwrap().objects;
+    assert_eq!(surviving.len(), 1);
+    assert_ne!(surviving[0].key, old_hint);
+    dispatch.fail.store(0, Ordering::Relaxed);
+    assert_eq!(restarted.reconcile_shard(0).await.unwrap().dispatched, 1);
+    restarted.register_upload(&scope, operation).await.unwrap();
+    restarted.index_upload(&scope, operation).await.unwrap();
+    restarted.try_dispatch(&scope, operation).await;
+    assert!(!has_upload_hint(storage.as_ref(), operation).await);
+    let hits = restarted
         .retrieve(
             scope,
             "quartz".into(),
@@ -5649,6 +5674,26 @@ impl Storage for InterruptAcceptance {
     async fn delete(&self, key: &Key) -> StorageResult<()> {
         self.inner.delete(key).await
     }
+}
+
+fn hint_operation(key: &Key) -> Option<uuid::Uuid> {
+    key.as_str()
+        .rsplit('/')
+        .next()?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+async fn has_upload_hint(storage: &dyn Storage, operation: uuid::Uuid) -> bool {
+    let shard = operation.as_bytes()[0] % sanctum_service::DISPATCH_SHARDS;
+    let prefix = Key::parse(format!("_dispatch/{shard:02x}/pending")).unwrap();
+    let page = storage.list(Some(&prefix), None, 100).await.unwrap();
+    assert!(page.next_cursor.is_none());
+    page.objects
+        .iter()
+        .any(|object| hint_operation(&object.key) == Some(operation))
 }
 
 fn upload_frames<'a>(

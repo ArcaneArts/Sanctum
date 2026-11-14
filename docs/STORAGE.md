@@ -315,8 +315,14 @@ Configure the scheduler frequency against the measured queue depth.
 Once the collection manifest is retired, repair removes its upload and
 rebuild hints, including hints whose operation envelopes were already
 reclaimed. A late delivery to a retired collection is acknowledged
-without publishing anything. Hints for active collections are preserved
-while acceptance is still writing the envelope.
+without publishing anything. New upload hints include the staged attempt
+UUID. Repair keeps a fresh hint while admission writes its envelope. After
+15 minutes, repair can fence an unaccepted envelope and remove that attempt's
+hint. If another attempt already won, repair removes only the losing attempt's
+hint. It also removes hints left by terminal or compacted operations.
+Operation-only hints from older servers still dispatch accepted work and
+remain discoverable while their envelope is absent. Upgrade repair workers
+before enabling new writers that create attempt-scoped hints.
 [Cloud Tasks HTTP acknowledgments](https://docs.cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks#HttpRequest).
 
 The private listener accepts manual registration, preparation, and indexing

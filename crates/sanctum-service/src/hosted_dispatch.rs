@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use sanctum_core::{Error, Result, Scope};
 use sanctum_db::Unit;
-use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES};
+use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES, Object};
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncReadExt, sync::Notify, task::JoinSet, time::timeout};
 use uuid::Uuid;
@@ -80,8 +80,19 @@ async fn record_next_attempt(
 }
 
 struct HintPage {
-    hints: Vec<(Scope, Uuid, bool)>,
+    hints: Vec<(Scope, Uuid, HintKind, Object)>,
     next_cursor: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum HintKind {
+    Upload(Option<Uuid>),
+    Rebuild,
+}
+
+pub(super) struct UploadHint {
+    pub(super) attempt: Option<Uuid>,
+    pub(super) object: Object,
 }
 
 impl HostedCatalog {
@@ -99,7 +110,7 @@ impl HostedCatalog {
         if let Some(wake) = &self.standalone_wake {
             wake.notify_one();
         }
-        if let Err(error) = self.dispatch_pending(scope, operation).await {
+        if let Err(error) = self.dispatch_pending(scope, operation, None).await {
             tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection, %operation,
                 "hosted operation remains pending dispatch");
         }
@@ -184,17 +195,24 @@ impl HostedCatalog {
         // Dropping the request aborts the in-flight attempts. Unconfirmed
         // handoffs remain discoverable under their original task identity.
         let mut running = JoinSet::new();
-        for (scope, operation, rebuild) in hints {
+        for (scope, operation, kind, object) in hints {
             if running.len() == REPAIR_CONCURRENCY {
                 record_next_attempt(&mut report, &mut running).await?;
             }
             let service = self.clone();
             running.spawn(async move {
                 let attempt = async {
-                    if rebuild {
-                        service.dispatch_rebuild(&scope, operation).await
-                    } else {
-                        service.dispatch_pending(&scope, operation).await
+                    match kind {
+                        HintKind::Rebuild => service.dispatch_rebuild(&scope, operation).await,
+                        HintKind::Upload(attempt) => {
+                            service
+                                .dispatch_pending(
+                                    &scope,
+                                    operation,
+                                    Some(UploadHint { attempt, object }),
+                                )
+                                .await
+                        }
                     }
                 };
                 let result = timeout(attempt_timeout, attempt).await.unwrap_or_else(|_| {
@@ -221,14 +239,16 @@ impl HostedCatalog {
             failed: 0,
             next_cursor,
         };
-        for (scope, operation, rebuild) in hints {
+        for (scope, operation, kind, object) in hints {
             if stopping() {
                 break;
             }
-            let result = if rebuild {
-                self.work_standalone_rebuild(&scope, operation).await
-            } else {
-                self.work_standalone_upload(&scope, operation).await
+            let result = match kind {
+                HintKind::Rebuild => self.work_standalone_rebuild(&scope, operation).await,
+                HintKind::Upload(attempt) => {
+                    self.work_standalone_upload(&scope, operation, UploadHint { attempt, object })
+                        .await
+                }
             };
             report.record(&scope, operation, result);
         }
@@ -256,7 +276,13 @@ impl HostedCatalog {
         if !self.publication.is_retired(&unit).await? {
             return Ok(false);
         }
-        self.clear_hint(scope, operation, rebuild).await?;
+        let kind = if rebuild {
+            HintKind::Rebuild
+        } else {
+            HintKind::Upload(None)
+        };
+        self.delete_hint(&self.dispatch_hint(scope, operation, kind)?)
+            .await?;
         Ok(true)
     }
 
@@ -276,26 +302,34 @@ impl HostedCatalog {
             hints: page
                 .objects
                 .into_iter()
-                .filter_map(|entry| parse_hint(&pending, &entry.key))
+                .filter_map(|entry| {
+                    let (scope, operation, kind) = parse_hint(&pending, &entry.key)?;
+                    Some((scope, operation, kind, entry))
+                })
                 .collect(),
             next_cursor: page.next_cursor,
         })
     }
 
-    pub(crate) async fn record_dispatch_hint(&self, scope: &Scope, operation: Uuid) -> Result<()> {
-        self.record_hint(scope, operation, false).await
-    }
-
-    pub(crate) async fn record_hint(
+    pub(crate) async fn record_dispatch_hint(
         &self,
         scope: &Scope,
         operation: Uuid,
-        rebuild: bool,
+        attempt: Uuid,
     ) -> Result<()> {
-        let key = self.dispatch_hint(scope, operation, rebuild)?;
+        self.write_hint(&self.dispatch_hint(scope, operation, HintKind::Upload(Some(attempt)))?)
+            .await
+    }
+
+    pub(crate) async fn record_rebuild_hint(&self, scope: &Scope, operation: Uuid) -> Result<()> {
+        self.write_hint(&self.dispatch_hint(scope, operation, HintKind::Rebuild)?)
+            .await
+    }
+
+    async fn write_hint(&self, key: &Key) -> Result<()> {
         match self
             .storage
-            .put_control(&key, b"{}".as_slice().into(), Condition::Create)
+            .put_control(key, b"{}".as_slice().into(), Condition::Create)
             .await
         {
             Ok(_) | Err(Error::Conflict(_)) => Ok(()),
@@ -303,30 +337,47 @@ impl HostedCatalog {
         }
     }
 
-    pub(crate) async fn clear_dispatch_hint(&self, scope: &Scope, operation: Uuid) -> Result<()> {
-        self.clear_hint(scope, operation, false).await
-    }
-
-    pub(crate) async fn clear_hint(
+    pub(crate) async fn clear_dispatch_hint(
         &self,
         scope: &Scope,
         operation: Uuid,
-        rebuild: bool,
+        attempt: Uuid,
     ) -> Result<()> {
-        let key = self.dispatch_hint(scope, operation, rebuild)?;
-        match self.storage.delete(&key).await {
+        self.clear_upload_attempt_hint(scope, operation, attempt)
+            .await?;
+        self.delete_hint(&self.dispatch_hint(scope, operation, HintKind::Upload(None))?)
+            .await
+    }
+
+    pub(super) async fn clear_upload_attempt_hint(
+        &self,
+        scope: &Scope,
+        operation: Uuid,
+        attempt: Uuid,
+    ) -> Result<()> {
+        self.delete_hint(&self.dispatch_hint(scope, operation, HintKind::Upload(Some(attempt)))?)
+            .await
+    }
+
+    pub(crate) async fn clear_rebuild_hint(&self, scope: &Scope, operation: Uuid) -> Result<()> {
+        self.delete_hint(&self.dispatch_hint(scope, operation, HintKind::Rebuild)?)
+            .await
+    }
+
+    pub(super) async fn delete_hint(&self, key: &Key) -> Result<()> {
+        match self.storage.delete(key).await {
             Ok(()) | Err(Error::NotFound(_)) => Ok(()),
             Err(error) => Err(error),
         }
     }
 
-    fn dispatch_hint(&self, scope: &Scope, operation: Uuid, rebuild: bool) -> Result<Key> {
+    fn dispatch_hint(&self, scope: &Scope, operation: Uuid, kind: HintKind) -> Result<Key> {
         let shard = operation.as_bytes()[0] % DISPATCH_SHARDS;
         let partition = self.dispatch_partition(shard)?;
-        let name = if rebuild {
-            format!("rebuild-{operation}")
-        } else {
-            operation.to_string()
+        let name = match kind {
+            HintKind::Rebuild => format!("rebuild-{operation}"),
+            HintKind::Upload(Some(attempt)) => format!("{operation}.{attempt}"),
+            HintKind::Upload(None) => operation.to_string(),
         };
         Key::parse(format!(
             "{partition}/pending/{}/{}/{name}",
@@ -350,7 +401,7 @@ impl HostedCatalog {
     }
 }
 
-fn parse_hint(prefix: &Key, key: &Key) -> Option<(Scope, Uuid, bool)> {
+fn parse_hint(prefix: &Key, key: &Key) -> Option<(Scope, Uuid, HintKind)> {
     let path = key
         .as_str()
         .strip_prefix(prefix.as_str())?
@@ -361,11 +412,14 @@ fn parse_hint(prefix: &Key, key: &Key) -> Option<(Scope, Uuid, bool)> {
         tenant: tenant.parse().ok()?,
         collection: collection.parse().ok()?,
     };
-    let (id, rebuild) = match operation.strip_prefix("rebuild-") {
-        Some(id) => (id, true),
-        None => (operation, false),
+    let (id, kind) = match operation.strip_prefix("rebuild-") {
+        Some(id) => (id, HintKind::Rebuild),
+        None => match operation.split_once('.') {
+            Some((id, attempt)) => (id, HintKind::Upload(Some(attempt.parse().ok()?))),
+            None => (operation, HintKind::Upload(None)),
+        },
     };
-    Some((scope, id.parse().ok()?, rebuild))
+    Some((scope, id.parse().ok()?, kind))
 }
 
 #[cfg(test)]

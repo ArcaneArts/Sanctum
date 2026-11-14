@@ -17,7 +17,8 @@ impl HostedCatalog {
         let (record, version) = self.require_operation(&prefix, operation).await?;
         match record.stage {
             Stage::Canceled { .. } => {
-                self.clear_dispatch_hint(scope, operation).await?;
+                self.clear_dispatch_hint(scope, operation, record.attempt)
+                    .await?;
                 return Ok(record.job());
             }
             Stage::PendingRegistration | Stage::PendingIndexing { .. } => {}
@@ -74,6 +75,7 @@ impl HostedCatalog {
         registration: Option<Registration>,
     ) -> Result<HostedJob> {
         let operation = record.operation;
+        let attempt = record.attempt;
         self.discard_input(prefix, &record).await?;
         record.dispatched_at = None;
         record.stage = Stage::Canceled { registration };
@@ -85,7 +87,7 @@ impl HostedCatalog {
                 )
             })
             .await?;
-        self.clear_dispatch_hint(scope, operation).await?;
+        self.clear_dispatch_hint(scope, operation, attempt).await?;
         Ok(job)
     }
 }
