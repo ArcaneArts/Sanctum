@@ -8,6 +8,7 @@ use std::{
 };
 
 use prost::Message;
+use rusqlite::OptionalExtension;
 use sanctum_embedding::{EmbedError, Provider, Purpose};
 use sanctum_proto::v1::{self, sanctum_client::SanctumClient, upload_text_frame::Frame};
 use sanctum_service::{
@@ -4590,6 +4591,83 @@ async fn deleting_a_local_source_reclaims_its_failed_replacement_while_queue_is_
             .await
             .is_empty()
     );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn startup_defers_blocked_orphan_cleanup_without_abandoning_other_inputs() {
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start(&dir).await;
+    create(&mut running.client, "default").await;
+    let original = upload(&mut running.client, header("default"), b"current agate").await;
+    running.service.pause_queue(true).unwrap();
+    let pending = running
+        .client
+        .submit_text(tokio_stream::iter([
+            replacement(Some(&original.source_id), Some(&original.revision_id)),
+            data(b"pending jasper"),
+            end(),
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+    running.stop().await;
+
+    let blocked_id = uuid::Uuid::new_v4().to_string();
+    let blocked = text_path(&dir, &original.source_id, &blocked_id);
+    std::fs::create_dir_all(&blocked).unwrap();
+    let disposable = text_path(&dir, &original.source_id, &uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(disposable.parent().unwrap()).unwrap();
+    std::fs::write(&disposable, b"abandoned text").unwrap();
+    let collection = dir.path().join("default/notes/meta.db");
+    let due = |db_path: &std::path::Path| {
+        rusqlite::Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT cleanup_after > unixepoch() FROM revision_garbage
+                 WHERE source_id = ?1 AND revision_id = ?2",
+                [&original.source_id, &blocked_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .unwrap()
+    };
+    let running = Running::start(&dir).await;
+    assert_eq!(due(&collection), Some(true));
+    assert!(blocked.is_dir());
+    assert!(!disposable.exists());
+    running.stop().await;
+
+    std::fs::remove_dir(&blocked).unwrap();
+    std::fs::write(&blocked, b"abandoned text").unwrap();
+    let mut running = Running::start(&dir).await;
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    running.service.reclaim_retired(&scope).unwrap();
+    assert!(blocked.is_file());
+    assert_eq!(due(&collection), Some(true));
+    rusqlite::Connection::open(&collection)
+        .unwrap()
+        .execute(
+            "UPDATE revision_garbage SET cleanup_after = 0 WHERE revision_id = ?1",
+            [&blocked_id],
+        )
+        .unwrap();
+    running.service.reclaim_retired(&scope).unwrap();
+    assert!(!blocked.parent().unwrap().exists());
+    assert_eq!(due(&collection), None);
+
+    let hits = search(&mut running.client, "default", "agate").await;
+    assert_eq!(hits[0].excerpt, "current agate");
+    let pending_path = text_path(&dir, &pending.source_id, &pending.revision_id);
+    assert_eq!(std::fs::read(pending_path).unwrap(), b"pending jasper");
+    running.service.pause_queue(false).unwrap();
+    let published = await_ready(&mut running.client, job_request(pending.operation_id)).await;
+    assert_eq!(published.revision_id, pending.revision_id);
+    let hits = search(&mut running.client, "default", "jasper").await;
+    assert_eq!(hits[0].excerpt, "pending jasper");
     running.stop().await;
 }
 

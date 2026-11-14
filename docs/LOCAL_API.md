@@ -65,6 +65,10 @@ checks for the operation in a fresh read. A committed job keeps its input
 and can return its receipt. If the read confirms the operation is absent,
 the server attempts to reclaim the input immediately. Startup rechecks
 input left behind after interruption, an inconclusive read, or failed cleanup.
+If startup finds an unreferenced revision but cannot remove its files,
+it records a cleanup retry in the collection database and continues
+with other abandoned revisions. Periodic maintenance retries after at
+least one minute, and the deadline survives another restart.
 
 If a local upload fails after entering publication, maintenance checks
 the collection database before settling its queue record. An already

@@ -82,6 +82,22 @@ impl CollectionDb {
         Ok(())
     }
 
+    pub fn defer_orphan_cleanup(&self, revision: RevisionKey) -> Result<()> {
+        self.0
+            .execute(
+                "INSERT INTO revision_garbage (source_id, revision_id, cleanup_after)
+                 VALUES (?1, ?2, unixepoch() + ?3)
+                 ON CONFLICT (source_id, revision_id) DO NOTHING",
+                params![
+                    revision.source.to_string(),
+                    revision.revision.to_string(),
+                    CLEANUP_RETRY_SECONDS
+                ],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
     pub fn tracks_revision_files(&self, revision: RevisionKey) -> Result<bool> {
         self.0
             .query_row(

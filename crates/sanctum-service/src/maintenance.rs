@@ -192,19 +192,35 @@ impl Service {
 
     pub(crate) fn reclaim_startup_orphans(&self) -> Result<()> {
         for scope in self.local_scopes()? {
-            self.files.clear_staging(&scope)?;
-            let database = self.database(&scope)?;
-            self.files.visit_revisions(&scope, |source, revision| {
-                let key = RevisionKey { source, revision };
-                if !database.tracks_revision_files(key)?
-                    && !self.queue.retains_input(&scope, key)?
-                {
-                    self.files.discard_text(&scope, source, revision)?;
-                }
-                Ok(())
-            })?;
+            if let Err(error) = self.files.clear_staging(&scope) {
+                tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
+                    "could not clear local upload staging");
+            }
+            if let Err(error) = self.reclaim_collection_orphans(&scope) {
+                tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
+                    "could not scan for abandoned local revisions");
+            }
         }
         Ok(())
+    }
+
+    fn reclaim_collection_orphans(&self, scope: &Scope) -> Result<()> {
+        let database = self.database(scope)?;
+        self.files.visit_revisions(scope, |source, revision| {
+            let key = RevisionKey { source, revision };
+            if !database.tracks_revision_files(key)?
+                && !self.queue.retains_input(scope, key)?
+                && let Err(error) = self.files.discard_text(scope, source, revision)
+            {
+                tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
+                    %source, %revision, "could not remove abandoned local revision");
+                if let Err(error) = database.defer_orphan_cleanup(key) {
+                    tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
+                        %source, %revision, "could not schedule abandoned local revision cleanup");
+                }
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn reclaim_staged_inputs(&self) -> Result<()> {

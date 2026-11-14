@@ -171,6 +171,14 @@ Merged in [PR #4](https://github.com/ArcaneArts/Sanctum/pull/4).
   [Deletion request contract](LOCAL_API.md#text-uploads).
 - Startup reclaims abandoned uploads while preserving committed revisions and
   queued or retryable inputs. Existing v1 databases migrate in place.
+- A failed removal of an unreferenced local revision during startup
+  enters the collection's durable cleanup queue. Startup continues
+  scanning other inputs. The regression verifies the retry deadline
+  across restart, removal by maintenance, exact retrieval of the
+  committed revision, and subsequent publication of a queued replacement.
+  A generated Python client exercised the standalone server after a
+  process kill and confirmed the periodic worker cleared the orphan receipt.
+  [Local acceptance recovery](LOCAL_API.md#text-uploads).
 - The local gRPC tests cover both replacement targets, stale expected revisions,
   competing queued replacements, deletion during queued work, and retirement
   of old index rows and files. A v1 fixture verifies migration and orphan cleanup.
