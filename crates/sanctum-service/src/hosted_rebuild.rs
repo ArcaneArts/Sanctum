@@ -193,6 +193,9 @@ impl HostedCatalog {
     }
 
     pub(crate) async fn dispatch_rebuild(&self, scope: &Scope, operation: Uuid) -> Result<bool> {
+        if self.clear_retired_dispatch(scope, operation, true).await? {
+            return Ok(false);
+        }
         let Some(dispatcher) = self
             .dispatcher
             .as_ref()
@@ -242,6 +245,9 @@ impl HostedCatalog {
         scope: &Scope,
         operation: Uuid,
     ) -> Result<bool> {
+        if self.clear_retired_dispatch(scope, operation, true).await? {
+            return Ok(false);
+        }
         if self.embedding.is_none() {
             return Ok(false);
         }
@@ -269,6 +275,9 @@ impl HostedCatalog {
         step: u32,
         target_profile: Option<&str>,
     ) -> Result<()> {
+        if self.clear_retired_dispatch(scope, operation, true).await? {
+            return Ok(());
+        }
         if target_profile.is_some() && target_profile != self.embedding_profile() {
             return Ok(());
         }

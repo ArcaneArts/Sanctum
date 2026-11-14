@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use sanctum_core::{Error, Result, Scope};
+use sanctum_db::Unit;
 use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES};
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncReadExt, sync::Notify};
@@ -161,6 +162,31 @@ impl HostedCatalog {
             failed,
             next_cursor,
         })
+    }
+
+    /// Clears the dispatch hint when a late upload task reaches a retired collection.
+    pub async fn discard_retired_upload_task(
+        &self,
+        scope: &Scope,
+        operation: Uuid,
+    ) -> Result<bool> {
+        self.clear_retired_dispatch(scope, operation, false).await
+    }
+
+    pub(crate) async fn clear_retired_dispatch(
+        &self,
+        scope: &Scope,
+        operation: Uuid,
+        rebuild: bool,
+    ) -> Result<bool> {
+        // A retired manifest is permanent. A missing envelope is inconclusive
+        // because admission writes its dispatch hint before the envelope.
+        let unit = Unit::collection(self.prefix.as_ref(), scope)?;
+        if !self.publication.is_retired(&unit).await? {
+            return Ok(false);
+        }
+        self.clear_hint(scope, operation, rebuild).await?;
+        Ok(true)
     }
 
     async fn hint_page(&self, shard: u8, cursor: Option<&str>) -> Result<HintPage> {

@@ -3,7 +3,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use axum::{
@@ -13,7 +13,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::post,
 };
-use sanctum_core::ByteRange;
+use sanctum_core::{ByteRange, Error};
 use sanctum_proto::v1::{self, sanctum_client::SanctumClient, upload_text_frame::Frame};
 use sanctum_service::HostedCatalog;
 use sanctum_storage::{Condition, Download, Key, ListPage, Object, Reader, Storage, Version};
@@ -224,22 +224,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
     })
     .await
     .unwrap();
-    let frames = [
-        Frame::Header(v1::UploadTextHeader {
-            scope: Some(scope.clone()),
-            request_id: Some(operation.to_string()),
-            name: "repair.txt".into(),
-            ..Default::default()
-        }),
-        Frame::Data(TEXT.as_bytes().to_vec()),
-        Frame::End(v1::UploadTextEnd {}),
-    ]
-    .map(|frame| v1::UploadTextFrame { frame: Some(frame) });
-    let accepted = api
-        .submit_text(tokio_stream::iter(frames))
-        .await
-        .unwrap()
-        .into_inner();
+    let accepted = submit_text(&mut api, &scope, operation).await;
     assert_eq!(accepted.operation_id, operation.to_string());
     assert_eq!(accepted.total_bytes, TEXT.len() as u64);
     assert_eq!(accepted.state(), v1::IngestionState::Accepted);
@@ -373,7 +358,7 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         .into_inner();
     assert_eq!(published.state(), v1::IngestionState::TextReady);
     let search = v1::SearchTextRequest {
-        scope: Some(scope),
+        scope: Some(scope.clone()),
         query: "rhodonite".into(),
         mode: v1::SearchMode::Lexical.into(),
         ..Default::default()
@@ -416,24 +401,236 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         after.hits[0].database_generation
     );
     assert_eq!(before.hits[0].chunk, after.hits[0].chunk);
+
+    verify_retirement(
+        storage.clone(),
+        prefix.as_ref(),
+        &http,
+        queue.as_ref(),
+        make_catalog,
+    )
+    .await;
+}
+
+async fn verify_retirement(
+    storage: Arc<dyn Storage>,
+    prefix: Option<&Key>,
+    http: &reqwest::Client,
+    queue: &TaskQueue,
+    make_catalog: impl Fn() -> HostedCatalog,
+) {
+    let (mut api, _api_server) = serve_api(make_catalog()).await;
+    let scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "repair".into(),
+    };
+    let accepted_before = queue.accepted.lock().unwrap().len();
+    let retired = v1::Scope {
+        collection: "retired".into(),
+        ..scope.clone()
+    };
+    api.create_collection(v1::CreateCollectionRequest {
+        scope: Some(retired.clone()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    // Place all three pending hints in the same repair shard. The operation
+    // UUID can recur in another collection, so retirement must be scoped.
+    queue.enabled.store(false, Ordering::SeqCst);
+    let operation = Uuid::from_u128(1);
+    let second = Uuid::from_u128(2);
+    for (scope, operation) in [
+        (&scope, operation),
+        (&retired, operation),
+        (&retired, second),
+    ] {
+        assert_eq!(
+            submit_text(&mut api, scope, operation).await.state(),
+            v1::IngestionState::Accepted,
+        );
+    }
+    api.delete_collection(v1::DeleteCollectionRequest {
+        scope: Some(retired),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let first_hint = scoped_key(
+        prefix,
+        &format!("_dispatch/00/pending/default/retired/{operation}"),
+    );
+    let second_hint = scoped_key(
+        prefix,
+        &format!("_dispatch/00/pending/default/retired/{second}"),
+    );
+    let live_hint = scoped_key(
+        prefix,
+        &format!("_dispatch/00/pending/default/repair/{operation}"),
+    );
+    let active_uncommitted = scoped_key(
+        prefix,
+        &format!("_dispatch/00/pending/default/repair/{}", Uuid::from_u128(3)),
+    );
+    storage
+        .put_control(
+            &active_uncommitted,
+            Bytes::from_static(b"{}"),
+            Condition::Create,
+        )
+        .await
+        .unwrap();
+    let head = scoped_key(prefix, "default/collections/retired/HEAD.json");
+    let operation_key = scoped_key(
+        prefix,
+        &format!("default/collections/retired/operations/{second}/operation.json"),
+    );
+    storage.head(&first_hint).await.unwrap();
+    storage.head(&second_hint).await.unwrap();
+
+    let standalone = HostedCatalog::new(storage.clone(), prefix.cloned(), 1024)
+        .unwrap()
+        .with_standalone_worker(Arc::new(tokio::sync::Notify::new()));
+    let retired_page = standalone
+        .work_standalone_shard(0, None, || false)
+        .await
+        .unwrap();
+    assert_eq!((retired_page.dispatched, retired_page.failed), (1, 0));
+    assert!(matches!(
+        storage.head(&first_hint).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        storage.head(&second_hint).await,
+        Err(Error::NotFound(_))
+    ));
+    storage.head(&operation_key).await.unwrap();
+    storage.head(&live_hint).await.unwrap();
+
+    // Simulate a hint left by an older server or an interrupted cleanup.
+    storage
+        .put_control(&second_hint, Bytes::from_static(b"{}"), Condition::Create)
+        .await
+        .unwrap();
+    let (mut manifest, version) = read_control(storage.as_ref(), &head).await;
+    manifest["deleted_at_ms"] = json!(
+        (SystemTime::now() - Duration::from_secs(901))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    );
+    storage
+        .put_control(
+            &head,
+            serde_json::to_vec(&manifest).unwrap().into(),
+            Condition::Match(version),
+        )
+        .await
+        .unwrap();
+    let sweeper = make_catalog();
+    loop {
+        let report = sweeper.sweep_hosted_snapshots().await.unwrap();
+        assert_eq!(report.failed, 0);
+        if !report.more {
+            break;
+        }
+    }
+    assert!(matches!(
+        storage.head(&operation_key).await,
+        Err(Error::NotFound(_))
+    ));
+    storage.head(&second_hint).await.unwrap();
+
+    queue.enabled.store(true, Ordering::SeqCst);
+    let (resumed, _resumed_server) = serve_http(crate::hosted_worker::router(make_catalog())).await;
+    let replay_hint = scoped_key(
+        prefix,
+        &format!("_dispatch/00/pending/default/retired/rebuild-{second}"),
+    );
+    storage
+        .put_control(&replay_hint, Bytes::from_static(b"{}"), Condition::Create)
+        .await
+        .unwrap();
+    assert_eq!(
+        reconcile(http, &resumed, 0).await,
+        json!({"dispatched": 1, "failed": 0, "more": false}),
+    );
+    assert!(matches!(
+        storage.head(&second_hint).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        storage.head(&replay_hint).await,
+        Err(Error::NotFound(_))
+    ));
+    storage.head(&live_hint).await.unwrap();
+    storage.head(&active_uncommitted).await.unwrap();
+    assert_eq!(queue.accepted.lock().unwrap().len(), accepted_before + 1);
+    for stage in [
+        "register-upload",
+        "prepare-upload",
+        "index-upload",
+        "embed-upload",
+        "rebuild-collection",
+    ] {
+        let mut payload = json!({
+            "tenant": "default", "collection": "retired", "operation_id": second,
+        });
+        if matches!(stage, "embed-upload" | "rebuild-collection") {
+            payload["step"] = json!(0);
+        }
+        let response = http
+            .post(format!("{resumed}/internal/tasks/{stage}"))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT, "{stage}");
+    }
+    assert_eq!(queue.accepted.lock().unwrap().len(), accepted_before + 1);
+}
+
+async fn submit_text(
+    client: &mut SanctumClient<Channel>,
+    scope: &v1::Scope,
+    operation: Uuid,
+) -> v1::IngestionJob {
+    let frames = [
+        Frame::Header(v1::UploadTextHeader {
+            scope: Some(scope.clone()),
+            request_id: Some(operation.to_string()),
+            name: "repair.txt".into(),
+            ..Default::default()
+        }),
+        Frame::Data(TEXT.as_bytes().to_vec()),
+        Frame::End(v1::UploadTextEnd {}),
+    ]
+    .map(|frame| v1::UploadTextFrame { frame: Some(frame) });
+    client
+        .submit_text(tokio_stream::iter(frames))
+        .await
+        .unwrap()
+        .into_inner()
 }
 
 async fn collection_generation(storage: &dyn Storage, prefix: Option<&Key>) -> Uuid {
-    let path = "default/collections/repair/HEAD.json";
-    let key =
-        Key::parse(prefix.map_or_else(|| path.to_owned(), |prefix| format!("{prefix}/{path}")))
-            .unwrap();
-    let mut bytes = Vec::new();
-    storage
-        .get(&key)
-        .await
-        .unwrap()
-        .reader
-        .read_to_end(&mut bytes)
-        .await
-        .unwrap();
-    let head: Value = serde_json::from_slice(&bytes).unwrap();
+    let key = scoped_key(prefix, "default/collections/repair/HEAD.json");
+    let (head, _) = read_control(storage, &key).await;
     serde_json::from_value(head["generation"]["id"].clone()).unwrap()
+}
+
+fn scoped_key(prefix: Option<&Key>, path: &str) -> Key {
+    Key::parse(prefix.map_or_else(|| path.to_owned(), |prefix| format!("{prefix}/{path}"))).unwrap()
+}
+
+async fn read_control(storage: &dyn Storage, key: &Key) -> (Value, Version) {
+    let mut download = storage.get(key).await.unwrap();
+    let mut bytes = Vec::new();
+    download.reader.read_to_end(&mut bytes).await.unwrap();
+    (
+        serde_json::from_slice(&bytes).unwrap(),
+        download.object.version,
+    )
 }
 
 async fn reconcile(http: &reqwest::Client, worker: &str, shard: u8) -> Value {
