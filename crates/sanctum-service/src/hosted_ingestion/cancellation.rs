@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use sanctum_core::{Error, Result, Scope};
 use sanctum_db::{Command, Unit, command_receipt};
 use sanctum_db_sqlite::hosted::{Registration, release_canceled_intent};
@@ -17,11 +19,7 @@ impl HostedCatalog {
         let (record, version) = self.require_operation(&prefix, operation).await?;
         match record.stage {
             Stage::Canceled { .. } => {
-                self.try_discard_completed_input(scope, &prefix, &record)
-                    .await;
-                self.clear_dispatch_hint(scope, operation, record.attempt)
-                    .await?;
-                return Ok(record.job());
+                return Ok(self.finish_cancellation(scope, &prefix, record).await);
             }
             Stage::PendingRegistration | Stage::PendingIndexing { .. } => {}
             _ => return Err(finished()),
@@ -76,8 +74,6 @@ impl HostedCatalog {
         version: Version,
         registration: Option<Registration>,
     ) -> Result<HostedJob> {
-        let operation = record.operation;
-        let attempt = record.attempt;
         record.dispatched_at = None;
         record.stage = Stage::Canceled { registration };
         let record = self
@@ -88,10 +84,31 @@ impl HostedCatalog {
                 )
             })
             .await?;
-        self.try_discard_completed_input(scope, prefix, &record)
-            .await;
-        self.clear_dispatch_hint(scope, operation, attempt).await?;
-        Ok(record.job())
+        Ok(self.finish_cancellation(scope, prefix, record).await)
+    }
+
+    async fn finish_cancellation(
+        &self,
+        scope: &Scope,
+        prefix: &Key,
+        record: Operation,
+    ) -> HostedJob {
+        let operation = record.operation;
+        let clear_hint = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.clear_dispatch_hint(scope, operation, record.attempt),
+        );
+        let (_, result) = tokio::join!(
+            self.try_discard_completed_input(scope, prefix, &record),
+            clear_hint,
+        );
+        let result =
+            result.unwrap_or_else(|_| Err(Error::Busy("dispatch hint cleanup timed out".into())));
+        if let Err(error) = result {
+            tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
+                %operation, "dispatch repair will retry canceled upload hint cleanup");
+        }
+        record.job()
     }
 }
 

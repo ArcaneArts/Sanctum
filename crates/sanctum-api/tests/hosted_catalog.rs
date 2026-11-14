@@ -1943,6 +1943,117 @@ async fn hosted_job_outcomes_survive_staged_input_cleanup_failure() {
 }
 
 #[tokio::test]
+async fn hosted_cancellation_replays_while_dispatch_hint_deletes_fail() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
+    let dispatch = Arc::new(TestDispatch {
+        fail: AtomicU8::new(0),
+        delivered: std::sync::Mutex::new(Vec::new()),
+    });
+    let service = || {
+        HostedCatalog::new(storage.clone(), None, 1024)
+            .unwrap()
+            .with_dispatch(dispatch.clone())
+    };
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let wire = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    let catalog = service();
+    catalog.create_collection(&scope, None).await.unwrap();
+    let mut server = start(catalog.clone()).await;
+    let operation = uuid::Uuid::from_u128(121);
+    let request = v1::IngestionJobRequest {
+        scope: Some(wire.clone()),
+        operation_id: operation.to_string(),
+    };
+    let accepted = server
+        .client
+        .submit_text(upload_frames(
+            &v1::UploadTextHeader {
+                scope: Some(wire.clone()),
+                name: "canceled.txt".into(),
+                request_id: Some(request.operation_id.clone()),
+                ..Default::default()
+            },
+            [b"canceled quartz".as_slice()],
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    catalog.register_upload(&scope, operation).await.unwrap();
+    storage
+        .interrupt
+        .store(REJECT_DISPATCH_HINT_DELETES, Ordering::Relaxed);
+    let canceled = server
+        .client
+        .cancel_ingestion_job(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(canceled.state(), v1::IngestionState::Canceled);
+    assert_eq!(canceled.revision_id, accepted.revision_id);
+    assert!(has_upload_hint(storage.as_ref(), operation).await);
+    server.stop().await;
+
+    let restarted = service();
+    let mut server = start(restarted.clone()).await;
+    assert_eq!(
+        server
+            .client
+            .cancel_ingestion_job(request.clone())
+            .await
+            .unwrap()
+            .into_inner(),
+        canceled
+    );
+    assert!(matches!(
+        restarted
+            .index_upload(&scope, operation)
+            .await
+            .unwrap()
+            .state,
+        sanctum_service::HostedJobState::Canceled
+    ));
+    let report = restarted.reconcile_shard(0).await.unwrap();
+    assert_eq!((report.dispatched, report.failed), (0, 1));
+    assert!(has_upload_hint(storage.as_ref(), operation).await);
+
+    storage.interrupt.store(0, Ordering::Relaxed);
+    let report = restarted.reconcile_shard(0).await.unwrap();
+    assert_eq!((report.dispatched, report.failed), (0, 0));
+    assert!(!has_upload_hint(storage.as_ref(), operation).await);
+    assert_eq!(
+        server
+            .client
+            .get_ingestion_job(request)
+            .await
+            .unwrap()
+            .into_inner(),
+        canceled
+    );
+    assert!(
+        server
+            .client
+            .search_text(v1::SearchTextRequest {
+                scope: Some(wire),
+                query: "quartz".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .hits
+            .is_empty()
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_cancellation_recovers_from_lost_checkpoints_without_publishing() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
@@ -8240,6 +8351,7 @@ const REJECT_DISPATCH_HINT_WRITES: u8 = 39;
 const PARALLEL_RANGE_START: u8 = 40;
 const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
 const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
+const REJECT_DISPATCH_HINT_DELETES: u8 = 46;
 
 struct InterruptedRead<'a>(&'a AtomicU8, u8);
 
@@ -8578,6 +8690,12 @@ impl Storage for InterruptAcceptance {
     }
 
     async fn delete(&self, key: &Key) -> StorageResult<()> {
+        if self.interrupt.load(Ordering::Relaxed) == REJECT_DISPATCH_HINT_DELETES
+            && key.as_str().starts_with("_dispatch/")
+            && key.as_str().contains("/pending/")
+        {
+            return Err(Error::Busy("test blocked dispatch hint cleanup".into()));
+        }
         if key.as_str().ends_with("/sources/late-000")
             && self.interrupt.load(Ordering::Relaxed) == REJECT_RETIRED_COLLECTION_DELETE
         {
