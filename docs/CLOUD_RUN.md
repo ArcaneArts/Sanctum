@@ -134,6 +134,8 @@ request deadlines for the maintenance routes.
 Create one HTTP job per shard. Each call scans one bounded page and advances
 its stored cursor. The worker attempts up to four hints concurrently, with
 30 seconds per hint and 240 seconds for the page, including cursor I/O.
+If a saved cursor contains malformed JSON, a complete read lets the worker
+restart that shard's scan and conditionally save the next checkpoint.
 The example gives Scheduler 300 seconds to receive the result. An attempt
 that times out remains discoverable. A later scan retries it with its
 existing task identity within the same dispatch window. Expired uploads

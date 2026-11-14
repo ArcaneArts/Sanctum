@@ -838,6 +838,13 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - The private maintenance endpoint scans a bounded page of a single shard
   and persists its cursor in object storage. It reads operation envelopes
   directly and can retry after an API or worker restart.
+- Dispatch repair restarts a shard scan on a completely read, malformed
+  checkpoint. It preserves the checkpoint after an incomplete transfer and
+  uses the normal conditional write after the scan succeeds. The filesystem
+  and live MinIO worker tests replaced the stored cursor with malformed JSON,
+  restarted the worker, and recovered a missing task through a loopback
+  Cloud Tasks fixture. The recovered job returned exact UTF-8 after the
+  worker completed it. [Dispatch behavior](STORAGE.md#cloud-tasks-dispatch).
 - The HTTP fixture checks Google Cloud Tasks request format, OIDC audience
   and account, deduplication, and retryable service errors. The local
   integration test interrupts dispatch and resumes the repair cursor across

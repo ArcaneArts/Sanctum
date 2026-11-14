@@ -1150,12 +1150,28 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
     first_worker.abort();
     assert!(first_worker.await.unwrap_err().is_cancelled());
 
+    let cursor = scoped_key(
+        prefix.as_ref(),
+        &format!("_dispatch/{shard:02x}/cursor.json"),
+    );
+    let version = storage.head(&cursor).await.unwrap().version;
+    storage
+        .put_control(
+            &cursor,
+            Bytes::from_static(br#"{"next":"interrupted"#),
+            Condition::Match(version),
+        )
+        .await
+        .unwrap();
+
     queue.enabled.store(true, Ordering::SeqCst);
     let (worker, repair_server) = serve_http(crate::hosted_worker::router(make_catalog())).await;
     assert_eq!(
         reconcile(&http, &worker, shard).await,
         json!({"dispatched": 1, "failed": 0, "more": false}),
     );
+    let (saved_cursor, _) = read_control(storage.as_ref(), &cursor).await;
+    assert_eq!(saved_cursor, json!({"next": null}));
     assert_eq!(
         queue.accepted.lock().unwrap()[0]["task"]["httpRequest"],
         queue.refused.lock().unwrap()[1]["task"]["httpRequest"],
