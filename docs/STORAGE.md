@@ -156,22 +156,26 @@ headers, and bodies that exceed the requested range return immediately.
 [retry behavior](https://docs.cloud.google.com/storage/docs/retry-strategy).
 
 Object listing retries the same prefix and page token after a transient HTTP
-error, interrupted response body, or timeout. Each page has up to three attempts
-of ten seconds each, plus backoff. The adapter returns only a complete,
+error, interrupted or incomplete JSON body, or timeout. Each page has up to
+three attempts of ten seconds each, plus backoff. The adapter returns a complete,
 validated page, so a failed attempt contributes no objects to usage totals or
 maintenance scans. Listing requests select only the continuation token and
 the name, size, ETag, generation, and update time for each object. The response
 buffer allows 2 KiB per requested item plus 16 KiB for the page envelope and
 token. Single-object metadata and upload confirmations have a 1 MiB response
-limit. Authorization errors, malformed JSON, and oversized responses end the
-request.
+limit. Authorization errors, JSON syntax or schema errors, and oversized
+responses end the request. Unexpected EOF during JSON decoding is retryable
+for single-object metadata as well.
 [GCS list pagination](https://docs.cloud.google.com/storage/docs/json_api/v1/objects/list),
 [GCS partial responses](https://docs.cloud.google.com/storage/docs/json_api#partial-response).
 
 Bulk transfers use bounded 8 MiB parts in a GCS resumable upload
 session. After an interrupted request or retryable HTTP failure,
 the adapter asks GCS for its persisted offset and resumes from that byte.
-A status response can also confirm an upload whose final response was lost.
+A status response can also confirm an upload whose final receipt was lost or
+ended before its JSON was complete. If a conditional control write returns
+an incomplete receipt, the caller receives a retryable error and can check
+the committed value. The adapter sends the conditional write once.
 The adapter bounds retries without progress. A part or status request
 that returns HTTP 404 or 410 ends the session with a retryable error.
 Hosted uploads can then verify a committed object by digest or replay
