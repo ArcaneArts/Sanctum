@@ -1,4 +1,5 @@
 use sanctum_core::{Error, Result, Scope};
+pub use sanctum_db_sqlite::SourceStatus;
 use uuid::Uuid;
 
 use crate::{HostedCatalog, Revision, Service};
@@ -16,6 +17,16 @@ impl Service {
 
     pub fn source(&self, scope: &Scope, source: Uuid, expected: Option<Uuid>) -> Result<Revision> {
         self.database(scope)?.source(source, expected)
+    }
+
+    pub fn source_status(
+        &self,
+        scope: &Scope,
+        source: Uuid,
+        expected: Option<Uuid>,
+    ) -> Result<SourceStatus> {
+        self.database(scope)?
+            .source_status(source, expected, self.embedding_profile())
     }
 }
 
@@ -39,6 +50,19 @@ impl HostedCatalog {
     ) -> Result<(Revision, Uuid)> {
         self.with_collection(scope, move |db| db.source(source, expected))
             .await
+    }
+
+    pub async fn source_status(
+        &self,
+        scope: &Scope,
+        source: Uuid,
+        expected: Option<Uuid>,
+    ) -> Result<(SourceStatus, Uuid)> {
+        let profile = self.embedding_profile().map(str::to_owned);
+        self.with_collection(scope, move |db| {
+            db.source_status(source, expected, profile.as_deref())
+        })
+        .await
     }
 }
 

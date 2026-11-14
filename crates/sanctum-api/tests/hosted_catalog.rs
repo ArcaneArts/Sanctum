@@ -2540,7 +2540,7 @@ async fn hosted_embeddings_reuse_current_inputs_and_isolate_profiles() {
     assert_eq!(catalog.embed_collection(&scope).await.unwrap(), 0);
     server.stop().await;
 
-    let catalog = HostedCatalog::new(storage, None, 1024)
+    let catalog = HostedCatalog::new(storage.clone(), None, 1024)
         .unwrap()
         .with_embedding(Some(Arc::new(HostedEmbeddingFixture {
             profile: "fixture-v2",
@@ -2548,6 +2548,22 @@ async fn hosted_embeddings_reuse_current_inputs_and_isolate_profiles() {
             queries: AtomicUsize::new(0),
         })));
     let mut server = start(catalog.clone()).await;
+    let current_source = v1::GetSourceRequest {
+        scope: Some(wire_scope),
+        source_id: second.source_id.clone(),
+        expected_revision_id: Some(second.revision_id.clone()),
+    };
+    let pending = server
+        .client
+        .get_source(current_source.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(pending.database_generation.is_some());
+    let pending = pending.processing.unwrap();
+    assert!(!pending.ready);
+    assert_eq!(pending.retained_revisions, 1);
+    assert_eq!(pending.pending_object_cleanup, Some(0));
     let changed = server
         .client
         .search_text(hybrid)
@@ -2574,6 +2590,81 @@ async fn hosted_embeddings_reuse_current_inputs_and_isolate_profiles() {
         rebuilt.hits[0].chunk.as_ref().unwrap().revision_id,
         second.revision_id
     );
+    let ready = server
+        .client
+        .get_source(current_source.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .processing
+        .unwrap();
+    assert!(ready.ready);
+    assert_eq!(ready.retained_revisions, 1);
+    let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
+    let executor =
+        sanctum_db::Publication::new(storage, std::time::Duration::from_secs(15)).unwrap();
+    let age = async |statement| {
+        let mut lease = executor.acquire(&unit).await.unwrap();
+        lease
+            .apply(
+                vec![sanctum_db::Command {
+                    operation: uuid::Uuid::new_v4(),
+                    payload: statement,
+                }],
+                |transaction, statement| {
+                    transaction
+                        .execute(statement, [])
+                        .map_err(|error| Error::Internal(Box::new(error)))?;
+                    Ok("aged".into())
+                },
+            )
+            .await
+            .unwrap();
+        lease.release().await.unwrap();
+    };
+    age("UPDATE revisions SET retire_at = 0 WHERE retire_at IS NOT NULL").await;
+    catalog.reclaim_hosted_sources(&scope).await.unwrap();
+    let cleanup = server
+        .client
+        .get_source(current_source.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .processing
+        .unwrap();
+    assert!(cleanup.ready);
+    assert_eq!(cleanup.retained_revisions, 0);
+    assert_eq!(cleanup.pending_object_cleanup, Some(1));
+    age("UPDATE hosted_object_garbage SET delete_after = 0").await;
+    assert_eq!(catalog.reclaim_hosted_sources(&scope).await.unwrap(), 1);
+    let cleaned = server
+        .client
+        .get_source(current_source)
+        .await
+        .unwrap()
+        .into_inner()
+        .processing
+        .unwrap();
+    assert!(cleaned.ready);
+    assert_eq!(cleaned.pending_object_cleanup, Some(0));
+    age("INSERT INTO hosted_object_garbage (object_key, delete_after) VALUES ('legacy', 0)").await;
+    let legacy = server
+        .client
+        .get_source(v1::GetSourceRequest {
+            scope: Some(v1::Scope {
+                tenant: scope.tenant.to_string(),
+                collection: scope.collection.to_string(),
+            }),
+            source_id: second.source_id,
+            expected_revision_id: Some(second.revision_id),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .processing
+        .unwrap();
+    assert!(legacy.ready);
+    assert_eq!(legacy.pending_object_cleanup, None);
     server.stop().await;
 }
 

@@ -906,17 +906,7 @@ impl Sanctum for Grpc {
                 .await
                 .map_err(status)?,
         };
-        Ok(Response::new(v1::EmbeddingStatus {
-            coverage: Some(v1::EmbeddingCoverage {
-                profile_id: status.profile,
-                total_chunks: status.coverage.total,
-                embedded_chunks: status.coverage.embedded,
-                failed_chunks: status.coverage.failed,
-            }),
-            retrying_chunks: status.retrying,
-            next_retry_at_unix_seconds: status.next_retry,
-            sample_error: status.sample_error,
-        }))
+        Ok(Response::new(wire_embedding_status(status)))
     }
 
     async fn cancel_ingestion_job(
@@ -1257,26 +1247,34 @@ impl Sanctum for Grpc {
             "expected_revision_id",
             "invalid expected revision ID",
         )?;
-        let (revision, generation) = match &self.0 {
+        let (source_status, generation) = match &self.0 {
             Backend::Local(service) => {
                 let service = service.clone();
                 let scope = scope.clone();
                 (
-                    work(move || service.source(&scope, source, expected)).await?,
+                    work(move || service.source_status(&scope, source, expected)).await?,
                     None,
                 )
             }
             Backend::Hosted(catalog) => {
-                let (revision, generation) = catalog
-                    .source(&scope, source, expected)
+                let (source_status, generation) = catalog
+                    .source_status(&scope, source, expected)
                     .await
                     .map_err(status)?;
-                (revision, Some(generation.to_string()))
+                (source_status, Some(generation.to_string()))
             }
         };
+        let ready = source_status.ready();
         Ok(Response::new(v1::GetSourceResponse {
-            current_revision: Some(wire_revision(&scope, revision)),
+            current_revision: Some(wire_revision(&scope, source_status.revision)),
             database_generation: generation,
+            processing: Some(v1::SourceProcessing {
+                ready,
+                embedding: Some(wire_embedding_status(source_status.embedding)),
+                retained_revisions: source_status.retained_revisions,
+                pending_revision_cleanup: source_status.pending_revision_cleanup,
+                pending_object_cleanup: source_status.pending_object_cleanup,
+            }),
         }))
     }
 
@@ -1344,6 +1342,20 @@ fn wire_usage(
         started_at_unix_ms: unix_ms(measured.started_at).map_err(status)?,
         finished_at_unix_ms: unix_ms(measured.finished_at).map_err(status)?,
     })
+}
+
+fn wire_embedding_status(status: sanctum_service::EmbeddingStatus) -> v1::EmbeddingStatus {
+    v1::EmbeddingStatus {
+        coverage: Some(v1::EmbeddingCoverage {
+            profile_id: status.profile,
+            total_chunks: status.coverage.total,
+            embedded_chunks: status.coverage.embedded,
+            failed_chunks: status.coverage.failed,
+        }),
+        retrying_chunks: status.retrying,
+        next_retry_at_unix_seconds: status.next_retry,
+        sample_error: status.sample_error,
+    }
 }
 
 fn unix_ms(time: std::time::SystemTime) -> Result<u64> {

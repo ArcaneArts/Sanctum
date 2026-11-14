@@ -233,11 +233,11 @@ pub fn retire_revisions(tx: &Transaction<'_>, profile: Option<&str>) -> Result<(
         let source = revision.source.to_string();
         let id = revision.revision.to_string();
         tx.execute(
-            "INSERT OR IGNORE INTO hosted_object_garbage (object_key, delete_after)
-             SELECT text_key, unixepoch() + ?3 FROM hosted_revision_objects
+            "INSERT OR IGNORE INTO hosted_object_garbage (object_key, delete_after, source_id)
+             SELECT text_key, unixepoch() + ?3, source_id FROM hosted_revision_objects
                WHERE source_id = ?1 AND revision_id = ?2
              UNION
-             SELECT original_key, unixepoch() + ?3 FROM hosted_revision_objects
+             SELECT original_key, unixepoch() + ?3, source_id FROM hosted_revision_objects
                WHERE source_id = ?1 AND revision_id = ?2 AND original_key IS NOT NULL",
             params![source, id, HOSTED_READER_GRACE_SECONDS],
         )

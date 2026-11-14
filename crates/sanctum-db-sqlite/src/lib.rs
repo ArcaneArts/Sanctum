@@ -19,6 +19,7 @@ mod sources;
 pub mod vector_index;
 pub mod watched_folders;
 pub use lifecycle::{RevisionKey, SourceIdentity};
+pub use sources::SourceStatus;
 
 const CATALOG_SCHEMA: &str = include_str!("catalog.sql");
 const CATALOG_MIGRATIONS: &[&str] = &[
@@ -42,6 +43,7 @@ const COLLECTION_MIGRATIONS: &[&str] = &[
     include_str!("collection_v9.sql"),
     include_str!("collection_v10.sql"),
     include_str!("metadata_indexes.sql"),
+    include_str!("collection_v12.sql"),
 ];
 
 #[derive(Debug)]

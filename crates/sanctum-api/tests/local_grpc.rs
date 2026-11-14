@@ -1753,6 +1753,25 @@ async fn embedding_search_reuses_vectors_and_isolates_profiles() {
         Some("simulated context limit")
     );
     assert_eq!(embedding_status.coverage.unwrap().failed_chunks, 1);
+    let current_source = v1::GetSourceRequest {
+        scope: scope("default"),
+        source_id: changed.source_id.clone(),
+        expected_revision_id: Some(changed.revision_id.clone()),
+    };
+    let failed = running
+        .client
+        .get_source(current_source.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .processing
+        .unwrap();
+    assert!(!failed.ready);
+    assert_eq!(failed.retained_revisions, 1);
+    assert_eq!(
+        failed.embedding.unwrap().sample_error.as_deref(),
+        Some("simulated context limit")
+    );
     let stale = running
         .client
         .get_embedding_status(status_request(&same.revision_id))
@@ -1815,6 +1834,26 @@ async fn embedding_search_reuses_vectors_and_isolates_profiles() {
         .unwrap();
     await_coverage(&mut restarted.client, 2, 0).await;
     assert_eq!(corrected.document_inputs.load(Ordering::SeqCst), 2);
+    let ready = restarted
+        .client
+        .get_source(current_source.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .processing
+        .unwrap();
+    assert!(ready.ready);
+    assert_eq!(ready.retained_revisions, 1);
+    assert_eq!(
+        ready
+            .embedding
+            .unwrap()
+            .coverage
+            .unwrap()
+            .profile_id
+            .as_deref(),
+        Some("profile-b")
+    );
     let response = restarted
         .client
         .search_text(request)
@@ -1827,6 +1866,17 @@ async fn embedding_search_reuses_vectors_and_isolates_profiles() {
     );
     expire_and_reclaim(&dir, &restarted.service);
     assert!(!text_path(&dir, &same.source_id, &same.revision_id).exists());
+    let cleaned = restarted
+        .client
+        .get_source(current_source)
+        .await
+        .unwrap()
+        .into_inner()
+        .processing
+        .unwrap();
+    assert!(cleaned.ready);
+    assert_eq!(cleaned.retained_revisions, 0);
+    assert_eq!(cleaned.pending_revision_cleanup, 0);
     restarted.stop().await;
 }
 

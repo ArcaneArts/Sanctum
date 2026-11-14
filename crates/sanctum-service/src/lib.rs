@@ -60,6 +60,7 @@ pub use hosted_rebuild::RebuildPage;
 pub use local_import::{ImportEvent, ImportOptions, ImportState};
 pub use pending_scan::{PendingText, ScanOptions, ScanPage, ScanStop};
 pub use sanctum_db_sqlite::embedding::{ChunkEmbeddingState, EmbeddingStatus};
+pub use source_inspection::SourceStatus;
 pub use watched_folders::{WatchedFolder, run_watched_folders};
 pub use worker::{run_local_maintenance, run_local_worker};
 
