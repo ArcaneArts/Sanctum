@@ -256,13 +256,13 @@ impl HostedCatalog {
         };
         let mut writer = self.publication.acquire(unit).await?;
         let result = writer
-            .apply_stage(
+            .apply_cancellable_stage(
                 INDEX_STAGE,
                 vec![Command {
                     operation,
                     payload: prepared,
                 }],
-                move |tx, prepared| {
+                move |tx, prepared, checkpoint| {
                     let outcome = if unix_seconds()? >= expires_at {
                         // A committed revision can outlive its publication receipt.
                         if let Some(content) =
@@ -301,6 +301,7 @@ impl HostedCatalog {
                                             BufReader::new(prepared.file.reopen()?),
                                             chunking,
                                             |range, text| {
+                                                checkpoint()?;
                                                 let reference = ChunkRef {
                                                     source: registration.source,
                                                     revision,

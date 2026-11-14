@@ -9,7 +9,9 @@ use std::{
 use sanctum_core::Result;
 use tempfile::NamedTempFile;
 
-use crate::corrupt;
+use tokio_util::sync::CancellationToken;
+
+use crate::{corrupt, snapshot_work};
 
 const MAGIC: [u8; 4] = *b"SPD1";
 pub(crate) const HEADER_BYTES: u64 = 16;
@@ -37,7 +39,12 @@ fn page_size(file: &mut File) -> Result<u32> {
 
 /// Returns None when a full backup is preferable. Both inputs are closed files
 /// produced by SQLite. The buffer is bounded independently of database size.
-pub(crate) fn encode(before: &Path, after: &Path, limit: u64) -> Result<Option<NamedTempFile>> {
+pub(crate) fn encode(
+    before: &Path,
+    after: &Path,
+    limit: u64,
+    cancellation: &CancellationToken,
+) -> Result<Option<NamedTempFile>> {
     let mut old = File::open(before)?;
     let mut new = File::open(after)?;
     let size = page_size(&mut new)?;
@@ -61,6 +68,7 @@ pub(crate) fn encode(before: &Path, after: &Path, limit: u64) -> Result<Option<N
     let mut bytes = HEADER_BYTES;
     let mut position = 0;
     while position < after_bytes {
+        snapshot_work::check(cancellation)?;
         let next = (after_bytes - position).min(BUFFER_BYTES as u64) as usize;
         let previous_bytes = before_bytes.saturating_sub(position).min(next as u64) as usize;
         old.read_exact(&mut previous[..previous_bytes])?;
@@ -91,7 +99,12 @@ pub(crate) fn encode(before: &Path, after: &Path, limit: u64) -> Result<Option<N
 }
 
 /// Applies a previously verified patch to a private, closed backup file.
-pub(crate) fn apply(database: &mut File, delta: File, expected_database_bytes: u64) -> Result<()> {
+pub(crate) fn apply(
+    database: &mut File,
+    delta: File,
+    expected_database_bytes: u64,
+    cancellation: &CancellationToken,
+) -> Result<()> {
     let size = page_size(database)?;
     let page_bytes = u64::from(size);
     let old_bytes = database.metadata()?.len();
@@ -122,7 +135,11 @@ pub(crate) fn apply(database: &mut File, delta: File, expected_database_bytes: u
     let mut previous = None;
     let mut number = [0; 8];
     let mut page = vec![0; size as usize];
-    for _ in 0..records {
+    let check_every = (BUFFER_BYTES as u64 / page_bytes).max(1);
+    for record in 0..records {
+        if record.is_multiple_of(check_every) {
+            snapshot_work::check(cancellation)?;
+        }
         reader.read_exact(&mut number)?;
         reader.read_exact(&mut page)?;
         let number = u64::from_be_bytes(number);

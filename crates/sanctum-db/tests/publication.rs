@@ -135,6 +135,112 @@ async fn verify_active_writer(storage: Arc<dyn Storage>, prefix: &str) {
 }
 
 #[tokio::test]
+async fn filesystem_snapshot_preparation_observes_cancellation() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = sanctum_storage_fs::FileStorage::open(directory.path()).unwrap();
+    verify_canceled_preparation(Arc::new(storage), "canceled-preparation").await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live MinIO bucket and S3 credentials"]
+async fn minio_snapshot_preparation_observes_cancellation() {
+    let prefix = format!("canceled-preparation-{}", Uuid::new_v4());
+    verify_canceled_preparation(minio_storage(), &prefix).await;
+}
+
+async fn verify_canceled_preparation(storage: Arc<dyn Storage>, prefix: &str) {
+    let prefix = Key::parse(prefix).unwrap();
+    let unit = Unit::catalog(Some(&prefix), &"default".parse().unwrap()).unwrap();
+    let store = Arc::new(PublicationStorage::new(storage.clone()));
+    let ttl = LOCAL_TAKEOVER_LEASE;
+    let short = Publication::new(store.clone(), ttl).unwrap();
+    let long = Publication::new(storage.clone(), Duration::from_secs(15)).unwrap();
+
+    for (lose_lease, expected) in [(false, 7), (true, 14)] {
+        let initial = long.generation(&unit).await.unwrap();
+        let mut lease = short.acquire(&unit).await.unwrap();
+        let operation = Uuid::new_v4();
+        let (started, started_rx) = oneshot::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel();
+        let (stopped, stopped_rx) = oneshot::channel();
+        let mut started = Some(started);
+        let mut stopped = Some(stopped);
+        let mut prepare = Box::pin(lease.apply_cancellable_stage(
+            "index",
+            vec![command(operation, 100)],
+            move |tx, payload, checkpoint| {
+                let outcome = apply_value(tx, payload)?;
+                started.take().unwrap().send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let canceled = checkpoint();
+                let interrupted = tx.query_row(
+                    "WITH RECURSIVE seq(i) AS (
+                        VALUES(0) UNION ALL SELECT i + 1 FROM seq WHERE i < 10000000
+                    ) SELECT max(i) FROM seq",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                );
+                stopped
+                    .take()
+                    .unwrap()
+                    .send((
+                        matches!(canceled, Err(Error::Busy(_))),
+                        interrupted
+                            .err()
+                            .and_then(|error| error.sqlite_error_code()),
+                    ))
+                    .unwrap();
+                Ok(outcome)
+            },
+        ));
+        tokio::select! {
+            result = &mut prepare => panic!("preparation finished early: {result:?}"),
+            started = started_rx => started.unwrap(),
+        }
+        if lose_lease {
+            let (_hold, reply) = oneshot::channel();
+            *store.control_reply_hold.lock().unwrap() = Some(reply);
+            let result = tokio::time::timeout(ttl * 3, &mut prepare).await.unwrap();
+            assert!(matches!(result, Err(Error::StaleRevision(_))));
+        }
+        drop(prepare);
+        resume.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), stopped_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            (true, Some(rusqlite::ErrorCode::OperationInterrupted)),
+        );
+        if lose_lease {
+            assert!(matches!(
+                lease.release().await,
+                Err(Error::StaleRevision(_))
+            ));
+            // The renewal reached storage before its reply was lost.
+            tokio::time::sleep(ttl).await;
+        } else {
+            lease.release().await.unwrap();
+        }
+
+        assert_eq!(long.generation(&unit).await.unwrap(), initial);
+        assert_eq!(
+            long.stage_receipt(&unit, operation, "index").await.unwrap(),
+            None
+        );
+        let mut retry = long.acquire(&unit).await.unwrap();
+        let (published, receipts) = retry
+            .apply_stage("index", vec![command(operation, 7)], apply_value)
+            .await
+            .unwrap();
+        retry.release().await.unwrap();
+        assert_eq!(receipts[0].outcome, expected.to_string());
+        assert_eq!(long.generation(&unit).await.unwrap(), Some(published));
+    }
+    delete_prefix(storage.as_ref(), &prefix).await;
+}
+
+#[tokio::test]
 async fn filesystem_reclamation_renews_through_slow_io() {
     let directory = tempfile::tempdir().unwrap();
     let storage = sanctum_storage_fs::FileStorage::open(directory.path()).unwrap();
