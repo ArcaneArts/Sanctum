@@ -536,10 +536,12 @@ impl StagedUpload {
         let id = &self.import_external().id;
         let retain_original = self.upload.retain_original;
         let extract_rtf = is_rtf(&self.upload.name);
+        let chunking = self.service.chunking;
         if let Some(job) = pending.as_ref().filter(|job| {
             matches(job.import_hash.as_deref(), job.git.as_ref())
                 && job.retain_original == retain_original
                 && job.extract_rtf == extract_rtf
+                && job.chunking == chunking
         }) {
             return Ok(Some(ImportEvent {
                 source: Some(job.source),
@@ -552,6 +554,7 @@ impl StagedUpload {
             matches(Some(&source.hash), source.git.as_ref())
                 && source.extracted == extract_rtf
                 && (!extract_rtf || source.retain_original == retain_original)
+                && source.chunker == chunking.identifier()
         }) {
             if let Some(pending) = pending {
                 self.service.queue.supersede_import(&self.scope, pending)?;

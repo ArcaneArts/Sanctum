@@ -347,6 +347,10 @@ worker restarts. Existing published revisions keep their byte ranges.
 A replacement uses the settings effective at its acceptance. Revision
 inspection reports the algorithm identifier and the configured budget
 when applicable. `GetRuntimeInfo` reports the current defaults.
+Repeating a local, watched-folder, URL, or Git import with different
+chunk settings queues a replacement even if the input bytes are unchanged.
+The source ID stays the same. Publication records `source_replaced` and
+`metadata_reset`, and compatible embedding inputs can reuse their vectors.
 
 ## Runtime information
 
@@ -606,10 +610,10 @@ configuration files. Directory traversal skips symbolic links, `.git`,
 `node_modules`, and the managed storage directory.
 
 A file's import identity combines the canonical import root with its
-relative path. Repeating an import reuses a pending operation or skips an
-unchanged file using its content digest. An edit keeps the source ID and
-queues a replacement. Each queued event includes an operation ID for
-`sanctum-cli job` or `GetIngestionJob`.
+relative path. Repeating an import with the same chunk settings reuses a
+matching pending operation or skips an unchanged file using its content
+digest. An edit keeps the source ID and queues a replacement. Each queued
+event includes an operation ID for `sanctum-cli job` or `GetIngestionJob`.
 
 Each collection runs one scan per canonical import root at a time. A manual
 import for an active root returns retryable `UNAVAILABLE`. A watched folder
@@ -790,12 +794,12 @@ An oversized or failed download never enters the ingestion queue.
 
 The normalized requested URL, excluding its fragment, is the source's
 external ID in the `url` namespace. Re-importing the same URL compares the
-body's BLAKE3 digest. An unchanged body reuses the current revision or
-pending operation. A changed body keeps the source ID and queues a new
-revision. The response records the final URL, ETag, Last-Modified, and
-Content-Type observed during the fetch when present. The accepted
-operation and published revision retain the provenance of the fetch that
-produced them. Each import performs a complete GET. URLs are stored as
+body's BLAKE3 digest. An unchanged body with the same chunk settings
+reuses the current revision or pending operation. A changed body keeps the
+source ID and queues a new revision. The response records the final URL,
+ETag, Last-Modified, and Content-Type observed during the fetch when
+present. The accepted operation and published revision retain the provenance
+of the fetch that produced them. Each import performs a complete GET. URLs are stored as
 provenance, so keep secrets out of their query strings.
 
 An overlapping import of the same normalized requested URL into the same
@@ -864,9 +868,10 @@ hostname. [Git TLS configuration](https://git-scm.com/docs/git-config#Documentat
 The import stream reports each selected path, its commit and blob IDs, and
 the ingestion operation when one was accepted. A repository and ref define
 an independent source namespace, with each path as its external ID. An
-unchanged blob preserves the revision. An edit preserves the source ID and
-queues a replacement. The accepted operation and committed revision record
-the repository, ref, commit, path, and blob that produced that revision.
+unchanged blob with the same chunk settings preserves the revision. An edit
+preserves the source ID and queues a replacement. The accepted operation and
+committed revision record the repository, ref, commit, path, and blob that
+produced that revision.
 
 An import reports selected paths missing from the new commit. Use
 `--prune-missing` to delete them and supersede their pending operations. Pruning

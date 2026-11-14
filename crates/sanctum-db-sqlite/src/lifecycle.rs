@@ -26,6 +26,7 @@ pub struct SourceIdentity {
     pub retain_original: bool,
     pub extracted: bool,
     pub git: Option<GitProvenance>,
+    pub chunker: String,
 }
 
 impl CollectionDb {
@@ -144,7 +145,8 @@ pub(super) fn find_source(
     let source = connection
         .query_row(
             "SELECT s.id, s.current_revision, s.external_namespace, s.external_id,
-                    COALESCE(r.original_hash, r.content_hash), r.retain_original, r.extractor IS NOT NULL, r.git_provenance
+                    COALESCE(r.original_hash, r.content_hash), r.retain_original,
+                    r.extractor IS NOT NULL, r.git_provenance, r.chunker
          FROM sources s JOIN revisions r ON r.source_id = s.id AND r.id = s.current_revision
          WHERE s.deleted = 0 AND
             ((?1 IS NOT NULL AND s.id = ?1) OR
@@ -164,6 +166,7 @@ pub(super) fn find_source(
                     retain_original: row.get(5)?,
                     extracted: row.get(6)?,
                     git: read_json(row, 7)?,
+                    chunker: row.get(8)?,
                 })
             },
         )
