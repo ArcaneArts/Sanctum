@@ -123,12 +123,13 @@ executable. On Debian-based systems install the built package with
 session with a tray host such as the Xfce Status Tray plugin. The Linux menu
 provides **Open Sanctum** and **Quit Sanctum**. [Tauri Debian packaging](https://v2.tauri.app/distribute/debian/), [Tauri tray support](https://v2.tauri.app/learn/system-tray/).
 
-For a package smoke test, launch Sanctum and create a collection. Close the
-window, confirm the MCP server still serves the collection, and reopen
-**Open Sanctum** from the tray. Launching the app again should focus the same
-window. Select **Quit Sanctum**, verify the listener stops, and relaunch to
-check the stored collection. Platform results and signing status are in the
-[implementation status](IMPLEMENTATION_STATUS.md).
+For a package smoke test, launch Sanctum and create a collection. Use
+**Import file** to select a UTF-8 file and wait for **Text ready** in Activity.
+Copy the endpoint from **Connect**, close the window, then use MCP to search
+for and fetch the imported text. Choose **Open Sanctum** in the tray to restore
+the window. Launching the app again should focus the same window. Select **Quit
+Sanctum**, verify the listener stops, then relaunch and fetch the same text
+again. [Platform results and signing status](IMPLEMENTATION_STATUS.md).
 
 ## macOS distribution signing
 
