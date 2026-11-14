@@ -5559,13 +5559,22 @@ async fn hosted_expiration_settles_pending_stages_and_preserves_committed_text()
             staged.enqueue().await
         }
     };
-    let redispatch = submit(first.clone(), "redispatch", None).await.unwrap();
-    let abandoned = submit(first.clone(), "abandoned", None).await.unwrap();
+    // Exercise one intended expired hint in the repair shard. Other expired
+    // operations are exercised by the upload sweep below.
+    let request = |shard: u128| Some(uuid::Uuid::from_u128((shard << 120) | 1));
+    let redispatch = submit(first.clone(), "redispatch", request(0))
+        .await
+        .unwrap();
+    let abandoned = submit(first.clone(), "abandoned", request(1))
+        .await
+        .unwrap();
     first
         .register_upload(&scope, abandoned.operation)
         .await
         .unwrap();
-    let published = submit(first.clone(), "published", None).await.unwrap();
+    let published = submit(first.clone(), "published", request(2))
+        .await
+        .unwrap();
     first
         .register_upload(&scope, published.operation)
         .await
@@ -5575,7 +5584,9 @@ async fn hosted_expiration_settles_pending_stages_and_preserves_committed_text()
         first.index_upload(&scope, published.operation).await,
         Err(Error::Busy(_))
     ));
-    let embedding = submit(first.clone(), "embedding", None).await.unwrap();
+    let embedding = submit(first.clone(), "embedding", request(3))
+        .await
+        .unwrap();
     first
         .register_upload(&scope, embedding.operation)
         .await
@@ -5584,7 +5595,7 @@ async fn hosted_expiration_settles_pending_stages_and_preserves_committed_text()
         .index_upload(&scope, embedding.operation)
         .await
         .unwrap();
-    let recent = submit(first.clone(), "recent", None).await.unwrap();
+    let recent = submit(first.clone(), "recent", request(4)).await.unwrap();
     drop(first);
 
     let executor = sanctum_db::Publication::new(storage.clone(), Duration::from_secs(30)).unwrap();

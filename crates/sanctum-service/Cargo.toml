@@ -29,3 +29,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 walkdir.workspace = true
 notify = "8.2.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

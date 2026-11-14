@@ -5,13 +5,15 @@ use sanctum_core::{Error, Result, Scope};
 use sanctum_db::{Command, Unit, collection_prefix};
 use sanctum_storage::{Condition, Key, MAX_CONTROL_BYTES};
 use serde::{Deserialize, Serialize};
-use tokio::{
-    io::AsyncReadExt,
-    time::{Instant, timeout, timeout_at},
-};
+use tokio::{io::AsyncReadExt, time::timeout};
 use uuid::Uuid;
 
-use crate::{HostedCatalog, db::hosted, hosted_rebuild::collection_manifest};
+use crate::{
+    HostedCatalog,
+    db::hosted,
+    hosted_rebuild::collection_manifest,
+    maintenance_budget::{REQUEST_TIMEOUT, SweepBudget},
+};
 
 #[derive(Serialize, Deserialize)]
 struct Deletion {
@@ -45,9 +47,6 @@ const DELETE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONCURRENT_DELETES: usize = 4;
 const DISCOVERY_LIMIT: u32 = 32;
 const COLLECTION_LIMIT: usize = 8;
-const COLLECTION_TIMEOUT: Duration = Duration::from_secs(180);
-const SWEEP_WORK_TIMEOUT: Duration = Duration::from_secs(210);
-const SWEEP_TIMEOUT: Duration = Duration::from_secs(240);
 
 impl HostedCatalog {
     pub async fn delete_source(
@@ -96,18 +95,14 @@ impl HostedCatalog {
 
     pub async fn sweep_hosted_sources(&self) -> Result<SourceSweep> {
         timeout(
-            SWEEP_TIMEOUT,
-            self.sweep_source_page(Instant::now() + SWEEP_WORK_TIMEOUT, COLLECTION_TIMEOUT),
+            REQUEST_TIMEOUT,
+            self.sweep_source_page(SweepBudget::start()),
         )
         .await
         .map_err(|_| Error::Busy("hosted source sweep checkpoint timed out".into()))?
     }
 
-    async fn sweep_source_page(
-        &self,
-        work_deadline: Instant,
-        collection_timeout: Duration,
-    ) -> Result<SourceSweep> {
+    async fn sweep_source_page(&self, budget: SweepBudget) -> Result<SourceSweep> {
         let path = "_maintenance/source-sweep.json";
         let key = Key::parse(
             self.prefix
@@ -170,9 +165,6 @@ impl HostedCatalog {
             more: false,
         };
         for _ in 0..COLLECTION_LIMIT.min(cursor.pending.len()) {
-            if Instant::now() >= work_deadline {
-                break;
-            }
             let manifest = cursor
                 .pending
                 .front()
@@ -181,15 +173,15 @@ impl HostedCatalog {
                 .ok_or_else(|| {
                     Error::Internal("invalid collection manifest in source sweep cursor".into())
                 })?;
-            let attempt = timeout(collection_timeout, self.reclaim_source_batch(&scope));
-            let Ok(result) = timeout_at(work_deadline, attempt).await else {
-                // Give the unfinished collection a full attempt in the next invocation.
+            let Some(result) = budget
+                .attempt(self.reclaim_source_batch(&scope))
+                .await
+                .transpose()
+            else {
                 break;
             };
             cursor.pending.pop_front();
-            match result
-                .unwrap_or_else(|_| Err(Error::Busy("source cleanup attempt timed out".into())))
-            {
+            match result {
                 Ok((deleted, deferred)) => {
                     report.collections += 1;
                     report.deleted += deleted;
@@ -321,7 +313,7 @@ mod tests {
         };
         service.create_collection(&scope, None).await.unwrap();
         let paused = service
-            .sweep_source_page(Instant::now(), COLLECTION_TIMEOUT)
+            .sweep_source_page(SweepBudget::exhausted())
             .await
             .unwrap();
         assert_eq!(paused.collections, 0);

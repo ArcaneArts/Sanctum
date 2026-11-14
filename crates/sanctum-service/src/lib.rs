@@ -42,6 +42,7 @@ mod local_import;
 mod local_jobs;
 mod local_writes;
 mod maintenance;
+mod maintenance_budget;
 mod managed_metadata_indexes;
 mod pending_scan;
 mod source_inspection;

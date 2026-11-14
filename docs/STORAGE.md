@@ -472,6 +472,10 @@ published HEAD generation and leaves already downloaded reader files usable.
 The maintenance response includes `recovered_creations` for creation intents
 resolved with a successful catalog outcome.
 
+The snapshot, source, and upload sweeps preserve items interrupted by the
+invocation's work deadline in their saved pages.
+[Scheduler and sweep budgets](CLOUD_RUN.md#schedule-dispatch-repair).
+
 ### Hosted metadata
 
 MCP and gRPC can read or edit namespaced JSON on collections, current

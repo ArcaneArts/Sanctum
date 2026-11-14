@@ -716,6 +716,22 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - With live MinIO, the worker endpoint attempted eight collections, then
   a fresh worker advanced seven saved manifests before fetching the next
   page. The pass visited all 20 collections. [Sweep budgets](CLOUD_RUN.md#schedule-dispatch-repair).
+- Delivered in [PR #126](https://github.com/ArcaneArts/Sanctum/pull/126).
+
+### Snapshot and upload sweep deadlines
+
+- Source, snapshot, and upload sweeps share per-item and per-invocation
+  deadlines. An item interrupted by the invocation's work deadline stays
+  in the checkpoint. A full item timeout is counted and the scan can move
+  on to other items. Cursor formats and database fencing are unchanged.
+- The paused-clock test covers a timed-out item followed by successful
+  work, and distinguishes a full timeout from a work deadline. Filesystem
+  restart tests verify that the snapshot and upload sweep cursors retain
+  discovered work when the invocation runs out of time.
+- The worker HTTP routes on live MinIO each resumed a saved page after a
+  worker restart. They completed two remaining snapshot units and one
+  upload candidate, preserving current generations and young inputs.
+  [Scheduler budgets](CLOUD_RUN.md#schedule-dispatch-repair).
 
 ## Scheduled hosted snapshot reclamation
 
