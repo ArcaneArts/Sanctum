@@ -114,6 +114,16 @@ Merged in [PR #3](https://github.com/ArcaneArts/Sanctum/pull/3).
   restart. MCP returned exact byte ranges from the original revision IDs.
 - The gRPC tests cover persisted pause and acceptance, tenant-scoped cancellation,
   recovery from a missing receipt, and retry after a storage read failure.
+- After a queue write error, local admission checks the durable operation
+  before releasing any input. A committed operation returns its saved receipt.
+  An absent operation allows immediate file cleanup, with startup recovery
+  covering inconclusive reads or failed cleanup. A deferred SQLite constraint
+  forced both UTF-8 and RTF submissions to fail at commit. The gRPC regression
+  verified cleanup without restarting, retry with the same request IDs, and
+  publication after restart. A generated Python client exercised the same
+  fault on a standalone server for uploads and a local import, then verified
+  the original accepted operations and exact excerpts after a process kill.
+  [Local acceptance](LOCAL_API.md#text-uploads).
 - Caller-provided upload request IDs were added in a later cycle.
 - Local uploads now save the accepted input's BLAKE3 digest in `runtime.db`.
   The worker verifies it before publishing text and also checks retained RTF

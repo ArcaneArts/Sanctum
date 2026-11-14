@@ -3152,6 +3152,91 @@ async fn upload_search_fetch_survives_restart_and_stays_in_tenant() {
 }
 
 #[tokio::test]
+async fn local_upload_reclaims_input_after_queue_commit_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start_with_workers(&dir, None, false).await;
+    create(&mut running.client, "default").await;
+    let runtime = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
+    runtime
+        .execute_batch(
+            "CREATE TABLE queue_commit_parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE queue_commit_probe(id INTEGER REFERENCES queue_commit_parent(id)
+                 DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER reject_queue_commit AFTER INSERT ON ingestion_jobs
+             BEGIN INSERT INTO queue_commit_probe VALUES (1); END;",
+        )
+        .unwrap();
+    let mut text_header = header("default");
+    let Some(Frame::Header(text)) = &mut text_header.frame else {
+        unreachable!();
+    };
+    text.request_id = Some(uuid::Uuid::new_v4().to_string());
+    let mut rtf_header = header("default");
+    let Some(Frame::Header(rtf)) = &mut rtf_header.frame else {
+        unreachable!();
+    };
+    rtf.name = "notes.rtf".into();
+    rtf.request_id = Some(uuid::Uuid::new_v4().to_string());
+    rtf.external.as_mut().unwrap().id = "rtf-report".into();
+    rtf.retain_original = true;
+    let uploads = [
+        (text_header, b"keep genuine ruby".as_slice()),
+        (rtf_header, br"{\rtf1 keep genuine quartz}".as_slice()),
+    ];
+    for (header, bytes) in &uploads {
+        let error = running
+            .client
+            .submit_text(tokio_stream::iter([header.clone(), data(bytes), end()]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Internal);
+    }
+    let sources = dir.path().join("default/notes/sources");
+    assert_eq!(sources.read_dir().unwrap().count(), 0);
+    for table in ["ingestion_jobs", "local_upload_requests"] {
+        let count: i64 = runtime
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    runtime
+        .execute("DROP TRIGGER reject_queue_commit", [])
+        .unwrap();
+    let mut accepted = Vec::new();
+    for (header, bytes) in uploads {
+        let submit = || tokio_stream::iter([header.clone(), data(bytes), end()]);
+        let job = running
+            .client
+            .submit_text(submit())
+            .await
+            .unwrap()
+            .into_inner();
+        let replay = running
+            .client
+            .submit_text(submit())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(job, replay);
+        accepted.push(job);
+    }
+    drop(runtime);
+    running.stop().await;
+
+    let mut running = Running::start(&dir).await;
+    for (job, needle) in accepted.into_iter().zip(["ruby", "quartz"]) {
+        let status = await_ready(&mut running.client, job_request(job.operation_id)).await;
+        assert_eq!(status.text_revision.unwrap().revision_id, job.revision_id);
+        let hits = search(&mut running.client, "default", needle).await;
+        assert_eq!(hits[0].excerpt, format!("keep genuine {needle}"));
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn unfinished_oversized_and_invalid_uploads_leave_no_searchable_chunks() {
     let dir = TempDir::new().unwrap();
     let mut running = Running::start(&dir).await;
