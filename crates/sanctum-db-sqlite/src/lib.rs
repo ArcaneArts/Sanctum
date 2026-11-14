@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 pub mod embedding;
 pub mod hosted;
+pub mod import_paths;
 mod lifecycle;
 pub mod local_collections;
 pub mod metadata;

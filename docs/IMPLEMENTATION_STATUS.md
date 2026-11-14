@@ -441,6 +441,12 @@ Merged in [PR #20](https://github.com/ArcaneArts/Sanctum/pull/20).
   and indexed the public Sanctum README over HTTPS and reused its revision
   on a second fetch. The [private HTTPS check](#authenticated-git-over-https)
   exercises operator-supplied credentials through a real Git backend.
+- Git reconciliation uses a per-import SQLite file with a 1 MiB page-cache
+  target. The spill test confirms that a 4,096-path index writes to disk
+  before the scan finishes and is removed when closed. The local gRPC
+  regression covers multiple reconciliation pages, pending and published
+  removals, excluded paths, and reuse of 129 pending jobs. The standalone
+  private HTTPS check also passed with Basic and Bearer credentials.
 
 ## Resumable changes and Python gRPC client
 
