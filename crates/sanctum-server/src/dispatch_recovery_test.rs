@@ -79,6 +79,7 @@ impl Dispatch for FixtureDispatch {
 struct StalledCheckpoint {
     storage: Arc<dyn Storage>,
     checkpoint: Mutex<Option<oneshot::Sender<oneshot::Receiver<()>>>>,
+    after_dispatch: bool,
 }
 
 #[async_trait::async_trait]
@@ -101,14 +102,17 @@ impl Storage for StalledCheckpoint {
 
     async fn put_control(&self, key: &Key, bytes: Bytes, condition: Condition) -> Result<Version> {
         if key.as_str().ends_with("/operation.json") && matches!(condition, Condition::Match(_)) {
-            let checkpoint = self.checkpoint.lock().unwrap().take();
-            if let Some(checkpoint) = checkpoint {
-                let payload: Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(payload["stage"], "pending_indexing");
-                let (in_flight, canceled) = oneshot::channel();
-                checkpoint.send(canceled).unwrap();
-                std::future::pending::<()>().await;
-                drop(in_flight);
+            let payload: Value = serde_json::from_slice(&bytes).unwrap();
+            if payload["stage"] == "pending_indexing"
+                && payload["dispatched_at"].is_number() == self.after_dispatch
+            {
+                let checkpoint = self.checkpoint.lock().unwrap().take();
+                if let Some(checkpoint) = checkpoint {
+                    let (in_flight, canceled) = oneshot::channel();
+                    checkpoint.send(canceled).unwrap();
+                    std::future::pending::<()>().await;
+                    drop(in_flight);
+                }
             }
         }
         self.storage.put_control(key, bytes, condition).await
@@ -279,11 +283,15 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
     let stalled = catalog_with_storage(Arc::new(StalledCheckpoint {
         storage: storage.clone(),
         checkpoint: Mutex::new(Some(checkpoint)),
+        after_dispatch: false,
     }));
-    let (deadline_worker, deadline_server) = serve_http(
-        crate::hosted_worker::router_with_task_deadline(stalled, Duration::from_secs(2)),
-    )
-    .await;
+    let (deadline_worker, deadline_server) =
+        serve_http(crate::hosted_worker::router_with_task_budgets(
+            stalled,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        ))
+        .await;
     let timeout = http
         .post(format!("{deadline_worker}/internal/tasks/register-upload"))
         .json(&payload)
@@ -314,7 +322,61 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         .unwrap()
         .into_inner();
     assert_eq!(after_timeout.state(), v1::IngestionState::Accepted);
+    let (checkpoint, mut dispatch_reached) = oneshot::channel();
+    let stalled = catalog_with_storage(Arc::new(StalledCheckpoint {
+        storage: storage.clone(),
+        checkpoint: Mutex::new(Some(checkpoint)),
+        after_dispatch: true,
+    }));
+    let (handoff_worker, handoff_server) =
+        serve_http(crate::hosted_worker::router_with_task_budgets(
+            stalled,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        ))
+        .await;
+    let acknowledged = http
+        .post(format!("{handoff_worker}/internal/tasks/register-upload"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(acknowledged.status(), StatusCode::NO_CONTENT);
+    let mut canceled = dispatch_reached
+        .try_recv()
+        .expect("dispatch checkpoint reached");
+    assert!(matches!(
+        canceled.try_recv(),
+        Err(oneshot::error::TryRecvError::Closed)
+    ));
+    assert_eq!(queue.accepted.lock().unwrap().len(), 2);
+    let registered = api
+        .get_ingestion_job(job.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(registered.state(), v1::IngestionState::Registered);
+    assert_eq!(
+        collection_generation(storage.as_ref(), prefix.as_ref()).await,
+        committed_registration
+    );
+    handoff_server.abort();
+    assert!(handoff_server.await.unwrap_err().is_cancelled());
+
     let (worker, _worker_server) = serve_http(crate::hosted_worker::router(make_catalog())).await;
+    assert_eq!(
+        reconcile(&http, &worker, shard).await,
+        json!({"dispatched": 1, "failed": 0, "more": false}),
+    );
+    assert_eq!(
+        queue.accepted.lock().unwrap().len(),
+        2,
+        "repair reused the task name"
+    );
+    assert_eq!(
+        reconcile(&http, &worker, shard).await,
+        json!({"dispatched": 0, "failed": 0, "more": false}),
+    );
     let stages = ["register-upload", "prepare-upload", "index-upload"];
     for (index, stage) in stages.iter().enumerate() {
         let task = queue.accepted.lock().unwrap()[index].clone();
@@ -333,11 +395,15 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
             let stalled = catalog_with_storage(Arc::new(StalledCheckpoint {
                 storage: storage.clone(),
                 checkpoint: Mutex::new(Some(checkpoint)),
+                after_dispatch: false,
             }));
-            let (slow_worker, _slow_server) = serve_http(
-                crate::hosted_worker::router_with_task_deadline(stalled, Duration::from_secs(2)),
-            )
-            .await;
+            let (slow_worker, _slow_server) =
+                serve_http(crate::hosted_worker::router_with_task_budgets(
+                    stalled,
+                    Duration::from_secs(2),
+                    Duration::from_secs(2),
+                ))
+                .await;
             let response = http
                 .post(format!("{slow_worker}{path}"))
                 .header("content-type", "application/json")

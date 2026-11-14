@@ -2055,16 +2055,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 
 ## Hosted worker task deadlines
 
-- Worker task routes return HTTP 503 after 570 seconds, leaving time to
-  respond before Cloud Tasks and the example Cloud Run worker reach their
-  600-second deadlines. Maintenance routes retain their own scheduler
-  deadlines. [Worker deployment](CLOUD_RUN.md#deploy-the-services).
+- Worker task routes return HTTP 503 when the stage exceeds its 570-second
+  budget. The immediate follow-up attempt gets up to 15 more seconds after a
+  successful stage. This leaves time to respond before the 600-second Cloud
+  Tasks and Cloud Run deadlines. Maintenance routes use scheduler deadlines.
+  [Worker deployment](CLOUD_RUN.md#deploy-the-services).
 - The filesystem and live MinIO regression stalled a registration request
   after SQLite publication and before the operation checkpoint. The worker
   canceled the stalled write and returned 503. A fresh worker reused the
   registration receipt without publishing another database generation.
-  It then delivered preparation and indexing and verified exact UTF-8
-  retrieval through gRPC. This run used a loopback Cloud Tasks fixture.
+  The regression also stalled the dispatch checkpoint after the follow-up
+  task was accepted. The worker acknowledged registration with HTTP 204.
+  A fresh repair instance reused the same task name and saved the dispatch
+  checkpoint. Preparation and indexing then completed and gRPC returned
+  the exact UTF-8 bytes. These runs used a loopback Cloud Tasks fixture.
 
 - Canceling the task future or losing its writer lease now signals blocking
   SQLite snapshot work. Indexing checks between chunks, SQLite checks during
