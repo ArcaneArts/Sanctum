@@ -201,3 +201,8 @@ on both roles to enable background embedding of new revisions.
 The [storage guide](STORAGE.md) documents the worker stages, retry behavior,
 and MinIO configuration. Live Cloud Run, GCS, and IAM verification requires
 an authorized deployment environment.
+
+Cloud Run roles write JSON logs to stderr. Use
+`RUST_LOG=info,sanctum_service=debug,sanctum_db=debug` on the API and
+worker to collect per-operation timings and transfer sizes during a
+measurement window. [Server diagnostics](LOCAL_API.md#server-diagnostics).

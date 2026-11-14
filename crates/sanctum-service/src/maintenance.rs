@@ -82,11 +82,21 @@ impl Service {
         writer.prune_unreferenced_embeddings()?;
         writer.commit()?;
 
-        for garbage in database.garbage()? {
+        let garbage = database.garbage()?;
+        let count = garbage.len();
+        for garbage in garbage {
             self.files
                 .discard_text(scope, garbage.source, garbage.revision)?;
             database.acknowledge_garbage(garbage)?;
         }
+        tracing::debug!(
+            event = "cleanup_pass",
+            kind = "local_source",
+            tenant = %scope.tenant,
+            collection = %scope.collection,
+            reclaimed_revisions = count,
+            "completed local revision cleanup"
+        );
         Ok(())
     }
 

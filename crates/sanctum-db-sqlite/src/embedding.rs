@@ -173,6 +173,23 @@ impl CollectionDb {
 }
 
 impl<T: std::ops::Deref<Target = rusqlite::Connection>> RevisionWrite<T> {
+    pub fn cached_revision_chunks(
+        &self,
+        source: Uuid,
+        revision: Uuid,
+        profile: &str,
+    ) -> Result<u64> {
+        self.0
+            .query_row(
+                "SELECT count(*) FROM chunks c JOIN embedding_cache e
+                    ON e.profile = ?3 AND e.input_hash = c.content_hash AND e.vector IS NOT NULL
+                 WHERE c.source_id = ?1 AND c.revision_id = ?2",
+                params![source.to_string(), revision.to_string(), profile],
+                |row| unsigned_column(row, 0),
+            )
+            .map_err(database_error)
+    }
+
     pub fn store_embedding(&self, profile: &str, hash: &str, vector: &[f32]) -> Result<()> {
         let bytes: Vec<u8> = vector
             .iter()

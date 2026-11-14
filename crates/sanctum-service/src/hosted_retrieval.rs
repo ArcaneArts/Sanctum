@@ -1,20 +1,20 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use sanctum_core::{Error, Result, Scope, ScopeId};
 use sanctum_db::{Unit, collection_prefix};
 use sanctum_db_sqlite::vector_index::VectorIndex;
-use sanctum_embedding::{Purpose, embed};
+use sanctum_embedding::Purpose;
 use sanctum_storage::Key;
 use uuid::Uuid;
 
 use crate::embedding::{
     CollectionSearchResult, Coverage, PreparedQuery, SearchResult,
     collections::{Candidates, collection_scopes, merge, rank_collection},
-    fuse, limit_hits,
+    fuse, limit_hits, query_scope,
 };
 use crate::{
     Chunk, ChunkEmbeddingState, ChunkRef, Hit, HostedCatalog, SearchMode, db,
-    hit_metadata::metadata_for_hit, metadata_filter::Filter, verified_excerpt,
+    hit_metadata::metadata_for_hit, metadata_filter::Filter, telemetry, verified_excerpt,
 };
 
 impl HostedCatalog {
@@ -44,6 +44,7 @@ impl HostedCatalog {
         filter: Option<Filter>,
         mode: SearchMode,
     ) -> Result<SearchResult> {
+        let start = Instant::now();
         let prepared = self
             .prepare_hosted_query(
                 std::slice::from_ref(&scope),
@@ -114,6 +115,15 @@ impl HostedCatalog {
             hit.metadata = fields;
             hits.push(hit);
         }
+        telemetry::search(
+            &scope.tenant,
+            Some(&scope.collection),
+            start.elapsed(),
+            actual_mode,
+            coverage,
+            hits.len(),
+            degraded,
+        );
         Ok(SearchResult {
             hits,
             coverage,
@@ -132,7 +142,8 @@ impl HostedCatalog {
         filter: Option<Filter>,
         requested: SearchMode,
     ) -> Result<CollectionSearchResult> {
-        let scopes = collection_scopes(tenant, collections)?;
+        let start = Instant::now();
+        let scopes = collection_scopes(tenant.clone(), collections)?;
         let prepared = self
             .prepare_hosted_query(&scopes, query, limit, filter.as_ref(), requested)
             .await?;
@@ -193,6 +204,15 @@ impl HostedCatalog {
             hit.metadata = fields;
             hits.push((scope, hit));
         }
+        telemetry::search(
+            &tenant,
+            None,
+            start.elapsed(),
+            mode,
+            coverage,
+            hits.len(),
+            degraded,
+        );
         Ok(CollectionSearchResult {
             hits,
             mode,
@@ -230,7 +250,16 @@ impl HostedCatalog {
                     }
                 }
                 if available {
-                    match embed(provider.as_ref(), Purpose::Query, &[query]).await {
+                    let (tenant, collection) = query_scope(scopes);
+                    match telemetry::embed(
+                        &tenant,
+                        collection.as_ref(),
+                        provider.as_ref(),
+                        Purpose::Query,
+                        &[query],
+                    )
+                    .await
+                    {
                         Ok(mut vectors) => prepared.vector = vectors.pop().map(Arc::from),
                         Err(error) => {
                             tracing::warn!(%error, "hosted query embedding unavailable");
@@ -308,8 +337,18 @@ impl HostedCatalog {
         key: String,
     ) -> Result<String> {
         let key = self.checked_text_key(scope, key)?;
+        let start = Instant::now();
         let bytes = self.storage.read_range(&key, chunk.range).await?;
-        verified_excerpt(chunk, &bytes)
+        let excerpt = verified_excerpt(chunk, &bytes)?;
+        tracing::trace!(
+            event = "source_range_read",
+            tenant = %scope.tenant,
+            collection = %scope.collection,
+            bytes = bytes.len(),
+            duration_ms = start.elapsed().as_secs_f64() * 1_000.0,
+            "read and verified a source range"
+        );
+        Ok(excerpt)
     }
 
     pub(crate) fn checked_text_key(&self, scope: &Scope, key: String) -> Result<Key> {

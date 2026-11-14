@@ -43,6 +43,7 @@ mod maintenance;
 mod managed_metadata_indexes;
 mod pending_scan;
 mod source_inspection;
+mod telemetry;
 mod url_import;
 mod watched_folders;
 mod worker;

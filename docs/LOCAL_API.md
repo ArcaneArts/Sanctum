@@ -680,6 +680,40 @@ or field returns `ALREADY_EXISTS`, and dropping an unknown index returns
 write path. Hosted changes publish a new generation, and an already
 opened database session keeps its pinned snapshot.
 
+## Server diagnostics
+
+The server writes logs to stderr. Cloud Run roles emit one JSON object per
+line. To collect the same events locally, start the server with:
+
+```sh
+SANCTUM_LOG_FORMAT=json \
+RUST_LOG=info,sanctum_service=debug,sanctum_db=debug \
+cargo run --locked -p sanctum-server 2>sanctum.jsonl
+```
+
+Supply your usual `SANCTUM_CONFIG_JSON` in the environment. Each event
+places measurements in `fields`. Filter by `fields.event` to extract
+timings and counts for an existing log pipeline:
+
+| Event | Measurements |
+| --- | --- |
+| `local_job_claimed` | Queue age since acceptance and attempt number |
+| `ingestion_stage` | Scoped operation age, stage duration, input bytes, and outcome |
+| `embedding_request` | Profile ID, document/query purpose, input count, elapsed time, and outcome class |
+| `vector_reuse` | Published chunk count and count covered by an existing vector at publication |
+| `search` | Served search mode, elapsed time, hits, embedding coverage, and degradation reason when present |
+| `hosted_input_transfer` | Direction, staged source bytes, and duration |
+| `snapshot_publish`, `snapshot_download` | Snapshot size, actual transferred database bytes, and duration |
+| `snapshot_cache` | Generation and whether it was already materialized at lookup |
+| `cleanup_pass` | Reclaimed entries, failures and further work when available |
+
+Use `sanctum_service=trace` to include `source_range_read` events for
+individual verified hosted excerpts. The byte counts refer to the source
+ranges read. Measurements include work completed at the event's boundary,
+so an upload that later fails can still produce a transfer event. Scoped
+events use IDs and counters. Provider events omit response bodies and
+credentials, and search events omit query and source text.
+
 ## Read-only SQL sessions and snapshots
 
 `OpenDatabaseSession` accepts a tenant and optional collection. With only

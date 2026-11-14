@@ -1,4 +1,7 @@
-use std::io::{self, BufReader, BufWriter, Write};
+use std::{
+    io::{self, BufReader, BufWriter, Write},
+    time::Instant,
+};
 
 use sanctum_chunk::index_utf8_with_settings;
 use sanctum_core::{ChunkSettings, Error, Result, Scope, is_rtf};
@@ -16,7 +19,7 @@ use uuid::Uuid;
 use super::{
     EmbeddingStep, HostedCatalog, HostedJob, Operation, REGISTRATION_WINDOW, Stage, unix_seconds,
 };
-use crate::{ChunkRef, Revision, RevisionContent};
+use crate::{ChunkRef, Revision, RevisionContent, telemetry};
 
 pub(super) const INDEX_STAGE: &str = "index";
 
@@ -45,6 +48,7 @@ impl HostedCatalog {
             Stage::PendingIndexing { registration } => registration,
             _ => return Ok(record.job()),
         };
+        let start = Instant::now();
         let unit = Unit::collection(self.prefix.as_ref(), scope)?;
         let receipt = self
             .publication
@@ -70,9 +74,11 @@ impl HostedCatalog {
             },
         };
         if let Outcome::Canceled(registration) = outcome {
-            return self
+            let job = self
                 .checkpoint_canceled(scope, &prefix, record, version, registration)
-                .await;
+                .await?;
+            job.log_stage(scope, "index", start);
+            return Ok(job);
         }
         let Stage::PendingIndexing { registration } = record.stage else {
             unreachable!("stage was checked above");
@@ -104,10 +110,13 @@ impl HostedCatalog {
         if discard_input {
             self.discard_input(&prefix, &record).await?;
         }
-        self.checkpoint(&prefix, record, version, |stage| {
-            matches!(stage, Stage::PendingIndexing { .. })
-        })
-        .await
+        let job = self
+            .checkpoint(&prefix, record, version, |stage| {
+                matches!(stage, Stage::PendingIndexing { .. })
+            })
+            .await?;
+        job.log_stage(scope, "index", start);
+        Ok(job)
     }
 
     async fn index_registered(
@@ -144,6 +153,8 @@ impl HostedCatalog {
             .embedding
             .as_ref()
             .map(|provider| provider.profile_id().to_owned());
+        let measure_reuse = tracing::enabled!(tracing::Level::DEBUG) && profile.is_some();
+        let (metrics_tx, metrics_rx) = std::sync::mpsc::channel();
         let operation = record.operation;
         let revision = record.revision;
         let chunking = record.chunking;
@@ -181,7 +192,7 @@ impl HostedCatalog {
                                 outcome
                             }
                             Ok(prepared) => {
-                                publish_revision(
+                                let revision_writer = publish_revision(
                                     tx,
                                     &prepared.revision,
                                     &prepared.objects,
@@ -212,6 +223,17 @@ impl HostedCatalog {
                                         Ok(())
                                     },
                                 )?;
+                                if measure_reuse
+                                    && let Some(profile) = &profile
+                                    && let Ok(reused) = revision_writer.cached_revision_chunks(
+                                        registration.source,
+                                        revision,
+                                        profile,
+                                    )
+                                {
+                                    let _ =
+                                        metrics_tx.send((prepared.revision.content.chunks, reused));
+                                }
                                 Outcome::Ready(Box::new(prepared.revision.content))
                             }
                         }
@@ -224,6 +246,9 @@ impl HostedCatalog {
         let released = writer.release().await;
         let (_, receipts) = result?;
         released?;
+        if let Ok((chunks, reused)) = metrics_rx.try_recv() {
+            telemetry::vector_reuse(scope, operation, chunks, reused);
+        }
         decode(&receipts[0].outcome)
     }
 
@@ -234,6 +259,7 @@ impl HostedCatalog {
         record: &Operation,
         registration: &Registration,
     ) -> Result<Prepared> {
+        let download_started = Instant::now();
         let input_key = record.input_key(prefix)?;
         let input = self.storage.get(&input_key).await?;
         if input.object.length != record.bytes {
@@ -251,6 +277,16 @@ impl HostedCatalog {
         if copied != record.bytes {
             return Err(invalid_input());
         }
+        tracing::debug!(
+            event = "hosted_input_transfer",
+            tenant = %scope.tenant,
+            collection = %scope.collection,
+            operation = %record.operation,
+            direction = "download",
+            bytes = copied,
+            duration_ms = download_started.elapsed().as_secs_f64() * 1_000.0,
+            "downloaded a staged source"
+        );
         let is_rtf = is_rtf(&record.upload.name);
         let expected = record.blake3.clone();
         let chunking = record.chunking;

@@ -13,10 +13,24 @@ mod standalone_worker;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .init();
     let mut config = Config::from_env()?;
+    let logs = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing::Level::INFO.into())
+                .from_env_lossy(),
+        );
+    if config.cloud_run_role.is_some()
+        || std::env::var_os("SANCTUM_LOG_FORMAT").as_deref() == Some(std::ffi::OsStr::new("json"))
+    {
+        logs.json()
+            .with_current_span(false)
+            .with_span_list(false)
+            .init();
+    } else {
+        logs.init();
+    }
     let embedding: Option<Arc<dyn sanctum_embedding::Provider>> = config
         .embedding
         .take()

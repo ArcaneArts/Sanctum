@@ -1,11 +1,14 @@
-use std::io::{BufReader, BufWriter, Read};
+use std::{
+    io::{BufReader, BufWriter, Read},
+    time::Instant,
+};
 
 use sanctum_chunk::index_utf8_with_settings;
 use sanctum_core::{Error, ExternalSource, Result, Scope, is_rtf};
 use sanctum_extract::{RTF_EXTRACTOR, rtf_to_utf8};
 use uuid::Uuid;
 
-use crate::{ChunkRef, Job, JobState, Revision, RevisionContent, Service, StagedUpload};
+use crate::{ChunkRef, Job, JobState, Revision, RevisionContent, Service, StagedUpload, telemetry};
 
 const PROGRESS_STEP: u64 = 1024 * 1024;
 
@@ -43,7 +46,35 @@ impl Service {
         let Some(job) = self.queue.claim()? else {
             return Ok(false);
         };
-        match self.index_job(&job) {
+        let start = Instant::now();
+        tracing::debug!(
+            event = "local_job_claimed",
+            tenant = %job.scope.tenant,
+            collection = %job.scope.collection,
+            operation = %job.id,
+            attempt = job.attempts,
+            queue_age_seconds = telemetry::queue_age(job.created_at),
+            "claimed local ingestion work"
+        );
+        let result = self.process_claim(&job);
+        let outcome = match &result {
+            Ok(outcome) => *outcome,
+            Err(_) => "error",
+        };
+        telemetry::ingestion_stage(
+            &job.scope,
+            job.id,
+            "local_index",
+            job.created_at,
+            job.bytes,
+            start.elapsed(),
+            outcome,
+        );
+        result.map(|_| true)
+    }
+
+    fn process_claim(&self, job: &Job) -> Result<&'static str> {
+        match self.index_job(job) {
             Ok(revision) => {
                 if job.extract_rtf
                     && !job.retain_original
@@ -56,6 +87,7 @@ impl Service {
                     return Err(error);
                 }
                 self.queue.ready(job.id, &revision)?;
+                Ok("text_ready")
             }
             Err(error) => {
                 let (code, message) = match &error {
@@ -69,12 +101,15 @@ impl Service {
                     self.files
                         .discard_text(&job.scope, job.source, job.revision)?;
                 }
-                if code == "retryable" && state != JobState::Canceled {
-                    return Err(error);
+                if state == JobState::Canceled {
+                    Ok("canceled")
+                } else if code == "retryable" {
+                    Err(error)
+                } else {
+                    Ok(code)
                 }
             }
         }
-        Ok(true)
     }
 
     fn index_job(&self, job: &Job) -> Result<Revision> {
@@ -172,7 +207,8 @@ impl Service {
             &job.initial_chunk_metadata,
             revision.content.chunks,
         )?;
-        writer.register(&revision, job.replacement, self.embedding_profile())?;
+        let profile = self.embedding_profile();
+        writer.register(&revision, job.replacement, profile)?;
         writer.set_initial_metadata(
             &revision,
             &job.initial_metadata,
@@ -181,9 +217,20 @@ impl Service {
         if !self.queue.begin_publish(job.id)? {
             return Err(Error::Conflict("indexing canceled".into()));
         }
+        let reused = profile
+            .filter(|_| tracing::enabled!(tracing::Level::DEBUG))
+            .and_then(|profile| {
+                writer
+                    .cached_revision_chunks(job.source, job.revision, profile)
+                    .ok()
+            });
         writer.commit()?;
+        if let Some(reused) = reused {
+            telemetry::vector_reuse(&job.scope, job.id, revision.content.chunks, reused);
+        }
         Ok(revision)
     }
+
     fn extract_rtf(&self, job: &Job) -> Result<(String, &'static str)> {
         let original = self
             .files
