@@ -20,6 +20,8 @@ mod download;
 #[cfg(test)]
 mod download_tests;
 #[cfg(test)]
+mod list_tests;
+#[cfg(test)]
 mod upload_tests;
 
 const MULTIPART_ABORT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -197,23 +199,39 @@ impl Storage for S3Storage {
         limit: u32,
     ) -> Result<ListPage> {
         let prefix = prefix.map(|prefix| format!("{prefix}/"));
+        let limit = list_limit(limit)?;
         let page = self
             .0
             .list_paginated(
                 prefix.as_deref(),
                 PaginatedListOptions {
-                    max_keys: Some(list_limit(limit)?),
+                    max_keys: Some(limit),
                     page_token: cursor.map(str::to_owned),
                     ..Default::default()
                 },
             )
             .await
             .map_err(storage_error)?;
+        if page.result.objects.len() > limit {
+            return Err(invalid_response(
+                "S3 listing exceeded its requested page size",
+            ));
+        }
         let objects = page
             .result
             .objects
             .into_iter()
-            .map(object)
+            .map(|meta| {
+                if prefix
+                    .as_ref()
+                    .is_some_and(|prefix| !meta.location.as_ref().starts_with(prefix))
+                {
+                    return Err(invalid_response(
+                        "S3 listing returned an object outside its prefix",
+                    ));
+                }
+                object(meta)
+            })
             .collect::<Result<_>>()?;
         Ok(ListPage {
             objects,

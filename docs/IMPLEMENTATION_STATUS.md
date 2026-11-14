@@ -2262,6 +2262,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   returned cold results in 5.96–6.23 s with a 2.41 GiB cgroup peak.
   [Measured results](CAPACITY.md#concurrent-grpc-search-on-1-gib-fts-snapshots).
 
+## Object listing scope
+
+- S3 and GCS validate list results against the requested path boundary and
+  page size. A sibling collection, or an object named exactly like the
+  prefix being listed, fails the whole page before usage calculations or
+  retired-collection cleanup can consume it. The loopback provider tests
+  verified both cases and the S3 page size limit.
+- The live MinIO contract passed. A proxy also inserted a sibling key into
+  the retired collection's listing. The worker recorded a failed sweep
+  item and preserved both inputs. A fresh worker reclaimed the retired
+  snapshot and input once the listing was corrected, leaving the sibling
+  input and the retired collection tombstone in storage.
+  [Storage contract](STORAGE.md#storage-backends).
+
 ## GCS listing retries
 
 - The GCS adapter retries transient listing failures against the same page

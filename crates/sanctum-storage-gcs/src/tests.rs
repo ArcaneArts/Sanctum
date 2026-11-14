@@ -182,6 +182,14 @@ async fn list(
             "items": [metadata("default/notes/a", 4, 9), metadata("default/notes/b", 6, 10)]
         }))
         .into_response(),
+        Some("sibling") => Json(json!({
+            "items": [metadata("default/notes-other/a", 4, 9)], "nextPageToken": "later"
+        }))
+        .into_response(),
+        Some("prefix-object") => Json(json!({
+            "items": [metadata("default/notes", 4, 9)]
+        }))
+        .into_response(),
         Some("invalid") => "{\"items\":[".into_response(),
         Some("stalled") if attempt == 1 => std::future::pending().await,
         Some("stalled") => Json(json!({})).into_response(),
@@ -600,6 +608,23 @@ async fn list_page_bounds_retries_and_preserves_permanent_errors() {
 }
 
 #[tokio::test]
+async fn list_rejects_objects_outside_the_requested_prefix() {
+    let (storage, fixture, server) = start().await;
+    let prefix = Key::parse("default/notes").unwrap();
+    for token in ["sibling", "prefix-object"] {
+        assert!(matches!(
+            storage.list(Some(&prefix), Some(token), 1).await,
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+    assert_eq!(
+        *fixture.lists.lock().unwrap(),
+        [Some("sibling".into()), Some("prefix-object".into())]
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn gcs_metadata_is_bounded_and_preserves_valid_maximum_pages() {
     let (storage, fixture, server) = start().await;
     let prefix = Key::parse("maximum").unwrap();
@@ -647,7 +672,7 @@ async fn list_page_retries_a_stalled_response() {
         .append_pair("fields", LIST_FIELDS)
         .append_pair("pageToken", "stalled");
     let page = storage
-        .list_page(url, 1, Duration::from_millis(250))
+        .list_page(url, Some("default/notes/"), 1, Duration::from_millis(250))
         .await
         .unwrap();
     assert!(page.objects.is_empty() && page.next_cursor.is_none());
