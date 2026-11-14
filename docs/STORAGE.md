@@ -310,6 +310,12 @@ or begins a new pass when the previous pass ended. Dispatch retries keep
 the same task name within a six-hour window. A later window uses a new
 name so repair can recover tasks that exhausted their queue retries.
 Configure the scheduler frequency against the measured queue depth.
+Once the collection manifest is retired, repair removes its upload and
+rebuild hints, including hints whose operation envelopes were already
+reclaimed. A late delivery to a retired collection is acknowledged
+without publishing anything. Hints for active collections are preserved
+while acceptance is still writing the envelope.
+[Cloud Tasks HTTP acknowledgments](https://docs.cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks#HttpRequest).
 
 The private listener accepts manual registration, preparation, and indexing
 when `cloud_tasks` is omitted. Index deliveries queued before this change and

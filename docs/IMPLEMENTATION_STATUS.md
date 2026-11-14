@@ -1636,3 +1636,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   cases checked replacement, a different total length, and stalled
   transfers. The live GCS bucket contract still needs authorized ADC.
   [GCS adapter](STORAGE.md#google-cloud-storage-adapter).
+
+## Dispatch repair after collection deletion
+
+- The worker uses the collection manifest's durable tombstone to remove
+  upload and profile rebuild hints. Late worker deliveries to a retired
+  collection complete without publishing. An active collection can
+  keep its hint through the acceptance gap before an envelope exists.
+- The filesystem and live MinIO tests retired a collection while uploads
+  were queued. They checked cleanup before and after reclaiming the
+  envelopes, HTTP acknowledgment of late tasks after a worker restart,
+  and successful repair of the same upload ID in an active collection.
+  Queue creation used a loopback Cloud Tasks fixture.
+  [Cloud Tasks dispatch](STORAGE.md#cloud-tasks-dispatch).

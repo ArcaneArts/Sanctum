@@ -111,15 +111,29 @@ async fn apply(service: HostedCatalog, task: RegisterUpload, stage: TaskStage) -
             service.try_dispatch(&scope, task.operation_id).await;
             StatusCode::NO_CONTENT
         }
-        Err(Error::NotFound(_)) => StatusCode::NOT_FOUND,
-        Err(error) => {
-            tracing::warn!(
-                %error, tenant = %scope.tenant, collection = %scope.collection,
-                operation = %task.operation_id, ?stage, "hosted task will need a retry"
-            );
-            StatusCode::SERVICE_UNAVAILABLE
+        Err(error) => failed_upload(&service, &scope, task.operation_id, stage, error).await,
+    }
+}
+
+async fn failed_upload(
+    service: &HostedCatalog,
+    scope: &Scope,
+    operation: Uuid,
+    stage: TaskStage,
+    error: Error,
+) -> StatusCode {
+    match service.discard_retired_upload_task(scope, operation).await {
+        Ok(true) => return StatusCode::NO_CONTENT,
+        Ok(false) if matches!(error, Error::NotFound(_)) => return StatusCode::NOT_FOUND,
+        Ok(false) => {}
+        Err(cleanup) => {
+            tracing::warn!(%cleanup, tenant = %scope.tenant, collection = %scope.collection, %operation,
+                "could not check whether the hosted task was retired");
         }
     }
+    tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection, %operation,
+        ?stage, "hosted task will need a retry");
+    StatusCode::SERVICE_UNAVAILABLE
 }
 
 async fn reconcile(State(service): State<HostedCatalog>, Path(shard): Path<u8>) -> Response {
@@ -209,11 +223,15 @@ async fn embed_upload(
             service.try_dispatch(&scope, task.operation_id).await;
             StatusCode::NO_CONTENT
         }
-        Err(Error::NotFound(_)) => StatusCode::NOT_FOUND,
         Err(error) => {
-            tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
-                operation = %task.operation_id, step = task.step, "hosted embedding task will need a retry");
-            StatusCode::SERVICE_UNAVAILABLE
+            failed_upload(
+                &service,
+                &scope,
+                task.operation_id,
+                TaskStage::Embed { step: task.step },
+                error,
+            )
+            .await
         }
     }
 }

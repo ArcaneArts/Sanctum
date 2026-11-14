@@ -390,6 +390,9 @@ impl HostedCatalog {
         let Some(dispatcher) = self.dispatcher.as_ref() else {
             return Ok(false);
         };
+        if self.clear_retired_dispatch(scope, operation, false).await? {
+            return Ok(false);
+        }
         let prefix = self.operation_prefix(scope, operation)?;
         let Some((mut record, version)) = self.read_operation(&prefix, operation).await? else {
             return Ok(false);
@@ -461,6 +464,9 @@ impl HostedCatalog {
         scope: &Scope,
         operation: Uuid,
     ) -> Result<bool> {
+        if self.clear_retired_dispatch(scope, operation, false).await? {
+            return Ok(false);
+        }
         let prefix = self.operation_prefix(scope, operation)?;
         let Some((record, _)) = self.read_operation(&prefix, operation).await? else {
             return Ok(false);

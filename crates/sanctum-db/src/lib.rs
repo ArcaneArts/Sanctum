@@ -393,6 +393,13 @@ impl Publication {
             .and_then(|(head, _)| if head.deleted { None } else { head.generation }))
     }
 
+    pub async fn is_retired(&self, unit: &Unit) -> Result<bool> {
+        Ok(self
+            .read_head(unit)
+            .await?
+            .is_some_and(|(head, _)| head.deleted))
+    }
+
     pub async fn read(&self, unit: &Unit, directory: &Path) -> Result<Option<Materialized>> {
         let Some((head, _)) = self.read_head(unit).await? else {
             return Ok(None);
