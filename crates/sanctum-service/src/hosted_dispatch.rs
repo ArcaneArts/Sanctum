@@ -16,7 +16,7 @@ const REPAIR_CONCURRENCY: usize = 4;
 const REPAIR_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 const REPAIR_PAGE_TIMEOUT: Duration = Duration::from_secs(240);
 const STANDALONE_LIST_TIMEOUT: Duration = Duration::from_secs(45);
-const REPLAY_DISPATCH_TIMEOUT: Duration = Duration::from_secs(15);
+const API_DISPATCH_TIMEOUT: Duration = Duration::from_secs(15);
 pub const HOSTED_STAGE_TIMEOUT: Duration = Duration::from_secs(570);
 
 #[derive(Default, Serialize, Deserialize)]
@@ -120,24 +120,25 @@ impl HostedCatalog {
         }
     }
 
-    pub(super) async fn restore_replay_dispatch(
+    pub(super) async fn dispatch_saved_upload(
         &self,
         scope: &Scope,
         operation: Uuid,
-        attempt: Uuid,
+        refresh_attempt: Option<Uuid>,
     ) {
-        // Admission wrote the hint before accepting the envelope. A redundant
-        // repair failure does not change the saved acceptance.
-        let refresh = async {
-            if let Err(error) = self.record_dispatch_hint(scope, operation, attempt).await {
+        // The durable hint was written before saving the envelope or retry.
+        let dispatch = async {
+            if let Some(attempt) = refresh_attempt
+                && let Err(error) = self.record_dispatch_hint(scope, operation, attempt).await
+            {
                 tracing::warn!(%error, tenant = %scope.tenant, collection = %scope.collection,
                     %operation, "could not refresh the accepted upload's dispatch hint");
             }
             self.try_dispatch(scope, operation).await;
         };
-        if timeout(REPLAY_DISPATCH_TIMEOUT, refresh).await.is_err() {
+        if timeout(API_DISPATCH_TIMEOUT, dispatch).await.is_err() {
             tracing::warn!(tenant = %scope.tenant, collection = %scope.collection,
-                %operation, "timed out refreshing dispatch for an accepted upload");
+                %operation, "timed out attempting immediate dispatch for a saved upload");
         }
     }
 

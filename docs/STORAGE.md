@@ -285,10 +285,12 @@ RPC. If there is no accepted envelope, the request stays retryable and
 the staged input remains available to admission-fenced cleanup.
 Concurrent requests with the same ID adopt the winning operation and
 discard their losing input when possible.
-Replaying an accepted upload returns its saved receipt even if refreshing
-the dispatch hint fails. That refresh and the immediate dispatch attempt
-share a 15-second budget. The initial submission still writes the hint
-before accepting the envelope, so scheduled repair can find the operation.
+The initial submission writes the hint before accepting the envelope, so
+scheduled repair can find the operation. Once acceptance is durable, the
+API spends up to 15 seconds on immediate dispatch, including its storage
+reads and dispatch checkpoint. Replays use the same budget and can also
+refresh the hint within it. A dispatch or refresh failure leaves the saved
+receipt available to the caller.
 
 The `ACCEPTED` status can be queried after restart through `GetIngestionJob`.
 A replacement targeting an external reference has an empty `source_id` until
@@ -718,8 +720,9 @@ backoff still applies.
 
 The retry counter and dispatch hint survive restarts. If storage loses the
 retry checkpoint reply, the RPC checks that the same upload attempt saved
-the requested counter or a newer one, then attempts dispatch. The dispatch
-repair scan can recover an interrupted or unavailable Cloud Tasks handoff.
+the requested counter or a newer one. Immediate dispatch gets up to 15
+seconds once the retry is durable. The dispatch repair scan can recover
+an interrupted or unavailable Cloud Tasks handoff and reuse its task name.
 Without Cloud Tasks configured, deliver the pending stage to the private
 worker. Terminal operations require a new submission to try again.
 

@@ -4442,6 +4442,97 @@ async fn hosted_manual_retry_restores_a_dispatch_after_restart() {
     server.stop().await;
 }
 
+#[tokio::test]
+async fn hosted_upload_and_retry_return_saved_receipts_when_dispatch_checkpoint_stalls() {
+    use std::time::Duration;
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
+    let dispatch = Arc::new(RetryDispatch::default());
+    let catalog = || {
+        HostedCatalog::new(storage.clone(), None, 1024)
+            .unwrap()
+            .with_dispatch(dispatch.clone())
+    };
+    let mut server = start(catalog()).await;
+    let scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    server
+        .client
+        .create_collection(v1::CreateCollectionRequest {
+            scope: Some(scope.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let operation = uuid::Uuid::from_u128(123);
+    let header = v1::UploadTextHeader {
+        scope: Some(scope.clone()),
+        name: "dispatch.txt".into(),
+        request_id: Some(operation.to_string()),
+        ..Default::default()
+    };
+    let request = v1::IngestionJobRequest {
+        scope: Some(scope),
+        operation_id: operation.to_string(),
+    };
+    let mut saved = None;
+    for retry in 0..=1 {
+        storage
+            .interrupt
+            .store(BLOCK_DISPATCH_CHECKPOINT, Ordering::Relaxed);
+        let mut client = server.client.clone();
+        let header = header.clone();
+        let request = request.clone();
+        let response = tokio::spawn(async move {
+            if retry == 0 {
+                client
+                    .submit_text(upload_frames(&header, [b"quartz".as_slice()]))
+                    .await
+            } else {
+                client.retry_ingestion_job(request).await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while storage.interrupt.load(Ordering::Relaxed) != DISPATCH_CHECKPOINT_BLOCKED {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!response.is_finished());
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::time::resume();
+        // Let the gRPC response cross the socket before measuring its delivery.
+        let receipt = tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .expect("dispatch stalled beyond the receipt deadline")
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        assert_eq!(receipt.state(), v1::IngestionState::Accepted);
+        if let Some(saved) = &saved {
+            assert_eq!(&receipt, saved);
+        }
+        saved = Some(receipt);
+        assert_eq!(
+            storage.interrupt.load(Ordering::Relaxed),
+            DISPATCH_CHECKPOINT_DROPPED
+        );
+        assert!(has_upload_hint(storage.as_ref(), operation).await);
+        let repair = catalog().reconcile_shard(0).await.unwrap();
+        assert_eq!((repair.dispatched, repair.failed), (1, 0));
+        let task = (TaskStage::Register, retry);
+        let delivered = dispatch.delivered.lock().unwrap();
+        assert_eq!(delivered.len(), (retry as usize + 1) * 2);
+        assert_eq!(delivered[delivered.len() - 2..], [task, task]);
+    }
+    server.stop().await;
+}
+
 #[derive(Default)]
 struct RetryDispatch {
     reject_next: std::sync::atomic::AtomicBool,
@@ -8352,6 +8443,9 @@ const PARALLEL_RANGE_START: u8 = 40;
 const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
 const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
 const REJECT_DISPATCH_HINT_DELETES: u8 = 46;
+const BLOCK_DISPATCH_CHECKPOINT: u8 = 47;
+const DISPATCH_CHECKPOINT_BLOCKED: u8 = 48;
+const DISPATCH_CHECKPOINT_DROPPED: u8 = 49;
 
 struct InterruptedRead<'a>(&'a AtomicU8, u8);
 
@@ -8576,6 +8670,13 @@ impl Storage for InterruptAcceptance {
         }
         let interrupt = if key.as_str().ends_with("/operation.json") {
             match self.interrupt.load(Ordering::Relaxed) {
+                BLOCK_DISPATCH_CHECKPOINT
+                    if !serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["dispatched_at"].is_null() =>
+                {
+                    self.interrupt.store(DISPATCH_CHECKPOINT_BLOCKED, Ordering::Relaxed);
+                    let _dropped = InterruptedRead(&self.interrupt, DISPATCH_CHECKPOINT_DROPPED);
+                    return std::future::pending().await;
+                }
                 3 => {
                     self.interrupt.store(4, Ordering::Relaxed);
                     while self.interrupt.load(Ordering::Relaxed) == 4 {
