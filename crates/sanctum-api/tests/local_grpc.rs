@@ -2647,6 +2647,92 @@ async fn accepted_jobs_and_pause_survive_restart_and_cancellation_is_scoped() {
 }
 
 #[tokio::test]
+async fn startup_finishes_interrupted_cancellation_while_the_queue_is_paused() {
+    let dir = TempDir::new().unwrap();
+    let mut first = Running::start_with_workers(&dir, None, false).await;
+    create(&mut first.client, "default").await;
+    first.service.pause_queue(true).unwrap();
+    let submit = |request: v1::UploadTextFrame| {
+        tokio_stream::iter([request, data(br"{\rtf1 canceled azurite}"), end()])
+    };
+    let mut request = rtf_header(true, "interrupted-cancellation");
+    let Some(Frame::Header(header)) = &mut request.frame else {
+        unreachable!();
+    };
+    header.request_id = Some(uuid::Uuid::new_v4().to_string());
+    header.source_metadata.push(v1::MetadataEntry {
+        namespace: "test".into(),
+        key: "label".into(),
+        value_json: "\"pending\"".into(),
+    });
+    let accepted = first
+        .client
+        .submit_text(submit(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let id = job_request(accepted.operation_id);
+    let staged = text_path(&dir, &accepted.source_id, &accepted.revision_id);
+    assert!(staged.with_file_name("original").exists());
+
+    // Leave the worker at a persisted extraction checkpoint, then use the
+    // public cancellation path and stop before the worker acknowledges it.
+    let runtime = rusqlite::Connection::open(dir.path().join("runtime.db")).unwrap();
+    runtime
+        .execute(
+            "UPDATE ingestion_jobs SET status = 'indexing', attempts = 1, extracting = 1
+             WHERE operation_id = ?1",
+            [&id.operation_id],
+        )
+        .unwrap();
+    let canceling = first
+        .client
+        .cancel_ingestion_job(id.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(canceling.state(), v1::IngestionState::Extracting);
+    first.stop().await;
+
+    let mut restarted = Running::start(&dir).await;
+    assert!(restarted.service.queue_paused().unwrap());
+    let canceled = restarted
+        .client
+        .get_ingestion_job(id.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(canceled.state(), v1::IngestionState::Canceled);
+    assert_eq!(canceled.attempts, 1);
+    assert!(canceled.text_revision.is_none());
+    assert!(!staged.parent().unwrap().exists());
+    assert!(
+        search(&mut restarted.client, "default", "azurite")
+            .await
+            .is_empty()
+    );
+    let replayed = restarted
+        .client
+        .submit_text(submit(request))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(replayed, canceled);
+    let released: (bool, bool, bool) = runtime
+        .query_row(
+            "SELECT finished_at IS NOT NULL, extracting = 0, initial_metadata IS NULL
+             FROM ingestion_jobs WHERE operation_id = ?1",
+            [&id.operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(released, (true, true, true));
+    restarted.service.pause_queue(false).unwrap();
+    assert!(!restarted.service.process_next().unwrap());
+    restarted.stop().await;
+}
+
+#[tokio::test]
 async fn recovery_reuses_a_collection_commit_with_a_missing_queue_receipt() {
     let dir = TempDir::new().unwrap();
     let mut first = Running::start(&dir).await;
