@@ -921,6 +921,23 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   context tool returns the same cited hit and exact source text.
 - Delivered in [PR #51](https://github.com/ArcaneArts/Sanctum/pull/51).
 
+## Direct source range retrieval
+
+- gRPC, MCP, and the CLI read up to 64 KiB from a published source revision
+  using tenant, collection, source and revision IDs, and half-open canonical
+  UTF-8 offsets. Hosted responses include the SQLite snapshot generation.
+  [Range API](LOCAL_API.md#fetch-text-by-source-range).
+- Regression tests cover exact Unicode bytes, invalid boundaries, tenant
+  isolation, deleted sources, and retained revisions before and after
+  reclamation. The local test reuses offsets from a pending RTF scan once
+  publication completes.
+- With live MinIO, hosted MCP, the CLI, and a newly generated Python gRPC
+  client all fetched `café` from a published RTF revision by offsets obtained
+  before indexing. The local stdio bridge fetched the exact bytes of `❄️`
+  from a text revision. The checked-in Python example also exercised local
+  upload, change watching, search, and range retrieval.
+  [PR #131](https://github.com/ArcaneArts/Sanctum/pull/131).
+
 ## Runtime information
 
 - gRPC and the CLI expose process health, storage mode, effective

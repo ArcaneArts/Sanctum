@@ -203,6 +203,14 @@ enum Command {
         revision_id: String,
         ordinal: u64,
     },
+    /// Write the exact canonical UTF-8 byte range of a source revision to stdout.
+    FetchRange {
+        collection: String,
+        source_id: String,
+        revision_id: String,
+        start_byte: u64,
+        end_byte: u64,
+    },
 }
 
 #[tokio::main]
@@ -860,6 +868,25 @@ async fn main() -> anyhow::Result<()> {
                 .await?
                 .into_inner();
             print!("{}", hit.excerpt);
+        }
+        Command::FetchRange {
+            collection,
+            source_id,
+            revision_id,
+            start_byte,
+            end_byte,
+        } => {
+            let range = client
+                .fetch_source_range(v1::FetchSourceRangeRequest {
+                    scope: scope(collection),
+                    source_id,
+                    revision_id,
+                    start_byte,
+                    end_byte,
+                })
+                .await?
+                .into_inner();
+            print!("{}", range.text);
         }
     }
     Ok(())

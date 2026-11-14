@@ -22,6 +22,7 @@ service Sanctum {
   rpc SearchCollections(SearchCollectionsRequest) returns (SearchTextResponse);
   rpc FetchChunk(FetchChunkRequest) returns (TextHit);
   rpc FetchContext(FetchContextRequest) returns (TextContext);
+  rpc FetchSourceRange(FetchSourceRangeRequest) returns (SourceTextRange);
   rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
   rpc GetSource(GetSourceRequest) returns (GetSourceResponse);
   rpc DeleteSource(DeleteSourceRequest) returns (DeletedSource);
@@ -831,6 +832,27 @@ message TextContext {
   uint64 start_byte = 2;
   uint64 end_byte = 3; // Exclusive.
   string text = 4;
+}
+
+message FetchSourceRangeRequest {
+  Scope scope = 1;
+  string source_id = 2;
+  string revision_id = 3;
+  // Half-open canonical UTF-8 byte range. Both ends must be character
+  // boundaries. The range must contain 1 to 65536 bytes.
+  uint64 start_byte = 4;
+  uint64 end_byte = 5;
+}
+
+message SourceTextRange {
+  Scope scope = 1;
+  string source_id = 2;
+  string revision_id = 3;
+  uint64 start_byte = 4;
+  uint64 end_byte = 5;
+  string text = 6;
+  string representation = 7;
+  optional string database_generation = 8;
 }
 
 message HitMetadataEntry {

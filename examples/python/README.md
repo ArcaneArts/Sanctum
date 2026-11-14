@@ -19,7 +19,8 @@ PYTHONPATH="$generated" python examples/python/ingest_and_watch.py README.md \
 The example generates the client from the same contract used by Rust.
 It creates a collection if needed, streams the file into the durable
 queue, waits for lexical publication, reads its change event, and
-searches the collection. Run it against a dedicated collection since it
+searches the collection. It fetches each hit by its source revision and
+byte offsets. Run it against a dedicated collection since it
 creates a new source on each run. [gRPC Python quickstart](https://grpc.io/docs/languages/python/quickstart/).
 
 ## Read structured errors

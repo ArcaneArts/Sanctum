@@ -92,7 +92,7 @@ def child(command, **kwargs):
 
 READ_ONLY_TOOLS = {
     "list_collections", "ingestion_status", "search", "search_collections",
-    "scan_pending_text", "fetch_chunk", "fetch_context", "get_metadata",
+    "scan_pending_text", "fetch_chunk", "fetch_context", "fetch_source_range", "get_metadata",
 }
 WRITE_TOOLS = {"create_collection", "ingest_text", "mutate_metadata"}
 
@@ -211,6 +211,11 @@ def check(bin_dir):
                 assert exact["end_byte"] == len(content.encode("utf-8"))
                 context = stdio.tool("fetch_context", **reference, before_bytes=8, after_bytes=8)
                 assert context["text"] == content and context["hit"] == exact
+                locator = {key: value for key, value in reference.items() if key != "ordinal"}
+                start = content.encode().index("❄️".encode())
+                part = stdio.tool("fetch_source_range", **locator, start_byte=start,
+                                  end_byte=start + len("❄️".encode()))
+                assert part["text"] == "❄️" and part["representation"] == "canonical_utf8", part
                 missing = stdio.request("tools/call", {"name": "fetch_chunk", "arguments": reference | {"tenant": "other"}})
                 assert missing.get("isError"), missing
                 bridge.stdin.close()
@@ -382,12 +387,28 @@ def check_hosted(bin_dir):
         assert pending["stop"] == "complete" and pending["read_bytes"] == len(canonical), pending
         assert pending["source"]["total_bytes"] == len(canonical), pending
         assert pending["matches"] == [{"start_byte": canonical.index(b"caf"), "end_byte": len(canonical)}]
+        match, = pending["matches"]
         limited = rpc.tool("scan_pending_text", **rtf_operation, literal="café",
                            byte_limit=len(canonical) - 1)
         assert limited["stop"] == "byte_limit" and not limited["matches"], limited
         assert limited["read_bytes"] == len(canonical) - 1, limited
         assert limited["scanned_bytes"] == len(canonical) - len("é".encode()), limited
         assert not rpc.tool("search", **scope, query="prepared")["hits"]
+        delivery = urllib.request.Request(f"http://{worker['worker']}/internal/tasks/index-upload",
+                                          json.dumps(rtf_operation).encode(),
+                                          {"Content-Type": "application/json"})
+        with urllib.request.urlopen(delivery, timeout=30) as response:
+            assert response.status == 204
+        source = pending["source"]
+        locator = scope | {key: source[key] for key in ("source_id", "revision_id")}
+        found = rpc.tool("fetch_source_range", **locator, **match)
+        assert found["text"] == "café" and found["database_generation"], found
+        fetched = subprocess.run(
+            [cli, "--endpoint", api, "--tenant", scope["tenant"], "fetch-range", scope["collection"],
+             locator["source_id"], locator["revision_id"], str(match["start_byte"]), str(match["end_byte"])],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        assert fetched.stdout == "café", fetched.stdout
     print("Hosted MCP verified HTTP/1.1, h2c, cross-process requests, and pending RTF byte ranges.")
 
 
