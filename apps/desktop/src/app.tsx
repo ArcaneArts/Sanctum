@@ -1,13 +1,14 @@
 import { Channel, invoke } from "@tauri-apps/api/core"
-import { Activity, CircleAlert, Copy, Database, FilePlus, FolderOpen, Layers, Pause, Play, Plus, Radio, RefreshCw, Settings2 } from "lucide-react"
+import { Activity, CircleAlert, Copy, Database, FilePlus, FolderOpen, Layers, Pause, Play, Plus, Radio, Settings2 } from "lucide-react"
 import { useCallback, useEffect, useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
-import { bytes, type ImportEvent, type Job, type Overview, type Usage } from "@/contracts"
+import { bytes, type ImportEvent, type Job, type Overview } from "@/contracts"
 import { cn } from "@/lib/utils"
 import { SettingsPanel } from "@/settings"
+import { StorageCard } from "@/storage-card"
 
 const navigation = [
   { id: "activity", label: "Activity", icon: Activity },
@@ -27,7 +28,6 @@ export function App() {
   const [overview, setOverview] = useState<Overview | null>(null)
   const [collection, setCollection] = useState("")
   const [newCollection, setNewCollection] = useState("")
-  const [usage, setUsage] = useState<Usage | null>(null)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [operationError, setOperationError] = useState<string | null>(null)
@@ -62,9 +62,6 @@ export function App() {
     void poll()
     return () => { active = false; clearTimeout(timer) }
   }, [collection])
-
-  const mcpUrl = overview?.runtime.mcp_url
-  useEffect(() => { setUsage(null) }, [mcpUrl, overview?.runtime.generation])
 
   const running = overview?.runtime.phase === "running"
   const filesystem = overview?.runtime.storage_backend === "filesystem"
@@ -147,7 +144,7 @@ export function App() {
           <div className="flex items-center gap-2"><Layers size={17} className="text-primary" /><h2 className="font-semibold">Collections</h2></div>
           <div className="flex flex-wrap items-center gap-2">
             <select aria-label="Filter by collection" className="max-w-52 rounded-md border border-border bg-background px-3 py-2 text-sm"
-              value={activeCollection} onChange={event => { setCollection(event.currentTarget.value); setUsage(null) }}>
+              value={activeCollection} onChange={event => setCollection(event.currentTarget.value)}>
               <option value="">All activity</option>
               {overview?.collections.map(id => <option key={id} value={id}>{id}</option>)}
             </select>
@@ -163,7 +160,6 @@ export function App() {
               await invoke("create_collection", { collection: id })
               setNewCollection("")
               setCollection(id)
-              setUsage(null)
             })
           }}>
             <Input aria-label="Collection ID" placeholder="New collection ID" value={newCollection}
@@ -172,22 +168,8 @@ export function App() {
           </form>
         </Card>
         <div className="grid gap-4 sm:grid-cols-2">
-          <Card className="p-4">
-            <div className="flex items-center justify-between gap-2">
-              <h2 className="font-semibold">Storage
-                {overview?.runtime.storage_backend && <span className="ml-2 text-xs font-normal text-muted-foreground">
-                  {({ filesystem: "Local folder", s3: "S3", gcs: "Google Cloud" })[overview.runtime.storage_backend]}
-                </span>}
-              </h2>
-              <Button variant="ghost" size="small" disabled={!running || busy}
-                onClick={() => void run(async () => setUsage(await invoke<Usage>("storage_usage", { collection: activeCollection || null })))}>
-                <RefreshCw size={13} /> Refresh
-              </Button>
-            </div>
-            <p className="mt-2 text-sm text-muted-foreground">
-              {usage ? `${bytes(usage.bytes)} across ${usage.files.toLocaleString()} ${filesystem ? "files" : "objects"}` : `Measure ${activeCollection || "all storage"}`}
-            </p>
-          </Card>
+          <StorageCard key={JSON.stringify([activeCollection, overview?.runtime.generation, overview?.runtime.mcp_url, running])}
+            collection={activeCollection} backend={overview?.runtime.storage_backend} running={running} />
           <Card className="p-4">
             <h2 className="font-semibold">Embeddings{target && <span className="ml-2 text-xs font-normal text-muted-foreground">{target}</span>}</h2>
             <p className="mt-2 text-sm text-muted-foreground">

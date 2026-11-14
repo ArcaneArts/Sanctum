@@ -51,6 +51,13 @@ struct Embedding {
 pub(crate) struct Usage {
     bytes: u64,
     files: u64,
+    finished_at_unix_ms: u64,
+}
+
+#[derive(Serialize)]
+pub(crate) struct UsageProgress {
+    bytes: u64,
+    files: u64,
 }
 
 #[derive(Serialize)]
@@ -410,7 +417,9 @@ pub(crate) async fn cancel_job(
 pub(crate) async fn storage_usage(
     host: State<'_, Host>,
     collection: Option<String>,
+    progress: Channel<UsageProgress>,
 ) -> Reply<Usage> {
+    use v1::storage_usage_event::Event;
     use v1::storage_usage_request::Scope;
     let scope = match collection {
         Some(collection) => Scope::Collection(v1::Scope {
@@ -419,16 +428,35 @@ pub(crate) async fn storage_usage(
         }),
         None => Scope::Cluster(v1::Empty {}),
     };
-    let usage = host
+    let mut scan = host
         .client()
         .await
         .map_err(error)?
-        .get_storage_usage(v1::StorageUsageRequest { scope: Some(scope) })
+        .measure_storage_usage(v1::StorageUsageRequest { scope: Some(scope) })
         .await
         .map_err(|status| status.message().to_owned())?
         .into_inner();
-    Ok(Usage {
-        bytes: usage.bytes,
-        files: usage.files,
-    })
+    while let Some(event) = scan
+        .message()
+        .await
+        .map_err(|status| status.message().to_owned())?
+    {
+        match event.event {
+            Some(Event::Progress(current)) => progress
+                .send(UsageProgress {
+                    bytes: current.bytes,
+                    files: current.files,
+                })
+                .map_err(error)?,
+            Some(Event::Complete(usage)) => {
+                return Ok(Usage {
+                    bytes: usage.bytes,
+                    files: usage.files,
+                    finished_at_unix_ms: usage.finished_at_unix_ms,
+                });
+            }
+            None => return Err("Server sent an empty storage measurement event".into()),
+        }
+    }
+    Err("Storage measurement ended before the server returned a total".into())
 }

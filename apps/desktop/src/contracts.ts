@@ -64,7 +64,8 @@ export type Overview = {
   api_error: string | null
 }
 
-export type Usage = { bytes: number, files: number }
+export type UsageProgress = { bytes: number, files: number }
+export type Usage = UsageProgress & { finished_at_unix_ms: number }
 export type ImportEvent = { path: string, state: string, message: string | null }
 
 export function bytes(value: number) {

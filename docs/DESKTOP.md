@@ -27,7 +27,8 @@ frontend edits. [Tauri development file watching](https://v2.tauri.app/develop/)
 3. In **Activity**, create and select a collection, then import a file or
    folder. Track accepted jobs and current embedding coverage. Select
    **Refresh** under Storage to measure the selected collection or the
-   entire local store.
+   entire local store. Larger scans show how many files or objects have
+   been counted. The last completed total shows its measurement time.
 4. In **Connect**, copy the Streamable HTTP URL or stdio configuration.
    Add it to your MCP client and use `list_collections`, `search`, and
    `fetch_chunk` to retrieve cited text. [MCP tools and examples](MCP.md).
