@@ -1505,3 +1505,14 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   [Reproduction and results](CAPACITY.md#200-mib-rtf-extraction).
 - `pnpm check` and the locked release build passed. The original
   benchmark also passed a 1 MiB UTF-8 smoke run.
+
+## First collection catalog reads
+
+- The large RTF benchmark exposed a first-use race between catalog initialization
+  and background cleanup. Collection listing and existence reads use a read-only
+  SQLite transaction so the schema version and rows come from the same snapshot.
+  A new catalog with no committed schema is empty until initialization commits.
+- A two-connection SQLite regression reproduced the missing-table error before
+  the fix and verified empty lists and a missing collection before commit, then
+  a visible collection after commit. A committed schema with a damaged table
+  still reports the database error. `pnpm check` passed.

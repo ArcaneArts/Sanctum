@@ -211,15 +211,15 @@ pub fn delete_catalog_collection(transaction: &Transaction<'_>, collection: &str
 }
 
 pub fn list_collections(path: &Path) -> Result<Vec<String>> {
-    match path.try_exists()? {
-        true => query_all(
-            &open(path, false)?,
+    Ok(read_initialized_catalog(path, |catalog, _| {
+        query_all(
+            catalog,
             "SELECT id FROM collections ORDER BY id",
             [],
             |row| row.get(0),
-        ),
-        false => Ok(Vec::new()),
-    }
+        )
+    })?
+    .unwrap_or_default())
 }
 
 pub fn list_collections_page(path: &Path, after: Option<&str>, limit: u32) -> Result<Vec<String>> {
@@ -241,23 +241,22 @@ pub fn list_collection_details(
     after: Option<&str>,
     limit: Option<u32>,
 ) -> Result<Vec<CollectionDetails>> {
-    if !path.try_exists()? {
-        return Ok(Vec::new());
-    }
-    let connection = open_read_only(path)?;
-    let name = if schema_version(&connection)? < 5 {
-        "id"
-    } else {
-        "COALESCE(display_name, id)"
-    };
-    query_all(
-        &connection,
-        &format!(
-            "SELECT id, {name}, created_at FROM collections WHERE id > ?1 ORDER BY id LIMIT ?2"
-        ),
-        params![after.unwrap_or_default(), limit.map_or(-1, i64::from)],
-        row_collection_details,
-    )
+    Ok(read_initialized_catalog(path, |catalog, version| {
+        let name = if version < 5 {
+            "id"
+        } else {
+            "COALESCE(display_name, id)"
+        };
+        query_all(
+            catalog,
+            &format!(
+                "SELECT id, {name}, created_at FROM collections WHERE id > ?1 ORDER BY id LIMIT ?2"
+            ),
+            params![after.unwrap_or_default(), limit.map_or(-1, i64::from)],
+            row_collection_details,
+        )
+    })?
+    .unwrap_or_default())
 }
 
 pub fn update_collection_details(
@@ -303,22 +302,38 @@ fn row_collection_details(row: &Row<'_>) -> rusqlite::Result<CollectionDetails> 
 }
 
 pub fn require_collection(path: &Path, collection: &str) -> Result<()> {
-    if path.try_exists()? {
-        let found = open_read_only(path)?
+    let exists = read_initialized_catalog(path, |catalog, _| {
+        catalog
             .query_row(
-                "SELECT 1 FROM collections WHERE id = ?1",
+                "SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?1)",
                 [collection],
-                |_| Ok(()),
+                |row| row.get::<_, bool>(0),
             )
-            .optional()
-            .map_err(database_error)?;
-        if found.is_some() {
-            return Ok(());
-        }
+            .map_err(database_error)
+    })?;
+    if exists == Some(true) {
+        return Ok(());
     }
     Err(Error::NotFound(format!(
         "collection {collection} was not found"
     )))
+}
+
+fn read_initialized_catalog<T>(
+    path: &Path,
+    read: impl FnOnce(&Connection, usize) -> Result<T>,
+) -> Result<Option<T>> {
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let mut connection = open_read_only(path)?;
+    let transaction = connection.transaction().map_err(database_error)?;
+    // A first writer can create root.db before the schema is visible to readers.
+    let version = schema_version(&transaction)?;
+    if version == 0 {
+        return Ok(None);
+    }
+    read(&transaction, version).map(Some)
 }
 
 pub struct CollectionDb(Connection);
@@ -765,5 +780,52 @@ fn database_error(error: rusqlite::Error) -> Error {
             Error::Busy("database is busy".into())
         }
         _ => Error::Internal(Box::new(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_collection_is_invisible_until_the_catalog_transaction_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.db");
+        let mut connection = open(&path, true).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        initialize_catalog(&transaction).unwrap();
+        assert!(activate_collection(&transaction, "notes").unwrap());
+
+        assert!(list_collections(&path).unwrap().is_empty());
+        assert!(list_collections_page(&path, None, 5).unwrap().is_empty());
+        assert!(matches!(
+            require_collection(&path, "notes"),
+            Err(Error::NotFound(_))
+        ));
+
+        transaction.commit().unwrap();
+        assert_eq!(list_collections(&path).unwrap(), ["notes"]);
+        assert_eq!(list_collections_page(&path, None, 5).unwrap(), ["notes"]);
+        require_collection(&path, "notes").unwrap();
+    }
+
+    #[test]
+    fn catalog_with_a_committed_schema_version_reports_missing_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.db");
+        let connection = open(&path, true).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+
+        assert!(list_collections(&path).is_err());
+        assert!(list_collections_page(&path, None, 5).is_err());
+        assert!(matches!(
+            require_collection(&path, "notes"),
+            Err(Error::Internal(_))
+        ));
     }
 }
