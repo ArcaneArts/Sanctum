@@ -747,11 +747,10 @@ impl Lease {
     }
 
     async fn reclaim(&mut self, grace: Duration, cursor: Option<&str>) -> Result<CleanupPage> {
+        let storage = self.publication.storage.clone();
         let prefix = Key::parse(format!("{}/snapshots", self.unit.prefix))?;
         let page = self
-            .publication
-            .storage
-            .list(Some(&prefix), cursor, 128)
+            .while_renewing(storage.list(Some(&prefix), cursor, 128))
             .await?;
         let mut deleted = 0;
         let prefix = format!("{prefix}/");
@@ -771,8 +770,7 @@ impl Lease {
                     .duration_since(object.modified_at)
                     .is_ok_and(|age| age >= grace)
                 {
-                    self.ensure_live()?;
-                    self.publication.storage.delete(&object.key).await?;
+                    self.while_renewing(storage.delete(&object.key)).await?;
                 }
                 continue;
             }
@@ -792,22 +790,21 @@ impl Lease {
                 continue;
             }
             let marker = Key::parse(format!("{prefix}{generation}/retired.json"))?;
-            self.ensure_live()?;
             if is_marker {
                 if !self.retired_data_exists(generation).await? {
-                    self.ensure_live()?;
-                    self.publication.storage.delete(&marker).await?;
+                    self.while_renewing(storage.delete(&marker)).await?;
                 }
                 continue;
             }
-            match self.publication.storage.head(&marker).await {
+            match self.while_renewing(storage.head(&marker)).await {
                 Err(Error::NotFound(_)) => {
                     // Start grace from the observation that the snapshot is no longer current.
-                    self.ensure_live()?;
                     match self
-                        .publication
-                        .storage
-                        .put_control(&marker, bytes::Bytes::from_static(b"{}"), Condition::Create)
+                        .while_renewing(storage.put_control(
+                            &marker,
+                            bytes::Bytes::from_static(b"{}"),
+                            Condition::Create,
+                        ))
                         .await
                     {
                         Ok(_) | Err(Error::Conflict(_)) => {}
@@ -819,10 +816,9 @@ impl Lease {
                         .duration_since(observation.modified_at)
                         .is_ok_and(|age| age >= grace) =>
                 {
-                    self.ensure_live()?;
-                    self.publication.storage.delete(&object.key).await?;
+                    self.while_renewing(storage.delete(&object.key)).await?;
                     deleted += 1;
-                    self.publication.storage.delete(&marker).await?;
+                    self.while_renewing(storage.delete(&marker)).await?;
                 }
                 Ok(_) => {}
                 Err(error) => return Err(error),
@@ -834,12 +830,13 @@ impl Lease {
         })
     }
 
-    async fn retired_data_exists(&self, generation: Uuid) -> Result<bool> {
+    async fn retired_data_exists(&mut self, generation: Uuid) -> Result<bool> {
+        let storage = self.publication.storage.clone();
         for key in [
             self.unit.snapshot(generation)?,
             self.unit.delta(generation)?,
         ] {
-            match self.publication.storage.head(&key).await {
+            match self.while_renewing(storage.head(&key)).await {
                 Ok(_) => return Ok(true),
                 Err(Error::NotFound(_)) => {}
                 Err(error) => return Err(error),
@@ -863,10 +860,10 @@ impl Lease {
                 next_cursor: None,
             });
         }
+        let storage = self.publication.storage.clone();
+        let prefix = self.unit.prefix.clone();
         let page = self
-            .publication
-            .storage
-            .list(Some(&self.unit.prefix), cursor, 128)
+            .while_renewing(storage.list(Some(&prefix), cursor, 128))
             .await?;
         let manifest = self.unit.head()?;
         let mut deleted = 0;
@@ -874,8 +871,7 @@ impl Lease {
             if object.key == manifest {
                 continue;
             }
-            self.ensure_live()?;
-            self.publication.storage.delete(&object.key).await?;
+            self.while_renewing(storage.delete(&object.key)).await?;
             deleted += 1;
         }
         if page.next_cursor.is_none() && self.head.generation.is_some() {

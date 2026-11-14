@@ -807,6 +807,13 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - Abandoned input and extraction candidates still need a cleanup path.
 - Delivered in [PR #39](https://github.com/ArcaneArts/Sanctum/pull/39).
 
+- The snapshot sweep renews the unit's writer lease during storage I/O.
+  Filesystem and live MinIO tests delayed listing and deletion beyond the
+  initial lease, verified a competing writer stayed fenced out, and confirmed
+  cleanup stopped after a renewal response was lost. A later sweep marked the
+  orphan, preserved the published generation, and reclaimed the retired unit.
+  [PR #143](https://github.com/ArcaneArts/Sanctum/pull/143).
+
 ## Hosted MCP ingress
 
 - The object-backed API shares its port between gRPC and stateless MCP.

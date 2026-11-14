@@ -1,9 +1,16 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use rusqlite::{Connection, Transaction, params};
 use sanctum_core::{Error, Scope};
 use sanctum_db::{Command, Publication, Unit};
 use sanctum_storage::{Key, Storage};
+use tokio::{io::AsyncReadExt, sync::oneshot};
 use uuid::Uuid;
 
 const LOCAL_TAKEOVER_LEASE: Duration = Duration::from_millis(650);
@@ -124,6 +131,131 @@ async fn verify_active_writer(storage: Arc<dyn Storage>, prefix: &str) {
         ),
         12
     );
+    delete_prefix(storage.as_ref(), &prefix).await;
+}
+
+#[tokio::test]
+async fn filesystem_reclamation_renews_through_slow_io() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = sanctum_storage_fs::FileStorage::open(directory.path()).unwrap();
+    verify_reclamation_lease(Arc::new(storage), "slow-reclamation").await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live MinIO bucket and S3 credentials"]
+async fn minio_reclamation_renews_through_slow_io() {
+    let prefix = format!("slow-reclamation-{}", Uuid::new_v4());
+    verify_reclamation_lease(minio_storage(), &prefix).await;
+}
+
+async fn verify_reclamation_lease(storage: Arc<dyn Storage>, prefix: &str) {
+    let prefix = Key::parse(prefix).unwrap();
+    let unit = Unit::catalog(Some(&prefix), &"default".parse().unwrap()).unwrap();
+    let grace = Duration::from_secs(300);
+    let ttl = Duration::from_millis(500);
+    let store = Arc::new(PublicationStorage::new(storage.clone()));
+    let sweep = Publication::new(store.clone(), ttl).unwrap();
+    let other = Publication::new(storage.clone(), Duration::from_secs(15)).unwrap();
+    let mut writer = other.acquire(&unit).await.unwrap();
+    let (current, _) = writer
+        .apply(vec![command(Uuid::new_v4(), 7)], apply_value)
+        .await
+        .unwrap();
+    writer.release().await.unwrap();
+    let orphan = Key::parse(format!(
+        "{prefix}/default/catalog/snapshots/{}/root.db",
+        Uuid::new_v4()
+    ))
+    .unwrap();
+    storage
+        .put_control(
+            &orphan,
+            bytes::Bytes::from_static(b"orphan"),
+            sanctum_storage::Condition::Create,
+        )
+        .await
+        .unwrap();
+    store.cleanup_delay_ms.store(800, Ordering::Relaxed);
+    let (listing, listed) = oneshot::channel();
+    *store.list_started.lock().unwrap() = Some(listing);
+    let interrupted = tokio::spawn({
+        let sweep = sweep.clone();
+        let unit = unit.clone();
+        async move { sweep.reclaim(&unit, grace, None).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), listed)
+        .await
+        .unwrap()
+        .unwrap();
+    let (finish, response) = oneshot::channel();
+    *store.control_reply_hold.lock().unwrap() = Some(response);
+    assert!(matches!(
+        interrupted.await.unwrap(),
+        Err(Error::StaleRevision(_))
+    ));
+    assert!(finish.send(()).is_err());
+    let marker = Key::parse(format!(
+        "{}/retired.json",
+        orphan.as_str().strip_suffix("/root.db").unwrap()
+    ))
+    .unwrap();
+    assert!(matches!(
+        storage.head(&marker).await,
+        Err(Error::NotFound(_))
+    ));
+    // The renewal may have committed before its response was lost.
+    tokio::time::sleep(ttl).await;
+
+    let (listing, listed) = oneshot::channel();
+    *store.list_started.lock().unwrap() = Some(listing);
+    let active = tokio::spawn({
+        let sweep = sweep.clone();
+        let unit = unit.clone();
+        async move { sweep.reclaim(&unit, grace, None).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), listed)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(ttl + Duration::from_millis(50)).await;
+    assert!(matches!(other.acquire(&unit).await, Err(Error::Busy(_))));
+    assert_eq!(active.await.unwrap().unwrap().deleted, 0);
+    storage.head(&marker).await.unwrap();
+    assert_eq!(other.generation(&unit).await.unwrap(), Some(current));
+
+    other.fence_deletion(&unit).await.unwrap();
+    let head = Key::parse(format!("{prefix}/default/catalog/HEAD.json")).unwrap();
+    let record = storage.get(&head).await.unwrap();
+    let mut bytes = Vec::new();
+    record
+        .reader
+        .take(1024 * 1024)
+        .read_to_end(&mut bytes)
+        .await
+        .unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    manifest["deleted_at_ms"] = serde_json::json!(
+        (SystemTime::now() - grace - Duration::from_secs(1))
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    storage
+        .put_control(
+            &head,
+            serde_json::to_vec(&manifest).unwrap().into(),
+            sanctum_storage::Condition::Match(record.object.version),
+        )
+        .await
+        .unwrap();
+    let page = sweep.reclaim_retired(&unit, grace, None).await.unwrap();
+    assert_eq!(page.deleted, 3);
+    assert!(page.next_cursor.is_none());
+    let remaining = storage.list(Some(&prefix), None, 10).await.unwrap();
+    assert_eq!(remaining.objects.len(), 1);
+    assert_eq!(remaining.objects[0].key, head);
+    assert!(other.is_retired(&unit).await.unwrap());
+    assert!(other.generation(&unit).await.unwrap().is_none());
     delete_prefix(storage.as_ref(), &prefix).await;
 }
 
@@ -482,6 +614,8 @@ struct PublicationStorage {
     snapshot_gets: std::sync::atomic::AtomicUsize,
     fail_delta: std::sync::atomic::AtomicBool,
     fail_only_delta_head: std::sync::atomic::AtomicBool,
+    cleanup_delay_ms: AtomicU64,
+    list_started: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl PublicationStorage {
@@ -495,6 +629,8 @@ impl PublicationStorage {
             snapshot_gets: Default::default(),
             fail_delta: Default::default(),
             fail_only_delta_head: Default::default(),
+            cleanup_delay_ms: Default::default(),
+            list_started: Default::default(),
         }
     }
 
@@ -504,6 +640,13 @@ impl PublicationStorage {
             .load(std::sync::atomic::Ordering::Relaxed);
         if delay != 0 {
             tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+        }
+    }
+
+    async fn delay_cleanup(&self) {
+        let delay = self.cleanup_delay_ms.load(Ordering::Relaxed);
+        if delay != 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
         }
     }
 }
@@ -608,10 +751,15 @@ impl Storage for PublicationStorage {
         cursor: Option<&str>,
         limit: u32,
     ) -> sanctum_core::Result<sanctum_storage::ListPage> {
+        if let Some(started) = self.list_started.lock().unwrap().take() {
+            started.send(()).unwrap();
+        }
+        self.delay_cleanup().await;
         self.inner.list(prefix, cursor, limit).await
     }
 
     async fn delete(&self, key: &sanctum_storage::Key) -> sanctum_core::Result<()> {
+        self.delay_cleanup().await;
         self.inner.delete(key).await
     }
 }
