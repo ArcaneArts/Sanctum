@@ -505,11 +505,13 @@ cargo run --locked -p sanctum-cli -- unwatch notes WATCH_ID
 ```
 
 `WatchFolder` persists a canonical directory, filters, and reconciliation
-interval in the local queue. The server scans when a watch is added, after
-restart, and at the configured interval (60 seconds by default). Periodic
-reconciliation coalesces edits between scans and uses content hashes.
-Pausing the local queue prevents new scans. Scans already in progress may
-finish after pause or removal.
+interval in the local queue. Native filesystem notifications schedule a
+debounced scan. Notification overflow requests reconciliation. The server
+also scans when a watch is added, after restart, and at the configured
+interval (60 seconds by default). Periodic scans cover filesystems where
+notifications are unavailable and edits the backend missed. Every scan
+uses content hashes. Pausing the local queue prevents new scans. Scans
+already in progress may finish after pause or removal.
 
 Missing files are reported by default. Use `--prune-missing` to delete
 selected sources whose files disappeared. An unavailable root or an

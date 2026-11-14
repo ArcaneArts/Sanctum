@@ -308,6 +308,16 @@ Merged in [PR #18](https://github.com/ArcaneArts/Sanctum/pull/18).
   and edits and removals made while the server was offline. A standalone
   CLI smoke test also detected an edit while running and verified that the
   source ID stayed the same.
+- Native filesystem notifications request debounced scans without waiting for
+  the periodic reconciliation interval. The service schedules a full scan
+  after notification loss and retains the periodic scan for missed edits.
+- The gRPC test ran on macOS and in a Linux ARM64 container with a one-hour
+  reconciliation interval. It picked up a newly created nested file and
+  coalesced three rapid saves into one replacement. The overflow fixture
+  verified both the bounded queue's overflow signal and the native backend's
+  rescan flag. On macOS, a generated Python client registered the watch and
+  MCP recovered the live replacement and an offline edit with the original
+  source ID. [Watched folder behavior](LOCAL_API.md#watched-folders).
 
 ## URL imports
 
@@ -1826,3 +1836,4 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   continuation. In desktop activity, **Next page** showed the completed
   upload and **Previous page** restored the empty page.
   [Desktop activity](DESKTOP.md#first-use).
+- Delivered in [PR #122](https://github.com/ArcaneArts/Sanctum/pull/122).
