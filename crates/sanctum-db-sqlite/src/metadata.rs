@@ -149,6 +149,29 @@ pub fn read_catalog_metadata(path: &Path, collection: &str) -> Result<Vec<Entry>
     catalog_entries(&connection, collection, None)
 }
 
+/// Returns one metadata list per collection in request order. Every collection
+/// must exist in the same catalog snapshot, even if metadata is not needed.
+pub fn read_search_catalog(
+    path: &Path,
+    collections: &[String],
+    include_metadata: bool,
+) -> Result<Vec<Vec<Entry>>> {
+    super::read_initialized_catalog(path, |catalog, _| {
+        collections
+            .iter()
+            .map(|collection| {
+                if include_metadata {
+                    catalog_entries(catalog, collection, None)
+                } else {
+                    super::confirm_collection(catalog, collection)?;
+                    Ok(Vec::new())
+                }
+            })
+            .collect()
+    })?
+    .ok_or_else(|| Error::NotFound("tenant catalog was not initialized".into()))
+}
+
 pub fn mutate_catalog_metadata(
     transaction: &Transaction<'_>,
     collection: &str,
@@ -162,18 +185,7 @@ fn catalog_entries(
     collection: &str,
     edits: Option<&[Mutation]>,
 ) -> Result<Vec<Entry>> {
-    let exists: bool = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?1)",
-            [collection],
-            |row| row.get(0),
-        )
-        .map_err(database_error)?;
-    if !exists {
-        return Err(Error::NotFound(format!(
-            "collection {collection} was not found"
-        )));
-    }
+    super::confirm_collection(connection, collection)?;
     apply(
         connection,
         "collection_metadata",

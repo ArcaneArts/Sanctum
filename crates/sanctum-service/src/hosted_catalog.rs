@@ -174,14 +174,23 @@ impl HostedCatalog {
         scope: &Scope,
         read: impl FnOnce(&std::path::Path, String) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let unit = Unit::catalog(self.prefix.as_ref(), &scope.tenant)?;
+        let collection = scope.collection.to_string();
+        self.with_tenant_catalog(&scope.tenant, move |path| read(path, collection))
+            .await
+    }
+
+    pub(crate) async fn with_tenant_catalog<T: Send + 'static>(
+        &self,
+        tenant: &ScopeId,
+        read: impl FnOnce(&std::path::Path) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let unit = Unit::catalog(self.prefix.as_ref(), tenant)?;
         let database = self
             .snapshots
             .read(&self.publication, &unit)
             .await?
             .ok_or_else(|| Error::NotFound("tenant catalog was not found".into()))?;
-        let collection = scope.collection.to_string();
-        tokio::task::spawn_blocking(move || read(database.path(), collection))
+        tokio::task::spawn_blocking(move || read(database.path()))
             .await
             .map_err(|error| Error::Internal(Box::new(error)))?
     }

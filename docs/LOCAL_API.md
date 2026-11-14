@@ -506,6 +506,10 @@ and hybrid searches use only the active profile for vector ranking.
 Overlapping hits from the same revision are collapsed. Each reference
 carries the collection it came from.
 
+Hosted search uses one tenant catalog generation for collection membership
+and collection metadata throughout the request. Each collection still
+contributes results from its own published generation.
+
 ```sh
 cargo run --locked -p sanctum-cli -- search notes quartz --also reference --mode hybrid
 ```

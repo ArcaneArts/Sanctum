@@ -312,10 +312,7 @@ async fn hosted_pending_literal_scan_reports_exact_ranges_and_partial_coverage()
     use v1::{PendingTextScanStop as Stop, pending_text_scan_event::Event};
 
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(InterruptAcceptance {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        interrupt: AtomicU8::new(0),
-    });
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let catalog = HostedCatalog::new(storage.clone(), None, 512 * 1024).unwrap();
     let scope = sanctum_core::Scope {
         tenant: "default".parse().unwrap(),
@@ -1652,10 +1649,7 @@ async fn hosted_submissions_store_exact_bytes_and_replay_after_restart() {
 #[tokio::test]
 async fn hosted_cancellation_recovers_from_lost_checkpoints_without_publishing() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(InterruptAcceptance {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        interrupt: AtomicU8::new(0),
-    });
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let catalog = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
     let scope = sanctum_core::Scope {
         tenant: "default".parse().unwrap(),
@@ -1826,10 +1820,7 @@ async fn hosted_cancellation_recovers_from_lost_checkpoints_without_publishing()
 #[tokio::test]
 async fn hosted_registration_replays_after_checkpoint_failure_and_orders_replacements() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(InterruptAcceptance {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        interrupt: AtomicU8::new(0),
-    });
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let catalog = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
     let mut server = start(catalog.clone()).await;
     let scope = sanctum_core::Scope {
@@ -2026,10 +2017,7 @@ async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf()
     use v1::{PendingTextScanStop as Stop, pending_text_scan_event::Event};
 
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(InterruptAcceptance {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        interrupt: AtomicU8::new(0),
-    });
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let dispatch = Arc::new(TestDispatch {
         fail: AtomicU8::new(0),
         delivered: std::sync::Mutex::new(Vec::new()),
@@ -2292,10 +2280,7 @@ async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf()
 #[tokio::test]
 async fn hosted_lexical_search_keeps_rank_and_coalesces_touching_excerpts() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(InterruptAcceptance {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        interrupt: AtomicU8::new(0),
-    });
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let catalog = HostedCatalog::new(storage.clone(), None, 1024 * 1024)
         .unwrap()
         .with_chunking(sanctum_core::ChunkSettings {
@@ -2405,10 +2390,7 @@ async fn hosted_lexical_search_keeps_rank_and_coalesces_touching_excerpts() {
 #[tokio::test]
 async fn hosted_search_reads_independent_ranges_concurrently_and_preserves_rank() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(InterruptAcceptance {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        interrupt: AtomicU8::new(0),
-    });
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let catalog = HostedCatalog::new(storage.clone(), None, 32 * 1024).unwrap();
     let scope = sanctum_core::Scope {
         tenant: "default".parse().unwrap(),
@@ -2473,10 +2455,7 @@ async fn hosted_search_reads_independent_ranges_concurrently_and_preserves_rank(
 #[tokio::test]
 async fn hosted_indexing_publishes_searchable_text_and_fences_old_replacements() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(InterruptAcceptance {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        interrupt: AtomicU8::new(0),
-    });
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let catalog = HostedCatalog::new(storage.clone(), None, 1024 * 1024).unwrap();
     let mut server = start(catalog.clone()).await;
     let scope = sanctum_core::Scope {
@@ -2998,14 +2977,18 @@ async fn hosted_embeddings_reuse_current_inputs_and_isolate_profiles() {
 
 #[tokio::test]
 async fn hosted_collection_search_uses_one_query_vector_and_keeps_hits_scoped() {
+    use v1::{
+        MetadataLevel, MetadataOperator, metadata_filter::Expression, metadata_mutation::Edit,
+    };
+
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let provider = Arc::new(HostedEmbeddingFixture {
         profile: "fixture-v1",
         fail: AtomicU8::new(0),
         queries: AtomicUsize::new(0),
     });
-    let service = HostedCatalog::new(storage, None, 1024)
+    let service = HostedCatalog::new(storage.clone(), None, 1024)
         .unwrap()
         .with_embedding(Some(provider.clone()));
     let mut server = start(service.clone()).await;
@@ -3047,12 +3030,14 @@ async fn hosted_collection_search_uses_one_query_vector_and_keeps_hits_scoped() 
         mode: v1::SearchMode::Hybrid.into(),
         ..Default::default()
     };
+    storage.catalog_reads.store(0, Ordering::Relaxed);
     let result = server
         .client
         .search_collections(query.clone())
         .await
         .unwrap()
         .into_inner();
+    assert_eq!(storage.catalog_reads.load(Ordering::Relaxed), 1);
     assert_eq!(provider.queries.load(Ordering::Relaxed), 1);
     assert_eq!(result.mode(), v1::SearchMode::Hybrid);
     assert_eq!(
@@ -3096,8 +3081,54 @@ async fn hosted_collection_search_uses_one_query_vector_and_keeps_hits_scoped() 
             .into_inner();
         assert_eq!(context.hit.unwrap().embedding_state, hit.embedding_state);
     }
+    for (collection, allowed) in [("first", true), ("second", false)] {
+        server
+            .client
+            .mutate_metadata(v1::MutateMetadataRequest {
+                target: Some(v1::MetadataTarget {
+                    scope: Some(v1::Scope {
+                        tenant: "default".into(),
+                        collection: collection.into(),
+                    }),
+                    ..Default::default()
+                }),
+                edits: vec![v1::MetadataMutation {
+                    namespace: "integration".into(),
+                    key: "include".into(),
+                    edit: Some(Edit::SetJson(allowed.to_string())),
+                }],
+            })
+            .await
+            .unwrap();
+    }
+    let filtered = v1::SearchCollectionsRequest {
+        metadata_filter: Some(v1::MetadataFilter {
+            expression: Some(Expression::Test(v1::MetadataPredicate {
+                level: MetadataLevel::Collection.into(),
+                namespace: "integration".into(),
+                key: "include".into(),
+                operator: MetadataOperator::Equal.into(),
+                operand_json: Some("true".into()),
+                ..Default::default()
+            })),
+        }),
+        ..query.clone()
+    };
+    storage.catalog_reads.store(0, Ordering::Relaxed);
+    let result = server
+        .client
+        .search_collections(filtered)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(storage.catalog_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(provider.queries.load(Ordering::Relaxed), 2);
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.hits[0].excerpt, "shared first 🦀");
+    assert_eq!(result.embedding_coverage.unwrap().total_chunks, 2);
+
     let wrong_tenant = v1::SearchCollectionsRequest {
-        collections: vec!["private".into()],
+        collections: vec!["first".into(), "private".into()],
         ..query.clone()
     };
     assert_eq!(
@@ -3109,6 +3140,7 @@ async fn hosted_collection_search_uses_one_query_vector_and_keeps_hits_scoped() 
             .code(),
         Code::NotFound
     );
+    assert_eq!(provider.queries.load(Ordering::Relaxed), 2);
     let duplicate = v1::SearchCollectionsRequest {
         collections: vec!["first".into(), "first".into()],
         ..query
@@ -3335,10 +3367,7 @@ impl sanctum_embedding::Provider for HostedEmbeddingFixture {
 #[tokio::test]
 async fn hosted_manual_retry_restores_a_dispatch_after_restart() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(InterruptAcceptance {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        interrupt: AtomicU8::new(0),
-    });
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let dispatch = Arc::new(RetryDispatch::default());
     let catalog = || {
         HostedCatalog::new(storage.clone(), None, 1024)
@@ -3700,10 +3729,7 @@ async fn embedding_task_checkpoint_replays_a_committed_batch_without_republishin
     }
 
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(InterruptAcceptance {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        interrupt: AtomicU8::new(0),
-    });
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let dispatch = Arc::new(TestDispatch {
         fail: AtomicU8::new(0),
         delivered: std::sync::Mutex::new(Vec::new()),
@@ -4715,10 +4741,7 @@ async fn hosted_metadata_is_atomic_and_filters_published_revisions() {
 #[tokio::test]
 async fn hosted_source_sweep_resumes_a_partly_processed_page_after_a_lost_checkpoint_response() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(InterruptAcceptance {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        interrupt: AtomicU8::new(0),
-    });
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
     let service = catalog();
     for index in 0..10 {
@@ -4787,10 +4810,7 @@ async fn hosted_source_sweep_resumes_a_partly_processed_page_after_a_lost_checkp
 #[tokio::test]
 async fn hosted_source_sweep_retries_failed_objects_without_holding_up_later_batches() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(InterruptAcceptance {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        interrupt: AtomicU8::new(0),
-    });
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
     let service = catalog();
     let scope = sanctum_core::Scope {
@@ -5266,10 +5286,7 @@ async fn hosted_database_sessions_pin_a_scope_and_generation_across_instances() 
 #[tokio::test]
 async fn maintenance_recovers_hosted_collection_creation_without_a_client_retry() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(InterruptAcceptance {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        interrupt: AtomicU8::new(0),
-    });
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let prefix = Key::parse("managed").unwrap();
     let make_catalog = || HostedCatalog::new(storage.clone(), Some(prefix.clone()), 1024).unwrap();
     let executor =
@@ -5740,10 +5757,7 @@ async fn hosted_expiration_settles_pending_stages_and_preserves_committed_text()
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(InterruptAcceptance {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        interrupt: AtomicU8::new(0),
-    });
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let dispatch = Arc::new(TestDispatch {
         fail: AtomicU8::new(0),
         delivered: std::sync::Mutex::new(Vec::new()),
@@ -6020,10 +6034,7 @@ async fn upload_sweep_fences_an_in_flight_acceptance_before_reclaiming() {
     use std::time::{Duration, SystemTime};
 
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(InterruptAcceptance {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        interrupt: AtomicU8::new(3),
-    });
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 3));
     let dispatch = Arc::new(TestDispatch {
         fail: AtomicU8::new(0),
         delivered: std::sync::Mutex::new(Vec::new()),
@@ -6145,10 +6156,7 @@ async fn upload_sweep_fences_an_in_flight_acceptance_before_reclaiming() {
 #[tokio::test]
 async fn hosted_submissions_recover_from_interrupted_acceptance() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(InterruptAcceptance {
-        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
-        interrupt: AtomicU8::new(0),
-    });
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let catalog = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
     let mut server = start(catalog.clone()).await;
     let scope = v1::Scope {
@@ -6251,6 +6259,17 @@ impl Drop for InterruptedRead<'_> {
 struct InterruptAcceptance {
     inner: sanctum_storage_fs::FileStorage,
     interrupt: AtomicU8,
+    catalog_reads: AtomicUsize,
+}
+
+impl InterruptAcceptance {
+    fn new(path: &std::path::Path, interrupt: u8) -> Self {
+        Self {
+            inner: sanctum_storage_fs::FileStorage::open(path).unwrap(),
+            interrupt: AtomicU8::new(interrupt),
+            catalog_reads: AtomicUsize::new(0),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -6260,6 +6279,9 @@ impl Storage for InterruptAcceptance {
     }
 
     async fn get(&self, key: &Key) -> StorageResult<Download> {
+        if key.as_str().ends_with("/catalog/HEAD.json") {
+            self.catalog_reads.fetch_add(1, Ordering::Relaxed);
+        }
         if self.interrupt.load(Ordering::Relaxed) == REJECT_ORIGINAL_READ
             && key.as_str().contains("/inputs/")
         {

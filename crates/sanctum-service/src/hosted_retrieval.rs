@@ -45,19 +45,18 @@ impl HostedCatalog {
         mode: SearchMode,
     ) -> Result<SearchResult> {
         let start = Instant::now();
-        let prepared = self
-            .prepare_hosted_query(
-                std::slice::from_ref(&scope),
-                query,
-                limit,
-                filter.as_ref(),
-                mode,
-            )
+        let mut prepared = self.validate_search(&query, limit, filter.as_ref())?;
+        let scopes = std::slice::from_ref(&scope);
+        let metadata = self
+            .search_catalog(&scope.tenant, scopes, filter.as_ref())
+            .await?
+            .pop()
+            .expect("catalog metadata was resolved for one collection");
+        self.prepare_hosted_vector(scopes, query, mode, &mut prepared)
             .await?;
         let profile = prepared.profile.clone();
-        let metadata = self.search_metadata(&scope, filter.as_ref()).await?;
         let ((coverage, ranked), generation) = self
-            .with_collection(&scope, move |database| {
+            .read_collection_snapshot(&scope, move |database| {
                 let coverage = database.embedding_coverage(prepared.profile.as_deref())?;
                 let (actual_mode, degraded) = match prepared.strategy(mode, coverage) {
                     Ok(strategy) => strategy,
@@ -160,19 +159,21 @@ impl HostedCatalog {
     ) -> Result<CollectionSearchResult> {
         let start = Instant::now();
         let scopes = collection_scopes(tenant.clone(), collections)?;
-        let prepared = self
-            .prepare_hosted_query(&scopes, query, limit, filter.as_ref(), requested)
+        let mut prepared = self.validate_search(&query, limit, filter.as_ref())?;
+        let catalog = self
+            .search_catalog(&tenant, &scopes, filter.as_ref())
+            .await?;
+        self.prepare_hosted_vector(&scopes, query, requested, &mut prepared)
             .await?;
         let candidate_limit = candidate_budget(limit);
         let filter = filter.map(Arc::new);
         let mut all = Vec::with_capacity(scopes.len());
         let mut coverage = Coverage::default();
-        for scope in scopes {
-            let metadata = self.search_metadata(&scope, filter.as_deref()).await?;
+        for (scope, metadata) in scopes.into_iter().zip(catalog) {
             let filter = filter.clone();
             let query = prepared.clone();
             let ((ranked, current), generation) = self
-                .with_collection(&scope, move |database| {
+                .read_collection_snapshot(&scope, move |database| {
                     let (ranked, current) = rank_collection(
                         database,
                         &query,
@@ -247,19 +248,27 @@ impl HostedCatalog {
         })
     }
 
-    async fn prepare_hosted_query(
+    fn validate_search(
         &self,
-        scopes: &[Scope],
-        query: String,
+        query: &str,
         limit: u32,
         filter: Option<&Filter>,
-        mode: SearchMode,
     ) -> Result<PreparedQuery> {
-        let mut prepared =
-            PreparedQuery::new(&query, limit, self.embedding_profile().map(str::to_owned))?;
+        let prepared =
+            PreparedQuery::new(query, limit, self.embedding_profile().map(str::to_owned))?;
         if let Some(filter) = filter {
             filter.validate()?;
         }
+        Ok(prepared)
+    }
+
+    async fn prepare_hosted_vector(
+        &self,
+        scopes: &[Scope],
+        query: String,
+        mode: SearchMode,
+        prepared: &mut PreparedQuery,
+    ) -> Result<()> {
         if mode != SearchMode::Lexical {
             if let Some(provider) = &self.embedding {
                 let profile = provider.profile_id().to_owned();
@@ -267,7 +276,7 @@ impl HostedCatalog {
                 for scope in scopes {
                     let profile = profile.clone();
                     let (has_embeddings, _) = self
-                        .with_collection(scope, move |db| db.has_embeddings(&profile))
+                        .read_collection_snapshot(scope, move |db| db.has_embeddings(&profile))
                         .await?;
                     if has_embeddings {
                         available = true;
@@ -296,25 +305,37 @@ impl HostedCatalog {
                 prepared.degraded = Some("embedding_disabled");
             }
         }
-        Ok(prepared)
+        Ok(())
     }
 
-    async fn search_metadata(
+    async fn search_catalog(
         &self,
-        scope: &Scope,
+        tenant: &ScopeId,
+        scopes: &[Scope],
         filter: Option<&Filter>,
-    ) -> Result<Vec<db::metadata::Entry>> {
-        if filter.is_some_and(Filter::uses_collection_metadata) {
-            self.with_catalog(scope, |path, collection| {
-                db::metadata::read_catalog_metadata(path, &collection)
-            })
-            .await
-        } else {
-            Ok(Vec::new())
-        }
+    ) -> Result<Vec<Vec<db::metadata::Entry>>> {
+        let ids = scopes
+            .iter()
+            .map(|scope| scope.collection.to_string())
+            .collect::<Vec<_>>();
+        let include_metadata = filter.is_some_and(Filter::uses_collection_metadata);
+        self.with_tenant_catalog(tenant, move |path| {
+            db::metadata::read_search_catalog(path, &ids, include_metadata)
+        })
+        .await
     }
 
     pub(crate) async fn with_collection<T: Send + 'static>(
+        &self,
+        scope: &Scope,
+        read: impl FnOnce(&db::CollectionDb) -> Result<T> + Send + 'static,
+    ) -> Result<(T, Uuid)> {
+        self.require_collection(scope).await?;
+        self.read_collection_snapshot(scope, read).await
+    }
+
+    // The caller has resolved collection membership against the tenant catalog.
+    async fn read_collection_snapshot<T: Send + 'static>(
         &self,
         scope: &Scope,
         read: impl FnOnce(&db::CollectionDb) -> Result<T> + Send + 'static,
@@ -332,6 +353,7 @@ impl HostedCatalog {
         scope: &Scope,
         read: impl FnOnce(db::CollectionDb) -> Result<T> + Send + 'static,
     ) -> Result<(T, Uuid)> {
+        self.require_collection(scope).await?;
         let database = self.collection_snapshot(scope).await?;
         tokio::task::spawn_blocking(move || {
             let value = read(db::CollectionDb::open_read_only(database.path())?)?;
@@ -342,7 +364,6 @@ impl HostedCatalog {
     }
 
     async fn collection_snapshot(&self, scope: &Scope) -> Result<Arc<Materialized>> {
-        self.require_collection(scope).await?;
         let unit = Unit::collection(self.prefix.as_ref(), scope)?;
         self.snapshots
             .read(&self.publication, &unit)

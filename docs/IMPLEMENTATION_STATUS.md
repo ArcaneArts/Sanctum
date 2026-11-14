@@ -713,6 +713,16 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   returned the embedded collection, and restart preserved both results.
 - Delivered in [PR #36](https://github.com/ArcaneArts/Sanctum/pull/36).
 
+- Hosted searches resolve collection membership and collection metadata from
+  one tenant catalog generation per request. Collection databases are still
+  opened individually. The gRPC regression verifies one catalog manifest read
+  and one provider query with and without a collection-level filter.
+- Standalone API and worker processes backed by live MinIO searched across
+  three collections. A local HTTP proxy observed one catalog manifest read
+  on each of two requests. Both returned the exact UTF-8 excerpts from the
+  two collections that matched the filter. The hosted MCP smoke also passed.
+  [PR #144](https://github.com/ArcaneArts/Sanctum/pull/144).
+
 ## Hosted embedding profile rebuilds
 
 - Scheduled discovery detects a changed server profile and scans object
