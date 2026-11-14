@@ -1,10 +1,11 @@
 use std::{
+    io,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
 use bytes::{Buf, Bytes, BytesMut};
-use futures::TryStreamExt;
+use futures::{TryStreamExt, stream};
 
 #[cfg(test)]
 mod tests;
@@ -27,6 +28,7 @@ const CLOUD_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write
 const PART_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_UPLOAD_RETRIES: u32 = 4;
 const MAX_DOWNLOAD_ATTEMPTS: u32 = 4;
+const MAX_DOWNLOAD_RESUMES: u32 = 4;
 
 #[async_trait::async_trait]
 trait Credential: Send + Sync {
@@ -62,6 +64,7 @@ impl Credential for ApplicationCredentials {
     }
 }
 
+#[derive(Clone)]
 pub struct GcsStorage {
     bucket: String,
     endpoint: Url,
@@ -409,7 +412,7 @@ impl Storage for GcsStorage {
                 .media(key, None, object.version.generation.as_deref())
                 .await
             {
-                Ok(response) => return download(object, response),
+                Ok(response) => return self.download(object, response),
                 Err(Error::Conflict(_) | Error::NotFound(_)) => {
                     if attempt < MAX_DOWNLOAD_ATTEMPTS {
                         tokio::time::sleep(Duration::from_millis(10 << (attempt - 1))).await;
@@ -426,15 +429,7 @@ impl Storage for GcsStorage {
     async fn read_range(&self, key: &Key, range: ByteRange) -> Result<Bytes> {
         let size = range_len(range)?;
         let response = self.media(key, Some(range), None).await?;
-        let expected = format!("bytes {}-{}", range.start, range.end - 1);
-        let valid_range = header_value(response.headers(), header::CONTENT_RANGE)
-            .and_then(|value| value.split_once('/'))
-            .is_some_and(|(actual, total)| {
-                actual == expected && total.parse::<u64>().is_ok_and(|total| total >= range.end)
-            });
-        if !valid_range {
-            return Err(invalid_response("GCS returned a different byte range"));
-        }
+        response_range(&response, range)?;
         let mut result = BytesMut::with_capacity(size);
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.try_next().await.map_err(transfer_error)? {
@@ -537,20 +532,126 @@ impl Storage for GcsStorage {
     }
 }
 
-fn download(object: Object, response: Response) -> Result<Download> {
+impl GcsStorage {
+    fn download(&self, object: Object, response: Response) -> Result<Download> {
+        check_download_length(&response, object.length)?;
+        let generation = object.version.generation.clone().ok_or_else(|| {
+            invalid_response("GCS download metadata omitted its object generation")
+        })?;
+        let download = ResumableDownload {
+            storage: self.clone(),
+            key: object.key.clone(),
+            generation,
+            length: object.length,
+            response,
+            offset: 0,
+        };
+        let stream = stream::try_unfold(download, |mut download| async move {
+            let chunk = download.next_chunk().await.map_err(|error| match error {
+                Error::Io(error) => error,
+                error => io::Error::other(error),
+            })?;
+            Ok::<_, io::Error>(chunk.map(|bytes| (bytes, download)))
+        });
+        Ok(Download {
+            object,
+            reader: Box::pin(StreamReader::new(Box::pin(stream))),
+        })
+    }
+}
+
+struct ResumableDownload {
+    storage: GcsStorage,
+    key: Key,
+    generation: String,
+    length: u64,
+    response: Response,
+    offset: u64,
+}
+
+impl ResumableDownload {
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
+        let mut retries = 0;
+        loop {
+            match self.response.chunk().await {
+                Ok(Some(chunk)) if chunk.is_empty() => continue,
+                Ok(Some(chunk)) => {
+                    if chunk.len() as u64 > self.length - self.offset {
+                        return Err(invalid_response("GCS returned more bytes than expected"));
+                    }
+                    self.offset += chunk.len() as u64;
+                    return Ok(Some(chunk));
+                }
+                Ok(None) if self.offset == self.length => return Ok(None),
+                Err(error) if self.offset == self.length => {
+                    return Err(transfer_error(error));
+                }
+                Ok(None) | Err(_) => self.resume(&mut retries).await?,
+            }
+        }
+    }
+
+    async fn resume(&mut self, retries: &mut u32) -> Result<()> {
+        let range = ByteRange {
+            start: self.offset,
+            end: self.length,
+        };
+        while *retries < MAX_DOWNLOAD_RESUMES {
+            tokio::time::sleep(Duration::from_millis(100 << *retries)).await;
+            *retries += 1;
+            match self
+                .storage
+                .media(&self.key, Some(range), Some(&self.generation))
+                .await
+            {
+                Ok(response) => {
+                    let total = response_range(&response, range)?;
+                    if total != self.length {
+                        return Err(invalid_response(
+                            "GCS resumed a download with a different object length",
+                        ));
+                    }
+                    check_download_length(&response, range.end - range.start)?;
+                    tracing::debug!(
+                        event = "gcs_download_resume",
+                        offset = self.offset,
+                        object_bytes = self.length,
+                        attempt = *retries,
+                        "resumed a GCS object download"
+                    );
+                    self.response = response;
+                    return Ok(());
+                }
+                Err(Error::Busy(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::Busy(
+            "GCS download stalled before reaching its expected length".into(),
+        ))
+    }
+}
+
+fn check_download_length(response: &Response, expected: u64) -> Result<()> {
     if response
         .content_length()
-        .is_some_and(|length| length != object.length)
+        .is_some_and(|length| length != expected)
     {
         return Err(invalid_response(
             "GCS download length differs from its metadata",
         ));
     }
-    let reader = StreamReader::new(response.bytes_stream().map_err(std::io::Error::other));
-    Ok(Download {
-        object,
-        reader: Box::pin(reader),
-    })
+    Ok(())
+}
+
+fn response_range(response: &Response, range: ByteRange) -> Result<u64> {
+    let expected = format!("bytes {}-{}", range.start, range.end - 1);
+    header_value(response.headers(), header::CONTENT_RANGE)
+        .and_then(|value| value.split_once('/'))
+        .filter(|(actual, _)| *actual == expected)
+        .and_then(|(_, total)| total.parse::<u64>().ok())
+        .filter(|total| *total >= range.end)
+        .ok_or_else(|| invalid_response("GCS returned a different byte range"))
 }
 
 #[derive(Deserialize)]

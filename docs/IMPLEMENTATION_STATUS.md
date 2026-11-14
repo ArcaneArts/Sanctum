@@ -43,9 +43,10 @@ which parts have working implementations and where to find the evidence.
   [Hosted acceptance runbook](CLOUD_RUN.md#verify-a-deployment).
 - **Capacity.** The recorded workloads cover 200 MiB UTF-8 and RTF sources, a 2.34 GiB
   collection, 10,000 mostly idle MinIO tenants, concurrent active
-  collections, and real embeddings. Two simultaneous cold 2 GiB snapshot
-  reads exceeded ten seconds in every MinIO sample. The Cloud Run run
-  must measure transfer, database opens, warm reuse, and memory before
+  collections, and real embeddings. On Linux ARM64 with MinIO, concurrent
+  cold gRPC searches against two 2 GiB snapshots took 5.96–6.40 s and
+  reached 4.55 GiB of cgroup memory. Cloud Run still needs its own
+  transfer, database open, warm reuse, and memory measurements before
   setting production limits. [Benchmark results](CAPACITY.md).
 
 The sections below record individual delivery slices. Later measurements
@@ -1623,3 +1624,15 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   and peak memory was 4.52 GiB. The Cloud Run benchmark still needs the
   authorized deployment.
   [Timings and memory](CAPACITY.md#concurrent-grpc-search-on-2-gib-fts-snapshots).
+
+## GCS downloads interrupted after streaming starts
+
+- A full read resumes at the next byte within the original object generation.
+  The adapter checks the complete expected interval and length for each
+  resumed request and bounds attempts that make no progress.
+- The loopback JSON API interrupted a response after the reader received
+  its first bytes, rejected the first retry, and truncated the next
+  response. The final stream matched the fixture byte for byte. Separate
+  cases checked replacement, a different total length, and stalled
+  transfers. The live GCS bucket contract still needs authorized ADC.
+  [GCS adapter](STORAGE.md#google-cloud-storage-adapter).
