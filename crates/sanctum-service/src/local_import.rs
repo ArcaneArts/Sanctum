@@ -1,16 +1,75 @@
 use std::{
+    collections::HashSet,
     fs::{self, File},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use sanctum_core::{Error, ExternalSource, GitProvenance, Result, Scope, UrlProvenance, is_rtf};
+use sanctum_core::{
+    Error, ExternalSource, GitProvenance, Result, Scope, ScopeId, UrlProvenance, is_rtf,
+};
 use sanctum_db_sqlite::{CollectionDb, SourceIdentity};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::{Service, StagedUpload, TextUpload, local_jobs::new_job};
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub(crate) enum ImportTarget {
+    Local(String),
+    Git(String),
+    Url(String),
+}
+
+type ImportKey = (ScopeId, ScopeId, ImportTarget);
+
+#[derive(Clone, Default)]
+pub(crate) struct ActiveImports(Arc<Mutex<HashSet<ImportKey>>>);
+
+pub(crate) struct ActiveImport {
+    imports: ActiveImports,
+    key: ImportKey,
+}
+
+impl ActiveImports {
+    pub(crate) fn begin(&self, scope: &Scope, target: ImportTarget) -> Result<ActiveImport> {
+        let key = (scope.tenant.clone(), scope.collection.clone(), target);
+        let mut imports = self
+            .0
+            .lock()
+            .map_err(|_| Error::Busy("import coordinator is unavailable".into()))?;
+        if !imports.insert(key.clone()) {
+            return Err(Error::Busy(
+                match key.2 {
+                    ImportTarget::Local(_) => {
+                        "this path is already being imported into the collection"
+                    }
+                    ImportTarget::Git(_) => {
+                        "this repository and ref are already being imported into the collection"
+                    }
+                    ImportTarget::Url(_) => {
+                        "this URL is already being imported into the collection"
+                    }
+                }
+                .into(),
+            ));
+        }
+        Ok(ActiveImport {
+            imports: self.clone(),
+            key,
+        })
+    }
+}
+
+impl Drop for ActiveImport {
+    fn drop(&mut self) {
+        if let Ok(mut imports) = self.imports.0.lock() {
+            imports.remove(&self.key);
+        }
+    }
+}
 
 #[derive(Default, serde::Deserialize, serde::Serialize)]
 pub struct ImportOptions {
@@ -156,6 +215,9 @@ impl Service {
             "local-fs:{}",
             blake3::hash(root.as_os_str().as_encoded_bytes()).to_hex(),
         );
+        let _active = self
+            .imports
+            .begin(scope, ImportTarget::Local(namespace.clone()))?;
         let base = if file_type.is_dir() {
             root.as_path()
         } else {
@@ -726,6 +788,54 @@ pub(crate) fn default_text(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_imports_share_the_canonical_root_guard_until_the_scan_exits() {
+        let store = tempfile::tempdir().unwrap();
+        let input = tempfile::tempdir().unwrap();
+        let service = Service::open(store.path(), 1024).unwrap();
+        let scope = Scope {
+            tenant: "default".parse().unwrap(),
+            collection: "notes".parse().unwrap(),
+        };
+        let other = Scope {
+            collection: "archive".parse().unwrap(),
+            ..scope.clone()
+        };
+        service.create_collection(&scope).unwrap();
+        service.create_collection(&other).unwrap();
+        fs::write(input.path().join("note.txt"), "first version").unwrap();
+
+        let alias = input.path().join(".");
+        let options = ImportOptions::default();
+        let mut operation = None;
+        service
+            .import_local(&scope, input.path(), &options, |event| {
+                assert!(matches!(event.state, ImportState::Queued));
+                operation = event.operation;
+                assert!(matches!(
+                    service.import_local(&scope, &alias, &options, |_| panic!("overlapping scan")),
+                    Err(Error::Busy(_))
+                ));
+                service
+                    .import_local(&other, &alias, &options, |event| {
+                        assert!(matches!(event.state, ImportState::Queued));
+                        assert_ne!(event.operation, operation);
+                        true
+                    })
+                    .unwrap();
+                false
+            })
+            .unwrap();
+        assert!(operation.is_some());
+        service
+            .import_local(&scope, &alias, &options, |event| {
+                assert!(matches!(event.state, ImportState::Pending));
+                assert_eq!(event.operation, operation);
+                true
+            })
+            .unwrap();
+    }
 
     #[test]
     fn stopping_a_local_import_drops_its_partially_copied_file() {
