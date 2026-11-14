@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::{
     Change, HostedCatalog, MetadataEntry, MetadataMutation, RevisionTarget,
     db::{CollectionDb, metadata},
+    hosted_retrieval::query_snapshot,
     metadata_filter::Level,
     metadata_query,
 };
@@ -116,9 +117,34 @@ impl HostedCatalog {
     }
 
     pub async fn changes(&self, scope: &Scope, after: u64, limit: u32) -> Result<Vec<Change>> {
-        super::validate_change_limit(limit)?;
-        self.with_collection(scope, move |database| database.changes(after, limit))
+        self.poll_changes(scope, after, limit, None)
             .await
             .map(|(changes, _)| changes)
+    }
+
+    /// A stream caught up to a generation can skip querying it again.
+    pub async fn poll_changes(
+        &self,
+        scope: &Scope,
+        after: u64,
+        limit: u32,
+        caught_up_to: Option<Uuid>,
+    ) -> Result<(Vec<Change>, Uuid)> {
+        super::validate_change_limit(limit)?;
+        self.require_collection(scope).await?;
+        let unit = Unit::collection(self.prefix.as_ref(), scope)?;
+        let generation = self
+            .publication
+            .generation(&unit)
+            .await?
+            .ok_or_else(|| Error::NotFound("collection database was not found".into()))?;
+        if caught_up_to == Some(generation.id) {
+            return Ok((Vec::new(), generation.id));
+        }
+        let snapshot = self
+            .snapshots
+            .read_generation(&self.publication, &unit, generation)
+            .await?;
+        query_snapshot(snapshot, move |database| database.changes(after, limit)).await
     }
 }
