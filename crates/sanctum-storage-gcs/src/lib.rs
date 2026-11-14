@@ -29,6 +29,9 @@ const PART_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_UPLOAD_RETRIES: u32 = 4;
 const MAX_DOWNLOAD_ATTEMPTS: u32 = 4;
 const MAX_DOWNLOAD_RESUMES: u32 = 4;
+const MAX_RANGE_ATTEMPTS: u32 = 3;
+const RANGE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const RANGE_DEADLINE: Duration = Duration::from_secs(15);
 
 #[async_trait::async_trait]
 trait Credential: Send + Sync {
@@ -166,6 +169,8 @@ impl GcsStorage {
         if response.status() != expected {
             return Err(if response.status().is_success() {
                 invalid_response("GCS returned an unexpected status for the requested byte range")
+            } else if response.status() == StatusCode::REQUEST_TIMEOUT {
+                Error::Busy("GCS download request timed out".into())
             } else {
                 http_error(response.status())
             });
@@ -181,6 +186,35 @@ impl GcsStorage {
             ));
         }
         Ok(response)
+    }
+
+    async fn read_exact_range(
+        &self,
+        key: &Key,
+        range: ByteRange,
+        size: usize,
+        transferred: &mut usize,
+    ) -> Result<Bytes> {
+        let response = self.media(key, Some(range), None).await?;
+        response_range(&response, range)?;
+        check_download_length(&response, size as u64)?;
+        let mut result = BytesMut::with_capacity(size);
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .map_err(|_| Error::Busy("GCS byte range response was interrupted".into()))?
+        {
+            *transferred += chunk.len();
+            if chunk.len() > size - result.len() {
+                return Err(invalid_response("GCS returned more bytes than requested"));
+            }
+            result.extend_from_slice(&chunk);
+        }
+        if result.len() != size {
+            return Err(invalid_response("GCS returned fewer bytes than requested"));
+        }
+        Ok(result.freeze())
     }
 
     async fn write_small(&self, key: &Key, bytes: Bytes, generation: &str) -> Result<Version> {
@@ -428,25 +462,37 @@ impl Storage for GcsStorage {
 
     async fn read_range(&self, key: &Key, range: ByteRange) -> Result<Bytes> {
         let size = range_len(range)?;
-        let response = self.media(key, Some(range), None).await?;
-        response_range(&response, range)?;
-        let mut result = BytesMut::with_capacity(size);
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.try_next().await.map_err(transfer_error)? {
-            if chunk.len() > size - result.len() {
-                return Err(invalid_response("GCS returned more bytes than requested"));
+        let mut transferred = 0;
+        let (result, attempts) = tokio::time::timeout(RANGE_DEADLINE, async {
+            let mut attempt = 1;
+            loop {
+                let result = tokio::time::timeout(
+                    RANGE_ATTEMPT_TIMEOUT,
+                    self.read_exact_range(key, range, size, &mut transferred),
+                )
+                .await
+                .unwrap_or_else(|_| Err(Error::Busy("GCS byte range attempt timed out".into())));
+                match result {
+                    Ok(bytes) => return Ok((bytes, attempt)),
+                    Err(Error::Busy(_)) if attempt < MAX_RANGE_ATTEMPTS => {
+                        // Nothing from a failed response has left the adapter.
+                        // Replay the exact requested range, discarding partial bytes.
+                        tokio::time::sleep(Duration::from_millis(100 << (attempt - 1))).await;
+                        attempt += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-            result.extend_from_slice(&chunk);
-        }
-        if result.len() != size {
-            return Err(invalid_response("GCS returned fewer bytes than requested"));
-        }
+        })
+        .await
+        .map_err(|_| Error::Busy("GCS byte range read exceeded its deadline".into()))??;
         tracing::debug!(
             requested_bytes = size,
-            transferred_bytes = result.len(),
+            transferred_bytes = transferred,
+            attempts,
             "GCS range read"
         );
-        Ok(result.freeze())
+        Ok(result)
     }
 
     async fn put_stream(&self, key: &Key, mut reader: Reader, length: u64) -> Result<Version> {
