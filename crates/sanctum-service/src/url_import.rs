@@ -1,10 +1,11 @@
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{
     Client, StatusCode, Url,
-    header::{self, HeaderMap, HeaderName},
+    header::{self, HeaderMap, HeaderName, HeaderValue},
 };
-use sanctum_core::{Error, ExternalSource, Result, Scope, UrlProvenance, is_rtf};
+use sanctum_core::{Error, ExternalSource, ImportCredential, Result, Scope, UrlProvenance, is_rtf};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
@@ -18,7 +19,7 @@ const MAX_URL_BYTES: usize = 4096;
 #[derive(Clone)]
 pub(crate) struct UrlImporter {
     client: Client,
-    origins: Option<Arc<HashMap<String, Option<String>>>>,
+    origins: Option<Arc<HashMap<String, Option<ImportCredential>>>>,
 }
 
 impl UrlImporter {
@@ -37,27 +38,44 @@ impl UrlImporter {
         })
     }
 
-    fn token_env(&self, url: &Url) -> Result<Option<&str>> {
+    fn credential(&self, url: &Url) -> Result<Option<&ImportCredential>> {
         match &self.origins {
             None => Ok(None),
             Some(origins) => origins
                 .get(&url.origin().ascii_serialization())
-                .map(Option::as_deref)
+                .map(Option::as_ref)
                 .ok_or_else(|| Error::Invalid("URL import origin is not allowed".into())),
         }
     }
 
-    pub(crate) fn token(&self, url: &Url) -> Result<Option<String>> {
-        self.token_env(url)?
-            .map(|env| {
-                std::env::var(env)
-                    .ok()
-                    .filter(|token| !token.is_empty())
-                    .ok_or_else(|| {
-                        Error::Invalid("configured import credential is unavailable".into())
-                    })
-            })
-            .transpose()
+    pub(crate) fn authorization(&self, url: &Url) -> Result<Option<String>> {
+        let Some(credential) = self.credential(url)? else {
+            return Ok(None);
+        };
+        let secret = std::env::var(secret_env(credential))
+            .ok()
+            .filter(|secret| !secret.is_empty())
+            .ok_or_else(|| Error::Invalid("configured import credential is unavailable".into()))?;
+        if secret.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(Error::Invalid(
+                "configured import credential contains a control character".into(),
+            ));
+        }
+        let value = match credential {
+            ImportCredential::Bearer(_) => {
+                if !secret.is_ascii() {
+                    return Err(Error::Invalid(
+                        "configured bearer token must be ASCII".into(),
+                    ));
+                }
+                format!("Bearer {secret}")
+            }
+            ImportCredential::Basic(config) => {
+                let value = format!("{}:{secret}", config.username);
+                format!("Basic {}", STANDARD.encode(value))
+            }
+        };
+        Ok(Some(value))
     }
 
     async fn get(&self, requested: &Url) -> Result<reqwest::Response> {
@@ -67,8 +85,12 @@ impl UrlImporter {
                 .client
                 .get(url.clone())
                 .header(header::ACCEPT_ENCODING, "identity");
-            if let Some(token) = self.token(&url)? {
-                request = request.bearer_auth(token);
+            if let Some(authorization) = self.authorization(&url)? {
+                let mut value = HeaderValue::from_str(&authorization).map_err(|_| {
+                    Error::Invalid("configured import credential is not a valid HTTP header".into())
+                })?;
+                value.set_sensitive(true);
+                request = request.header(header::AUTHORIZATION, value);
             }
             let response = request.send().await.map_err(request_error)?;
             let status = response.status();
@@ -118,11 +140,11 @@ impl Service {
     /// Credentials are chosen by the operator for an exact HTTPS origin.
     pub fn with_url_origins(
         mut self,
-        origins: Option<HashMap<String, Option<String>>>,
+        origins: Option<HashMap<String, Option<ImportCredential>>>,
     ) -> Result<Self> {
         if let Some(origins) = origins {
             let mut normalized = HashMap::new();
-            for (origin, env) in origins {
+            for (origin, credential) in origins {
                 let url = parse_url(&origin)?;
                 if url.path() != "/" || url.query().is_some() || origin.contains('#') {
                     return Err(Error::Invalid(
@@ -130,17 +152,11 @@ impl Service {
                             .into(),
                     ));
                 }
-                if env.as_ref().is_some_and(|env| {
-                    url.scheme() != "https"
-                        || env.is_empty()
-                        || !env
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                }) {
-                    return Err(Error::Invalid("URL import credentials require an HTTPS origin and an environment variable name".into()));
+                if let Some(credential) = &credential {
+                    validate_credential(&url, credential)?;
                 }
                 if normalized
-                    .insert(url.origin().ascii_serialization(), env)
+                    .insert(url.origin().ascii_serialization(), credential)
                     .is_some()
                 {
                     return Err(Error::Invalid("duplicate URL import origin".into()));
@@ -237,6 +253,40 @@ impl Service {
         .map_err(task_error)??;
         Ok((event, provenance))
     }
+}
+
+fn secret_env(credential: &ImportCredential) -> &str {
+    match credential {
+        ImportCredential::Bearer(env) => env,
+        ImportCredential::Basic(config) => &config.password_env,
+    }
+}
+
+fn validate_credential(url: &Url, credential: &ImportCredential) -> Result<()> {
+    let env = secret_env(credential);
+    if url.scheme() != "https"
+        || env.is_empty()
+        || !env
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(Error::Invalid(
+            "import credentials require an HTTPS origin and an environment variable name".into(),
+        ));
+    }
+    if let ImportCredential::Basic(config) = credential
+        && (config.username.is_empty()
+            || config
+                .username
+                .bytes()
+                .any(|byte| byte == b':' || byte.is_ascii_control()))
+    {
+        return Err(Error::Invalid(
+            "basic import credentials require a username without colons or control characters"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_url(input: &str) -> Result<Url> {

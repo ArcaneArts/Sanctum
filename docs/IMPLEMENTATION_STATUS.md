@@ -341,7 +341,8 @@ Merged in [PR #20](https://github.com/ArcaneArts/Sanctum/pull/20).
   tenant scope, exclusion of worktree edits, unchanged input, replacements,
   size failures, and explicit pruning. A standalone CLI smoke test fetched
   and indexed the public Sanctum README over HTTPS and reused its revision
-  on a second fetch. Authenticated private Git retrieval remains unverified.
+  on a second fetch. The [private HTTPS check](#authenticated-git-over-https)
+  exercises operator-supplied credentials through a real Git backend.
 
 ## Resumable changes and Python gRPC client
 
@@ -1516,3 +1517,18 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   the fix and verified empty lists and a missing collection before commit, then
   a visible collection after commit. A committed schema with a damaged table
   still reports the database error. `pnpm check` passed.
+
+## Authenticated Git over HTTPS
+
+- Exact-origin import configuration accepts an HTTP Basic username and an
+  environment variable for the password or token alongside the existing
+  bearer configuration. Git passes the Authorization header through the
+  child environment. A private CA bundle can be supplied through
+  `GIT_SSL_CAINFO`.
+- The standalone check runs Git's smart HTTP backend over TLS. It exercises
+  authenticated upload-pack discovery and fetch, exact MCP retrieval,
+  unchanged re-import, replacement after a new commit, rejection without a
+  credential, and rejection of redirects, unlisted origins, and an
+  untrusted certificate. The check passed on macOS ARM64 and Debian
+  ARM64. `pnpm check` passed.
+  [Configuration and reproduction](LOCAL_API.md#git-imports).

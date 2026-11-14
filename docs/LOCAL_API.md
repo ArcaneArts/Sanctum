@@ -622,11 +622,13 @@ provenance, so keep secrets out of their query strings.
 Set `url_import_origins` in `SANCTUM_CONFIG_JSON` to restrict requests to
 exact scheme, host, and port combinations. A null value permits that origin
 without credentials. For an HTTPS origin, a string names a server environment
-variable holding a bearer token. The server looks up a credential separately
-for each destination, including redirects. An empty object disables URL
-imports. An omitted field allows HTTP(S) destinations for the trusted local
-operator. Use network egress controls as well when an origin's DNS or service
-is outside the operator's control.
+variable holding a bearer token. An object with `username` and
+`password_env` uses HTTP Basic authentication, where the named environment
+variable holds the password or token. The server looks up a credential
+separately for each destination, including URL redirects. An empty object
+disables remote imports. An omitted field allows HTTP(S) destinations for
+the trusted local operator. Use network egress controls as well when an
+origin's DNS or service is outside the operator's control.
 
 ```json
 {
@@ -634,7 +636,11 @@ is outside the operator's control.
   "storage_root": "./local-data",
   "url_import_origins": {
     "https://example.org": null,
-    "https://docs.example.org": "SANCTUM_DOCS_TOKEN"
+    "https://docs.example.org": "SANCTUM_DOCS_TOKEN",
+    "https://git.example.org": {
+      "username": "sanctum-reader",
+      "password_env": "SANCTUM_GIT_TOKEN"
+    }
   }
 }
 ```
@@ -658,9 +664,15 @@ The adapter enumerates committed regular files and streams raw blobs to
 staging. It skips worktree changes, symbolic links, and submodule entries.
 It reads Git LFS pointer files as ordinary committed text. Fetching uses the
 configured HTTPS origin policy and credential from [URL imports](#url-imports).
-Git's configuration and credential helpers from the operator's home directory
-are bypassed, HTTPS redirects are disabled, and the adapter creates no checkout
-or hook directory.
+For private GitHub repositories, configure the GitHub username and use the
+name of a variable containing its personal access token for `password_env`.
+[GitHub HTTPS authentication](https://docs.github.com/en/get-started/git-basics/about-remote-repositories).
+
+The adapter bypasses the operator's Git configuration and credential helpers,
+disables HTTPS redirects, and creates no checkout or hook directory. For a
+Git host with a private CA, set `GIT_SSL_CAINFO` in the Sanctum server process
+to its CA certificate bundle. The fetch still verifies the certificate and
+hostname. [Git TLS configuration](https://git-scm.com/docs/git-config#Documentation/git-config.txt-httpsslCAInfo).
 
 The import stream reports each selected path, its commit and blob IDs, and
 the ingestion operation when one was accepted. A repository and ref define
@@ -673,6 +685,14 @@ An import reports selected paths missing from the new commit. Use
 `--prune-missing` to delete them and supersede their pending operations. Pruning
 runs after the tree is read successfully and all selected blobs are accepted.
 Includes and excludes use the same globs as local directory imports.
+
+The local HTTPS integration check uses a temporary Git repository and
+self-signed TLS fixture. It requires Python 3, Git, and OpenSSL.
+
+```sh
+cargo build --locked -p sanctum-server -p sanctum-cli
+python3 scripts/check-git-https.py
+```
 
 ### Structured metadata queries
 

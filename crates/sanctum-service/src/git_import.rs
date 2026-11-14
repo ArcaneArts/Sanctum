@@ -95,17 +95,15 @@ impl Service {
         let (path, revision) = match &repository {
             Repository::Local(path) => (path.as_path(), reference),
             Repository::Remote(url) => {
-                let token = self.url_importer.token(url)?;
-                if token
-                    .as_ref()
-                    .is_some_and(|token| token.bytes().any(|byte| byte.is_ascii_control()))
-                {
-                    return Err(Error::Invalid(
-                        "Git import credential contains a control character".into(),
-                    ));
-                }
+                let authorization = self.url_importer.authorization(url)?;
                 let dir = temporary.insert(tempfile::tempdir()?);
-                fetch(dir, url.as_str(), reference, token.as_deref(), &stopped)?;
+                fetch(
+                    dir,
+                    url.as_str(),
+                    reference,
+                    authorization.as_deref(),
+                    &stopped,
+                )?;
                 (dir.path(), "FETCH_HEAD")
             }
         };
@@ -308,7 +306,7 @@ fn fetch(
     dir: &TempDir,
     url: &str,
     reference: &str,
-    token: Option<&str>,
+    authorization: Option<&str>,
     stopped: &impl Fn() -> bool,
 ) -> Result<()> {
     let path = dir.path();
@@ -325,13 +323,16 @@ fn fetch(
     }
     let mut fetch = git(path);
     fetch.args(["-c", "protocol.https.allow=always"]);
-    if let Some(token) = token {
+    if let Some(ca) = std::env::var_os("GIT_SSL_CAINFO") {
+        fetch.env("GIT_SSL_CAINFO", ca);
+    }
+    if let Some(authorization) = authorization {
         // Keep the credential out of process arguments and repository config.
         fetch
             .args(["--config-env=http.extraHeader=SANCTUM_GIT_AUTHORIZATION"])
             .env(
                 "SANCTUM_GIT_AUTHORIZATION",
-                format!("Authorization: Bearer {token}"),
+                format!("Authorization: {authorization}"),
             );
     }
     let mut child = fetch
