@@ -591,6 +591,11 @@ Each unit lists up to 64 objects per page. Individual deletes have a
 two-second deadline. The sweep records rejected or timed-out deletes
 in `failed_deletions` and continues through the page. A later full
 scan revisits those objects. A lost writer lease ends the unit's pass.
+When a collection is retired between pages, the sweep starts listing
+at the collection prefix after reader grace. It saves a separate
+continuation for that listing so operations, sources, and snapshots are
+all eligible for reclamation. Older checkpoints without a retirement flag
+also start at the collection prefix for retired collections.
 The maintenance response includes `recovered_creations` for creation intents
 resolved with a successful catalog outcome.
 
