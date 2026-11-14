@@ -112,6 +112,7 @@ impl CloudTasks {
     fn payload(&self, task: Task<'_>) -> Result<Value> {
         let (stage, step) = match task.stage {
             TaskStage::Register => ("register-upload", None),
+            TaskStage::Prepare => ("prepare-upload", None),
             TaskStage::Index => ("index-upload", None),
             TaskStage::Embed { step } => ("embed-upload", Some(step)),
             TaskStage::Rebuild { step } => ("rebuild-collection", Some(step)),
@@ -276,6 +277,18 @@ mod tests {
             .send_with_token(task(TaskStage::Register, 2), "fixture")
             .await
             .unwrap();
+
+        let prepare = dispatcher.payload(task(TaskStage::Prepare, 1)).unwrap();
+        let index = dispatcher.payload(task(TaskStage::Index, 1)).unwrap();
+        assert_eq!(
+            prepare["task"]["httpRequest"]["url"],
+            "https://sanctum-worker.example/internal/tasks/prepare-upload"
+        );
+        assert_ne!(prepare["task"]["name"], index["task"]["name"]);
+        assert_eq!(
+            prepare["task"]["httpRequest"]["body"],
+            index["task"]["httpRequest"]["body"]
+        );
 
         let scheduled = dispatcher
             .payload(Task {

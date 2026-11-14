@@ -249,8 +249,8 @@ arrives out of order.
 
 2. Using an identity with worker invocation permission and a token for
    `WORKER_URL`, POST the report's `tenant`, `collection`, and
-   `operation` as `operation_id` to `/internal/tasks/index-upload`
-   before registration.
+   `operation` as `operation_id` to `/internal/tasks/prepare-upload` or
+   `/internal/tasks/index-upload` before registration.
    Expect HTTP 503 and confirm the operation remains accepted. Then stop
    sending requests to both services. Check Cloud Monitoring's
    container instance count for both active and idle instances and
@@ -261,12 +261,12 @@ arrives out of order.
 3. Resume the queue and scheduled jobs. Refresh the caller ID token if
    necessary and run the check with the same operation and size using
    `--phase verify --wait-seconds 600`. Record Cloud Tasks and worker
-   request logs for registration and indexing, then check the operation
+   request logs for registration, preparation, and indexing, then check the operation
    and source references in the report. Confirm Scheduler separately by
    using `gcloud scheduler jobs run` on a dispatch job and observing
    the authenticated repair request and response in the worker logs.
    [Cloud Scheduler commands](https://docs.cloud.google.com/sdk/gcloud/reference/scheduler/jobs).
-4. POST the original registration and indexing task bodies again using
+4. POST the original registration, preparation, and indexing task bodies again using
    the authorized worker identity. Expect HTTP 204 and verify the same
    revision and database generation are returned by another
    `--phase verify` check. Save the relevant instance IDs and generation

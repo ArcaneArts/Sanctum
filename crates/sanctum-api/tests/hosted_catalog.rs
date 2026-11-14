@@ -1911,6 +1911,125 @@ async fn hosted_registration_replays_after_checkpoint_failure_and_orders_replace
 }
 
 #[tokio::test]
+async fn hosted_preparation_recovers_after_lost_response_without_rereading_rtf() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance {
+        inner: sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
+        interrupt: AtomicU8::new(0),
+    });
+    let dispatch = Arc::new(TestDispatch {
+        fail: AtomicU8::new(0),
+        delivered: std::sync::Mutex::new(Vec::new()),
+    });
+    let service = || {
+        HostedCatalog::new(storage.clone(), None, 1024)
+            .unwrap()
+            .with_dispatch(dispatch.clone())
+    };
+    let catalog = service();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let wire = v1::Scope {
+        tenant: "default".into(),
+        collection: "notes".into(),
+    };
+    catalog.create_collection(&scope, None).await.unwrap();
+    let mut server = start(catalog.clone()).await;
+    let id = uuid::Uuid::from_u128(200);
+    let header = v1::UploadTextHeader {
+        scope: Some(wire.clone()),
+        name: "prepared.rtf".into(),
+        request_id: Some(id.to_string()),
+        ..Default::default()
+    };
+    let rtf = br"{\rtf1\ansi durably prepared caf\'e9}";
+    let accepted = server
+        .client
+        .submit_text(upload_frames(&header, [rtf.as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(matches!(
+        catalog.prepare_upload(&scope, id).await,
+        Err(Error::Busy(_))
+    ));
+    catalog.register_upload(&scope, id).await.unwrap();
+    catalog.try_dispatch(&scope, id).await;
+    storage.interrupt.store(2, Ordering::Relaxed);
+    assert!(matches!(
+        catalog.prepare_upload(&scope, id).await,
+        Err(Error::Busy(_))
+    ));
+    server.stop().await;
+    drop(catalog);
+
+    let restarted = service();
+    let report = restarted.reconcile_shard(0).await.unwrap();
+    assert_eq!((report.dispatched, report.failed), (1, 0));
+    assert_eq!(
+        *dispatch.delivered.lock().unwrap(),
+        [
+            (id, TaskStage::Register, None),
+            (id, TaskStage::Prepare, None),
+            (id, TaskStage::Index, None),
+        ]
+    );
+    let mut server = start(restarted.clone()).await;
+    let query = || v1::SearchTextRequest {
+        scope: Some(wire.clone()),
+        query: "durably".into(),
+        ..Default::default()
+    };
+    assert!(
+        server
+            .client
+            .search_text(query())
+            .await
+            .unwrap()
+            .into_inner()
+            .hits
+            .is_empty()
+    );
+    storage
+        .interrupt
+        .store(REJECT_ORIGINAL_READ, Ordering::Relaxed);
+    assert!(matches!(
+        restarted.prepare_upload(&scope, id).await.unwrap().state,
+        sanctum_service::HostedJobState::Registered
+    ));
+    assert!(matches!(
+        restarted.index_upload(&scope, id).await.unwrap().state,
+        sanctum_service::HostedJobState::TextReady
+    ));
+    restarted.index_upload(&scope, id).await.unwrap();
+    let hits = server
+        .client
+        .search_text(query())
+        .await
+        .unwrap()
+        .into_inner()
+        .hits;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].excerpt, "durably prepared café");
+    assert_eq!(
+        hits[0].chunk.as_ref().unwrap().revision_id,
+        accepted.revision_id
+    );
+    let inputs = Key::parse(format!("default/collections/notes/operations/{id}/inputs")).unwrap();
+    assert!(
+        storage
+            .list(Some(&inputs), None, 10)
+            .await
+            .unwrap()
+            .objects
+            .is_empty()
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_indexing_publishes_searchable_text_and_fences_old_replacements() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(InterruptAcceptance {
@@ -2566,8 +2685,8 @@ async fn hosted_manual_retry_restores_a_dispatch_after_restart() {
         &[
             (TaskStage::Register, 0),
             (TaskStage::Register, 1),
-            (TaskStage::Index, 1),
-            (TaskStage::Index, 2),
+            (TaskStage::Prepare, 1),
+            (TaskStage::Prepare, 2),
         ]
     );
     restarted.index_upload(&scope, operation).await.unwrap();
@@ -2670,7 +2789,7 @@ async fn dispatch_reconciliation_recovers_a_failed_handoff_and_advances_its_curs
         &*dispatch.delivered.lock().unwrap(),
         &[
             (operation, TaskStage::Register, None),
-            (operation, TaskStage::Index, None)
+            (operation, TaskStage::Prepare, None)
         ]
     );
     restarted.index_upload(&scope, operation).await.unwrap();
@@ -4632,6 +4751,7 @@ async fn hosted_submissions_recover_from_interrupted_acceptance() {
 const BLOCK_SCAN_RANGE: u8 = 5;
 const SCAN_RANGE_BLOCKED: u8 = 6;
 const SCAN_RANGE_DROPPED: u8 = 7;
+const REJECT_ORIGINAL_READ: u8 = 8;
 
 struct InterruptedRead<'a>(&'a AtomicU8);
 
@@ -4653,6 +4773,11 @@ impl Storage for InterruptAcceptance {
     }
 
     async fn get(&self, key: &Key) -> StorageResult<Download> {
+        if self.interrupt.load(Ordering::Relaxed) == REJECT_ORIGINAL_READ
+            && key.as_str().contains("/inputs/")
+        {
+            return Err(Error::Busy("test blocked original input reads".into()));
+        }
         self.inner.get(key).await
     }
 

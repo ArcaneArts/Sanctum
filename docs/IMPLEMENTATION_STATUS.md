@@ -1326,3 +1326,24 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   4.3 MB of SQLite storage each. Cloud Run performance with simultaneous
   GiB-scale databases remains open.
   [Method and results](CAPACITY.md#concurrent-hosted-retrieval-with-real-embeddings).
+
+## Durable hosted source preparation
+
+- Cloud Tasks dispatches preparation and lexical publication as separate
+  steps. The preparation checkpoint stores the canonical source digest,
+  size, chunk count, and RTF object reference. A retry of lexical
+  publication can use this checkpoint on another instance. Registration,
+  cancellation, and publication retain their existing fencing and receipts.
+- `pnpm check` passed. The hosted regression test lost the preparation
+  checkpoint response, started a fresh service, and reconciled the indexing
+  task. Indexing then returned the exact canonical excerpt while reads of
+  the original RTF were blocked.
+- Local Cloud Run role processes and live MinIO processed an RTF source
+  and a 200 MiB text upload with a restart between preparation and indexing.
+  Out-of-order requests returned 503, and duplicate deliveries preserved
+  the final generation. The generated client and MCP returned the same
+  exact 3,652-byte text range. The 200 MiB preparation request took 1.86 s
+  and the indexing request took 6.31 s. The latter includes one canonical
+  download and one SQLite publication. Live Cloud Run and Cloud Tasks
+  timing remains open.
+  [Storage contract](STORAGE.md#hosted-lexical-publication).
