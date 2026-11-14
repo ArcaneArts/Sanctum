@@ -2386,6 +2386,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   refused task handoff after restart and fetched the exact extracted text.
   [Hosted uploads](STORAGE.md#hosted-uploads).
 
+## Profile rebuild checkpoints with lost responses
+
+- Hosted rebuild workers recover a lost checkpoint reply when the saved
+  record acknowledges the completed step in the same run. If the
+  checkpoint never committed, the step stays retryable and redelivery
+  reuses its SQLite receipt.
+- The filesystem regression interrupted a checkpoint before commit,
+  rejected an out-of-order step, and recovered lost replies from the
+  following progress and completion writes without republishing vectors.
+  The live MinIO and Ollama test verified HTTP 204 on both lost replies,
+  one document embedding request, no extra publication on replay, and
+  semantic retrieval under the new profile over gRPC.
+  [Hosted embedding batches](STORAGE.md#hosted-embedding-batches).
+
 ## Hosted stage checkpoints with lost responses
 
 - The worker reads the upload envelope after an ambiguous checkpoint

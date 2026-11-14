@@ -498,7 +498,11 @@ repair hint and rebuild record as scheduled discovery. Search gives
 each collection's enqueue attempt up to one second and can return its
 normal result if that attempt fails. Strict semantic search still
 requires compatible vectors. Workers rebuild each collection in bounded
-steps and ignore old run IDs. See the
+steps and ignore old run IDs. If storage loses the reply to a step's
+checkpoint write, the worker can acknowledge the delivery after reading a
+later or completed checkpoint for that same run and operation. If the
+checkpoint did not advance, redelivery can use the existing SQLite
+receipt without recomputing the batch. See the
 [Cloud Run schedule](CLOUD_RUN.md#schedule-dispatch-repair).
 
 ### Hosted source deletion and reclamation
