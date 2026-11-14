@@ -536,16 +536,25 @@ async fn snapshot_cache_reuses_verified_files_and_preserves_active_readers() {
     assert_eq!(value(other.path()), 9);
     let again = cache.read(&publication, &unit).await.unwrap().unwrap();
     assert_eq!(value(again.path()), 3);
-    assert!(!Arc::ptr_eq(&two, &again));
+    assert!(Arc::ptr_eq(&two, &again));
+    let retained = again.path().to_owned();
+    drop((two, again));
+    assert!(retained.exists());
 
     let disabled = sanctum_db::SnapshotCache::new(0);
     let a = disabled.read(&publication, &unit).await.unwrap().unwrap();
     let b = disabled.read(&publication, &unit).await.unwrap().unwrap();
-    assert!(!Arc::ptr_eq(&a, &b));
+    assert!(Arc::ptr_eq(&a, &b));
+    let path = a.path().to_owned();
+    drop(a);
+    drop(b);
+    assert!(!path.exists());
+    let reopened = disabled.read(&publication, &unit).await.unwrap().unwrap();
+    assert_ne!(path, reopened.path());
 }
 
 #[tokio::test]
-async fn oversized_snapshot_reads_share_the_transfer_without_retaining_the_file() {
+async fn oversized_snapshot_reads_share_the_file_until_the_last_reader_releases_it() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(PublicationStorage::new(Arc::new(
         sanctum_storage_fs::FileStorage::open(directory.path()).unwrap(),
@@ -571,11 +580,21 @@ async fn oversized_snapshot_reads_share_the_transfer_without_retaining_the_file(
     assert_eq!(storage.snapshot_gets.load(Ordering::Relaxed), 1);
 
     let next = cache
+        .read_generation(&publication, &unit, generation.clone())
+        .await
+        .unwrap();
+    assert_eq!(value(next.path()), 7);
+    assert!(Arc::ptr_eq(&first, &next));
+    assert_eq!(storage.snapshot_gets.load(Ordering::Relaxed), 1);
+    let path = next.path().to_owned();
+    drop((first, second, next));
+    assert!(!path.exists());
+
+    let next = cache
         .read_generation(&publication, &unit, generation)
         .await
         .unwrap();
-    assert!(!Arc::ptr_eq(&first, &next));
-    assert_eq!(value(first.path()), 7);
+    assert_ne!(path, next.path());
     assert_eq!(value(next.path()), 7);
     assert_eq!(storage.snapshot_gets.load(Ordering::Relaxed), 2);
 }

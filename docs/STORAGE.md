@@ -386,10 +386,11 @@ The API resolves the current HEAD for each catalog or collection read.
 It reuses a downloaded snapshot when the generation and digest match,
 with at most 16 retained files and a 2 GiB default byte budget. Set
 `hosted_snapshot_cache_bytes` to change the budget or set it to zero to
-disable retention between transfers. Concurrent readers of the same verified
-generation share an active download, including when the file exceeds the budget
-or its cache entry is evicted during the download. Once the transfer and its
-waiters finish, an unretained generation is downloaded again on a later request.
+disable retention between requests. Readers of the same verified generation
+share an active download or a materialized file still in use. This also applies
+to snapshots that exceed the budget or are evicted while a reader holds them.
+An unretained file is removed when the last reader releases it. A subsequent
+request downloads that generation again if HEAD still points to it.
 Each materialized collection can retain one idle read-only
 SQLite connection for search, fetch, and other ordinary collection reads.
 Simultaneous reads can open additional connections and release them after
