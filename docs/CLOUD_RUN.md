@@ -133,8 +133,9 @@ its stored cursor. The worker attempts up to four hints concurrently, with
 30 seconds per hint and 240 seconds for the page, including cursor I/O.
 The example gives Scheduler 300 seconds to receive the result. An attempt
 that times out remains discoverable. A later scan retries it with its
-existing task identity within the same dispatch window. The worker OIDC
-audience is the service origin.
+existing task identity within the same dispatch window. Expired uploads
+get a separate task name for settlement under the regular worker deadline.
+The worker OIDC audience is the service origin.
 [Cloud Scheduler attempt deadlines](https://docs.cloud.google.com/scheduler/docs/reference/rest/v1/projects.locations.jobs).
 
 ```sh

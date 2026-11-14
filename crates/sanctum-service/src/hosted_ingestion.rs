@@ -154,6 +154,8 @@ struct Operation {
     dispatched_embedding_profile: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     dispatched_preparation: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    dispatched_expired: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     dispatch_retry: u32,
     #[serde(flatten)]
@@ -449,15 +451,18 @@ impl HostedCatalog {
         else {
             return Ok(false);
         };
-        let Some((stage, not_before)) = self.pending_upload_task(scope, operation, &record).await?
+        let now = unix_seconds()?;
+        let expired = now >= record.expires_at();
+        let Some((stage, not_before)) = self
+            .pending_upload_task(scope, operation, &record, expired)
+            .await?
         else {
             return Ok(false);
         };
-        let now = unix_seconds()?;
         let window =
             not_before.unwrap_or(now).max(now) / crate::hosted_dispatch::DISPATCH_WINDOW_SECONDS;
         let profile = match stage {
-            TaskStage::Embed { .. } => match self.embedding_profile() {
+            TaskStage::Embed { .. } if !expired => match self.embedding_profile() {
                 Some(profile) => Some(profile),
                 // Keep the durable hint for a worker with embeddings enabled.
                 None => return Ok(false),
@@ -465,7 +470,8 @@ impl HostedCatalog {
             _ => None,
         };
         let preparing = stage == TaskStage::Prepare;
-        if record.dispatched_preparation == preparing
+        if record.dispatched_expired == expired
+            && record.dispatched_preparation == preparing
             && record.dispatched_embedding_profile.as_deref() == profile
             && record.dispatched_at.is_some_and(|dispatched| {
                 dispatched / crate::hosted_dispatch::DISPATCH_WINDOW_SECONDS >= window
@@ -481,6 +487,7 @@ impl HostedCatalog {
                 profile,
                 window,
                 retry: record.dispatch_retry,
+                expired,
                 not_before,
             })
             .await?;
@@ -492,11 +499,13 @@ impl HostedCatalog {
             ?stage,
             window,
             retry = record.dispatch_retry,
+            expired,
             "handed off hosted upload task"
         );
         record.dispatched_at = Some(not_before.unwrap_or(now).max(now));
         record.dispatched_embedding_profile = profile.map(str::to_owned);
         record.dispatched_preparation = preparing;
+        record.dispatched_expired = expired;
         let key = envelope_key(&prefix)?;
         let body = serde_json::to_vec(&record).map_err(|error| Error::Internal(Box::new(error)))?;
         match self
@@ -526,7 +535,13 @@ impl HostedCatalog {
         else {
             return Ok(false);
         };
-        let Some((stage, not_before)) = self.pending_upload_task(scope, operation, &record).await?
+        if record.is_pending() && unix_seconds()? >= record.expires_at() {
+            self.settle_expired_upload(scope, &record).await?;
+            return Ok(false);
+        }
+        let Some((stage, not_before)) = self
+            .pending_upload_task(scope, operation, &record, false)
+            .await?
         else {
             return Ok(false);
         };
@@ -556,16 +571,13 @@ impl HostedCatalog {
         scope: &Scope,
         operation: Uuid,
         record: &Operation,
+        expired: bool,
     ) -> Result<Option<(TaskStage, Option<u64>)>> {
-        if record.is_pending() && unix_seconds()? >= record.expires_at() {
-            self.settle_expired_upload(scope, record).await?;
-            return Ok(None);
-        }
         let task = match record.stage {
             Stage::PendingRegistration => (TaskStage::Register, None),
             Stage::PendingIndexing {
                 preparation: None, ..
-            } if self.dispatcher.is_some() => (TaskStage::Prepare, None),
+            } if self.dispatcher.is_some() && !expired => (TaskStage::Prepare, None),
             Stage::PendingIndexing { .. } => (TaskStage::Index, None),
             Stage::TextReady {
                 embedding: Some(embedding),
@@ -574,7 +586,7 @@ impl HostedCatalog {
                 TaskStage::Embed {
                     step: embedding.step,
                 },
-                embedding.not_before,
+                embedding.not_before.filter(|_| !expired),
             ),
             Stage::TextReady {
                 embedding: None, ..
@@ -804,6 +816,7 @@ impl HostedUpload {
             dispatched_at: None,
             dispatched_embedding_profile: None,
             dispatched_preparation: false,
+            dispatched_expired: false,
             dispatch_retry: 0,
             stage: Stage::PendingRegistration,
         };

@@ -19,9 +19,12 @@ impl HostedCatalog {
         match target_profile {
             Some(target) if Some(target) != configured => return Ok(()),
             None if self.dispatcher.is_some() => {
-                self.require_operation(&self.operation_prefix(scope, operation)?, operation)
+                let (record, _) = self
+                    .require_operation(&self.operation_prefix(scope, operation)?, operation)
                     .await?;
-                return Ok(());
+                if unix_seconds()? < record.expires_at() {
+                    return Ok(());
+                }
             }
             _ => {}
         }

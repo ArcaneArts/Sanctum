@@ -531,6 +531,14 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         .into_inner();
     assert_eq!(retained.excerpt, TEXT);
 
+    verify_expired_dispatch(
+        storage.as_ref(),
+        prefix.as_ref(),
+        &http,
+        queue.as_ref(),
+        make_catalog,
+    )
+    .await;
     verify_retirement(
         storage.clone(),
         prefix.as_ref(),
@@ -539,6 +547,104 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         make_catalog,
     )
     .await;
+}
+
+async fn verify_expired_dispatch(
+    storage: &dyn Storage,
+    prefix: Option<&Key>,
+    http: &reqwest::Client,
+    queue: &TaskQueue,
+    make_catalog: impl Fn() -> HostedCatalog,
+) {
+    let (mut api, _api_server) = serve_api(make_catalog()).await;
+    let scope = v1::Scope {
+        tenant: "default".into(),
+        collection: "repair".into(),
+    };
+    let id = Uuid::from_u128(0x0f000000000000000000000000000008);
+    let accepted = submit_source(&mut api, &scope, id, "expired.txt", b"reserved upload").await;
+    assert_eq!(accepted.state(), v1::IngestionState::Accepted);
+    let original = queue.accepted.lock().unwrap().last().unwrap().clone();
+    let key = scoped_key(
+        prefix,
+        &format!("default/collections/repair/operations/{id}/operation.json"),
+    );
+    let (mut record, version) = read_control(storage, &key).await;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    record["created_at"] = json!(now - 31 * 86_400);
+    storage
+        .put_control(
+            &key,
+            serde_json::to_vec(&record).unwrap().into(),
+            Condition::Match(version),
+        )
+        .await
+        .unwrap();
+
+    let generation = collection_generation(storage, prefix).await;
+    let (worker, worker_server) = serve_http(crate::hosted_worker::router(make_catalog())).await;
+    assert_eq!(
+        reconcile(http, &worker, 15).await,
+        json!({"dispatched": 1, "failed": 0, "more": false}),
+    );
+    let recovery = queue.accepted.lock().unwrap().last().unwrap().clone();
+    assert_ne!(recovery["task"]["name"], original["task"]["name"]);
+    assert_eq!(
+        recovery["task"]["httpRequest"],
+        original["task"]["httpRequest"]
+    );
+    assert_eq!(collection_generation(storage, prefix).await, generation);
+    assert!(
+        read_control(storage, &key).await.0["dispatched_expired"]
+            .as_bool()
+            .unwrap()
+    );
+    assert_eq!(
+        reconcile(http, &worker, 15).await,
+        json!({"dispatched": 0, "failed": 0, "more": false}),
+    );
+    worker_server.abort();
+    assert!(worker_server.await.unwrap_err().is_cancelled());
+
+    let (worker, _worker_server) = serve_http(crate::hosted_worker::router(make_catalog())).await;
+    let body = STANDARD
+        .decode(recovery["task"]["httpRequest"]["body"].as_str().unwrap())
+        .unwrap();
+    for _ in 0..2 {
+        let result = http
+            .post(format!("{worker}/internal/tasks/register-upload"))
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(result.status(), StatusCode::NO_CONTENT);
+    }
+    let settled = api
+        .get_ingestion_job(v1::IngestionJobRequest {
+            scope: Some(scope),
+            operation_id: id.to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(settled.state(), v1::IngestionState::Failed);
+    assert_eq!(settled.error_code.as_deref(), Some("expired"));
+    let input_prefix = scoped_key(
+        prefix,
+        &format!("default/collections/repair/operations/{id}/inputs"),
+    );
+    assert!(
+        storage
+            .list(Some(&input_prefix), None, 10)
+            .await
+            .unwrap()
+            .objects
+            .is_empty()
+    );
 }
 
 async fn verify_retirement(

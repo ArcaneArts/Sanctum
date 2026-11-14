@@ -636,14 +636,18 @@ For an active collection, an envelope lookup that finds no record or
 only an admission fence still returns HTTP 404.
 [Cloud Tasks acknowledgments](https://docs.cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues.tasks#HttpRequest).
 
-Dispatch repair and the standalone worker settle pending uploads once
-their 30-day processing window ends. The upload sweep also handles pending
-envelopes left untouched for 30 days. They reuse registration and indexing
-receipts, or check the exact revision in the fenced collection database if
-the indexing receipt has aged out. Unpublished work becomes `FAILED` with
+Once a pending upload reaches its 30-day processing limit, dispatch repair
+queues its current settlement stage with an expiry-specific task name. The
+upload sweep can restore a missing hint before dispatching aged pending
+envelopes. With Cloud Tasks configured, the task worker settles the upload
+under the regular task deadline. The standalone worker settles it directly.
+Both reuse registration and indexing receipts or check the exact revision
+in the fenced collection database if the indexing receipt has aged out.
+Unpublished work becomes `FAILED` with
 code `expired`, releases any reserved external ID, and drops unreferenced
 input. Committed text remains searchable, including after an interrupted
 envelope checkpoint. An expired embedding step stops scheduling work for
-that upload, including a step awaiting provider backoff. Existing vectors
+that upload, including a step awaiting provider backoff or a worker
+without an embedding provider. Existing vectors
 and canonical source data remain available. Once the operation settles,
 the usual 45-day terminal retention applies.

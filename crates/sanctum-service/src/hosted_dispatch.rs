@@ -37,6 +37,7 @@ pub struct Task<'a> {
     pub profile: Option<&'a str>,
     pub window: u64,
     pub retry: u32,
+    pub expired: bool,
     pub not_before: Option<u64>,
 }
 
@@ -179,7 +180,7 @@ impl HostedCatalog {
         }
     }
 
-    /// Replays dispatch hints. Expired uploads may need to settle a committed database stage.
+    /// Replays dispatch hints without opening collection databases.
     async fn reconcile_dispatch(
         &self,
         shard: u8,
