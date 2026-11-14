@@ -41,7 +41,7 @@ which parts have working implementations and where to find the evidence.
   database sizes. This requires the authorized Sanctum project, deployment
   region, bucket, and deployer and invocation identities.
   [Hosted acceptance runbook](CLOUD_RUN.md#verify-a-deployment).
-- **Capacity.** The recorded workloads cover 200 MiB sources, a 2.34 GiB
+- **Capacity.** The recorded workloads cover 200 MiB UTF-8 and RTF sources, a 2.34 GiB
   collection, 10,000 mostly idle MinIO tenants, concurrent active
   collections, and real embeddings. Two simultaneous cold 2 GiB snapshot
   reads exceeded ten seconds in every MinIO sample. The Cloud Run run
@@ -1491,3 +1491,17 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   ready after its new vector was committed. The previous revision remained
   held in both replacement states. The run removed all 16 fixture objects.
   [Source inspection](LOCAL_API.md#source-inspection).
+
+## Large RTF ingestion measurements
+
+- The ingestion benchmark exercised 200 MiB RTF uploads through the
+  release gRPC CLI, lexical publication, and exact MCP retrieval on the
+  filesystem and live MinIO. It compared both excerpts with the expected
+  canonical UTF-8 bytes and checked that hidden RTF text was absent from
+  lexical results.
+- Text readiness took 6.865 s on the filesystem and 13.715 s on MinIO.
+  Peak sampled server RSS was 29,294,592 and 46,006,272 bytes,
+  respectively. These measurements cover the server process on macOS.
+  [Reproduction and results](CAPACITY.md#200-mib-rtf-extraction).
+- `pnpm check` and the locked release build passed. The original
+  benchmark also passed a 1 MiB UTF-8 smoke run.

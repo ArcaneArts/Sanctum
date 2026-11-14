@@ -47,6 +47,36 @@ all 1,404 bytes at the end of the input. The two filesystem timings
 are individual runs, and both used lexical indexing without embeddings.
 [Chunk settings](LOCAL_API.md#chunk-configuration).
 
+### 200 MiB RTF extraction
+
+Run the same benchmark with `--format rtf` to upload 209,715,200 bytes of
+deterministic RTF. The fixture contains a Windows-1252 hex escape,
+paragraph controls, a Unicode surrogate pair, and a hidden destination.
+The script writes the expected UTF-8 to a separate fixture file. It checks
+that the hidden marker is absent from lexical results and compares the
+search and fetch excerpts with the exact expected bytes at the returned
+canonical offsets.
+
+```sh
+python3 scripts/benchmark-ingestion.py --format rtf
+python3 scripts/benchmark-ingestion.py --format rtf --hosted
+```
+
+Use the standalone MinIO configuration described above for the hosted
+command. Both runs extracted 205,681,584 bytes of UTF-8. MCP returned chunk
+57,080 with the same 991-byte range from offset 205,680,593 through EOF.
+
+| Backend | Upload to acceptance | Acceptance to text ready | Total | Sampled peak server RSS | Warm MCP fetch | Stored collection bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Local filesystem | 0.224 s | 6.641 s | 6.865 s | 29,294,592 | 1.313 ms | 263,537,584 |
+| MinIO | 2.992 s | 10.723 s | 13.715 s | 46,006,272 | 3.323 ms | 263,858,234 |
+
+These are sequential release runs on the Apple M4 Max setup below. Peak
+server RSS uses 33 filesystem samples and 67 MinIO samples. It excludes
+the client, MinIO, and files on disk. Original retention and embeddings
+were disabled. The totals include the storage observed immediately after
+publication and retrieval.
+
 ## SQLite snapshot transfer and publication
 
 The MinIO benchmark publishes synthetic SQLite databases with about 1 GiB
