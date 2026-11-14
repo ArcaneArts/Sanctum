@@ -5968,7 +5968,7 @@ async fn hosted_database_sessions_pin_a_scope_and_generation_across_instances() 
     use v1::sql_value::Value;
 
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
     let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
     let writer = catalog();
     let scope = |collection: &str| sanctum_core::Scope {
@@ -5984,12 +5984,28 @@ async fn hosted_database_sessions_pin_a_scope_and_generation_across_instances() 
         collection: None,
     };
     let mut first = start(catalog()).await;
+    storage
+        .interrupt
+        .store(CHANGE_SESSION_REPLY, Ordering::Relaxed);
+    assert_eq!(
+        first
+            .client
+            .open_database_session(target.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable,
+    );
+    storage
+        .interrupt
+        .store(LOSE_SESSION_REPLY, Ordering::Relaxed);
     let opened = first
         .client
         .open_database_session(target.clone())
         .await
         .unwrap()
         .into_inner();
+    assert_eq!(storage.interrupt.load(Ordering::Relaxed), 0);
     let generation: uuid::Uuid = opened.snapshot_generation.unwrap().parse().unwrap();
     let handle = opened.session.unwrap();
     assert!(
@@ -6157,6 +6173,42 @@ async fn hosted_database_sessions_pin_a_scope_and_generation_across_instances() 
         Err(Error::NotFound(_))
     ));
     second.stop().await;
+}
+
+#[tokio::test]
+async fn hosted_database_open_stops_at_the_session_deadline() {
+    use std::time::Duration;
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
+    let catalog = HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    catalog.create_collection(&scope, None).await.unwrap();
+    let target = sanctum_service::DatabaseTarget {
+        tenant: scope.tenant,
+        collection: Some(scope.collection),
+    };
+    storage
+        .interrupt
+        .store(BLOCK_SESSION_REPLY, Ordering::Relaxed);
+    let open = tokio::spawn(async move { catalog.open_database_session(&target).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while storage.interrupt.load(Ordering::Relaxed) != SESSION_REPLY_BLOCKED {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!open.is_finished());
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(300)).await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), open).await.unwrap().unwrap(),
+        Err(Error::Busy(message)) if message == "database session lifetime elapsed before opening finished"
+    ));
 }
 
 #[tokio::test]
@@ -7375,6 +7427,10 @@ const LOSE_REBUILD_CHECKPOINT: u8 = 22;
 const FAIL_INPUT_SYNC: u8 = 23;
 const REJECT_CREATION_INTENT: u8 = 24;
 const LOSE_CREATION_INTENT: u8 = 25;
+const CHANGE_SESSION_REPLY: u8 = 26;
+const LOSE_SESSION_REPLY: u8 = 27;
+const BLOCK_SESSION_REPLY: u8 = 28;
+const SESSION_REPLY_BLOCKED: u8 = 29;
 const PARALLEL_RANGE_START: u8 = 40;
 const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
 const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
@@ -7510,6 +7566,31 @@ impl Storage for InterruptAcceptance {
         bytes: axum::body::Bytes,
         condition: Condition,
     ) -> StorageResult<Version> {
+        if key.as_str().contains("/snapshots/sessions/") {
+            match self.interrupt.load(Ordering::Relaxed) {
+                CHANGE_SESSION_REPLY => {
+                    self.interrupt.store(0, Ordering::Relaxed);
+                    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    value["generation"]["id"] = serde_json::json!(uuid::Uuid::new_v4());
+                    self.inner
+                        .put_control(key, serde_json::to_vec(&value).unwrap().into(), condition)
+                        .await?;
+                    return Err(Error::Busy("database session reply lost".into()));
+                }
+                LOSE_SESSION_REPLY => {
+                    self.interrupt.store(0, Ordering::Relaxed);
+                    self.inner.put_control(key, bytes, condition).await?;
+                    return Err(Error::Busy("database session reply lost".into()));
+                }
+                BLOCK_SESSION_REPLY => {
+                    self.inner.put_control(key, bytes, condition).await?;
+                    self.interrupt
+                        .store(SESSION_REPLY_BLOCKED, Ordering::Relaxed);
+                    return std::future::pending().await;
+                }
+                _ => {}
+            }
+        }
         let creation = key.as_str().contains("/catalog/creations/");
         if creation
             && self

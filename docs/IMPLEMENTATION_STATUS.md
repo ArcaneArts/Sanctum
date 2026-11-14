@@ -2359,6 +2359,18 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   and Scheduler delivery remain open.
   [Snapshot maintenance](STORAGE.md#scheduled-snapshot-reclamation).
 
+## Hosted SQL session opening after a lost reply
+
+- Opening a hosted database session can recover a lost write reply
+  when the saved handle matches the pinned generation and expiration.
+  The open request has the same five-minute deadline as the handle.
+- The filesystem regression rejected a mismatched record, then used a
+  recovered handle to query and export the pinned snapshot through a
+  fresh API instance. A paused-clock test blocked a reply after commit
+  and verified that the open call ended at its deadline. The live MinIO
+  worker scenario recovered a collection handle and queried and closed
+  it through gRPC. [Hosted database inspection](STORAGE.md#hosted-database-inspection).
+
 ## Hosted collection creation with a lost intent reply
 
 - The create RPC can continue after an ambiguous intent write when
