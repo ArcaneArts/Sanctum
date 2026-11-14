@@ -6642,6 +6642,87 @@ async fn start(catalog: HostedCatalog) -> Running {
 }
 
 #[tokio::test]
+async fn hosted_database_export_reports_shutdown_and_can_be_retried() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
+    let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    catalog().create_collection(&scope, None).await.unwrap();
+    let publication =
+        sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(30)).unwrap();
+    let unit = sanctum_db::Unit::collection(None, &scope).unwrap();
+    let mut writer = publication.acquire(&unit).await.unwrap();
+    writer
+        .apply(
+            vec![sanctum_db::Command {
+                operation: uuid::Uuid::new_v4(),
+                payload: (),
+            }],
+            |tx, ()| {
+                tx.execute_batch(
+                    "CREATE TABLE sample (body BLOB); INSERT INTO sample VALUES (zeroblob(8388608));",
+                )
+                .map_err(|error| Error::Internal(Box::new(error)))?;
+                Ok("seeded".into())
+            },
+        )
+        .await
+        .unwrap();
+    writer.release().await.unwrap();
+
+    let mut first = start(catalog()).await;
+    let opened = first
+        .client
+        .open_database_session(v1::DatabaseTarget {
+            tenant: scope.tenant.to_string(),
+            collection: Some(scope.collection.to_string()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let handle = opened.session.unwrap();
+    let mut interrupted = first
+        .client
+        .download_database(handle.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let mut received = interrupted.message().await.unwrap().unwrap().data.len() as u64;
+    first.stop.cancel();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match interrupted.message().await {
+                Ok(Some(frame)) => received += frame.data.len() as u64,
+                Err(error) => break error,
+                Ok(None) => panic!("incomplete export was reported as successful"),
+            }
+        }
+    })
+    .await
+    .expect("interrupted export should stop promptly");
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!((1..opened.bytes).contains(&received));
+    first.stop().await;
+
+    let mut second = start(catalog()).await;
+    let mut retry = second
+        .client
+        .download_database(handle)
+        .await
+        .unwrap()
+        .into_inner();
+    let mut received = 0;
+    while let Some(frame) = retry.message().await.unwrap() {
+        received += frame.data.len() as u64;
+    }
+    assert_eq!(received, opened.bytes);
+    second.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_database_export_replays_a_pinned_page_delta_on_another_instance() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());

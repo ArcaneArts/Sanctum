@@ -158,7 +158,7 @@ impl Sanctum for Grpc {
         database::query(&self.0, self.1.child_token(), request.into_inner()).await
     }
 
-    type DownloadDatabaseStream = ReceiverStream<std::result::Result<v1::DatabaseFrame, Status>>;
+    type DownloadDatabaseStream = database::DownloadStream;
 
     async fn download_database(
         &self,
