@@ -84,10 +84,11 @@ operation envelopes when it invokes this executor.
 The executor has a shared publication contract for the filesystem,
 MinIO, and GCS. Hosted creation stores a request under
 `<tenant>/catalog/creations/<request-id>.json` before initializing the
-collection database. Maintenance can resume from this intent even if
-the caller or initial API instance never retries. Activation is a
-separate fenced catalog commit with a request receipt. A committed
-receipt takes precedence on replay, and an interrupted activation
+collection database. After an ambiguous write reply, the same RPC can
+resume from the saved intent when it names the requested collection.
+Maintenance can also resume from the intent if the API instance stops.
+Activation is a separate fenced catalog commit with a request receipt.
+A committed receipt takes precedence on replay, and an interrupted activation
 reuses the published initial database. The intent is removed once
 the catalog outcome is committed. A pending request ID is reserved
 for the named collection within its tenant.

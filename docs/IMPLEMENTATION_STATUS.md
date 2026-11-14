@@ -2359,6 +2359,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   and Scheduler delivery remain open.
   [Snapshot maintenance](STORAGE.md#scheduled-snapshot-reclamation).
 
+## Hosted collection creation with a lost intent reply
+
+- The create RPC can continue after an ambiguous intent write when
+  storage confirms the requested collection or the catalog already has
+  its receipt. The RPC reports success only after catalog activation.
+- The filesystem gRPC tests verified that a failed intent write leaves
+  no collection or catalog snapshot, and a lost reply after the intent
+  commits allows activation in the same RPC. After restart, replay kept
+  the catalog generation and a different collection could not reuse
+  the request ID. The live MinIO worker scenario exercised the same
+  lost-reply path before ingestion and verified the initial collection
+  generation stayed the same on replay.
+  [Database publication](STORAGE.md#object-backed-database-publication).
+
 ## Hosted source uploads with lost responses
 
 - The hosted server verifies the stored length and BLAKE3 digest after an

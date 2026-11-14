@@ -525,15 +525,22 @@ async fn verify_recovery(storage: Arc<dyn Storage>, prefix: Option<Key>) {
         checkpoint: Mutex::new(None),
         after_dispatch: false,
         lose_source_reply: Some("/inputs/"),
-        lose_control_reply: Mutex::new(Some("/operation.json")),
+        lose_control_reply: Mutex::new(Some("/catalog/creations/")),
     });
     let (mut api, api_server) = serve_api(catalog_with_storage(api_storage.clone())).await;
-    api.create_collection(v1::CreateCollectionRequest {
+    let creation = v1::CreateCollectionRequest {
         scope: Some(scope.clone()),
-        ..Default::default()
-    })
-    .await
-    .unwrap();
+        request_id: Some(Uuid::new_v4().to_string()),
+    };
+    api.create_collection(creation.clone()).await.unwrap();
+    assert!(api_storage.lose_control_reply.lock().unwrap().is_none());
+    let created_generation = collection_generation(storage.as_ref(), prefix.as_ref()).await;
+    api.create_collection(creation).await.unwrap();
+    assert_eq!(
+        collection_generation(storage.as_ref(), prefix.as_ref()).await,
+        created_generation
+    );
+    *api_storage.lose_control_reply.lock().unwrap() = Some("/operation.json");
     let accepted = submit_source(&mut api, &scope, operation, "repair.rtf", RTF).await;
     assert!(api_storage.lose_control_reply.lock().unwrap().is_none());
     assert_eq!(accepted.operation_id, operation.to_string());

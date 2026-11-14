@@ -6183,6 +6183,36 @@ async fn maintenance_recovers_hosted_collection_creation_without_a_client_retry(
     let intent_prefix = Key::parse("managed/default/catalog/creations").unwrap();
     let mut api = start(make_catalog()).await;
 
+    let no_intent = uuid::Uuid::new_v4().to_string();
+    storage
+        .interrupt
+        .store(REJECT_CREATION_INTENT, Ordering::Relaxed);
+    assert_eq!(
+        api.client
+            .create_collection(request("no-intent", no_intent))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::Unavailable,
+    );
+    assert!(
+        storage
+            .list(Some(&intent_prefix), None, 8)
+            .await
+            .unwrap()
+            .objects
+            .is_empty()
+    );
+    let no_intent_unit = sanctum_db::Unit::collection(Some(&prefix), &scope("no-intent")).unwrap();
+    assert!(
+        executor
+            .generation(&no_intent_unit)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(executor.generation(&catalog).await.unwrap().is_none());
+
     // Persist the request while the initial SQLite writer is held.
     let before_initial = uuid::Uuid::new_v4().to_string();
     let first_scope = scope("before-initial");
@@ -6294,6 +6324,64 @@ async fn maintenance_recovers_hosted_collection_creation_without_a_client_retry(
             .unwrap();
     }
     assert_eq!(executor.generation(&catalog).await.unwrap(), generation);
+    api.stop().await;
+}
+
+#[tokio::test]
+async fn hosted_creation_finishes_after_a_lost_intent_write_reply() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance::new(
+        directory.path(),
+        LOSE_CREATION_INTENT,
+    ));
+    let start_catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let mut api = start(start_catalog()).await;
+    let request = v1::CreateCollectionRequest {
+        scope: Some(v1::Scope {
+            tenant: "default".into(),
+            collection: "notes".into(),
+        }),
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+    };
+    api.client.create_collection(request.clone()).await.unwrap();
+    assert_eq!(storage.interrupt.load(Ordering::Relaxed), 0);
+    let tenant = "default".parse().unwrap();
+    let executor =
+        sanctum_db::Publication::new(storage.clone(), std::time::Duration::from_secs(30)).unwrap();
+    let catalog = sanctum_db::Unit::catalog(None, &tenant).unwrap();
+    let committed = executor.generation(&catalog).await.unwrap().unwrap();
+    let intent_prefix = Key::parse("default/catalog/creations").unwrap();
+    assert!(
+        storage
+            .list(Some(&intent_prefix), None, 8)
+            .await
+            .unwrap()
+            .objects
+            .is_empty()
+    );
+    api.stop().await;
+
+    let fresh = start_catalog();
+    assert_eq!(
+        fresh.list_collections(&tenant, None, 10).await.unwrap(),
+        ["notes"]
+    );
+    let mut api = start(fresh).await;
+    api.client.create_collection(request.clone()).await.unwrap();
+    let mut different = request;
+    different.scope.as_mut().unwrap().collection = "other".into();
+    assert_eq!(
+        api.client
+            .create_collection(different)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::AlreadyExists
+    );
+    assert_eq!(
+        executor.generation(&catalog).await.unwrap(),
+        Some(committed)
+    );
     api.stop().await;
 }
 
@@ -7285,6 +7373,8 @@ const REJECT_PREPARED_EMBEDDING_WRITE: u8 = 20;
 const REJECT_REBUILD_CHECKPOINT: u8 = 21;
 const LOSE_REBUILD_CHECKPOINT: u8 = 22;
 const FAIL_INPUT_SYNC: u8 = 23;
+const REJECT_CREATION_INTENT: u8 = 24;
+const LOSE_CREATION_INTENT: u8 = 25;
 const PARALLEL_RANGE_START: u8 = 40;
 const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
 const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
@@ -7420,6 +7510,22 @@ impl Storage for InterruptAcceptance {
         bytes: axum::body::Bytes,
         condition: Condition,
     ) -> StorageResult<Version> {
+        let creation = key.as_str().contains("/catalog/creations/");
+        if creation
+            && self
+                .interrupt
+                .compare_exchange(
+                    REJECT_CREATION_INTENT,
+                    0,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            return Err(Error::Busy(
+                "creation intent write failed before commit".into(),
+            ));
+        }
         let rebuild_checkpoint = key.as_str() == "_embedding/default/notes.json";
         if rebuild_checkpoint
             && self
@@ -7477,6 +7583,19 @@ impl Storage for InterruptAcceptance {
             ));
         }
         let version = self.inner.put_control(key, bytes, condition).await?;
+        if creation
+            && self
+                .interrupt
+                .compare_exchange(
+                    LOSE_CREATION_INTENT,
+                    0,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            return Err(Error::Busy("creation intent write response lost".into()));
+        }
         if interrupt == 2 {
             return Err(Error::Busy("envelope write response lost".into()));
         }

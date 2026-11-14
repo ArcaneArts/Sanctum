@@ -40,24 +40,29 @@ impl HostedCatalog {
             .await
         {
             Ok(_) => {}
-            Err(Error::Conflict(_)) => match self.read_collection_creation(&key).await? {
-                Some(creation) if creation.collection != scope.collection.as_str() => {
-                    return Err(other_collection());
+            // A failed local sync can leave readable, nondurable intent bytes.
+            Err(error @ (Error::Invalid(_) | Error::Io(_))) => return Err(error),
+            Err(error) => {
+                match self.read_collection_creation(&key).await? {
+                    Some(creation) if creation.collection != scope.collection.as_str() => {
+                        return Err(other_collection());
+                    }
+                    Some(_) => {}
+                    None => {
+                        // Another instance may have activated the collection and removed the intent.
+                        if let Some(outcome) = self.publication.receipt(&catalog, operation).await?
+                        {
+                            return collection_outcome(scope, &outcome);
+                        }
+                        return Err(match error {
+                            Error::Conflict(_) => {
+                                Error::Busy("collection creation changed during admission".into())
+                            }
+                            error => error,
+                        });
+                    }
                 }
-                None => {
-                    // Another instance may have activated the collection and removed the intent.
-                    let outcome = self
-                        .publication
-                        .receipt(&catalog, operation)
-                        .await?
-                        .ok_or_else(|| {
-                            Error::Busy("collection creation changed during admission".into())
-                        })?;
-                    return collection_outcome(scope, &outcome);
-                }
-                Some(_) => {}
-            },
-            Err(error) => return Err(error),
+            }
         }
         let outcome = self
             .finish_collection_creation(scope, &catalog, operation, &key)
