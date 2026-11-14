@@ -1360,6 +1360,95 @@ async fn hosted_sources_page_current_revisions_and_keep_tenant_scope() {
 }
 
 #[tokio::test]
+async fn hosted_shutdown_replays_an_upload_committed_before_its_reply() {
+    use std::time::Duration;
+
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
+    let catalog = || HostedCatalog::new(storage.clone(), None, 1024).unwrap();
+    let scope = sanctum_core::Scope {
+        tenant: "default".parse().unwrap(),
+        collection: "notes".parse().unwrap(),
+    };
+    let service = catalog();
+    service.create_collection(&scope, None).await.unwrap();
+    let mut server = start(service.clone()).await;
+    let mut header = v1::UploadTextHeader {
+        scope: Some(v1::Scope {
+            tenant: "default".into(),
+            collection: "notes".into(),
+        }),
+        name: "notes.txt".into(),
+        ..Default::default()
+    };
+    storage
+        .interrupt
+        .store(BLOCK_UPLOAD_REPLY, Ordering::Relaxed);
+    let mut client = server.client.clone();
+    let upload = upload_frames(&header, [b"accepted beryl".as_slice()]);
+    let request = tokio::spawn(async move { client.submit_text(upload).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while storage.interrupt.load(Ordering::Relaxed) != UPLOAD_REPLY_BLOCKED {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let page = server
+        .client
+        .list_ingestion_jobs(v1::ListIngestionJobsRequest {
+            tenant: "default".into(),
+            collection: Some("notes".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let [accepted] = page.jobs.as_slice() else {
+        panic!("expected an accepted upload, got {:?}", page.jobs);
+    };
+    let operation: uuid::Uuid = accepted.operation_id.parse().unwrap();
+    assert_eq!(accepted.state(), v1::IngestionState::Accepted);
+    assert!(!request.is_finished());
+
+    tokio::time::timeout(Duration::from_secs(2), server.stop())
+        .await
+        .expect("an upload awaiting its storage reply must not hold the server open");
+    assert_eq!(
+        storage.interrupt.load(Ordering::Relaxed),
+        UPLOAD_REPLY_DROPPED
+    );
+    let error = request.await.unwrap().unwrap_err();
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!(error.message().contains("shutdown"));
+    assert_eq!(
+        error
+            .metadata()
+            .get_bin("sanctum-operation-id-bin")
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+            .as_ref(),
+        operation.as_bytes()
+    );
+
+    let restarted = catalog();
+    let mut api = start(restarted.clone()).await;
+    restarted.register_upload(&scope, operation).await.unwrap();
+    restarted.index_upload(&scope, operation).await.unwrap();
+    header.request_id = Some(operation.to_string());
+    let revision = api
+        .client
+        .upload_text(upload_frames(&header, [b"accepted beryl".as_slice()]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(revision.revision_id, accepted.revision_id);
+    assert_eq!(revision.bytes, b"accepted beryl".len() as u64);
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_synchronous_upload_waits_for_worker_and_replays() {
     use std::time::Duration;
 
@@ -7690,6 +7779,9 @@ const SESSION_REPLY_BLOCKED: u8 = 29;
 const BLOCK_SESSION_SNAPSHOT: u8 = 30;
 const SESSION_SNAPSHOT_BLOCKED: u8 = 31;
 const SESSION_SNAPSHOT_DROPPED: u8 = 32;
+const BLOCK_UPLOAD_REPLY: u8 = 33;
+const UPLOAD_REPLY_BLOCKED: u8 = 34;
+const UPLOAD_REPLY_DROPPED: u8 = 35;
 const PARALLEL_RANGE_START: u8 = 40;
 const PARALLEL_RANGE_READY: u8 = PARALLEL_RANGE_START + 4;
 const PARALLEL_RANGE_CONTINUED: u8 = PARALLEL_RANGE_READY + 1;
@@ -7931,6 +8023,14 @@ impl Storage for InterruptAcceptance {
             ));
         }
         let version = self.inner.put_control(key, bytes, condition).await?;
+        if key.as_str().ends_with("/operation.json")
+            && self.interrupt.load(Ordering::Relaxed) == BLOCK_UPLOAD_REPLY
+        {
+            self.interrupt
+                .store(UPLOAD_REPLY_BLOCKED, Ordering::Relaxed);
+            let _dropped = InterruptedRead(&self.interrupt, UPLOAD_REPLY_DROPPED);
+            return std::future::pending().await;
+        }
         if creation
             && self
                 .interrupt

@@ -100,6 +100,108 @@ impl Running {
 }
 
 #[tokio::test]
+async fn shutdown_interrupts_upload_frames_and_waits_without_losing_accepted_work() {
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let dir = TempDir::new().unwrap();
+    let mut running = Running::start_with_workers(&dir, None, false).await;
+    create(&mut running.client, "default").await;
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    sender.send(header("default")).await.unwrap();
+    sender.send(data(b"incomplete violet text")).await.unwrap();
+    let mut client = running.client.clone();
+    let incomplete =
+        tokio::spawn(async move { client.submit_text(ReceiverStream::new(receiver)).await });
+    let staging = dir.path().join("default/notes/staging");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !staging
+            .read_dir()
+            .is_ok_and(|mut entries| entries.next().is_some())
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let mut client = running.client.clone();
+    let waiting = tokio::spawn(async move {
+        client
+            .upload_text(tokio_stream::iter([
+                header("default"),
+                data(b"accepted violet text"),
+                end(),
+            ]))
+            .await
+    });
+    let job = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut jobs = running
+                .client
+                .list_ingestion_jobs(v1::ListIngestionJobsRequest {
+                    tenant: "default".into(),
+                    collection: Some("notes".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .jobs;
+            if let Some(job) = jobs.pop() {
+                break job;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!waiting.is_finished());
+
+    tokio::time::timeout(Duration::from_secs(2), running.stop())
+        .await
+        .expect("open upload calls must not prevent server shutdown");
+    let error = incomplete.await.unwrap().unwrap_err();
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!(error.message().contains("shutdown"));
+    tokio::time::timeout(Duration::from_secs(2), sender.closed())
+        .await
+        .unwrap();
+    assert_eq!(staging.read_dir().unwrap().count(), 0);
+    let error = waiting.await.unwrap().unwrap_err();
+    assert_eq!(error.code(), Code::Unavailable);
+    let envelope = tonic_types::Status::decode(error.details()).unwrap();
+    let detail = v1::RpcError::decode(envelope.details[0].value.as_slice()).unwrap();
+    assert!(detail.retryable);
+    assert_eq!(
+        detail.operation_id.as_deref(),
+        Some(job.operation_id.as_str())
+    );
+
+    let mut running = Running::start(&dir).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let saved = running
+                .client
+                .get_ingestion_job(job_request(job.operation_id.clone()))
+                .await
+                .unwrap()
+                .into_inner();
+            if saved.state() == v1::IngestionState::TextReady {
+                assert_eq!(saved.revision_id, job.revision_id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let hits = search(&mut running.client, "default", "violet").await;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].excerpt, "accepted violet text");
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn local_upload_request_ids_replay_across_concurrency_restart_and_expiry() {
     let dir = TempDir::new().unwrap();
     let mut running = Running::start_with_workers(&dir, None, false).await;

@@ -74,6 +74,23 @@ Merged in [PR #2](https://github.com/ArcaneArts/Sanctum/pull/2).
 - The standalone server and CLI smoke run exercised collection creation,
   listing, upload, search, and byte-exact fetch over loopback.
 
+### Uploads during server shutdown
+
+- A gRPC regression held a client stream open during shutdown and verified
+  that the partial staging file was discarded. An accepted synchronous
+  upload returned retryable `UNAVAILABLE` with its operation ID and
+  published the same revision after restart.
+- A hosted regression stalled storage after committing an acceptance
+  envelope. The server released the stalled request, supplied the
+  generated operation ID, and recovered the original revision when the
+  client replayed with that ID.
+- A generated Python client closed the real managed server's control
+  pipe with an unfinished `SubmitText` stream and an accepted
+  `UploadText` call in progress. The process exited in 10.9 ms on
+  local storage and 4.4 ms against live MinIO. In both cases a fresh
+  process published the original revision, and search returned the
+  exact accepted bytes. [Upload contract](LOCAL_API.md#text-uploads).
+
 ## Durable local lexical work
 
 Merged in [PR #3](https://github.com/ArcaneArts/Sanctum/pull/3).
