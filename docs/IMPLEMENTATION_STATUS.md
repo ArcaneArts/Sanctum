@@ -1281,6 +1281,19 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   restart and returns pending and canceled records across collections.
 - Delivered in [PR #65](https://github.com/ArcaneArts/Sanctum/pull/65).
 
+### Catalog reuse during tenant-wide activity listing
+
+- Each tenant-wide activity request resolves one published catalog generation
+  for collection visibility across storage pages. Collection-scoped requests
+  still check membership, and operation states come from live envelopes.
+- The gRPC integration test disables snapshot retention and counts one catalog
+  manifest read and one download across active and retired collections. It
+  also verifies the empty result for a tenant with no catalog.
+- A generated Python gRPC client against live MinIO traversed two object listing
+  pages with catalog retention disabled. It observed one catalog manifest read
+  and one download, returned the accepted and canceled jobs from two active
+  collections, and skipped the retired collection's job envelope.
+
 ## Local upload request replay
 
 - Local uploads and MCP deposits accept a scoped request UUID. The queue

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use sanctum_core::{Error, Result, Scope, ScopeId};
 use sanctum_db::{collection_prefix, tenant_prefix};
@@ -8,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{HostedCatalog, HostedJob};
+use crate::db;
 
 const MAX_PAGES: usize = 8;
 const MAX_TOKEN_BYTES: usize = 4096;
@@ -36,7 +35,7 @@ impl HostedCatalog {
                 "activity limit must be between 1 and 100".into(),
             ));
         }
-        let (prefix, tenant_wide) = match collection {
+        let prefix = match collection {
             Some(collection) => {
                 let scope = Scope {
                     tenant: tenant.clone(),
@@ -44,18 +43,18 @@ impl HostedCatalog {
                 };
                 self.require_collection(&scope).await?;
                 let root = collection_prefix(self.prefix.as_ref(), &scope)?;
-                (Key::parse(format!("{root}/operations"))?, false)
+                Key::parse(format!("{root}/operations"))?
             }
             None => {
                 let root = tenant_prefix(self.prefix.as_ref(), tenant)?;
-                (Key::parse(format!("{root}/collections"))?, true)
+                Key::parse(format!("{root}/collections"))?
             }
         };
         let mut next = cursor
             .map(|cursor| decode_cursor(&prefix, cursor))
             .transpose()?;
         let mut jobs = Vec::with_capacity(limit as usize);
-        let mut visible = HashMap::new();
+        let mut catalog = None;
         for _ in 0..MAX_PAGES {
             // Each object can produce at most one job. Consume the provider page
             // in full so its token never skips results past the requested limit.
@@ -67,29 +66,33 @@ impl HostedCatalog {
             if page.next_cursor.is_some() && page.next_cursor == next {
                 return Err(Error::Internal("job list cursor did not advance".into()));
             }
-            for object in page.objects {
-                let Some((scope, operation)) =
-                    operation_path(&prefix, &object.key, tenant, collection)
-                else {
-                    continue;
-                };
-                if tenant_wide {
-                    let live = match visible.get(&scope.collection) {
-                        Some(live) => *live,
-                        None => {
-                            let live = match self.require_collection(&scope).await {
-                                Ok(()) => true,
-                                Err(Error::NotFound(_)) => false,
-                                Err(error) => return Err(error),
-                            };
-                            visible.insert(scope.collection.clone(), live);
-                            live
-                        }
-                    };
-                    if !live {
-                        continue;
-                    }
+            let mut candidates: Vec<_> = page
+                .objects
+                .into_iter()
+                .filter_map(|object| operation_path(&prefix, &object.key, tenant, collection))
+                .collect();
+            if collection.is_none() && !candidates.is_empty() {
+                if catalog.is_none() {
+                    catalog = self.tenant_catalog_snapshot(tenant).await?;
                 }
+                let Some(snapshot) = catalog.clone() else {
+                    return Ok(HostedActivityPage { jobs, next: None });
+                };
+                candidates = tokio::task::spawn_blocking(move || -> Result<Vec<_>> {
+                    let collections = candidates
+                        .iter()
+                        .map(|(scope, _)| scope.collection.as_str());
+                    let membership = db::catalog_membership(snapshot.path(), collections)?;
+                    Ok(candidates
+                        .into_iter()
+                        .zip(membership)
+                        .filter_map(|(candidate, live)| live.then_some(candidate))
+                        .collect())
+                })
+                .await
+                .map_err(|error| Error::Internal(Box::new(error)))??;
+            }
+            for (scope, operation) in candidates {
                 let operation_prefix = self.operation_prefix(&scope, operation)?;
                 if let Some((record, _)) = self.read_operation(&operation_prefix, operation).await?
                 {

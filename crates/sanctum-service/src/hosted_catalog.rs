@@ -1,7 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
 use sanctum_core::{ChunkSettings, Error, Result, Scope, ScopeId, UsageMeasurement, UsageScope};
-use sanctum_db::{Command, Publication, SnapshotCache, Unit, collection_prefix, tenant_prefix};
+use sanctum_db::{
+    Command, Materialized, Publication, SnapshotCache, Unit, collection_prefix, tenant_prefix,
+};
 use sanctum_storage::{Key, Storage};
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -184,15 +186,21 @@ impl HostedCatalog {
         tenant: &ScopeId,
         read: impl FnOnce(&std::path::Path) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let unit = Unit::catalog(self.prefix.as_ref(), tenant)?;
         let database = self
-            .snapshots
-            .read(&self.publication, &unit)
+            .tenant_catalog_snapshot(tenant)
             .await?
             .ok_or_else(|| Error::NotFound("tenant catalog was not found".into()))?;
         tokio::task::spawn_blocking(move || read(database.path()))
             .await
             .map_err(|error| Error::Internal(Box::new(error)))?
+    }
+
+    pub(crate) async fn tenant_catalog_snapshot(
+        &self,
+        tenant: &ScopeId,
+    ) -> Result<Option<Arc<Materialized>>> {
+        let unit = Unit::catalog(self.prefix.as_ref(), tenant)?;
+        self.snapshots.read(&self.publication, &unit).await
     }
 }
 

@@ -16,9 +16,12 @@ use tonic::{Code, transport::Server};
 #[tokio::test]
 async fn hosted_activity_pages_resume_across_instances_and_keep_scope() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = Arc::new(sanctum_storage_fs::FileStorage::open(directory.path()).unwrap());
-    let service =
-        || HostedCatalog::new(storage.clone(), Some(Key::parse("managed").unwrap()), 1024).unwrap();
+    let storage = Arc::new(InterruptAcceptance::new(directory.path(), 0));
+    let service = || {
+        HostedCatalog::new(storage.clone(), Some(Key::parse("managed").unwrap()), 1024)
+            .unwrap()
+            .with_snapshot_cache_bytes(0)
+    };
     let catalog = service();
     let mut server = start(catalog.clone()).await;
     for (tenant, collection) in [
@@ -70,6 +73,40 @@ async fn hosted_activity_pages_resume_across_instances_and_keep_scope() {
             .await
             .unwrap();
     }
+    storage.catalog_reads.store(0, Ordering::Relaxed);
+    storage.catalog_downloads.store(0, Ordering::Relaxed);
+    let mut wide = server
+        .client
+        .list_ingestion_jobs(v1::ListIngestionJobsRequest {
+            tenant: "default".into(),
+            limit: Some(20),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(wide.next_page_token.is_none());
+    let mut jobs: Vec<_> = wide
+        .jobs
+        .drain(..)
+        .map(|job| job.scope.unwrap().collection)
+        .collect();
+    jobs.sort();
+    assert_eq!(jobs, ["notes", "reference"]);
+    assert_eq!(storage.catalog_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(storage.catalog_downloads.load(Ordering::Relaxed), 1);
+
+    let empty = server
+        .client
+        .list_ingestion_jobs(v1::ListIngestionJobsRequest {
+            tenant: "unknown".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(empty.jobs.is_empty() && empty.next_page_token.is_none());
+
     let mut request = v1::ListIngestionJobsRequest {
         tenant: "default".into(),
         limit: Some(1),
@@ -6687,6 +6724,7 @@ struct InterruptAcceptance {
     inner: sanctum_storage_fs::FileStorage,
     interrupt: AtomicU8,
     catalog_reads: AtomicUsize,
+    catalog_downloads: AtomicUsize,
     collection_reads: AtomicUsize,
     collection_downloads: AtomicUsize,
 }
@@ -6697,6 +6735,7 @@ impl InterruptAcceptance {
             inner: sanctum_storage_fs::FileStorage::open(path).unwrap(),
             interrupt: AtomicU8::new(interrupt),
             catalog_reads: AtomicUsize::new(0),
+            catalog_downloads: AtomicUsize::new(0),
             collection_reads: AtomicUsize::new(0),
             collection_downloads: AtomicUsize::new(0),
         }
@@ -6712,6 +6751,8 @@ impl Storage for InterruptAcceptance {
     async fn get(&self, key: &Key) -> StorageResult<Download> {
         if key.as_str().ends_with("/catalog/HEAD.json") {
             self.catalog_reads.fetch_add(1, Ordering::Relaxed);
+        } else if key.as_str().ends_with("/root.db") {
+            self.catalog_downloads.fetch_add(1, Ordering::Relaxed);
         } else if key.as_str().ends_with("/HEAD.json") {
             self.collection_reads.fetch_add(1, Ordering::Relaxed);
         } else if key.as_str().ends_with("/meta.db") {
