@@ -17,6 +17,8 @@ verification remains open.
 Run the desktop tray app and its managed Rust server from the repository
 root after installing the native prerequisites. The local setup uses a
 folder, SQLite, and optionally an existing Ollama instance for embeddings.
+This local workflow needs no Google Cloud account, release signing credentials,
+or notarization setup.
 
 ```sh
 pnpm install --frozen-lockfile
