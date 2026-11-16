@@ -20,8 +20,10 @@ which parts have working implementations and where to find the evidence.
   and x64 packages passed the [X11 tray workflow](#native-desktop-package-verification).
   The [Windows x64 installer](#windows-x64-installer-build) needs installation,
   WebView2 startup, and tray lifecycle verification on a licensed Windows
-  machine or an authorized evaluation guest. Windows distribution signing
-  remains open. The macOS bundle and both sidecars passed Developer ID
+  machine or an authorized evaluation guest. A disposable certificate
+  verified the [Windows signing procedure](DESKTOP.md#windows-distribution-signing).
+  Signing with the release team's trusted identity remains open.
+  The macOS bundle and both sidecars passed Developer ID
   signature verification. Notarization needs the release team's Keychain
   profile. [macOS release build](#macos-developer-id-release-build).
 - **Embedding providers.** Ollama and the OpenAI-compatible adapter have
@@ -1856,6 +1858,20 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
 - A release build on Apple Silicon produced a 14.24 MiB unsigned x64 NSIS
   installer. Extracting its payload confirmed three x64 PE executables.
   Both packaged sidecars matched the compiler output byte for byte.
+- The Tauri 2.12.4 CLI cross-built a 15.17 MiB x64 NSIS installer on
+  Apple Silicon with an operator-supplied signing overlay and a disposable
+  Authenticode certificate. The signer ran for the setup executable,
+  uninstaller, desktop executable, and both sidecars. 7-Zip extracted
+  the four payload executables. A local RFC 3161 authority timestamped each
+  signature. osslsigncode verified all four signatures and the setup
+  executable against the disposable signing and timestamp certificates.
+  The embedded sidecars matched their signed staging copies byte for byte.
+  The release build ran TypeScript checking and Vite bundling, and
+  `RUST_TEST_THREADS=2 pnpm check` passed with 218 tests and 24 opt-in
+  tests ignored.
+  The release certificate, trusted timestamp, and Windows installation and
+  tray behavior still need to be verified.
+  [Signing procedure](DESKTOP.md#windows-distribution-signing).
 - A disposable x64 Windows 11 Enterprise evaluation guest booted from
   checksum-verified Microsoft media into Windows Setup. Installing the
   app and exercising the tray, sidecar lifecycle, and WebView2 still

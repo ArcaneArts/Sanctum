@@ -132,6 +132,79 @@ the window. Launching the app again should focus the same window. Select **Quit
 Sanctum**, verify the listener stops, then relaunch and fetch the same text
 again. [Platform results and signing status](IMPLEMENTATION_STATUS.md).
 
+## Windows distribution signing
+
+Pass a release-only Tauri configuration overlay to the NSIS build. It
+selects the Authenticode signer without adding certificate material or
+credentials to the repository. The signer must replace the input file
+with the signed executable in place. Tauri substitutes the file path
+for `%1` and calls the signer for the setup executable, uninstaller,
+desktop executable, and both sidecars.
+[Tauri Windows signing](https://v2.tauri.app/distribute/sign/windows/#custom-sign-command).
+
+On Windows, open a shell that has the Windows SDK SignTool on `PATH`
+and can access the release certificate in the current user's Personal
+certificate store. Save the following overlay outside the checkout with
+the certificate's thumbprint and the signing provider's RFC 3161 timestamp
+URL. SignTool uses the thumbprint to select the certificate and SHA-256 to
+sign the binary and request the timestamp.
+[Microsoft SignTool](https://learn.microsoft.com/en-us/windows/win32/seccrypto/signtool).
+
+```json
+{
+  "bundle": {
+    "windows": {
+      "signCommand": {
+        "cmd": "signtool.exe",
+        "args": [
+          "sign", "/sha1", "CERTIFICATE_THUMBPRINT", "/fd", "SHA256",
+          "/tr", "RFC3161_TIMESTAMP_URL", "/td", "SHA256", "%1"
+        ]
+      }
+    }
+  }
+}
+```
+
+```powershell
+$releaseConfig = 'C:\release\windows-signing.json'
+pnpm --filter @sanctum/desktop tauri build --bundles nsis --config $releaseConfig
+```
+
+For a signed cross-build on macOS, use an overlay whose `signCommand`
+invokes the signing tool provided for that host by the release team.
+Use the tool's configuration or credential store for signing credentials.
+Pass the overlay to the [cross-build command](#native-packages) using
+`--config /absolute/path/to/windows-signing.json` in place of `--no-sign`.
+
+On a cross-build host, use 7-Zip to extract the three Sanctum executables
+and `uninstall.exe` from the **finished** setup executable. Verify the
+setup executable and each extracted executable with the corresponding
+public trust chain. [osslsigncode verification](https://github.com/mtrojnar/osslsigncode/blob/master/osslsigncode.md).
+
+```sh
+installer=apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Sanctum_0.1.0_x64-setup.exe
+certificates=/path/to/public-trust-chain.pem
+payload="$(mktemp -d)"
+7zz x "-o$payload" "$installer" sanctum-desktop.exe sanctum-server.exe sanctum-cli.exe uninstall.exe
+for file in "$installer" "$payload/sanctum-desktop.exe" "$payload/sanctum-server.exe" \
+  "$payload/sanctum-cli.exe" "$payload/uninstall.exe"; do
+  osslsigncode verify -CAfile "$certificates" -in "$file" || exit 1
+done
+```
+
+On the Windows test machine, verify the setup executable before installing
+it. After installation, repeat the verification for `sanctum-desktop.exe`,
+`sanctum-server.exe`, `sanctum-cli.exe`, and `uninstall.exe` in the install
+directory. Each command should exit successfully and show the expected
+publisher and a verified timestamp. Then exercise the tray and MCP
+package smoke test above.
+[SignTool verification options](https://learn.microsoft.com/en-us/windows/win32/seccrypto/signtool#verify-command-options).
+
+```powershell
+signtool.exe verify /pa /all /v /tw 'C:\release\Sanctum_0.1.0_x64-setup.exe'
+```
+
 ## macOS distribution signing
 
 On the release build machine, use the Developer ID Application identity
