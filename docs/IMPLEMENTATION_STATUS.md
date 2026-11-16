@@ -17,6 +17,14 @@ excerpt. Quitting and reopening the app preserved its source and revision
 IDs and exact bytes. The check removed its temporary collection and left
 the desktop server running for personal use.
 
+The installed macOS app was also visually checked through Activity, Settings,
+and Connect. Settings showed the local folder and Ollama profile, and Connect
+showed `http://127.0.0.1:47551/mcp` and the bundled stdio bridge. A background
+launch initially displayed a blank window; quitting and opening the app
+normally in Finder rendered these screens correctly. No frontend change was
+needed for that verification. Google Cloud credentials, Windows signing, and
+macOS notarization are not prerequisites for this local workflow.
+
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | Personal workflow verified on macOS. Cross-platform packaging and tray verification are tracked in milestone 2. |
