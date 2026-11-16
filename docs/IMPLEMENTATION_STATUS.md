@@ -6,7 +6,7 @@ which parts have working implementations and where to find the evidence.
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | Personal workflow verified on macOS. Cross-platform packaging and tray verification are tracked in milestone 2. |
-| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, URL and Git imports, a Windows x64 installer build, and verified macOS Developer ID signing | Live hosted provider checks, Windows installation and tray verification, Windows distribution signing, and macOS notarization |
+| 2. Providers and local integrations | Local profile rebuilds, multi-collection retrieval, embedding adapters and desktop settings, watched folders, URL and Git imports, verified Windows x64 installation and tray under ARM64 emulation, and macOS Developer ID signing | Live hosted provider checks, Windows distribution signing, and macOS notarization |
 | 3. Object storage and publication | Shared storage contract, filesystem and MinIO-tested S3, native GCS adapter, and fenced SQLite snapshot publication for hosted catalog, source, and metadata operations | Live GCS verification and cloud recovery scenarios |
 | 4. Cloud Run and Cloud Tasks | Linux API and worker containers, durable staged uploads, dispatch and repair, scheduled maintenance, and hosted gRPC and MCP | Live IAM, Cloud Run ingress, and Tasks and Scheduler delivery |
 | 5. Capacity | [200 MiB ingestion, GiB-scale snapshots, 10,000 MinIO tenants, and real embedding benchmarks](CAPACITY.md) | Cold/warm Cloud Run performance and production rollout limits |
@@ -18,9 +18,9 @@ which parts have working implementations and where to find the evidence.
   [Codex CLI check](#codex-mcp-retrieval) used real Ollama vectors and retrieved
   exact citations across a source edit and server restart. The Ubuntu ARM64
   and x64 packages passed the [X11 tray workflow](#native-desktop-package-verification).
-  The [Windows x64 installer](#windows-x64-installer-build) needs installation,
-  WebView2 startup, and tray lifecycle verification on a licensed Windows
-  machine or an authorized evaluation guest. A disposable certificate
+  The [Windows x64 installer](#windows-x64-installer-build) passed installation,
+  WebView2 startup, and tray lifecycle verification on Windows 11 ARM64
+  using x64 emulation. A disposable certificate
   verified the [Windows signing procedure](DESKTOP.md#windows-distribution-signing).
   Signing with the release team's trusted identity remains open.
   The macOS bundle and both sidecars passed Developer ID
@@ -1869,13 +1869,27 @@ Merged in [PR #26](https://github.com/ArcaneArts/Sanctum/pull/26).
   The release build ran TypeScript checking and Vite bundling, and
   `RUST_TEST_THREADS=2 pnpm check` passed with 218 tests and 24 opt-in
   tests ignored.
-  The release certificate, trusted timestamp, and Windows installation and
-  tray behavior still need to be verified.
+  The release certificate and a trusted timestamp still need to be verified.
   [Signing procedure](DESKTOP.md#windows-distribution-signing).
-- A disposable x64 Windows 11 Enterprise evaluation guest booted from
-  checksum-verified Microsoft media into Windows Setup. Installing the
-  app and exercising the tray, sidecar lifecycle, and WebView2 still
-  require a licensed Windows environment. [Build commands](DESKTOP.md#native-packages).
+- On Windows 11 Pro for Workstations Insider Preview, build 27754.1000
+  ARM64 in Parallels, the current unsigned x64 NSIS installer exited
+  successfully and the installed app rendered in WebView2 157.0.4341.24.
+  The GUI created a collection and imported a 95-byte UTF-8 file with a
+  custom extension, an accented character, an emoji, and CRLF. Activity
+  reached Text ready, and MCP search and fetch returned the exact bytes.
+- Closing the window kept the desktop and server PIDs and allowed the same
+  MCP retrieval. Open Sanctum in the notification-area menu restored the
+  window. A second launch exited with one desktop and one server remaining.
+  Quit Sanctum stopped both processes. Relaunch returned the same source ID,
+  revision ID, and bytes. Saving a worker count of two and applying it through
+  the GUI replaced the server process, and the installed CLI reported two
+  workers with the same source still retrievable. The installed stdio bridge
+  initialized MCP, returned the same 95-byte excerpt, and exited with code
+  zero after stdin closed. A final tray Quit left both API ports refusing
+  connections. The uninstaller exited successfully and removed the
+  installed executable.
+  These results exercise x64 binaries through Windows ARM64 emulation.
+  [Build commands](DESKTOP.md#native-packages).
 
 ## SQLite page-delta feasibility
 
