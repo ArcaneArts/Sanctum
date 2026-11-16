@@ -15,7 +15,8 @@ verification remains open.
 ## Get started
 
 Run the desktop tray app and its managed Rust server from the repository
-root after installing the native prerequisites.
+root after installing the native prerequisites. The local setup uses a
+folder, SQLite, and optionally an existing Ollama instance for embeddings.
 
 ```sh
 pnpm install --frozen-lockfile
