@@ -5,10 +5,11 @@ agents and other applications. Its Protobuf/gRPC API supports ingestion and
 retrieval with source references and namespaced integration metadata. Agents
 can connect to the local server through MCP HTTP or stdio.
 
-The desktop tray and its managed MCP server have been exercised on macOS
-and on Ubuntu ARM64 and x64 with an X11 tray host.
+The desktop tray and its managed MCP server have been exercised on macOS,
+on Ubuntu ARM64 and x64 with an X11 tray host, and on Windows 11 ARM64
+running the x64 installer through Windows emulation.
 The object-backed server has been tested against MinIO. Live Google Cloud
-verification and Windows tray testing are still open.
+verification remains open.
 [Implementation status and acceptance evidence](docs/IMPLEMENTATION_STATUS.md).
 
 ## Get started
