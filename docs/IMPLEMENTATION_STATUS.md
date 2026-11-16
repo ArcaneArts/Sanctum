@@ -56,6 +56,43 @@ which parts have working implementations and where to find the evidence.
 The sections below record individual delivery slices. Later measurements
 and recovery checks extend the initial evidence for each feature.
 
+## Requirement acceptance audit
+
+Audited [9e435f0](https://github.com/ArcaneArts/Sanctum/commit/9e435f0e34b57c7138e04e51e65b0c69fb78bbda)
+against the implementation goal and `PLAN.md` on 2026-11-16.
+The requirement numbers follow the goal's implementation scope.
+
+| Goal requirement | Current source and recorded verification | Outstanding acceptance |
+| --- | --- | --- |
+| 1. Rust services and PNPM workspace | [Cargo workspace](../Cargo.toml), [shared services](../crates/sanctum-service/src/lib.rs), and [desktop orchestration](../scripts/devtop.mjs). The [desktop workflow](#desktop-tray-and-first-use-flow) and [native package checks](#native-desktop-package-verification) ran the managed server. | Release distribution is tracked under requirement 11. |
+| 2. SQLite and filesystem, S3, and GCS storage | [SQLite adapter](../crates/sanctum-db-sqlite/src/lib.rs) and [storage interface](../crates/sanctum-storage/src/lib.rs). [Filesystem and MinIO contracts](#shared-object-storage-and-minio) exercised stored bytes and ranges. The native GCS adapter has loopback JSON API coverage. | Run the storage contract against an authorized GCS test bucket and verify generation conflicts and recovery there. |
+| 3. Streaming text and RTF chunking | [Chunker](../crates/sanctum-chunk/src/lib.rs) and [extractor](../crates/sanctum-extract/src/lib.rs). [200 MiB UTF-8 and RTF benchmarks](CAPACITY.md#200-mib-text-ingestion) measured bounded memory and exact canonical ranges. | Recorded local and MinIO measurements cover the input-size target. Hosted platform measurements remain under requirement 13. |
+| 4. Lexical, semantic, hybrid, and multi-collection retrieval | [Local retrieval](../crates/sanctum-service/src/embedding.rs) and [hosted retrieval](../crates/sanctum-service/src/hosted_retrieval.rs). [gRPC tests](../crates/sanctum-api/tests/local_grpc.rs) cover candidate filtering, ranking, tenant scope, and profile isolation. [Real embedding measurements](CAPACITY.md#retrieval-relevance-and-embedding-reuse) record relevance and reuse. | Verify retrieval through actual Cloud Run ingress with Vertex AI under requirements 6 and 8. |
+| 5. Integration metadata, changes, SQL, and export | [Metadata queries](../crates/sanctum-db-sqlite/src/metadata_query.rs), [local SQL sessions](../crates/sanctum-service/src/database_sessions.rs), and [hosted SQL sessions](../crates/sanctum-service/src/hosted_database.rs). The [metadata query](#structured-metadata-queries), [change stream](#hosted-change-cursors-and-streams), and [database inspection](#hosted-database-inspection) records include scope and generation checks. | Hosted deployment acceptance remains under requirement 8. |
+| 6. Embedding adapters and profile changes | [Provider contract](../crates/sanctum-embedding/src/lib.rs), [local profile work](../crates/sanctum-service/src/embedding/collections.rs), and [hosted rebuilds](../crates/sanctum-service/src/hosted_rebuild.rs). Ollama and its OpenAI-compatible endpoint returned real embeddings. [Profile tests](#hosted-embedding-profile-rebuilds) exercised rebuild and stale-delivery behavior. | Real Vertex AI document and query requests, configured dimensions, and subsequent strict semantic retrieval. |
+| 7. Source replacement and cleanup | [Local lifecycle](../crates/sanctum-service/src/local_jobs.rs), [hosted lifecycle](../crates/sanctum-service/src/hosted_lifecycle.rs), and [revision retirement](../crates/sanctum-db-sqlite/src/lifecycle.rs). [Local lifecycle](#local-source-lifecycle) and [hosted deletion](#hosted-source-deletion-and-reclamation) checks cover replacement, metadata reset, late work, and reclamation. | Recheck hosted recovery on GCS under requirements 2 and 8. |
+| 8. Durable local and hosted work | [Local runner](../crates/sanctum-service/src/worker.rs), [fenced publication](../crates/sanctum-db/src/lib.rs), and [Cloud Tasks dispatcher](../crates/sanctum-server/src/cloud_tasks.rs). [Publication contracts](../crates/sanctum-db/tests/publication.rs) and [hosted deployment verifier](../scripts/check-hosted-deployment.py) exercised faults, process loss, duplicate tasks, and unordered delivery locally and on MinIO. | Actual Cloud Run API and worker ingress, IAM, Cloud Tasks and Scheduler delivery, scale-to-zero repair, and recovery after instance loss. |
+| 9. Protobuf/gRPC and MCP | [Versioned contract](../proto/sanctum/v1/sanctum.proto), [generated Rust bindings and descriptor export](../crates/sanctum-proto/src/lib.rs), and [MCP adapter](../crates/sanctum-mcp/src/lib.rs). [Python client checks](#resumable-changes-and-python-grpc-client), [Codex retrieval](#codex-mcp-retrieval), and the [Windows stdio check](#windows-x64-installer-build) exercised the published interfaces. | Verify gRPC and MCP through Cloud Run ingress under requirement 8. |
+| 10. Upload and import adapters | [File and directory import](../crates/sanctum-service/src/local_import.rs), [watchers](../crates/sanctum-service/src/watched_folders.rs), [URL import](../crates/sanctum-service/src/url_import.rs), and [Git import](../crates/sanctum-service/src/git_import.rs). [Local gRPC checks](../crates/sanctum-api/tests/local_grpc.rs) cover updates and reconciliation. [Authenticated HTTPS Git verification](#authenticated-git-over-https) exercised the remote transport. | Local adapter workflows have recorded runtime evidence. Hosted upload acceptance remains under requirement 8. |
+| 11. Tauri, React, and shadcn/ui desktop | [Rust host](../apps/desktop/src-tauri/src/host.rs) and [React frontend](../apps/desktop/src). [macOS](#desktop-tray-and-first-use-flow), [Ubuntu ARM64 and x64](#native-desktop-package-verification), and [Windows ARM64 with x64 emulation](#windows-x64-installer-build) exercised tray and server lifecycle. Developer ID signatures and disposable Windows signatures and timestamps were verified. | Sign and verify with the Windows release identity. Submit the macOS app for notarization, staple its ticket, and verify Gatekeeper acceptance. |
+| 12. JSON configuration and multi-tenancy | [Configuration decoding](../crates/sanctum-config/src/lib.rs) and [desktop settings and child process](../apps/desktop/src-tauri/src/host.rs). Local and hosted gRPC checks verify tenant scope. The Windows GUI saved and applied settings, and the installed CLI confirmed the changed worker count. | Consistent API and worker configuration must also be exercised in the live deployment under requirement 8. |
+| 13. Usage, observability, and capacity | [Storage measurement](../crates/sanctum-storage/src/lib.rs), [telemetry](../crates/sanctum-service/src/telemetry.rs), [diagnostic events](LOCAL_API.md#server-diagnostics), and [capacity results](CAPACITY.md). Measurements include 200 MiB sources, multi-GiB collections, concurrent snapshots, 10,000 mostly idle tenants, and embedding reuse. | Cloud Run cold and warm timings, instance memory, transfer and publication measurements, and resulting production rollout limits. |
+
+The next external checks need the authorized Sanctum project ID, region,
+test bucket, deployment and invocation identities, and refreshed Google CLI
+and Application Default Credentials. On 2026-11-16, project discovery and
+ADC token refresh both returned a reauthentication failure. The
+[deployment runbook](CLOUD_RUN.md#verify-a-deployment) supplies the storage,
+provider, ingress, recovery, and capacity exercises once those resources
+are available.
+
+Windows release verification needs the release team's signing identity and
+timestamp service. macOS notarization needs a usable notarytool Keychain
+profile. On 2026-11-16, requesting history with the documented `Sanctum`
+profile returned `No Keychain password item found`.
+The [signing procedures](DESKTOP.md#windows-distribution-signing) describe
+the artifact verification steps.
+
 ## Local text ingestion and retrieval
 
 Merged in [PR #2](https://github.com/ArcaneArts/Sanctum/pull/2).
