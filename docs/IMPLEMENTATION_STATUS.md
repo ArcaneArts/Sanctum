@@ -3,6 +3,20 @@
 [PLAN.md](PLAN.md) defines the scope and acceptance criteria. This record tracks
 which parts have working implementations and where to find the evidence.
 
+The owner's current delivery priority is local use on macOS with filesystem
+storage and local Ollama embeddings. The handoff should make the desktop,
+imports, MCP retrieval, and restart persistence ready for personal use.
+Cloud deployment and public release validation follow local feedback and the
+owner's selection of deployment and signing resources.
+
+The 2026-11-16 local handoff built and launched the macOS app with the
+existing filesystem data directory and local Ollama `embeddinggemma-2:740m`
+at 768 dimensions. Through the desktop-managed MCP server, a temporary
+source reached semantic retrieval and returned its exact 94-byte UTF-8
+excerpt. Quitting and reopening the app preserved its source and revision
+IDs and exact bytes. The check removed its temporary collection and left
+the desktop server running for personal use.
+
 | Milestone | Current implementation | Remaining work |
 | --- | --- | --- |
 | 1. Local desktop and MCP | Local Rust service with gRPC, MCP HTTP and stdio, and a Tauri tray app for storage, imports, activity, settings, and Ollama-backed retrieval | Personal workflow verified on macOS. Cross-platform packaging and tray verification are tracked in milestone 2. |
